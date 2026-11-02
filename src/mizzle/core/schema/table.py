@@ -35,6 +35,13 @@ class Table:
         cls, *, name: str | None = None, schema: str | None = None, **kwargs: object
     ) -> None:
         super().__init_subclass__(**kwargs)
+        if parents := [
+            b.__name__ for b in cls.__bases__ if b is not Table and issubclass(b, Table)
+        ]:
+            raise SchemaError(
+                f"table class {cls.__name__} inherits from table {parents[0]}; tables cannot "
+                "inherit from other tables (mark them @final)"
+            )
         members: dict[str, object] = dict(vars(cls))
         columns = {attr: v for attr, v in members.items() if isinstance(v, ColumnBase)}
         if not columns:

@@ -50,6 +50,7 @@ class Config:
         raise MigrationError(f"unsupported dialect {self.dialect_name!r}")
 
     def url(self) -> str:
+        load_dotenv(self.root / ".env")
         url = os.environ.get(self.url_env)
         if not url:
             raise MigrationError(f"set the {self.url_env} environment variable to the database URL")
@@ -98,6 +99,26 @@ def _table(value: object, source: Path) -> dict[str, object]:
     if not isinstance(value, dict):
         raise MigrationError(f"{source}: [tool.mizzle] must be a table")
     return cast(dict[str, object], value)  # TOML tables have string keys
+
+
+def load_dotenv(path: Path) -> None:
+    """Load ``KEY=value`` lines from a ``.env`` file. Variables already set in the
+    environment win, so ``export DATABASE_URL=...`` overrides the file."""
+    if not path.is_file():
+        return
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip().removeprefix("export ").strip()
+        if not line or line.startswith("#"):
+            continue
+        key, sep, value = line.partition("=")
+        key, value = key.strip(), value.strip()
+        if not sep or not key.isidentifier():
+            continue
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
+            value = value[1:-1]
+        else:
+            value = value.split(" #", 1)[0].rstrip()  # unquoted values may end in a comment
+        os.environ.setdefault(key, value)
 
 
 def _from_mapping(root: Path, data: dict[str, object], source: Path) -> Config:

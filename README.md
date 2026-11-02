@@ -27,6 +27,8 @@ pip install "mizzle[studio]"  # + Studio (its UI downloads on first run, ~250 KB
 ```python
 # app/db/schema.py
 import enum
+from typing import final
+
 from mizzle import Table, index, many, one, sql
 from mizzle.pg import integer, pg_enum, serial, text, timestamp, varchar
 
@@ -36,6 +38,7 @@ class Role(enum.StrEnum):
     USER = "user"
 
 
+@final
 class Users(Table, name="users"):
     id = serial().primary_key()  # Column[int]
     email = varchar(255).not_null().unique()  # Column[str]
@@ -46,6 +49,7 @@ class Users(Table, name="users"):
     posts = many(lambda: Posts)
 
 
+@final
 class Posts(Table, name="posts"):
     id = serial().primary_key()
     author_id = integer().not_null().references(lambda: Users.id, on_delete="cascade")

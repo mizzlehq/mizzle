@@ -216,3 +216,28 @@ def test_init_rejects_bad_schema_paths(tmp_path: Path) -> None:
     for bad in ("schema.txt", "my-app/schema.py", "class/schema.py"):
         with pytest.raises(MigrationError):
             init_project(tmp_path, schema_file=Path(bad))
+
+
+def test_dotenv_is_loaded_without_overriding(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from mizzle.kit.config import load_dotenv
+
+    (tmp_path / ".env").write_text(
+        "# comment\n"
+        "export DATABASE_URL='postgresql://u:p@h/db'\n"
+        "PLAIN=value # trailing comment\n"
+        'QUOTED="a # not a comment"\n'
+        "ALREADY=from-file\n"
+        "not a variable line\n"
+    )
+    for key in ("DATABASE_URL", "PLAIN", "QUOTED"):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("ALREADY", "from-env")
+    load_dotenv(tmp_path / ".env")
+    import os
+
+    assert os.environ["DATABASE_URL"] == "postgresql://u:p@h/db"
+    assert os.environ["PLAIN"] == "value"
+    assert os.environ["QUOTED"] == "a # not a comment"
+    assert os.environ["ALREADY"] == "from-env"

@@ -11,3 +11,6 @@ dist/
 # Studio UI: local dev build, and the release manifest (written by release.yml)
 src/mizzle/studio/static/
 src/mizzle/studio/ui.json
+
+# Local secrets (database URLs, passwords)
+.env

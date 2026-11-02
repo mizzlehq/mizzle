@@ -102,3 +102,10 @@ def test_config_with_foreign_column() -> None:
 
     with pytest.raises(SchemaError, match="from another table"):
         validate_tables([Bad, Authors])
+
+
+def test_tables_cannot_inherit_from_tables() -> None:
+    with pytest.raises(SchemaError, match="cannot inherit from other tables"):
+
+        class Admins(Authors):
+            level = integer()

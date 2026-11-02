@@ -10,10 +10,13 @@ from mizzle.core.errors import MigrationError
 
 STARTER_SCHEMA = '''"""Database schema. Edit it, then run `mizzle generate` and `mizzle migrate`."""
 
+from typing import final
+
 from mizzle import Table, sql
 from mizzle.pg import serial, text, timestamp, varchar
 
 
+@final  # tables are never subclassed; also lets strict type checkers skip annotations
 class Users(Table, name="users"):
     id = serial().primary_key()
     email = varchar(255).not_null().unique()
