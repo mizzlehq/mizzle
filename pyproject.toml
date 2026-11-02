@@ -1,0 +1,58 @@
+[project]
+name = "mizzle"
+version = "0.1.0"
+description = "Drizzle-style typed async ORM for Python"
+readme = "README.md"
+requires-python = ">=3.12"
+license = "MIT"
+dependencies = ["asyncpg>=0.30"]
+
+[project.optional-dependencies]
+studio = ["starlette>=0.40", "uvicorn>=0.30"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+    "pytest-asyncio>=0.25",
+    "pytest-cov>=6.0",
+    "pyright>=1.1.400",
+    "mypy>=1.15",
+    "ruff>=0.11",
+    "asyncpg-stubs>=0.30",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+per-file-target-version = { "tests/**/*_py314.py" = "py314" }
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
+
+[tool.pyright]
+include = ["src", "tests"]
+strict = ["src", "tests/typing"]
+pythonVersion = "3.12"
+reportUnnecessaryTypeIgnoreComment = "error"
+ignore = ["tests/**/*_py314.py"]
+
+[tool.mypy]
+strict = true
+python_version = "3.12"
+files = ["src", "tests/typing"]
+
+[tool.coverage.run]
+source = ["mizzle"]
+
+[tool.coverage.report]
+fail_under = 90
+show_missing = true

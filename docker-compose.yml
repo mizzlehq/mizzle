@@ -1,0 +1,9 @@
+services:
+  postgres:
+    image: postgres:18
+    environment:
+      POSTGRES_USER: mizzle
+      POSTGRES_PASSWORD: mizzle
+      POSTGRES_DB: mizzle
+    ports:
+      - "54329:5432"
