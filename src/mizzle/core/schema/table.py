@@ -108,10 +108,8 @@ def validate_tables(tables: Sequence[type[Table]], casing: Casing | None = None)
             if column.reference is None:
                 continue
             target = column.reference.target()
-            if not isinstance(target, Column) or target.table is None:
-                raise SchemaError(
-                    f"{column.qualified_name} references something that is not a column"
-                )
+            if target.table is None:
+                raise SchemaError(f"{column.qualified_name} must reference a table column")
             if target.table not in registered:
                 raise SchemaError(
                     f"{column.qualified_name} references {target.qualified_name}, "
