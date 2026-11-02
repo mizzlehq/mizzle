@@ -1,7 +1,7 @@
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="assets/logo-dark.svg">
-    <img alt="mizzle" src="assets/logo.svg" width="320">
+    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/mizzlehq/mizzle/main/assets/logo-dark.png">
+    <img alt="mizzle" src="https://raw.githubusercontent.com/mizzlehq/mizzle/main/assets/logo.png" width="320">
   </picture>
 </p>
 
@@ -25,7 +25,7 @@ Built for PostgreSQL first; other SQL databases plug in through the dialect laye
 (`src/mizzle/dialects/`).
 
 A complete example app (FastAPI, migrations, seed data, tests) lives in
-[`examples/social`](examples/social).
+[`examples/social`](https://github.com/mizzlehq/mizzle/tree/main/examples/social).
 
 ## Install
 
