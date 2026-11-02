@@ -1,6 +1,15 @@
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/logo-dark.svg">
+    <img alt="mizzle" src="assets/logo.svg" width="320">
+  </picture>
+</p>
+
 # mizzle
 
-Drizzle-style, fully typed, async ORM for Python and PostgreSQL.
+A fully typed, async ORM for Python and PostgreSQL: write queries that read like SQL,
+get typed rows back, and evolve your schema with generated migrations. If you know
+[Drizzle](https://orm.drizzle.team) from TypeScript, mizzle will feel familiar.
 
 - **Schema in Python classes.** Result rows are typed for pyright and mypy, with no code
   generation.

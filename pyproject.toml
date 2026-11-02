@@ -1,11 +1,29 @@
 [project]
 name = "mizzle"
 version = "0.1.0"
-description = "Drizzle-style typed async ORM for Python"
+description = "Fully typed async ORM for PostgreSQL: SQL-like queries, schema-driven migrations and a data studio"
+keywords = ["orm", "postgresql", "asyncpg", "async", "sql", "query-builder", "migrations", "typed"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Framework :: AsyncIO",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Database",
+    "Topic :: Database :: Front-Ends",
+    "Typing :: Typed",
+]
 readme = "README.md"
 requires-python = ">=3.12"
 license = "MIT"
 dependencies = ["asyncpg>=0.30"]
+
+[project.urls]
+Homepage = "https://github.com/mizzlehq/mizzle"
+Repository = "https://github.com/mizzlehq/mizzle"
+Issues = "https://github.com/mizzlehq/mizzle/issues"
 
 [project.optional-dependencies]
 studio = [

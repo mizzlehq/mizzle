@@ -1,4 +1,4 @@
-"""mizzle: Drizzle-style typed async ORM."""
+"""mizzle: a fully typed async ORM for PostgreSQL."""
 
 from mizzle.core.errors import (
     CheckViolation,
