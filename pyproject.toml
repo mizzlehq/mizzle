@@ -8,7 +8,10 @@ license = "MIT"
 dependencies = ["asyncpg>=0.30"]
 
 [project.optional-dependencies]
-studio = ["starlette>=0.40", "uvicorn>=0.30"]
+studio = [
+    "starlette>=0.40",
+    "uvicorn>=0.30",
+]
 
 [project.scripts]
 mizzle = "mizzle.kit.cli:main"
@@ -26,6 +29,7 @@ dev = [
     "mypy>=1.15",
     "ruff>=0.11",
     "asyncpg-stubs>=0.30",
+    "httpx>=0.28.1",
 ]
 
 [tool.pytest.ini_options]
