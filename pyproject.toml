@@ -44,12 +44,13 @@ include = ["src", "tests"]
 strict = ["src", "tests/typing"]
 pythonVersion = "3.12"
 reportUnnecessaryTypeIgnoreComment = "error"
+enableTypeIgnoreComments = false  # "# type: ignore" is for mypy; pyright uses "# pyright: ignore"
 ignore = ["tests/**/*_py314.py"]
 
 [tool.mypy]
 strict = true
 python_version = "3.12"
-files = ["src"]
+files = ["src", "tests/typing"]
 
 [tool.coverage.run]
 source = ["mizzle"]

@@ -32,6 +32,7 @@ from mizzle.core.sql.nodes import (
 )
 
 if TYPE_CHECKING:
+    from mizzle.core.query.select import CteColumn, Select, Slot, Source
     from mizzle.core.schema.table import Table
 
 
@@ -174,3 +175,59 @@ class Compiler:
 
     def visit_Excluded(self, node: Excluded[Any]) -> str:
         return f"excluded.{self.column_name(node.column)}"
+
+    # -- SELECT -----------------------------------------------------------------------
+
+    def source(self, source: Source) -> str:
+        if isinstance(source, type):
+            return self.table_name(source)
+        return self.quote(source.name)
+
+    def select_slot(self, slot: Slot) -> str:
+        if isinstance(slot, type):
+            return ", ".join(self.visit(c) for c in slot.__table__.columns.values())
+        return self.visit(slot)
+
+    def count_value(self, value: int | Placeholder) -> str:
+        return self.visit(value) if isinstance(value, Placeholder) else self.bind(value)
+
+    def visit_CteColumn(self, node: CteColumn) -> str:
+        return f"{self.quote(node.cte.name)}.{self.quote(node.name)}"
+
+    def visit_Select(self, node: Select[Any]) -> str:
+        # Clauses are emitted strictly left to right so $n numbering follows the text.
+        parts: list[str] = []
+        if node.ctes:
+            ctes = ", ".join(f"{self.quote(c.name)} AS ({self.visit(c.query)})" for c in node.ctes)
+            parts.append(f"WITH {ctes}")
+        parts.append("SELECT DISTINCT" if node.distinct_ else "SELECT")
+        if isinstance(node.projection, dict):
+            items = [f"{self.visit(e)} AS {self.quote(k)}" for k, e in node.projection.items()]
+        else:
+            items = [self.select_slot(slot) for slot in node.slots()]
+        parts.append(", ".join(items))
+        parts.append(f"FROM {self.source(node.source)}")
+        for join in node.joins:
+            parts.append(f"{join.kind} JOIN {self.source(join.source)} ON {self.visit(join.on)}")
+        if node.where_ is not None:
+            parts.append(f"WHERE {self.visit(node.where_)}")
+        if node.group_by_:
+            parts.append("GROUP BY " + ", ".join(self.visit(e) for e in node.group_by_))
+        if node.having_ is not None:
+            parts.append(f"HAVING {self.visit(node.having_)}")
+        if node.order_by_:
+            parts.append("ORDER BY " + ", ".join(self.visit(e) for e in node.order_by_))
+        if node.limit_ is not None:
+            parts.append(f"LIMIT {self.count_value(node.limit_)}")
+        if node.offset_ is not None:
+            parts.append(f"OFFSET {self.count_value(node.offset_)}")
+        if node.lock is not None:
+            lock = "FOR UPDATE"
+            if node.lock.of:
+                lock += " OF " + ", ".join(self.quote(t.__table__.name) for t in node.lock.of)
+            if node.lock.skip_locked:
+                lock += " SKIP LOCKED"
+            if node.lock.nowait:
+                lock += " NOWAIT"
+            parts.append(lock)
+        return " ".join(parts)

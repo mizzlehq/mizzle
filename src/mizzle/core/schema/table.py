@@ -56,10 +56,8 @@ class Table:
         fields = ", ".join(f"{k}={v!r}" for k, v in self.__dict__.items())
         return f"{type(self).__name__}({fields})"
 
-    def __eq__(self, other: object) -> bool:
+    def __eq__(self, other: object) -> bool:  # also makes rows unhashable (__hash__ = None)
         return type(self) is type(other) and self.__dict__ == other.__dict__
-
-    __hash__ = None  # type: ignore[assignment]  # rows are mutable values
 
 
 def _constraint_columns(constraint: Constraint) -> tuple[Column[Any], ...]:
