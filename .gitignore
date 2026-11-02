@@ -7,3 +7,6 @@ dist/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+
+# Studio UI build output (built in CI and shipped in the wheel)
+src/mizzle/studio/static/

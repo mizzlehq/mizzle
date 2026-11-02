@@ -20,6 +20,11 @@ mizzle = "mizzle.kit.cli:main"
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
+[tool.hatch.build]
+# The Studio UI is gitignored but must ship in sdists and wheels (build it first:
+# `npm ci && npm run build` in studio-ui/).
+artifacts = ["src/mizzle/studio/static/**"]
+
 [dependency-groups]
 dev = [
     "pytest>=8.3",
