@@ -19,6 +19,21 @@ jobs:
       - run: uv run pyright --pythonversion 3.14
       - run: uv run mypy --python-version 3.14
 
+  ui:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: studio-ui
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: studio-ui/package-lock.json
+      - run: npm ci
+      - run: npm run build
+
   test:
     runs-on: ubuntu-latest
     strategy:

@@ -1,0 +1,41 @@
+name: Release
+
+# Push a tag like v0.2.0 to build the Studio UI, package it into the wheel, and publish.
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: studio-ui/package-lock.json
+      - name: Build Studio UI into src/mizzle/studio/static
+        working-directory: studio-ui
+        run: npm ci && npm run build
+      - uses: astral-sh/setup-uv@v6
+      - run: uv build
+      - name: Check the wheel contains the UI
+        run: unzip -l dist/*.whl | grep -q "mizzle/studio/static/index.html"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write  # PyPI trusted publishing; no API token stored in GitHub
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1

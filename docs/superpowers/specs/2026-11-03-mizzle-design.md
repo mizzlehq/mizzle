@@ -1,7 +1,7 @@
 # mizzle — Design Spec
 
 Date: 2026-11-03
-Status: Approved in conversation, pending written review
+Status: Implemented (phases 1-4). Changes made during implementation are listed in section 11.
 
 ## 1. Goal
 
@@ -335,3 +335,26 @@ Each phase gets its own implementation plan.
 2. **Relational queries.**
 3. **Kit:** config, snapshot, diff, DDL, introspection, `generate`, `migrate`, `push`, `pull`, `check`, `drop`, `typegen`.
 4. **Studio.**
+
+## 11. Changes during implementation
+
+- **Config file:** `mizzle.toml` in the project root, or `[tool.mizzle]` in `pyproject.toml`.
+  Only the current folder is searched (not parents), because loading a config imports the
+  schema modules. `--config` selects a file explicitly.
+- **typegen:** writes a real module `<schema>_types.py` with `XInsert` / `XUpdate`
+  TypedDicts, used as `db.insert(Users).values(UsersInsert(...))`, instead of a `.pyi` stub
+  that would shadow the schema module.
+- **Relations:** `fields` / `references` accept a list or a `lambda` (for tables declared
+  later). `one()` is typed `T | None` on rows. `columns=` partial loading is not implemented.
+  Arrays of numeric, bytea or interval cannot be loaded through `with_` yet.
+- **`select()` + join** returns whole rows of the FROM table only; use `select(A, B)` to get
+  joined rows. Right/full joins require `select(A, B)`.
+- **Errors:** driver errors are raised `from None` so logged tracebacks cannot print row
+  values from the driver's DETAIL; the original stays on `.original`. Data-exception
+  messages (SQLSTATE class 22) are replaced because PostgreSQL quotes the bad value.
+- **pull:** generates `pulled_schema.py` and, for an empty migrations folder, a baseline
+  migration with no statements.
+- **Studio:** React + Tailwind + Base UI + shadcn/ui in `studio-ui/`, built with Vite into
+  `src/mizzle/studio/static/` (gitignored, added to wheels by the release workflow). The
+  token travels in the URL fragment, so it is never sent to the server in a URL or logged.
+  Raw SQL in `--read-only` mode runs in a read-only transaction.
