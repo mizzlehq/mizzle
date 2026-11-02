@@ -11,7 +11,7 @@ from typing import Any, assert_type
 
 from mizzle.core.query.builder import QueryBuilder
 from mizzle.core.schema.column import Column
-from mizzle.core.sql.operators import count, eq
+from mizzle.core.sql.operators import count, eq, nullable
 from tests.models import Posts, Role, Users
 
 
@@ -55,3 +55,12 @@ async def relational(qb: QueryBuilder) -> None:
     assert_type(users[0].posts, list[Posts])
     assert_type(users[0].posts[0].author, Users | None)
     assert_type(await qb.query(Users).find_first(), Users | None)
+
+
+async def left_join_columns(qb: QueryBuilder) -> None:
+    rows = await (
+        qb.select(Users.id, nullable(Posts.title))
+        .from_(Users)
+        .left_join(Posts, eq(Posts.author_id, Users.id))
+    )
+    assert_type(rows, list[tuple[int, str | None]])

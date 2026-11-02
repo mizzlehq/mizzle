@@ -127,6 +127,19 @@ class TypedFunc[T](Func, Expr[T]):
 
 
 @dataclass(frozen=True)
+class Nullable(ExprBase):
+    """Marks an expression as possibly NULL for type checkers (see ``nullable()``).
+    Compiles and decodes exactly like the wrapped expression."""
+
+    expr: ExprBase
+
+
+@dataclass(frozen=True)
+class TypedNullable[T](Nullable, Expr[T]):
+    pass
+
+
+@dataclass(frozen=True)
 class OrderBy(Node):
     expr: Node
     descending: bool = False

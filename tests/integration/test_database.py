@@ -19,6 +19,7 @@ from mizzle import (
     desc,
     eq,
     excluded,
+    nullable,
     placeholder,
     sql,
 )
@@ -69,6 +70,19 @@ async def test_left_join_gives_none_for_missing(db: Database) -> None:
     )
     assert [(u.email, p.title if p else None) for u, p in rows] == [("ann", "hello"), ("bob", None)]
     assert rows[1][0] == bob
+
+
+async def test_nullable_left_join_columns(db: Database) -> None:
+    ann = await add_user(db, "ann")
+    await add_user(db, "bob")
+    await db.insert(Posts).values(author_id=ann.id, title="hello")
+    rows = await (
+        db.select(Users.email, nullable(Posts.title))
+        .from_(Users)
+        .left_join(Posts, eq(Posts.author_id, Users.id))
+        .order_by(Users.email)
+    )
+    assert rows == [("ann", "hello"), ("bob", None)]
 
 
 async def test_jsonb_roundtrip(db: Database) -> None:

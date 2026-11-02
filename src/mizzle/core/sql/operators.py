@@ -31,6 +31,7 @@ from mizzle.core.sql.nodes import (
     Raw,
     Star,
     TypedFunc,
+    TypedNullable,
     TypedPlaceholder,
 )
 
@@ -198,6 +199,13 @@ def placeholder[T](name: str) -> TypedPlaceholder[T]:
     """A value supplied later: ``q.prepare().execute(name=value)``. Its type comes from
     where it is used: ``eq(Users.id, placeholder("id"))`` makes it ``int``."""
     return TypedPlaceholder[T](name)
+
+
+def nullable[T](expr: Expr[T]) -> Expr[T | None]:
+    """Type a selected expression as possibly ``None``, e.g. a column of an outer-joined
+    table: ``select(Users.id, nullable(Posts.title)).from_(Users).left_join(Posts, ...)``.
+    (Whole tables in ``select(A, B)`` are made optional by the join automatically.)"""
+    return TypedNullable[T | None](expr)
 
 
 def excluded(column: ColumnBase) -> Excluded:

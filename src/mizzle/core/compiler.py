@@ -28,6 +28,7 @@ from mizzle.core.sql.nodes import (
     InList,
     Node,
     Not,
+    Nullable,
     OrderBy,
     Param,
     Placeholder,
@@ -231,6 +232,9 @@ class Compiler:
 
     def visit_Raw(self, node: Raw) -> str:
         return "".join(p if isinstance(p, str) else self.visit(p) for p in node.parts)
+
+    def visit_Nullable(self, node: Nullable) -> str:
+        return self.visit(node.expr)
 
     def visit_Identifier(self, node: Identifier) -> str:
         return self.quote(node.name)

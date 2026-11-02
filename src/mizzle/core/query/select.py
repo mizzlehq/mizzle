@@ -11,7 +11,15 @@ from mizzle.core.errors import QueryError
 from mizzle.core.query.base import Executable, Row, Runner, decode_table
 from mizzle.core.schema.column import ColumnBase
 from mizzle.core.schema.table import Table
-from mizzle.core.sql.nodes import Condition, Expr, ExprBase, Node, OrderBy, Placeholder
+from mizzle.core.sql.nodes import (
+    Condition,
+    Expr,
+    ExprBase,
+    Node,
+    Nullable,
+    OrderBy,
+    Placeholder,
+)
 from mizzle.core.sql.operators import and_
 
 type JoinKind = Literal["INNER", "LEFT", "RIGHT", "FULL"]
@@ -151,7 +159,8 @@ class SelectBase(Node):
                 index += len(slot.__table__.columns)
             else:
                 value = row[index]
-                values.append(slot.decode(value) if isinstance(slot, ColumnBase) else value)
+                inner = slot.expr if isinstance(slot, Nullable) else slot
+                values.append(inner.decode(value) if isinstance(inner, ColumnBase) else value)
                 index += 1
         if self.projection is None:
             return values[0]
