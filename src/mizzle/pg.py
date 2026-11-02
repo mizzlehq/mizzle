@@ -24,6 +24,7 @@ from mizzle.dialects.postgres.types import (
     jsonb,
     pg_enum,
     serial,
+    smallserial,
     time,
     uuid,
 )
@@ -47,6 +48,7 @@ __all__ = [
     "real",
     "serial",
     "smallint",
+    "smallserial",
     "text",
     "time",
     "timestamp",

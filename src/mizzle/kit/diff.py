@@ -61,6 +61,8 @@ class StrictRenames:
 
     renames: Mapping[str, str] = field(default_factory=dict[str, str])
     default_schema: str = "public"
+    # Called for leftovers instead of raising (the CLI asks the user when on a terminal).
+    ask: RenameResolver | None = None
 
     def _lookup(self, scope: str, old: str) -> str | None:
         full = f"{scope}.{old}"
@@ -85,6 +87,8 @@ class StrictRenames:
                 result[old] = new
         left_removed = [r for r in removed if r not in result]
         left_added = [a for a in added if a not in result.values()]
+        if left_removed and left_added and self.ask is not None:
+            return result | self.ask(kind, scope, left_removed, left_added)
         if left_removed and left_added:
             raise MigrationError(
                 f"{kind}s {left_removed} were removed and {left_added} added in {scope}: "

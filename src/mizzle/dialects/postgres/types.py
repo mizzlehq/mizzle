@@ -38,6 +38,10 @@ def bigserial(name: str | None = None) -> Column[int]:
     return Column("bigserial", (int,), name, nullable=False, generated=True)
 
 
+def smallserial(name: str | None = None) -> Column[int]:
+    return Column("smallserial", (int,), name, nullable=False, generated=True)
+
+
 def uuid(name: str | None = None) -> Column[_uuid.UUID | None]:
     return Column("uuid", (_uuid.UUID,), name)
 

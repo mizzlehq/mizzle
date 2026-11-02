@@ -106,6 +106,15 @@ class Session(QueryBuilder):
                 connection=conn,
             )
 
+    @property
+    def dialect(self) -> Dialect:
+        return self._dialect
+
+    @property
+    def driver(self) -> Driver:
+        """The connection pool (raises if not connected)."""
+        return self._require_driver()
+
     # -- internals --------------------------------------------------------------------
 
     def _require_driver(self) -> Driver:

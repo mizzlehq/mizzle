@@ -10,6 +10,9 @@ dependencies = ["asyncpg>=0.30"]
 [project.optional-dependencies]
 studio = ["starlette>=0.40", "uvicorn>=0.30"]
 
+[project.scripts]
+mizzle = "mizzle.kit.cli:main"
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"

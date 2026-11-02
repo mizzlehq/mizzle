@@ -1,0 +1,141 @@
+import copy
+from pathlib import Path
+
+import pytest
+
+from mizzle.core.errors import MigrationError
+from mizzle.core.snapshot import Snapshot, empty_snapshot
+from mizzle.core.steps import (
+    AddEnumValue,
+    CreateIndex,
+    CreateTable,
+    DropTable,
+    RenameConstraint,
+    Statement,
+)
+from mizzle.dialects.postgres import PostgresDialect
+from mizzle.dialects.postgres.ddl import normalize_default, normalize_type
+from mizzle.kit.config import load_config
+from mizzle.kit.diff import StrictRenames, diff
+from mizzle.kit.journal import BREAKPOINT, format_sql, parse_sql
+from mizzle.kit.snapshot import build_snapshot
+from tests.models import Posts, Users
+
+dialect = PostgresDialect()
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("'user'::role", "'user'"),
+        ("'-1'::integer", "-1"),
+        ("now()", "now()"),
+        ("'x'::character varying", "'x'"),
+        ("'{}'::jsonb", "'{}'"),
+        ("('2'::numeric)", "2"),
+        (None, None),
+    ],
+)
+def test_normalize_default(raw: str | None, expected: str | None) -> None:
+    assert normalize_default(raw) == expected
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("varchar(255)", "character varying(255)"),
+        ("numeric(10, 2)", "numeric(10,2)"),
+        ("timestamptz", "timestamp with time zone"),
+        ("text[]", "text[]"),
+        ("varchar(5)[]", "character varying(5)[]"),
+    ],
+)
+def test_normalize_type(raw: str, expected: str) -> None:
+    assert normalize_type(raw) == expected
+
+
+def snap() -> Snapshot:
+    return build_snapshot([Users, Posts], dialect)
+
+
+def test_initial_diff_creates_everything_in_order() -> None:
+    steps = diff(empty_snapshot("postgresql"), snap())
+    kinds = [type(s).__name__ for s in steps]
+    assert kinds == ["CreateEnum", "CreateTable", "CreateTable", "AddForeignKey"]
+
+
+def test_no_changes() -> None:
+    assert diff(snap(), snap()) == []
+
+
+def test_enum_value_added_and_removed() -> None:
+    old, new = snap(), snap()
+    new["enums"]["public.role"]["values"] = ["owner", "admin", "user"]
+    [step] = diff(old, new)
+    assert step == AddEnumValue("public", "role", "owner", None, "admin")
+    new["enums"]["public.role"]["values"] = ["admin"]
+    with pytest.raises(MigrationError, match="removing values"):
+        diff(old, new)
+
+
+def test_constraint_rename_is_detected() -> None:
+    old, new = snap(), snap()
+    fk = new["tables"]["public.posts"]["foreign_keys"].pop("posts_author_id_fkey")
+    fk["name"] = "posts_author_fk"
+    new["tables"]["public.posts"]["foreign_keys"]["posts_author_fk"] = fk
+    assert diff(old, new) == [
+        RenameConstraint("public", "posts", "posts_author_id_fkey", "posts_author_fk")
+    ]
+
+
+def test_strict_renames_refuse_to_guess() -> None:
+    old, new = snap(), snap()
+    table = new["tables"].pop("public.posts")
+    table["name"] = "articles"
+    new["tables"]["public.articles"] = table
+    with pytest.raises(MigrationError, match="--rename"):
+        diff(old, new, StrictRenames())
+    steps = diff(old, new, StrictRenames({"posts": "articles"}))
+    assert [s.describe() for s in steps] == ["rename table posts to articles"] + [
+        s.describe() for s in steps[1:]
+    ]
+    no_rename = diff(old, new)
+    assert any(isinstance(s, DropTable) for s in no_rename)
+    assert any(isinstance(s, CreateTable) for s in no_rename)
+
+
+def test_index_changes_drop_and_create() -> None:
+    old = snap()
+    new = copy.deepcopy(old)
+    new["tables"]["public.users"]["indexes"]["users_role_idx"] = {
+        "name": "users_role_idx",
+        "columns": ["role"],
+        "unique": False,
+        "where": None,
+    }
+    [step] = diff(old, new)
+    assert isinstance(step, CreateIndex)
+
+
+def test_sql_file_roundtrip() -> None:
+    statements = [
+        Statement("CREATE TABLE a (x int)"),
+        Statement("ALTER TYPE t ADD VALUE 'v'", False),
+    ]
+    text = format_sql(statements, "-- header\n")
+    assert BREAKPOINT in text
+    parsed = parse_sql(text)
+    assert [p.transactional for p in parsed] == [True, False]
+    assert parse_sql("-- only comments\n") == []
+
+
+def test_config_sources(tmp_path: Path) -> None:
+    (tmp_path / "pyproject.toml").write_text('[tool.mizzle]\nschema = "a.b"\n')
+    assert load_config(cwd=tmp_path).schema == ["a.b"]
+    (tmp_path / "mizzle.toml").write_text('schema = ["x", "y"]\nout = "db/migrations"\n')
+    config = load_config(cwd=tmp_path)
+    assert config.schema == ["x", "y"]
+    assert config.out == tmp_path / "db/migrations"
+    (tmp_path / "mizzle.toml").write_text('schema = "x"\nbogus = 1\n')
+    with pytest.raises(MigrationError, match="unknown settings"):
+        load_config(cwd=tmp_path)
