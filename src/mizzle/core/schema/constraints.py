@@ -6,7 +6,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
 
 from mizzle.core.schema.column import ColumnBase, ReferentialAction
-from mizzle.core.sql.nodes import Expr
+from mizzle.core.sql.nodes import Condition
 
 
 @dataclass(frozen=True)
@@ -14,12 +14,12 @@ class Index:
     name: str
     columns: tuple[ColumnBase, ...] = ()
     unique: bool = False
-    predicate: Expr[bool] | None = None
+    predicate: Condition | None = None
 
     def on(self, *columns: ColumnBase) -> Index:
         return replace(self, columns=columns)
 
-    def where(self, condition: Expr[bool]) -> Index:
+    def where(self, condition: Condition) -> Index:
         """Partial index."""
         return replace(self, predicate=condition)
 
@@ -48,7 +48,7 @@ class ForeignKey:
 @dataclass(frozen=True)
 class Check:
     name: str
-    condition: Expr[bool]
+    condition: Condition
 
 
 type Constraint = Index | UniqueConstraint | PrimaryKey | ForeignKey | Check
@@ -81,5 +81,5 @@ def foreign_key(
     return ForeignKey(tuple(columns), references, name, on_delete, on_update)
 
 
-def check(name: str, condition: Expr[bool]) -> Check:
+def check(name: str, condition: Condition) -> Check:
     return Check(name, condition)

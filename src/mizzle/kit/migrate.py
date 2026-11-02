@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable
-from typing import Any
 
 from mizzle.core.errors import MigrationError, MigrationTampered
 from mizzle.core.steps import Statement
@@ -15,7 +14,7 @@ log = logging.getLogger("mizzle")
 
 
 async def apply_statements(
-    conn: Connection, statements: list[Statement], after: tuple[str, list[Any]] | None = None
+    conn: Connection, statements: list[Statement], after: tuple[str, list[object]] | None = None
 ) -> None:
     """Run statements; ``after`` (e.g. the history record) runs only once all succeeded.
 

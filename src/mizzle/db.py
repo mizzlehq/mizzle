@@ -8,7 +8,7 @@ import time
 from collections.abc import AsyncGenerator, Awaitable, Callable, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from typing import Any, Self
+from typing import Self
 
 from mizzle.core.compiler import CompiledQuery
 from mizzle.core.errors import MizzleError, QueryError
@@ -29,7 +29,7 @@ class QueryEvent:
     ``log_params=True``: parameter values may hold passwords or personal data."""
 
     sql: str
-    params: tuple[Any, ...] | None
+    params: tuple[object, ...] | None
     duration_ms: float
     error: BaseException | None
 
@@ -40,6 +40,14 @@ type QueryLogger = Callable[[QueryEvent], None]
 class Session(QueryBuilder):
     """Query API. ``Database`` runs each statement on a pooled connection; inside
     ``transaction()`` a Session is bound to one connection."""
+
+    _dialect: Dialect
+    _driver: Driver | None
+    _casing: Casing | None
+    _logger: QueryLogger | None
+    _log_params: bool
+    _conn: Connection | None
+    _lock: asyncio.Lock
 
     def __init__(
         self,
@@ -53,11 +61,11 @@ class Session(QueryBuilder):
     ) -> None:
         super().__init__(self)
         self._dialect = dialect
-        self._driver: Driver | None = driver
-        self._casing: Casing | None = casing
+        self._driver = driver
+        self._casing = casing
         self._logger = logger
         self._log_params = log_params
-        self._conn: Connection | None = connection
+        self._conn = connection
         # One connection runs one statement at a time; the lock lets asyncio.gather()
         # inside a transaction queue up instead of failing.
         self._lock = asyncio.Lock()
@@ -75,7 +83,7 @@ class Session(QueryBuilder):
 
     # -- public API -------------------------------------------------------------------
 
-    async def execute(self, statement: Raw) -> list[dict[str, Any]]:
+    async def execute(self, statement: Raw) -> list[dict[str, object]]:
         """Run raw SQL built with ``sql(...)``; rows come back as dicts."""
         compiled = self.compile(statement)
         if compiled.has_placeholders:
@@ -116,6 +124,10 @@ class Session(QueryBuilder):
         return self._require_driver()
 
     # -- internals --------------------------------------------------------------------
+
+    def _swap_driver(self, driver: Driver | None) -> Driver | None:
+        old, self._driver = self._driver, driver
+        return old
 
     def _require_driver(self) -> Driver:
         if self._driver is None:
@@ -168,6 +180,8 @@ class Database(Session):
     Database can still build SQL (``to_sql()``) but cannot run it.
     """
 
+    tables: tuple[type[Table], ...]
+
     def __init__(
         self,
         *,
@@ -204,15 +218,16 @@ class Database(Session):
         db = cls(
             dialect=dialect, schema=schema, casing=casing, logger=logger, log_params=log_params
         )
-        db._driver = await dialect.connect(
-            url, pool_size=pool_size, statement_cache_size=statement_cache_size
+        db._swap_driver(
+            await dialect.connect(
+                url, pool_size=pool_size, statement_cache_size=statement_cache_size
+            )
         )
         return db
 
     async def close(self) -> None:
-        driver = self._driver
+        driver = self._swap_driver(None)
         if driver is not None:
-            self._driver = None
             await driver.close()
 
     async def __aenter__(self) -> Self:

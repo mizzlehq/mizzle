@@ -3,11 +3,10 @@ from __future__ import annotations
 import asyncio
 import time
 from collections.abc import Sequence
-from typing import Any
 
 from mizzle.core.errors import MigrationLockTimeout
 from mizzle.core.naming import Casing
-from mizzle.core.schema.column import Column
+from mizzle.core.schema.column import ColumnBase
 from mizzle.core.snapshot import Snapshot
 from mizzle.core.sql.nodes import Node
 from mizzle.core.steps import Statement, Step
@@ -22,8 +21,8 @@ MIGRATION_LOCK_KEY = 0x6D697A7A6C65  # "mizzle"
 
 
 class PostgresDialect:
-    name = "postgresql"
-    default_schema = ddl.DEFAULT_SCHEMA
+    name: str = "postgresql"
+    default_schema: str = ddl.DEFAULT_SCHEMA
 
     def compiler(self, casing: Casing | None = None) -> PostgresCompiler:
         return PostgresCompiler(casing)
@@ -35,10 +34,10 @@ class PostgresDialect:
             url, pool_size=pool_size, statement_cache_size=statement_cache_size
         )
 
-    def column_type(self, column: Column[Any]) -> str:
+    def column_type(self, column: ColumnBase) -> str:
         return ddl.column_type(column)
 
-    def column_default(self, column: Column[Any], casing: Casing | None) -> str | None:
+    def column_default(self, column: ColumnBase, casing: Casing | None) -> str | None:
         return ddl.column_default(column, casing)
 
     def expression(self, node: Node, casing: Casing | None) -> str:
@@ -81,8 +80,8 @@ class PostgresDialect:
     async def applied_migrations(self, conn: Connection, schema: str) -> dict[str, str]:
         table = ddl.qualified(schema, MIGRATIONS_TABLE)
         rows = await conn.fetch_dicts(f"SELECT name, hash FROM {table} ORDER BY id", [])
-        return {row["name"]: row["hash"] for row in rows}
+        return {str(row["name"]): str(row["hash"]) for row in rows}
 
-    def record_migration(self, schema: str, name: str, hash: str) -> tuple[str, list[Any]]:
+    def record_migration(self, schema: str, name: str, hash: str) -> tuple[str, list[object]]:
         table = ddl.qualified(schema, MIGRATIONS_TABLE)
         return f"INSERT INTO {table} (name, hash) VALUES ($1, $2)", [name, hash]

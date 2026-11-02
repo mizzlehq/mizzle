@@ -15,7 +15,7 @@ import re
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, cast
+from typing import TypedDict, cast
 
 from mizzle.core.errors import MigrationError
 from mizzle.core.snapshot import Snapshot, empty_snapshot
@@ -24,6 +24,19 @@ from mizzle.core.steps import Statement
 BREAKPOINT = "-- mizzle:breakpoint"
 NO_TRANSACTION = "-- mizzle:no-transaction"
 JOURNAL_VERSION = 1
+
+
+class JournalEntry(TypedDict):
+    index: int
+    name: str
+    hash: str
+    created_at: str
+
+
+class Journal(TypedDict):
+    version: int
+    dialect: str
+    entries: list[JournalEntry]
 
 
 def format_sql(statements: list[Statement], header: str = "") -> str:
@@ -76,7 +89,25 @@ class Migration:
         return cast(Snapshot, json.loads(self.snapshot_path.read_text(encoding="utf-8")))
 
 
+def _parse_entry(raw: object, source: Path) -> JournalEntry:
+    if isinstance(raw, dict):
+        entry = cast(dict[str, object], raw)  # JSON object: string keys
+        index, name = entry.get("index"), entry.get("name")
+        hash_, created_at = entry.get("hash"), entry.get("created_at")
+        if (
+            isinstance(index, int)
+            and isinstance(name, str)
+            and isinstance(hash_, str)
+            and isinstance(created_at, str)
+        ):
+            return JournalEntry(index=index, name=name, hash=hash_, created_at=created_at)
+    raise MigrationError(f"{source}: malformed journal entry {raw!r}")
+
+
 class MigrationsDir:
+    root: Path
+    dialect: str
+
     def __init__(self, root: Path, dialect: str) -> None:
         self.root = root
         self.dialect = dialect
@@ -85,17 +116,28 @@ class MigrationsDir:
     def journal_path(self) -> Path:
         return self.root / "meta" / "journal.json"
 
-    def journal(self) -> dict[str, Any]:
+    def journal(self) -> Journal:
         if not self.journal_path.exists():
-            return {"version": JOURNAL_VERSION, "dialect": self.dialect, "entries": []}
-        data = cast(dict[str, Any], json.loads(self.journal_path.read_text(encoding="utf-8")))
-        if data.get("dialect") != self.dialect:
+            return Journal(version=JOURNAL_VERSION, dialect=self.dialect, entries=[])
+        raw = cast(object, json.loads(self.journal_path.read_text(encoding="utf-8")))
+        if not isinstance(raw, dict):
+            raise MigrationError(f"{self.journal_path}: expected a JSON object")
+        data = cast(dict[str, object], raw)  # JSON object: string keys
+        dialect = data.get("dialect")
+        if dialect != self.dialect:
             raise MigrationError(
-                f"{self.journal_path} is for dialect {data.get('dialect')!r}, not {self.dialect!r}"
+                f"{self.journal_path} is for dialect {dialect!r}, not {self.dialect!r}"
             )
-        return data
+        version, entries = data.get("version"), data.get("entries")
+        if not isinstance(version, int) or not isinstance(entries, list):
+            raise MigrationError(f"{self.journal_path}: missing 'version' or 'entries'")
+        return Journal(
+            version=version,
+            dialect=self.dialect,
+            entries=[_parse_entry(e, self.journal_path) for e in cast(list[object], entries)],
+        )
 
-    def _save_journal(self, journal: dict[str, Any]) -> None:
+    def _save_journal(self, journal: Journal) -> None:
         self.journal_path.parent.mkdir(parents=True, exist_ok=True)
         self.journal_path.write_text(json.dumps(journal, indent=2) + "\n", encoding="utf-8")
 
@@ -120,12 +162,12 @@ class MigrationsDir:
         migration.sql_path.write_text(format_sql(statements, header), encoding="utf-8")
         migration.snapshot_path.write_text(json.dumps(snapshot, indent=2) + "\n", encoding="utf-8")
         journal["entries"].append(
-            {
-                "index": index,
-                "name": folder,
-                "hash": migration.hash(),
-                "created_at": datetime.datetime.now(datetime.UTC).isoformat(timespec="seconds"),
-            }
+            JournalEntry(
+                index=index,
+                name=folder,
+                hash=migration.hash(),
+                created_at=datetime.datetime.now(datetime.UTC).isoformat(timespec="seconds"),
+            )
         )
         self._save_journal(journal)
         return migration

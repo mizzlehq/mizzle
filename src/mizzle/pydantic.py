@@ -24,7 +24,8 @@ from __future__ import annotations
 import re
 from collections.abc import Mapping, Sequence
 from decimal import Decimal
-from typing import Annotated, Any, Literal
+from types import GenericAlias
+from typing import Annotated, Any, Literal, cast
 
 try:
     import pydantic
@@ -32,7 +33,7 @@ except ImportError as exc:  # pragma: no cover - exercised only without the extr
     raise ImportError('mizzle.pydantic needs pydantic: pip install "mizzle[pydantic]"') from exc
 
 from mizzle.core.errors import SchemaError
-from mizzle.core.schema.column import Column
+from mizzle.core.schema.column import ColumnBase
 from mizzle.core.schema.table import Table
 
 type Mode = Literal["select", "insert", "update"]
@@ -41,10 +42,10 @@ _VARCHAR = re.compile(r"(?:varchar|character varying)\((\d+)\)")
 _NUMERIC = re.compile(r"numeric\((\d+)(?:,\s*(\d+))?\)")
 
 
-def column_type(column: Column[Any]) -> Any:
+def column_type(column: ColumnBase) -> object:
     """The Python type a column holds (without ``None``), with length/precision limits."""
     if column.item is not None:
-        return list[column_type(column.item)]  # type: ignore[misc]
+        return GenericAlias(list, (column_type(column.item),))  # list[item type]
     if column.enum is not None:
         return column.enum
     if column.accepts is None:  # json / jsonb
@@ -60,15 +61,17 @@ def column_type(column: Column[Any]) -> Any:
     return base
 
 
-def _field(column: Column[Any], mode: Mode, override: Any) -> tuple[Any, Any]:
+def _field(column: ColumnBase, mode: Mode, override: object) -> tuple[object, object]:
     annotation = override if override is not None else column_type(column)
-    if mode == "select":
-        return (annotation | None if column.nullable else annotation), ...
-    if mode == "update":
-        return (annotation | None if column.nullable else annotation), None
-    # insert: generated/defaulted columns may be left out; required ones must be given
     if column.nullable:
-        return annotation | None, None
+        # Type forms (Annotated[...], list[...], Any, ...) support ``| None`` at runtime;
+        # the cast only tells the checkers so.
+        return cast(type[object], annotation) | None, (... if mode == "select" else None)
+    if mode == "select":
+        return annotation, ...
+    if mode == "update":
+        return annotation, None
+    # insert: generated/defaulted columns may be left out; required ones must be given
     if column.required_on_insert:
         return annotation, ...
     return annotation, None
@@ -81,7 +84,7 @@ def _model(
     name: str | None,
     include: Sequence[str] | None,
     exclude: Sequence[str],
-    refine: Mapping[str, Any] | None,
+    refine: Mapping[str, object] | None,
 ) -> type[pydantic.BaseModel]:
     columns = table.__table__.columns
     refine = refine or {}
@@ -89,7 +92,7 @@ def _model(
     if unknown := [c for c in named if c not in columns]:
         raise SchemaError(f"{table.__name__} has no column(s) {unknown}")
 
-    def wanted(attr: str, column: Column[Any]) -> bool:
+    def wanted(attr: str, column: ColumnBase) -> bool:
         if attr in exclude:
             return False
         if include is not None:
@@ -98,7 +101,7 @@ def _model(
             return False  # e.g. serial ids: assigned by the database, not by clients
         return not (mode == "update" and column.is_primary_key)
 
-    fields: dict[str, Any] = {
+    fields: dict[str, tuple[object, object]] = {
         attr: _field(column, mode, refine.get(attr))
         for attr, column in columns.items()
         if wanted(attr, column)
@@ -107,7 +110,9 @@ def _model(
     return pydantic.create_model(
         name or f"{table.__name__}{suffix}Model",
         __config__=pydantic.ConfigDict(from_attributes=True, extra="forbid"),
-        **fields,
+        # **kwargs are also checked against create_model's named options (__doc__, ...),
+        # so only Any values fit; the definitions are (type form, default) pairs.
+        **cast(dict[str, Any], fields),  # pyright: ignore[reportAny]
     )
 
 
@@ -117,7 +122,7 @@ def select_model(
     name: str | None = None,
     include: Sequence[str] | None = None,
     exclude: Sequence[str] = (),
-    refine: Mapping[str, Any] | None = None,
+    refine: Mapping[str, object] | None = None,
 ) -> type[pydantic.BaseModel]:
     """A model of a stored row. Validates table rows directly (``from_attributes``).
     Use ``exclude`` to keep secrets such as password hashes out of API responses."""
@@ -130,7 +135,7 @@ def insert_model(
     name: str | None = None,
     include: Sequence[str] | None = None,
     exclude: Sequence[str] = (),
-    refine: Mapping[str, Any] | None = None,
+    refine: Mapping[str, object] | None = None,
 ) -> type[pydantic.BaseModel]:
     """A model for new rows. For client input, pass ``include=[...]`` (an allowlist).
     ``refine={"email": EmailStr}`` replaces a field's type."""
@@ -143,7 +148,7 @@ def update_model(
     name: str | None = None,
     include: Sequence[str] | None = None,
     exclude: Sequence[str] = (),
-    refine: Mapping[str, Any] | None = None,
+    refine: Mapping[str, object] | None = None,
 ) -> type[pydantic.BaseModel]:
     """A model for partial updates: every field optional, primary keys left out.
     For client input, pass ``include=[...]`` (an allowlist)."""

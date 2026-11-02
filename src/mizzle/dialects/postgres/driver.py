@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from collections.abc import AsyncGenerator, Sequence
 from contextlib import asynccontextmanager
-from typing import Any, Literal
+from typing import Literal
 
 import asyncpg
 from asyncpg import exceptions as pg
@@ -87,22 +87,24 @@ def _rowcount(status: str) -> int:
 
 
 class PostgresConnection:
+    _conn: asyncpg.Connection | PoolConnectionProxy
+
     def __init__(self, conn: asyncpg.Connection | PoolConnectionProxy) -> None:
         self._conn = conn
 
-    async def fetch(self, sql: str, params: Sequence[Any]) -> list[Row]:
+    async def fetch(self, sql: str, params: Sequence[object]) -> list[Row]:
         try:
             return list(await self._conn.fetch(sql, *params))
         except Exception as exc:
             raise _translate(exc, sql) from None
 
-    async def fetch_dicts(self, sql: str, params: Sequence[Any]) -> list[dict[str, Any]]:
+    async def fetch_dicts(self, sql: str, params: Sequence[object]) -> list[dict[str, object]]:
         try:
             return [dict(record) for record in await self._conn.fetch(sql, *params)]
         except Exception as exc:
             raise _translate(exc, sql) from None
 
-    async def execute(self, sql: str, params: Sequence[Any]) -> int:
+    async def execute(self, sql: str, params: Sequence[object]) -> int:
         try:
             return _rowcount(await self._conn.execute(sql, *params))
         except Exception as exc:
@@ -126,6 +128,8 @@ async def _init_connection(conn: asyncpg.Connection) -> None:
 
 
 class PostgresDriver:
+    _pool: asyncpg.Pool
+
     def __init__(self, pool: asyncpg.Pool) -> None:
         self._pool = pool
 

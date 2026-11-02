@@ -8,6 +8,7 @@ import importlib
 import sys
 from collections.abc import Awaitable, Callable, Sequence
 from pathlib import Path
+from typing import Protocol, cast
 
 from mizzle.core.errors import DataLossBlocked, MigrationError, MizzleError
 from mizzle.core.snapshot import Snapshot
@@ -19,6 +20,25 @@ from mizzle.kit.diff import RenameKind, RenameResolver, StrictRenames, diff, no_
 from mizzle.kit.journal import MigrationsDir
 from mizzle.kit.migrate import apply_statements, run_migrations
 from mizzle.kit.snapshot import build_snapshot
+
+
+class Args(Protocol):
+    """Parsed arguments; each subcommand sets only its own options (see ``_parser``)."""
+
+    config: Path | None
+    func: Callable[[Config, Args], int]
+    name: str | None
+    custom: bool
+    rename: list[str] | None
+    no_renames: bool
+    allow_data_loss: bool
+    lock_timeout: float
+    force: bool
+    dry_run: bool
+    out: str | None
+    port: int
+    read_only: bool
+    no_open: bool
 
 
 def _interactive() -> bool:
@@ -50,12 +70,11 @@ def _ask_renames(
     return result
 
 
-def _resolver(args: argparse.Namespace, dialect: Dialect) -> RenameResolver:
+def _resolver(args: Args, dialect: Dialect) -> RenameResolver:
     if args.no_renames:
         return no_renames
     renames: dict[str, str] = {}
-    items: list[str] = args.rename or []
-    for item in items:
+    for item in args.rename or []:
         old, sep, new = item.partition("=")
         if not sep:
             raise MigrationError(f"--rename expects old=new, got {item!r}")
@@ -104,7 +123,7 @@ def _types_path(config: Config) -> Path:
 # -- commands -------------------------------------------------------------------------
 
 
-def cmd_generate(config: Config, args: argparse.Namespace) -> int:
+def cmd_generate(config: Config, args: Args) -> int:
     dialect = config.dialect()
     tables = config.load_tables()
     directory = MigrationsDir(config.out, dialect.name)
@@ -127,12 +146,12 @@ def cmd_generate(config: Config, args: argparse.Namespace) -> int:
     print(f"Created {migration.sql_path} ({len(steps)} changes)")
     types_path = _types_path(config)
     if types_path.exists():
-        types_path.write_text(render_types_module(tables, config.casing), encoding="utf-8")
+        types_path.write_text(render_types_module(tables), encoding="utf-8")
         print(f"Updated {types_path}")
     return 0
 
 
-def cmd_migrate(config: Config, args: argparse.Namespace) -> int:
+def cmd_migrate(config: Config, args: Args) -> int:
     directory = MigrationsDir(config.out, config.dialect_name)
 
     async def run(driver: Driver, dialect: Dialect) -> list[str]:
@@ -150,7 +169,7 @@ def cmd_migrate(config: Config, args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_push(config: Config, args: argparse.Namespace) -> int:
+def cmd_push(config: Config, args: Args) -> int:
     tables = config.load_tables()
 
     async def run(driver: Driver, dialect: Dialect) -> int:
@@ -179,7 +198,7 @@ def cmd_push(config: Config, args: argparse.Namespace) -> int:
     return asyncio.run(_with_driver(config, run))
 
 
-def cmd_pull(config: Config, args: argparse.Namespace) -> int:
+def cmd_pull(config: Config, args: Args) -> int:
     out = Path(args.out) if args.out else config.root / "pulled_schema.py"
     if out.exists() and not args.force:
         raise MigrationError(f"{out} exists; pass --force to overwrite it")
@@ -199,7 +218,7 @@ def cmd_pull(config: Config, args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_check(config: Config, args: argparse.Namespace) -> int:
+def cmd_check(config: Config, _args: Args) -> int:
     directory = MigrationsDir(config.out, config.dialect_name)
     problems: list[str] = []
     warnings: list[str] = []
@@ -233,7 +252,7 @@ def cmd_check(config: Config, args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_drop(config: Config, args: argparse.Namespace) -> int:
+def cmd_drop(config: Config, args: Args) -> int:
     directory = MigrationsDir(config.out, config.dialect_name)
     migrations = directory.migrations()
     if not migrations:
@@ -262,15 +281,15 @@ def cmd_drop(config: Config, args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_typegen(config: Config, args: argparse.Namespace) -> int:
+def cmd_typegen(config: Config, args: Args) -> int:
     tables = config.load_tables()
     path = Path(args.out) if args.out else _types_path(config)
-    path.write_text(render_types_module(tables, config.casing), encoding="utf-8")
+    path.write_text(render_types_module(tables), encoding="utf-8")
     print(f"Wrote {path}")
     return 0
 
 
-def cmd_studio(config: Config, args: argparse.Namespace) -> int:
+def cmd_studio(config: Config, args: Args) -> int:
     try:
         from mizzle.studio.server import serve
     except ImportError as exc:
@@ -335,11 +354,11 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    args = _parser().parse_args(argv)
+    # argparse sets these attributes dynamically; _parser defines them to match Args.
+    args = cast(Args, cast(object, _parser().parse_args(argv)))
     try:
         config = load_config(args.config)
-        func: Callable[[Config, argparse.Namespace], int] = args.func
-        return func(config, args)
+        return args.func(config, args)
     except MizzleError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1

@@ -14,7 +14,7 @@ import sys
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, cast
+from typing import cast
 
 from mizzle.core.errors import MigrationError
 from mizzle.core.naming import Casing
@@ -65,7 +65,7 @@ class Config:
                 module = importlib.import_module(module_name)
             except ImportError as exc:
                 raise MigrationError(f"cannot import schema module {module_name!r}: {exc}") from exc
-            for value in vars(module).values():
+            for value in cast(dict[str, object], vars(module)).values():
                 if (
                     isinstance(value, type)
                     and issubclass(value, Table)
@@ -78,25 +78,45 @@ class Config:
         return tables
 
 
-def _from_mapping(root: Path, data: dict[str, Any], source: Path) -> Config:
+def _str(data: dict[str, object], name: str, default: str, source: Path) -> str:
+    value = data.get(name, default)
+    if not isinstance(value, str):
+        raise MigrationError(f"{source}: {name!r} must be a string")
+    return value
+
+
+def _str_list(data: dict[str, object], name: str, default: list[str], source: Path) -> list[str]:
+    value = data.get(name, default)
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, list) and all(isinstance(v, str) for v in cast(list[object], value)):
+        return list(cast(list[str], value))
+    raise MigrationError(f"{source}: {name!r} must be a string or a list of strings")
+
+
+def _table(value: object, source: Path) -> dict[str, object]:
+    if not isinstance(value, dict):
+        raise MigrationError(f"{source}: [tool.mizzle] must be a table")
+    return cast(dict[str, object], value)  # TOML tables have string keys
+
+
+def _from_mapping(root: Path, data: dict[str, object], source: Path) -> Config:
     if unknown := set(data) - _KEYS:
         raise MigrationError(f"{source}: unknown settings {sorted(unknown)}")
     if "schema" not in data:
         raise MigrationError(f"{source}: 'schema' is required (the module with your tables)")
-    schema = data["schema"]
-    schemas = [schema] if isinstance(schema, str) else list(cast(list[str], schema))
     casing = data.get("casing")
     if casing not in (None, "snake_case"):
         raise MigrationError(f"{source}: casing must be 'snake_case'")
     return Config(
         root=root,
-        schema=schemas,
-        out=root / data.get("out", "migrations"),
-        dialect_name=data.get("dialect", "postgresql"),
-        url_env=data.get("url_env", "DATABASE_URL"),
-        casing=casing,
-        schema_filter=list(data.get("schema_filter", ["public"])),
-        migrations_schema=data.get("migrations_schema", "public"),
+        schema=_str_list(data, "schema", [], source),
+        out=root / _str(data, "out", "migrations", source),
+        dialect_name=_str(data, "dialect", "postgresql", source),
+        url_env=_str(data, "url_env", "DATABASE_URL", source),
+        casing=None if casing is None else "snake_case",
+        schema_filter=_str_list(data, "schema_filter", ["public"], source),
+        migrations_schema=_str(data, "migrations_schema", "public", source),
     )
 
 
@@ -108,9 +128,9 @@ def load_config(path: Path | None = None, cwd: Path | None = None) -> Config:
     """
     cwd = cwd or Path.cwd()
     if path is not None:
-        data = tomllib.loads(path.read_text(encoding="utf-8"))
+        data: dict[str, object] = tomllib.loads(path.read_text(encoding="utf-8"))
         if path.name == "pyproject.toml":
-            data = data.get("tool", {}).get("mizzle", {})
+            data = _table(_table(data.get("tool", {}), path).get("mizzle", {}), path)
         return _from_mapping(path.parent.resolve(), data, path)
     for directory in [cwd]:
         own = directory / "mizzle.toml"
@@ -118,9 +138,10 @@ def load_config(path: Path | None = None, cwd: Path | None = None) -> Config:
             return _from_mapping(directory, tomllib.loads(own.read_text(encoding="utf-8")), own)
         pyproject = directory / "pyproject.toml"
         if pyproject.exists():
-            tool = tomllib.loads(pyproject.read_text(encoding="utf-8")).get("tool", {})
+            document: dict[str, object] = tomllib.loads(pyproject.read_text(encoding="utf-8"))
+            tool = _table(document.get("tool", {}), pyproject)
             if "mizzle" in tool:
-                return _from_mapping(directory, tool["mizzle"], pyproject)
+                return _from_mapping(directory, _table(tool["mizzle"], pyproject), pyproject)
     raise MigrationError(
         f"no mizzle.toml or [tool.mizzle] in {cwd}; run from the project root or pass --config"
     )

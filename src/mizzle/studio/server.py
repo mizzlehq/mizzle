@@ -13,19 +13,16 @@ Security model (Studio can read and change data):
 from __future__ import annotations
 
 import datetime
-import decimal
 import enum
 import hmac
-import ipaddress
 import json
 import secrets
-import uuid
 import webbrowser
 from collections.abc import AsyncGenerator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, cast
+from typing import cast, override
 
 from starlette.applications import Starlette
 from starlette.middleware import Middleware
@@ -34,6 +31,7 @@ from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse, Response
 from starlette.routing import BaseRoute, Mount, Route
 from starlette.staticfiles import StaticFiles
+from starlette.types import ASGIApp
 
 from mizzle.core.errors import MizzleError
 from mizzle.core.snapshot import ColumnSnap, Snapshot, TableSnap, key
@@ -47,8 +45,11 @@ MAX_PAGE = 500
 _COMPARE = {"eq": "=", "ne": "<>", "lt": "<", "lte": "<=", "gt": ">", "gte": ">="}
 
 _NOT_BUILT = """<!doctype html><meta charset="utf-8"><title>mizzle studio</title>
-<p>The Studio UI is not built. Run <code>npm ci && npm run build</code> in <code>studio-ui/</code>.
+<p>The Studio UI is not built.
+Run <code>pnpm install && pnpm build</code> in <code>studio-ui/</code>.
 Release packages include it already.</p>"""
+
+type JSON = bool | int | float | str | list[JSON] | dict[str, JSON] | None
 
 _SECURITY_HEADERS = {
     "X-Content-Type-Options": "nosniff",
@@ -64,6 +65,8 @@ _SECURITY_HEADERS = {
 
 
 class StudioError(Exception):
+    status: int
+
     def __init__(self, message: str, status: int = 400) -> None:
         super().__init__(message)
         self.status = status
@@ -109,16 +112,16 @@ def _column(table: TableSnap, name: object) -> ColumnSnap:
     return table["columns"][name]
 
 
-def _object(value: object, what: str) -> dict[str, Any]:
+def _object(value: object, what: str) -> dict[str, object]:
     if not isinstance(value, dict):
         raise StudioError(f"{what} must be a JSON object")
-    return cast(dict[str, Any], value)
+    return cast(dict[str, object], value)  # JSON object keys are always strings
 
 
-def _array(value: object, what: str) -> list[Any]:
+def _array(value: object, what: str) -> list[object]:
     if not isinstance(value, list):
         raise StudioError(f"{what} must be a JSON list")
-    return cast(list[Any], value)  # type: ignore[redundant-cast]  # needed by pyright
+    return cast(list[object], value)
 
 
 def _cast_type(column: ColumnSnap) -> str:
@@ -137,19 +140,19 @@ def _as_text(value: object) -> str | None:
     return str(value)
 
 
-def _param(params: list[Any], column: ColumnSnap, value: object) -> str:
+def _param(params: list[object], column: ColumnSnap, value: object) -> str:
     params.append(_as_text(value))
     return f"CAST(${len(params)}::text AS {_cast_type(column)})"
 
 
-def _where(table: TableSnap, filters: list[Any], params: list[Any]) -> str:
+def _where(table: TableSnap, filters: list[object], params: list[object]) -> str:
     parts: list[str] = []
     for item in filters:
         f = _object(item, "filter")
         column = _column(table, f.get("column"))
         ref = f"t.{quote(column['name'])}"
         op = f.get("op")
-        if op in _COMPARE:
+        if isinstance(op, str) and op in _COMPARE:
             parts.append(f"{ref} {_COMPARE[op]} {_param(params, column, f.get('value'))}")
         elif op in ("like", "ilike"):
             params.append(_as_text(f.get("value")) or "")
@@ -163,7 +166,7 @@ def _where(table: TableSnap, filters: list[Any], params: list[Any]) -> str:
     return f" WHERE {' AND '.join(parts)}" if parts else ""
 
 
-def _key_match(table: TableSnap, key_values: object, params: list[Any]) -> str:
+def _key_match(table: TableSnap, key_values: object, params: list[object]) -> str:
     pk = table["primary_key"]
     if pk is None:
         raise StudioError(f"{table['name']} has no primary key; change its rows with SQL")
@@ -175,41 +178,32 @@ def _key_match(table: TableSnap, key_values: object, params: list[Any]) -> str:
     )
 
 
-def jsonable(value: Any) -> Any:
+def jsonable(value: object) -> JSON:
     match value:
         case None | bool() | int() | str():
             return value
         case float():
             return value if value == value and abs(value) != float("inf") else str(value)
         case dict():
-            return {str(k): jsonable(v) for k, v in cast(dict[Any, Any], value).items()}  # type: ignore[redundant-cast]
+            return {str(k): jsonable(v) for k, v in cast(dict[object, object], value).items()}
         case list() | tuple():
-            return [jsonable(v) for v in cast(list[Any], value)]
+            return [jsonable(v) for v in cast(list[object] | tuple[object, ...], value)]
         case bytes():
             return "\\x" + value.hex()
         case datetime.datetime() | datetime.date() | datetime.time():
             return value.isoformat()
         case enum.Enum():
-            return jsonable(value.value)
-        case decimal.Decimal() | uuid.UUID() | datetime.timedelta():
-            return str(value)
-        case _ if isinstance(value, ipaddress.IPv4Address | ipaddress.IPv6Address):
-            return str(value)
-        case _:
+            return jsonable(cast(object, value.value))
+        case _:  # Decimal, UUID, timedelta, IP addresses, ...
             return str(value)
 
 
 # -- handlers -------------------------------------------------------------------------
 
 
-def _studio(request: Request) -> Studio:
-    studio: Studio = request.app.state.studio
-    return studio
-
-
-async def _body(request: Request) -> dict[str, Any]:
+async def _body(request: Request) -> dict[str, object]:
     try:
-        data = await request.json()
+        data = cast(object, await request.json())
     except ValueError as exc:
         raise StudioError("request body must be JSON") from exc
     return _object(data, "request body")
@@ -220,29 +214,32 @@ def _writable(studio: Studio) -> None:
         raise StudioError("Studio is in read-only mode", 403)
 
 
-async def meta(request: Request) -> Response:
-    studio = _studio(request)
+async def _table(studio: Studio, request: Request) -> TableSnap:
+    path: dict[str, object] = request.path_params
+    return await studio.table(str(path["schema"]), str(path["table"]))
+
+
+async def meta(studio: Studio, _request: Request) -> Response:
     return JSONResponse({"read_only": studio.read_only, "dialect": studio.dialect.name})
 
 
-async def tables(request: Request) -> Response:
-    snapshot = await _studio(request).load_snapshot(refresh=True)
+async def tables(studio: Studio, _request: Request) -> Response:
+    snapshot = await studio.load_snapshot(refresh=True)
     return JSONResponse({"tables": list(snapshot["tables"].values()), "enums": snapshot["enums"]})
 
 
-async def list_rows(request: Request) -> Response:
-    studio = _studio(request)
-    table = await studio.table(request.path_params["schema"], request.path_params["table"])
+async def list_rows(studio: Studio, request: Request) -> Response:
+    table = await _table(studio, request)
     q = request.query_params
     try:
         limit = min(int(q.get("limit", "50")), MAX_PAGE)
         offset = int(q.get("offset", "0"))
-        filters = _array(json.loads(q.get("filters", "[]")), "filters")
+        filters = _array(cast(object, json.loads(q.get("filters", "[]"))), "filters")
     except ValueError as exc:
         raise StudioError(f"bad query parameters: {exc}") from exc
     if limit < 0 or offset < 0:
         raise StudioError("limit and offset must be >= 0")
-    params: list[Any] = []
+    params: list[object] = []
     where = _where(table, filters, params)
     order = q.get("order")
     if order:
@@ -265,12 +262,11 @@ async def list_rows(request: Request) -> Response:
     return JSONResponse({"total": total[0], "rows": [jsonable(r[0]) for r in rows]})
 
 
-async def insert_row(request: Request) -> Response:
-    studio = _studio(request)
+async def insert_row(studio: Studio, request: Request) -> Response:
     _writable(studio)
-    table = await studio.table(request.path_params["schema"], request.path_params["table"])
+    table = await _table(studio, request)
     values = _object((await _body(request)).get("values", {}), "values")
-    params: list[Any] = []
+    params: list[object] = []
     target = f"{qualified(table['schema'], table['name'])} AS t"
     if values:
         columns = [_column(table, c) for c in values]
@@ -284,15 +280,14 @@ async def insert_row(request: Request) -> Response:
     return JSONResponse({"row": jsonable(row[0])}, status_code=201)
 
 
-async def update_row(request: Request) -> Response:
-    studio = _studio(request)
+async def update_row(studio: Studio, request: Request) -> Response:
     _writable(studio)
-    table = await studio.table(request.path_params["schema"], request.path_params["table"])
+    table = await _table(studio, request)
     body = await _body(request)
     values = _object(body.get("values"), "values")
     if not values:
         raise StudioError("values must not be empty")
-    params: list[Any] = []
+    params: list[object] = []
     sets = ", ".join(
         f"{quote(c['name'])} = {_param(params, c, values[c['name']])}"
         for c in (_column(table, name) for name in values)
@@ -309,30 +304,28 @@ async def update_row(request: Request) -> Response:
     return JSONResponse({"row": jsonable(rows[0][0])})
 
 
-async def delete_rows(request: Request) -> Response:
-    studio = _studio(request)
+async def delete_rows(studio: Studio, request: Request) -> Response:
     _writable(studio)
-    table = await studio.table(request.path_params["schema"], request.path_params["table"])
+    table = await _table(studio, request)
     keys = _array((await _body(request)).get("keys"), "keys")
     if not keys:
         raise StudioError("keys must not be empty")
     deleted = 0
     async with studio.pool().acquire() as conn, conn.transaction():
         for k in keys:
-            params: list[Any] = []
+            params: list[object] = []
             match = _key_match(table, k, params)
             sql = f"DELETE FROM {qualified(table['schema'], table['name'])} AS t WHERE {match}"
             deleted += await conn.execute(sql, params)
     return JSONResponse({"deleted": deleted})
 
 
-async def run_sql(request: Request) -> Response:
-    studio = _studio(request)
+async def run_sql(studio: Studio, request: Request) -> Response:
     text = (await _body(request)).get("sql")
     if not isinstance(text, str) or not text.strip():
         raise StudioError("sql must be a non-empty string")
 
-    async def fetch(conn: Connection) -> list[dict[str, Any]]:
+    async def fetch(conn: Connection) -> list[dict[str, object]]:
         return await conn.fetch_dicts(text, [])
 
     async with studio.pool().acquire() as conn:
@@ -353,11 +346,12 @@ async def run_sql(request: Request) -> Response:
 
 
 def _api(
-    handler: Callable[[Request], Awaitable[Response]],
+    studio: Studio,
+    handler: Callable[[Studio, Request], Awaitable[Response]],
 ) -> Callable[[Request], Awaitable[Response]]:
     async def wrapped(request: Request) -> Response:
         try:
-            return await handler(request)
+            return await handler(studio, request)
         except StudioError as exc:
             return JSONResponse({"error": str(exc)}, status_code=exc.status)
         except MizzleError as exc:
@@ -367,11 +361,15 @@ def _api(
 
 
 class _Guard(BaseHTTPMiddleware):
-    def __init__(self, app: Any, token: str, allowed_hosts: set[str]) -> None:
+    expected: bytes
+    allowed_hosts: set[str]
+
+    def __init__(self, app: ASGIApp, token: str, allowed_hosts: set[str]) -> None:
         super().__init__(app)
         self.expected = f"Bearer {token}".encode()
         self.allowed_hosts = allowed_hosts
 
+    @override
     async def dispatch(self, request: Request, call_next: RequestResponseEndpoint) -> Response:
         if request.headers.get("host", "") not in self.allowed_hosts:
             return JSONResponse({"error": "forbidden host"}, status_code=403)
@@ -384,7 +382,7 @@ class _Guard(BaseHTTPMiddleware):
         return response
 
 
-async def _not_built(request: Request) -> Response:
+async def _not_built(_request: Request) -> Response:
     return HTMLResponse(_NOT_BUILT)
 
 
@@ -401,9 +399,8 @@ def create_app(
     studio = Studio(dialect, url, schemas, read_only)
 
     @asynccontextmanager
-    async def lifespan(app: Starlette) -> AsyncGenerator[None]:
+    async def lifespan(_app: Starlette) -> AsyncGenerator[None]:
         studio.driver = await dialect.connect(url, pool_size=4, statement_cache_size=100)
-        app.state.studio = studio
         try:
             yield
         finally:
@@ -411,13 +408,13 @@ def create_app(
 
     tables_path = "/api/tables/{schema}/{table}/rows"
     routes: list[BaseRoute] = [
-        Route("/api/meta", _api(meta)),
-        Route("/api/tables", _api(tables)),
-        Route(tables_path, _api(list_rows), methods=["GET"]),
-        Route(tables_path, _api(insert_row), methods=["POST"]),
-        Route(tables_path, _api(update_row), methods=["PATCH"]),
-        Route(tables_path, _api(delete_rows), methods=["DELETE"]),
-        Route("/api/sql", _api(run_sql), methods=["POST"]),
+        Route("/api/meta", _api(studio, meta)),
+        Route("/api/tables", _api(studio, tables)),
+        Route(tables_path, _api(studio, list_rows), methods=["GET"]),
+        Route(tables_path, _api(studio, insert_row), methods=["POST"]),
+        Route(tables_path, _api(studio, update_row), methods=["PATCH"]),
+        Route(tables_path, _api(studio, delete_rows), methods=["DELETE"]),
+        Route("/api/sql", _api(studio, run_sql), methods=["POST"]),
     ]
     if (static_dir / "index.html").exists():
         routes.append(Mount("/", StaticFiles(directory=static_dir, html=True)))

@@ -9,10 +9,8 @@ import keyword
 import re
 import uuid
 from collections.abc import Sequence
-from typing import Any
 
-from mizzle.core.naming import Casing
-from mizzle.core.schema.column import Column
+from mizzle.core.schema.column import ColumnBase
 from mizzle.core.schema.table import Table
 from mizzle.core.snapshot import ColumnSnap, Snapshot, TableSnap
 
@@ -59,13 +57,13 @@ def _sql(text: str) -> str:
 
 class _SchemaWriter:
     def __init__(self, snapshot: Snapshot) -> None:
-        self.snapshot = snapshot
+        self.snapshot: Snapshot = snapshot
         self.pg_imports: set[str] = set()
         self.enum_classes: dict[str, str] = {}  # db type name -> class name
         self.table_classes: dict[str, str] = {}  # "schema.table" -> class name
         self.attrs: dict[str, dict[str, str]] = {}  # "schema.table" -> column -> attribute
-        self.uses_column = False
-        self.uses_any = False
+        self.uses_column: bool = False
+        self.uses_any: bool = False
 
     def factory(self, sql_type: str, kwargs: str) -> str:
         if sql_type.endswith("[]"):
@@ -101,7 +99,7 @@ class _SchemaWriter:
         self.uses_column = True
         self.uses_any = True
         extra = f", {kwargs}" if kwargs else ""
-        return f"Column[Any]({sql_type!r}, None{extra})"
+        return f"ColumnBase({sql_type!r}, None{extra})"
 
     def column(self, table: TableSnap, column: ColumnSnap, attr: str) -> str:
         kwargs = f"name={column['name']!r}" if attr != column["name"] else ""
@@ -241,7 +239,7 @@ def render_schema_module(snapshot: Snapshot) -> str:
 
 # -- typegen --------------------------------------------------------------------------
 
-_PY_TYPES: dict[type[Any], str] = {
+_PY_TYPES: dict[type[object], str] = {
     int: "int",
     str: "str",
     bool: "bool",
@@ -262,7 +260,7 @@ _PY_TYPES: dict[type[Any], str] = {
 }
 
 
-def _py_type(column: Column[Any], imports: set[str]) -> str:
+def _py_type(column: ColumnBase, imports: set[str]) -> str:
     if column.enum is not None:
         imports.add(f"from {column.enum.__module__} import {column.enum.__qualname__}")
         base = column.enum.__qualname__
@@ -279,7 +277,7 @@ def _py_type(column: Column[Any], imports: set[str]) -> str:
     return f"{base} | None" if column.nullable else base
 
 
-def render_types_module(tables: Sequence[type[Table]], casing: Casing | None = None) -> str:
+def render_types_module(tables: Sequence[type[Table]]) -> str:
     """TypedDicts for insert/update values: ``db.insert(Users).values(UsersInsert(...))``."""
     imports: set[str] = set()
     blocks: list[str] = []

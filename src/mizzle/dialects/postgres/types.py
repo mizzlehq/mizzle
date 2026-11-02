@@ -6,7 +6,8 @@ import datetime as _dt
 import enum
 import ipaddress
 import uuid as _uuid
-from typing import Any
+from collections.abc import Iterable
+from typing import cast
 
 from mizzle.core.naming import snake_case
 from mizzle.core.schema.column import Column
@@ -20,7 +21,7 @@ type IPAddress = (
     | ipaddress.IPv6Network
 )
 
-_IP_TYPES: tuple[type[Any], ...] = (
+_IP_TYPES: tuple[type[object], ...] = (
     ipaddress.IPv4Address,
     ipaddress.IPv6Address,
     ipaddress.IPv4Interface,
@@ -77,11 +78,12 @@ class json[T](Column[T | None]):
 
 
 def array[T](item: Column[T], name: str | None = None) -> Column[list[T] | None]:
-    def encode(values: Any) -> Any:
-        return [item.encode(v) for v in values]
+    # Only called with list/tuple values (column accepts) or arrays decoded by asyncpg.
+    def encode(values: object) -> object:
+        return [item.encode(v) for v in cast(Iterable[object], values)]
 
-    def decode(values: Any) -> Any:
-        return [item.decode(v) for v in values]
+    def decode(values: object) -> object:
+        return [item.decode(v) for v in cast(Iterable[object], values)]
 
     column: Column[list[T] | None] = Column(
         f"{item.sql_type}[]",
@@ -95,8 +97,9 @@ def array[T](item: Column[T], name: str | None = None) -> Column[list[T] | None]
     return column
 
 
-def _enum_value(value: Any) -> Any:
-    return value.value
+def _enum_value(value: object) -> object:
+    # Only called with members of the column's enum. Enum.value is typed Any in typeshed.
+    return cast(enum.Enum, value).value  # pyright: ignore[reportAny]
 
 
 def pg_enum[E: enum.Enum](

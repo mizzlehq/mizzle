@@ -4,11 +4,10 @@ from __future__ import annotations
 
 import re
 from collections.abc import Sequence
-from typing import Any
 
 from mizzle.core.errors import MigrationError
 from mizzle.core.naming import Casing
-from mizzle.core.schema.column import MISSING, Column
+from mizzle.core.schema.column import MISSING, ColumnBase
 from mizzle.core.snapshot import ColumnSnap, ForeignKeySnap, IndexSnap, TableSnap
 from mizzle.core.sql.nodes import Node
 from mizzle.core.steps import (
@@ -100,7 +99,7 @@ def normalize_type(sql_type: str) -> str:
     return base + args + array
 
 
-def column_type(column: Column[Any]) -> str:
+def column_type(column: ColumnBase) -> str:
     if column.enum is not None:
         array = "[]" if column.sql_type.endswith("[]") else ""
         return type_ident(column.sql_type.removesuffix("[]")) + array
@@ -132,7 +131,7 @@ def expression(node: Node, casing: Casing | None = None) -> str:
     return compiler(casing).compile(node).sql
 
 
-def column_default(column: Column[Any], casing: Casing | None = None) -> str | None:
+def column_default(column: ColumnBase, casing: Casing | None = None) -> str | None:
     if column.default_value is MISSING:
         return None
     value = column.default_value

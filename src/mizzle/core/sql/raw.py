@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import string
 import sys
+from typing import cast
 
 from mizzle.core.errors import QueryError
 from mizzle.core.sql.nodes import Identifier, Node, Param, Raw
@@ -64,7 +65,8 @@ class _Sql:
                 if isinstance(item, Interpolation):
                     if item.conversion or item.format_spec:
                         raise QueryError("sql() t-strings do not support !r or :format")
-                    parts.append(_part(item.value))
+                    value = cast(object, item.value)  # typeshed types Interpolation.value as Any
+                    parts.append(_part(value))
                 elif item:
                     parts.append(item)
             return Raw(tuple(parts))

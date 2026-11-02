@@ -5,10 +5,10 @@ from __future__ import annotations
 import copy
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
-from typing import Any, Literal, Protocol
+from typing import Literal, Protocol
 
 from mizzle.core.errors import MigrationError
-from mizzle.core.snapshot import Snapshot, TableSnap, key
+from mizzle.core.snapshot import CheckSnap, IndexSnap, Snapshot, TableSnap, key
 from mizzle.core.steps import (
     AddCheck,
     AddColumn,
@@ -47,7 +47,7 @@ class RenameResolver(Protocol):
     """
 
     def __call__(
-        self, kind: RenameKind, scope: str, removed: list[str], added: list[str]
+        self, kind: RenameKind, scope: str, removed: list[str], added: list[str], /
     ) -> dict[str, str]: ...
 
 
@@ -99,7 +99,7 @@ class StrictRenames:
 
 
 def no_renames(
-    kind: RenameKind, scope: str, removed: list[str], added: list[str]
+    _kind: RenameKind, _scope: str, _removed: list[str], _added: list[str], /
 ) -> dict[str, str]:
     """Treat every removed/added pair as a real drop and create."""
     return {}
@@ -145,7 +145,7 @@ class _Plan:
         ]
 
 
-def _without_name(item: Mapping[str, Any]) -> dict[str, Any]:
+def _without_name(item: Mapping[str, object]) -> dict[str, object]:
     return {k: v for k, v in item.items() if k != "name"}
 
 
@@ -236,7 +236,7 @@ def _apply_renames(
     return tables
 
 
-def _diff_named[T: Mapping[str, Any]](
+def _diff_named[T: Mapping[str, object]](
     old: Mapping[str, T],
     new: Mapping[str, T],
     same: Callable[[T, T], bool],
@@ -291,10 +291,10 @@ def _diff_table(old: TableSnap, new: TableSnap, plan: _Plan, compare_expressions
     def rename(old_name: str, new_name: str) -> None:
         plan.renames.append(RenameConstraint(schema, name, old_name, new_name))
 
-    def same(a: Mapping[str, Any], b: Mapping[str, Any]) -> bool:
+    def same(a: Mapping[str, object], b: Mapping[str, object]) -> bool:
         return _without_name(a) == _without_name(b)
 
-    def same_check(a: Mapping[str, Any], b: Mapping[str, Any]) -> bool:
+    def same_check(a: CheckSnap, b: CheckSnap) -> bool:
         return not compare_expressions or a["expression"] == b["expression"]
 
     old_pk = {old["primary_key"]["name"]: old["primary_key"]} if old["primary_key"] else {}
@@ -332,10 +332,10 @@ def _diff_table(old: TableSnap, new: TableSnap, plan: _Plan, compare_expressions
         rename,
     )
 
-    def same_index(a: Mapping[str, Any], b: Mapping[str, Any]) -> bool:
+    def same_index(a: IndexSnap, b: IndexSnap) -> bool:
         if compare_expressions:
             return same(a, b)
-        return bool(a["columns"] == b["columns"] and a["unique"] == b["unique"])
+        return a["columns"] == b["columns"] and a["unique"] == b["unique"]
 
     _diff_named(
         old["indexes"],

@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 import re
 from collections.abc import Sequence
-from typing import Any
+from typing import cast
 
 from mizzle.core.snapshot import (
     ColumnSnap,
@@ -87,16 +87,35 @@ ORDER BY n.nspname, t.typname
 """
 
 
-def _column(row: dict[str, Any]) -> ColumnSnap:
-    sql_type: str = row["type"]
-    default = row["default"]
+type _Row = dict[str, object]
+
+
+def _int(value: object) -> int:
+    if not isinstance(value, int):
+        raise TypeError(f"expected int from the catalog, got {type(value).__name__}")
+    return value
+
+
+def _opt_str(value: object) -> str | None:
+    return None if value is None else str(value)
+
+
+def _strs(value: object) -> list[str]:
+    if not isinstance(value, list):
+        raise TypeError(f"expected an array from the catalog, got {type(value).__name__}")
+    return [str(v) for v in cast(list[object], value)]
+
+
+def _column(row: _Row) -> ColumnSnap:
+    name, sql_type, not_null = str(row["name"]), str(row["type"]), bool(row["not_null"])
+    default = _opt_str(row["default"])
     serial = next((s for s, base in SERIAL_TYPES.items() if base == sql_type), None)
     if serial is not None and default is not None and _NEXTVAL.fullmatch(default):
-        return ColumnSnap(name=row["name"], type=serial, not_null=row["not_null"], default=None)
+        return ColumnSnap(name=name, type=serial, not_null=not_null, default=None)
     return ColumnSnap(
-        name=row["name"],
+        name=name,
         type=sql_type,
-        not_null=row["not_null"],
+        not_null=not_null,
         default=normalize_default(default),
     )
 
@@ -113,9 +132,10 @@ async def introspect(conn: Connection, schemas: Sequence[str] = (DEFAULT_SCHEMA,
     tables = await conn.fetch_dicts(_TABLES, [schema_list, MIGRATIONS_TABLE])
     by_oid: dict[int, TableSnap] = {}
     for t in tables:
+        schema, name = str(t["schema"]), str(t["name"])
         snap = TableSnap(
-            schema=t["schema"],
-            name=t["name"],
+            schema=schema,
+            name=name,
             columns={},
             primary_key=None,
             uniques={},
@@ -123,53 +143,55 @@ async def introspect(conn: Connection, schemas: Sequence[str] = (DEFAULT_SCHEMA,
             foreign_keys={},
             indexes={},
         )
-        by_oid[t["oid"]] = snap
-        snapshot["tables"][key(t["schema"], t["name"])] = snap
-        if t["schema"] != DEFAULT_SCHEMA and t["schema"] not in snapshot["schemas"]:
-            snapshot["schemas"].append(t["schema"])
+        by_oid[_int(t["oid"])] = snap
+        snapshot["tables"][key(schema, name)] = snap
+        if schema != DEFAULT_SCHEMA and schema not in snapshot["schemas"]:
+            snapshot["schemas"].append(schema)
 
     oids = list(by_oid)
     for row in await conn.fetch_dicts(_COLUMNS, [oids]):
         column = _column(row)
-        by_oid[row["table_oid"]]["columns"][column["name"]] = column
+        by_oid[_int(row["table_oid"])]["columns"][column["name"]] = column
 
     for row in await conn.fetch_dicts(_CONSTRAINTS, [oids]):
-        table = by_oid[row["table_oid"]]
-        name, columns = row["name"], list(row["columns"])
+        table = by_oid[_int(row["table_oid"])]
+        name, columns = str(row["name"]), _strs(row["columns"])
         match row["kind"]:
             case "p":
                 table["primary_key"] = {"name": name, "columns": columns}
             case "u":
                 table["uniques"][name] = {"name": name, "columns": columns}
             case "c":
-                expression = _check_expression(row["definition"])
+                expression = _check_expression(str(row["definition"]))
                 table["checks"][name] = {"name": name, "expression": expression}
             case "f":
                 table["foreign_keys"][name] = {
                     "name": name,
                     "columns": columns,
-                    "ref_schema": row["ref_schema"],
-                    "ref_table": row["ref_table"],
-                    "ref_columns": list(row["ref_columns"]),
-                    "on_delete": _ACTIONS[row["on_delete"]],
-                    "on_update": _ACTIONS[row["on_update"]],
+                    "ref_schema": str(row["ref_schema"]),
+                    "ref_table": str(row["ref_table"]),
+                    "ref_columns": _strs(row["ref_columns"]),
+                    "on_delete": _ACTIONS[str(row["on_delete"])],
+                    "on_update": _ACTIONS[str(row["on_update"])],
                 }
             case _:
                 pass
 
     for row in await conn.fetch_dicts(_INDEXES, [oids]):
-        table = by_oid[row["table_oid"]]
+        table = by_oid[_int(row["table_oid"])]
+        name = str(row["name"])
         if row["has_expressions"]:
-            log.warning("skipping expression index %s (not supported yet)", row["name"])
+            log.warning("skipping expression index %s (not supported yet)", name)
             continue
-        table["indexes"][row["name"]] = {
-            "name": row["name"],
-            "columns": list(row["columns"]),
-            "unique": row["unique"],
-            "where": row["predicate"],
+        table["indexes"][name] = {
+            "name": name,
+            "columns": _strs(row["columns"]),
+            "unique": bool(row["unique"]),
+            "where": _opt_str(row["predicate"]),
         }
 
     for row in await conn.fetch_dicts(_ENUMS, [schema_list]):
-        enum = EnumSnap(schema=row["schema"], name=row["name"], values=list(row["values"]))
-        snapshot["enums"][key(row["schema"], row["name"])] = enum
+        schema, name = str(row["schema"]), str(row["name"])
+        enum = EnumSnap(schema=schema, name=name, values=_strs(row["values"]))
+        snapshot["enums"][key(schema, name)] = enum
     return snapshot

@@ -4,11 +4,11 @@ from __future__ import annotations
 
 import uuid
 from collections.abc import Sequence
-from typing import Any
+from typing import cast
 
 from mizzle.core.errors import SchemaError
 from mizzle.core.naming import Casing
-from mizzle.core.schema.column import Column
+from mizzle.core.schema.column import ColumnBase
 from mizzle.core.schema.constraints import Check, ForeignKey, Index, PrimaryKey, UniqueConstraint
 from mizzle.core.schema.table import Table, validate_tables
 from mizzle.core.snapshot import (
@@ -42,7 +42,7 @@ def build_snapshot(
     def schema_of(table: type[Table]) -> str:
         return table.__table__.schema or default_schema
 
-    def names(columns: Sequence[Column[Any]]) -> list[str]:
+    def names(columns: Sequence[ColumnBase]) -> list[str]:
         return [c.db_name(casing) for c in columns]
 
     for table in tables:
@@ -141,10 +141,10 @@ def build_snapshot(
     return snapshot
 
 
-def _add_enum(snapshot: Snapshot, schema: str, column: Column[Any]) -> None:
+def _add_enum(snapshot: Snapshot, schema: str, column: ColumnBase) -> None:
     assert column.enum is not None
     name = column.sql_type.removesuffix("[]")
-    values = [str(member.value) for member in column.enum]
+    values = [str(cast(object, member.value)) for member in column.enum]
     existing = snapshot["enums"].get(key(schema, name))
     if existing is not None and existing["values"] != values:
         raise SchemaError(f"enum type {name!r} is declared twice with different values")
