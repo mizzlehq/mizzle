@@ -133,7 +133,7 @@ async def test_create_then_introspect_matches(driver: PostgresDriver) -> None:
     assert live["tables"]["public.everything"]["columns"]["id"]["type"] == "serial"
     assert live["enums"]["public.mood"]["values"] == ["happy", "sad"]
     tricky = live["tables"]["public.everything"]["indexes"]["everything_tricky_idx"]
-    assert tricky["expression"] == "(label || ')''(\"'::text)"
+    assert tricky.get("expression") == "(label || ')''(\"'::text)"
     assert tricky["columns"] == []
 
 
