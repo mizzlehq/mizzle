@@ -91,3 +91,20 @@ def _errors(model: type[pydantic.BaseModel], data: dict[str, Any]) -> list[Any]:
     except pydantic.ValidationError as exc:
         return list(exc.errors())
     return []
+
+
+def test_generated_and_key_columns_are_not_client_settable() -> None:
+    assert "id" not in insert_model(Users).model_fields  # serial
+    assert "id" not in update_model(Users).model_fields  # primary key
+    assert "id" in select_model(Users).model_fields
+    assert _errors(insert_model(Users), {"email": "a", "id": 5})[0]["type"] == "extra_forbidden"
+
+
+def test_include_is_an_allowlist() -> None:
+    SignUp = insert_model(Users, include=["email", "bio"])
+    assert set(SignUp.model_fields) == {"email", "bio"}
+    attack = _errors(SignUp, {"email": "a", "role": "admin"})
+    assert attack[0]["loc"] == ("role",) and attack[0]["type"] == "extra_forbidden"
+    assert "id" in update_model(Users, include=["id", "bio"]).model_fields  # explicit opt-in
+    with pytest.raises(SchemaError):
+        insert_model(Users, include=["nope"])

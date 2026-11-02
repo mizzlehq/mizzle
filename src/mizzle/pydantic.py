@@ -1,15 +1,21 @@
 """Pydantic models from tables (like drizzle-zod). Needs ``pip install "mizzle[pydantic]"``.
 
-    UserOut = select_model(Users)     # every column, as stored
-    UserIn = insert_model(Users)      # required only where the database needs a value
-    UserPatch = update_model(Users)   # every column optional
+    UserOut = select_model(Users)                              # every column, as stored
+    SignUp = insert_model(Users, include=["email", "name"])    # what a client may send
+    UserPatch = update_model(Users, include=["name", "bio"])
 
     @app.post("/users", response_model=UserOut)
-    async def create(body: UserIn):   # FastAPI validates the request with UserIn
+    async def create(body: SignUp):    # FastAPI validates the request
         [user] = await db.insert(Users).values(body).returning()
-        return user                   # Users rows validate into UserOut directly
+        return user                    # Users rows validate into UserOut directly
 
-Models only contain the fields a client sent: ``values(model)`` / ``set(model)`` use
+Security: a model accepts every field it contains, so a request can set any of them.
+For models built from client input, list the allowed fields with ``include=`` (an
+allowlist). Otherwise a client could, for example, send ``"role": "admin"``. Insert and
+update models never contain database-generated columns (serial ids), and update models
+never contain primary keys, unless you ``include`` them explicitly.
+
+Models only carry the fields a client sent: ``values(model)`` / ``set(model)`` use
 ``model_dump(exclude_unset=True)``, so omitted fields keep their database defaults.
 """
 
@@ -73,17 +79,29 @@ def _model(
     mode: Mode,
     *,
     name: str | None,
+    include: Sequence[str] | None,
     exclude: Sequence[str],
     refine: Mapping[str, Any] | None,
 ) -> type[pydantic.BaseModel]:
     columns = table.__table__.columns
     refine = refine or {}
-    if unknown := [c for c in [*exclude, *refine] if c not in columns]:
+    named = [*(include or ()), *exclude, *refine]
+    if unknown := [c for c in named if c not in columns]:
         raise SchemaError(f"{table.__name__} has no column(s) {unknown}")
+
+    def wanted(attr: str, column: Column[Any]) -> bool:
+        if attr in exclude:
+            return False
+        if include is not None:
+            return attr in include
+        if mode != "select" and column.generated:
+            return False  # e.g. serial ids: assigned by the database, not by clients
+        return not (mode == "update" and column.is_primary_key)
+
     fields: dict[str, Any] = {
         attr: _field(column, mode, refine.get(attr))
         for attr, column in columns.items()
-        if attr not in exclude
+        if wanted(attr, column)
     }
     suffix = {"select": "", "insert": "Insert", "update": "Update"}[mode]
     return pydantic.create_model(
@@ -97,33 +115,39 @@ def select_model(
     table: type[Table],
     *,
     name: str | None = None,
+    include: Sequence[str] | None = None,
     exclude: Sequence[str] = (),
     refine: Mapping[str, Any] | None = None,
 ) -> type[pydantic.BaseModel]:
-    """A model of a stored row. Validates table rows directly (``from_attributes``)."""
-    return _model(table, "select", name=name, exclude=exclude, refine=refine)
+    """A model of a stored row. Validates table rows directly (``from_attributes``).
+    Use ``exclude`` to keep secrets such as password hashes out of API responses."""
+    return _model(table, "select", name=name, include=include, exclude=exclude, refine=refine)
 
 
 def insert_model(
     table: type[Table],
     *,
     name: str | None = None,
+    include: Sequence[str] | None = None,
     exclude: Sequence[str] = (),
     refine: Mapping[str, Any] | None = None,
 ) -> type[pydantic.BaseModel]:
-    """A model for new rows. ``refine={"email": EmailStr}`` replaces a field's type."""
-    return _model(table, "insert", name=name, exclude=exclude, refine=refine)
+    """A model for new rows. For client input, pass ``include=[...]`` (an allowlist).
+    ``refine={"email": EmailStr}`` replaces a field's type."""
+    return _model(table, "insert", name=name, include=include, exclude=exclude, refine=refine)
 
 
 def update_model(
     table: type[Table],
     *,
     name: str | None = None,
+    include: Sequence[str] | None = None,
     exclude: Sequence[str] = (),
     refine: Mapping[str, Any] | None = None,
 ) -> type[pydantic.BaseModel]:
-    """A model for partial updates: every field optional."""
-    return _model(table, "update", name=name, exclude=exclude, refine=refine)
+    """A model for partial updates: every field optional, primary keys left out.
+    For client input, pass ``include=[...]`` (an allowlist)."""
+    return _model(table, "update", name=name, include=include, exclude=exclude, refine=refine)
 
 
 __all__ = ["column_type", "insert_model", "select_model", "update_model"]
