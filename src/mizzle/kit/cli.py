@@ -17,6 +17,7 @@ from mizzle.dialects.base import Dialect, Driver
 from mizzle.kit.codegen import render_schema_module, render_types_module
 from mizzle.kit.config import Config, load_config
 from mizzle.kit.diff import RenameKind, RenameResolver, StrictRenames, diff, no_renames
+from mizzle.kit.init import init_project
 from mizzle.kit.journal import MigrationsDir
 from mizzle.kit.migrate import apply_statements, run_migrations
 from mizzle.kit.snapshot import build_snapshot
@@ -25,6 +26,7 @@ from mizzle.kit.snapshot import build_snapshot
 class Args(Protocol):
     """Parsed arguments; each subcommand sets only its own options (see ``_parser``)."""
 
+    command: str
     config: Path | None
     func: Callable[[Config, Args], int]
     name: str | None
@@ -40,6 +42,9 @@ class Args(Protocol):
     read_only: bool
     no_open: bool
     ui_path: str | None
+    schema: str
+    url_env: str
+    pyproject: bool
 
 
 def _interactive() -> bool:
@@ -290,6 +295,25 @@ def cmd_typegen(config: Config, args: Args) -> int:
     return 0
 
 
+def cmd_init(args: Args) -> int:
+    root = Path.cwd()
+    for line in init_project(
+        root,
+        schema_file=Path(args.schema),
+        out=args.out or "migrations",
+        url_env=args.url_env,
+        in_pyproject=args.pyproject,
+        force=args.force,
+    ):
+        print(f"  {line}")
+    print(
+        f"\nNext:\n  export {args.url_env}=postgresql://user:password@localhost:5432/db\n"
+        "  mizzle generate   # write the first migration from your schema\n"
+        "  mizzle migrate    # apply it"
+    )
+    return 0
+
+
 def cmd_studio(config: Config, args: Args) -> int:
     try:
         from mizzle.studio.server import serve
@@ -319,6 +343,14 @@ def _parser() -> argparse.ArgumentParser:
         )
         p.add_argument("--no-renames", action="store_true", help="treat changes as drop + create")
         p.add_argument("--allow-data-loss", action="store_true")
+
+    p = sub.add_parser("init", help="set up mizzle in this project")
+    p.add_argument("--schema", default="db/schema.py", help="schema module file to create")
+    p.add_argument("--out", default="migrations", help="migrations folder")
+    p.add_argument("--url-env", default="DATABASE_URL", help="env var with the database URL")
+    p.add_argument("--pyproject", action="store_true", help="use [tool.mizzle] in pyproject.toml")
+    p.add_argument("--force", action="store_true", help="replace an existing mizzle.toml")
+    p.set_defaults(func=None)
 
     p = sub.add_parser("generate", help="write a migration from schema changes")
     p.add_argument("--name")
@@ -368,6 +400,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     # argparse sets these attributes dynamically; _parser defines them to match Args.
     args = cast(Args, cast(object, _parser().parse_args(argv)))
     try:
+        if args.command == "init":  # runs before any config exists
+            return cmd_init(args)
         config = load_config(args.config)
         return args.func(config, args)
     except MizzleError as exc:

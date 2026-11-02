@@ -86,7 +86,8 @@ passed to `sql()` from user input** (for example with an f-string).
 
 ## Migrations
 
-`mizzle.toml` in your project root (or `[tool.mizzle]` in `pyproject.toml`):
+`mizzle init` creates `mizzle.toml`, a starter schema module and the migrations folder
+(`--pyproject` puts the settings in `[tool.mizzle]` of `pyproject.toml` instead):
 
 ```toml
 schema = "app.db.schema"   # module(s) with your tables
@@ -95,6 +96,7 @@ url_env = "DATABASE_URL"   # the URL is read from the environment
 ```
 
 ```bash
+mizzle init                # set up mizzle.toml, db/schema.py and migrations/
 mizzle generate            # write migrations/0001_.../migration.sql + snapshot.json
 mizzle migrate             # apply pending migrations (safe with many app servers)
 mizzle push                # dev: sync schema straight to the database

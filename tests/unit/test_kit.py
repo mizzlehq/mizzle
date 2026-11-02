@@ -177,3 +177,42 @@ def test_pulled_names_cannot_inject_code() -> None:
     source = render_schema_module(snapshot)
     assert "\nimport os" not in source
     compile(source, "pulled.py", "exec")
+
+
+def test_init_creates_config_schema_and_folder(tmp_path: Path) -> None:
+    from mizzle.kit.init import init_project
+
+    done = init_project(tmp_path, schema_file=Path("app/db/schema.py"))
+    assert done == [
+        "wrote mizzle.toml",
+        "wrote starter schema app/db/schema.py",
+        "created migrations/",
+    ]
+    config = load_config(cwd=tmp_path)
+    assert config.schema == ["app.db.schema"]
+    assert config.out == tmp_path / "migrations"
+    compile((tmp_path / "app/db/schema.py").read_text(), "schema.py", "exec")
+
+    with pytest.raises(MigrationError, match="already set up"):
+        init_project(tmp_path, schema_file=Path("app/db/schema.py"))
+    (tmp_path / "app/db/schema.py").write_text("# mine\n")
+    done = init_project(tmp_path, schema_file=Path("app/db/schema.py"), force=True)
+    assert "kept existing app/db/schema.py" in done
+    assert (tmp_path / "app/db/schema.py").read_text() == "# mine\n"  # never overwritten
+
+
+def test_init_in_pyproject(tmp_path: Path) -> None:
+    from mizzle.kit.init import init_project
+
+    (tmp_path / "pyproject.toml").write_text('[project]\nname = "x"\n')
+    init_project(tmp_path, schema_file=Path("schema.py"), in_pyproject=True)
+    assert load_config(cwd=tmp_path).schema == ["schema"]
+    assert '[project]\nname = "x"\n' in (tmp_path / "pyproject.toml").read_text()
+
+
+def test_init_rejects_bad_schema_paths(tmp_path: Path) -> None:
+    from mizzle.kit.init import init_project
+
+    for bad in ("schema.txt", "my-app/schema.py", "class/schema.py"):
+        with pytest.raises(MigrationError):
+            init_project(tmp_path, schema_file=Path(bad))
