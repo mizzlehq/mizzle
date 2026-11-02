@@ -37,9 +37,9 @@ class Role(enum.StrEnum):
 
 
 class Users(Table, name="users"):
-    id = serial().primary_key()                         # Column[int]
-    email = varchar(255).not_null().unique()            # Column[str]
-    bio = text()                                        # Column[str | None]
+    id = serial().primary_key()  # Column[int]
+    email = varchar(255).not_null().unique()  # Column[str]
+    bio = text()  # Column[str | None]
     role = pg_enum(Role).not_null().default(Role.USER)  # Column[Role]
     created_at = timestamp(tz=True).not_null().default(sql("now()"))
 
@@ -64,12 +64,10 @@ class Posts(Table, name="posts"):
 from mizzle import Database, desc, eq
 
 async with await Database.connect("postgresql://...", schema=[Users, Posts]) as db:
-    [ann] = await db.insert(Users).values(email="ann@x.io").returning()        # Users
+    [ann] = await db.insert(Users).values(email="ann@x.io").returning()  # Users
     admins = await db.select().from_(Users).where(eq(Users.role, Role.ADMIN))  # list[Users]
     pairs = await (
-        db.select(Users, Posts)
-        .from_(Users)
-        .left_join(Posts, eq(Posts.author_id, Users.id))
+        db.select(Users, Posts).from_(Users).left_join(Posts, eq(Posts.author_id, Users.id))
     )  # list[tuple[Users, Posts | None]]
 
     # Relational: one SQL statement, typed nested results.

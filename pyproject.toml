@@ -12,6 +12,9 @@ studio = [
     "starlette>=0.40",
     "uvicorn>=0.30",
 ]
+pydantic = [
+    "pydantic>=2.7",
+]
 
 [project.scripts]
 mizzle = "mizzle.kit.cli:main"
@@ -35,6 +38,7 @@ dev = [
     "ruff>=0.11",
     "asyncpg-stubs>=0.30",
     "httpx>=0.28.1",
+    "pydantic>=2.7",
 ]
 
 [tool.pytest.ini_options]

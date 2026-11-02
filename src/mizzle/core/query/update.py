@@ -6,14 +6,13 @@ filter cannot rewrite or wipe a whole table.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 from typing import Any, Self
 
 from mizzle.core.compiler import CompiledQuery
 from mizzle.core.errors import QueryError
 from mizzle.core.query.base import Executable, Runner
-from mizzle.core.query.insert import check_values
+from mizzle.core.query.insert import RowLike, as_mapping, check_values
 from mizzle.core.query.returning import Returning
 from mizzle.core.schema.table import Table
 from mizzle.core.sql.nodes import Expr
@@ -30,10 +29,11 @@ class Update[T: Table](Executable[int]):
     where_: Expr[bool] | None = None
     all_rows_: bool = False
 
-    def set(self, values: Mapping[str, Any] | None = None, /, **fields: Any) -> Self:
+    def set(self, values: RowLike | None = None, /, **fields: Any) -> Self:
+        """``set(bio="x")``, ``set({"bio": "x"})`` or ``set(pydantic_model)``."""
         if values is not None and fields:
             raise QueryError("pass a mapping or keyword arguments to set(), not both")
-        changes = dict(values) if values is not None else fields
+        changes = dict(as_mapping(values)) if values is not None else fields
         check_values(self.table, changes)
         return replace(self, values_={**self.values_, **changes})
 
