@@ -81,6 +81,8 @@ class Everything(Table, name="everything"):
             index("everything_label_idx").on(cls.label, cls.born),
             index("everything_label_lower_idx").on(sql("lower(label)")),
             unique_index("everything_flag_label_uq").on(cls.flag, sql("upper(label)")),
+            # A key whose text contains quotes and brackets must come back exactly.
+            index("everything_tricky_idx").on(sql("(label || ')''(\"')")),
             unique_index("everything_uid_live").on(cls.uid).where(sql("flag")),
             unique(cls.small, cls.r, name="everything_small_r_uq"),
             check("everything_num_positive", sql("num > 0")),
@@ -130,6 +132,9 @@ async def test_create_then_introspect_matches(driver: PostgresDriver) -> None:
     assert live["tables"]["public.everything"]["columns"]["small"]["default"] == "-1"
     assert live["tables"]["public.everything"]["columns"]["id"]["type"] == "serial"
     assert live["enums"]["public.mood"]["values"] == ["happy", "sad"]
+    tricky = live["tables"]["public.everything"]["indexes"]["everything_tricky_idx"]
+    assert tricky["expression"] == "(label || ')''(\"'::text)"
+    assert tricky["columns"] == []
 
 
 async def test_alter_migration_applies(driver: PostgresDriver) -> None:

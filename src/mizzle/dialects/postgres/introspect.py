@@ -69,7 +69,9 @@ SELECT i.indrelid AS table_oid, ic.relname AS name, i.indisunique AS unique,
              ORDER BY k.ord) AS columns,
        pg_get_expr(i.indpred, i.indrelid) AS predicate,
        i.indexprs IS NOT NULL AS has_expressions,
-       pg_get_indexdef(i.indexrelid) AS definition,
+       -- Each key on its own, straight from the catalog (no parsing of definition text).
+       ARRAY(SELECT pg_get_indexdef(i.indexrelid, k, true)
+             FROM generate_series(1, i.indnkeyatts) AS k ORDER BY k) AS keys,
        am.amname AS method
 FROM pg_index i
 JOIN pg_class ic ON ic.oid = i.indexrelid
@@ -129,22 +131,6 @@ def _check_expression(definition: str) -> str:
     # pg_get_constraintdef: "CHECK ((title <> ''::text))" -> "(title <> ''::text)"
     expr = definition.removeprefix("CHECK ").removesuffix(" NOT VALID")
     return expr[1:-1] if expr.startswith("(") and expr.endswith(")") else expr
-
-
-def _index_keys(definition: str) -> str:
-    """The key list of ``CREATE INDEX ... USING btree (<keys>) [WHERE ...]``."""
-    start = definition.index(" USING btree (") + len(" USING btree (")
-    depth, quoted = 1, False
-    for i, ch in enumerate(definition[start:], start):
-        if ch == "'":
-            quoted = not quoted  # '' inside a literal toggles twice: still correct
-        elif not quoted and ch == "(":
-            depth += 1
-        elif not quoted and ch == ")":
-            depth -= 1
-            if depth == 0:
-                return definition[start:i]
-    raise ValueError(f"cannot read the keys of index definition {definition!r}")
 
 
 async def introspect(conn: Connection, schemas: Sequence[str] = (DEFAULT_SCHEMA,)) -> Snapshot:
@@ -213,7 +199,7 @@ async def introspect(conn: Connection, schemas: Sequence[str] = (DEFAULT_SCHEMA,
         )
         if row["has_expressions"]:
             index["columns"] = []
-            index["expression"] = _index_keys(str(row["definition"]))
+            index["expression"] = ", ".join(_strs(row["keys"]))
         table["indexes"][name] = index
 
     for row in await conn.fetch_dicts(_ENUMS, [schema_list]):
