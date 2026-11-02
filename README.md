@@ -1,146 +1,82 @@
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/mizzlehq/mizzle/main/assets/logo-dark.png">
-    <img alt="mizzle" src="https://raw.githubusercontent.com/mizzlehq/mizzle/main/assets/logo.png" width="320">
+    <img alt="mizzle" src="https://raw.githubusercontent.com/mizzlehq/mizzle/main/assets/logo.png" width="300">
   </picture>
 </p>
 
-# mizzle
+<h3 align="center">Fully typed async ORM for Python and PostgreSQL</h3>
 
-A fully typed, async ORM for Python and PostgreSQL: write queries that read like SQL,
-get typed rows back, and evolve your schema with generated migrations. If you know
-[Drizzle](https://orm.drizzle.team) from TypeScript, mizzle will feel familiar.
+<p align="center">
+  <a href="https://github.com/mizzlehq/mizzle">GitHub</a> •
+  <a href="https://pypi.org/project/mizzle/">PyPI</a> •
+  <a href="https://github.com/mizzlehq/mizzle/tree/main/examples/social">Example app</a> •
+  <a href="https://github.com/mizzlehq/mizzle/releases">Releases</a>
+</p>
 
-- **Schema in Python classes.** Result rows are typed for pyright and mypy, with no code
-  generation.
-- **Two query styles:** a SQL-like builder (`select`, `insert`, `update`, `delete`, joins,
-  CTEs, upserts) and relational queries that load nested data in one SQL statement.
-- **Migration kit:** `generate`, `migrate`, `push`, `pull`, `check`, `drop`, `typegen`.
-- **Studio:** browse and edit data in your browser (`mizzle studio`).
-- **Safe by default:** values are always bind parameters, `update`/`delete` refuse to run
-  without `.where()`, migrations are locked, transactional and tamper-checked, and errors
-  never include row values.
+<br>
 
-Built for PostgreSQL first; other SQL databases plug in through the dialect layer
-(`src/mizzle/dialects/`).
+## What's mizzle?
 
-A complete example app (FastAPI, migrations, seed data, tests) lives in
-[`examples/social`](https://github.com/mizzlehq/mizzle/tree/main/examples/social).
+mizzle is an ORM for people who like SQL. You describe tables as Python classes and write
+queries that read like the SQL they produce. Every row comes back typed, so your editor and
+type checker know `user.email` is a `str` — no code generation, no plugins.
 
-## Install
+It is async from the ground up, built on [asyncpg](https://github.com/MagicStack/asyncpg),
+with one runtime dependency. Values are always sent as bind parameters, `update` and
+`delete` refuse to touch a whole table by accident, and database errors never leak your
+data into logs.
+
+Need nested data? Relational queries load a user with their posts and comments in a single
+SQL statement, typed all the way down.
+
+## Ecosystem
+
+**mizzle CLI** generates SQL migrations from your schema, applies them safely (even with
+many app servers starting at once), pushes changes straight to a dev database, and pulls an
+existing database into Python code.
+
+**mizzle studio** opens your database in the browser to browse, filter and edit data.
+
+## Quick look
 
 ```bash
-pip install mizzle            # ORM + migration CLI
-pip install "mizzle[studio]"  # + Studio (its UI downloads into your venv on first run, ~250 KB)
+pip install mizzle
+mizzle init        # creates mizzle.toml, db/schema.py and migrations/
 ```
 
-## Schema
-
 ```python
-# app/db/schema.py
-import enum
-from typing import final, override
+from typing import final
 
-from mizzle import Table, index, many, one, sql
-from mizzle.pg import integer, pg_enum, serial, text, timestamp, varchar
-
-
-class Role(enum.StrEnum):
-    ADMIN = "admin"
-    USER = "user"
+from mizzle import Database, Table, eq, sql
+from mizzle.pg import serial, text, timestamp, varchar
 
 
 @final
 class Users(Table, name="users"):
-    id = serial().primary_key()  # Column[int]
-    email = varchar(255).not_null().unique()  # Column[str]
-    bio = text()  # Column[str | None]
-    role = pg_enum(Role).not_null().default(Role.USER)  # Column[Role]
+    id = serial().primary_key()
+    email = varchar(255).not_null().unique()
+    bio = text()
     created_at = timestamp(tz=True).not_null().default(sql("now()"))
 
-    posts = many(lambda: Posts)
 
-
-@final
-class Posts(Table, name="posts"):
-    id = serial().primary_key()
-    author_id = integer().not_null().references(lambda: Users.id, on_delete="cascade")
-    title = text().not_null()
-
-    author = one(lambda: Users, fields=lambda: [Posts.author_id], references=lambda: [Users.id])
-
-    @classmethod
-    @override
-    def config(cls):
-        return [index("posts_author_idx").on(cls.author_id)]
-```
-
-## Queries
-
-```python
-from mizzle import Database, desc, eq
-
-async with await Database.connect("postgresql://...", schema=[Users, Posts]) as db:
-    [ann] = await db.insert(Users).values(email="ann@x.io").returning()  # Users
-    admins = await db.select().from_(Users).where(eq(Users.role, Role.ADMIN))  # list[Users]
-    pairs = await (
-        db.select(Users, Posts).from_(Users).left_join(Posts, eq(Posts.author_id, Users.id))
-    )  # list[tuple[Users, Posts | None]]
-
-    # Relational: one SQL statement, typed nested results.
-    users = await db.query(Users).find_many(
-        with_={"posts": {"order_by": desc(Posts.id), "limit": 5}},
-    )
-    users[0].posts[0].title  # str
-
-    async with db.transaction() as tx:
-        await tx.update(Users).set(bio="hi").where(eq(Users.id, ann.id))
-```
-
-Raw SQL: `sql(t"select * from users where id = {user_id}")` (Python 3.14+) or
-`sql("... where id = {}", user_id)`. Values become bind parameters. **Never build the text
-passed to `sql()` from user input** (for example with an f-string).
-
-## Migrations
-
-`mizzle init` creates `mizzle.toml`, a starter schema module and the migrations folder
-(`--pyproject` puts the settings in `[tool.mizzle]` of `pyproject.toml` instead):
-
-```toml
-schema = "app.db.schema"   # module(s) with your tables
-out = "migrations"         # commit this folder
-url_env = "DATABASE_URL"   # the URL is read from the environment
+async with await Database.connect("postgresql://...", schema=[Users]) as db:
+    [ann] = await db.insert(Users).values(email="ann@example.com").returning()
+    users = await db.select().from_(Users).where(eq(Users.id, ann.id))  # list[Users]
 ```
 
 ```bash
-mizzle init                # set up mizzle.toml, db/schema.py and migrations/
-mizzle generate            # write migrations/0001_.../migration.sql + snapshot.json
-mizzle migrate             # apply pending migrations (safe with many app servers)
-mizzle push                # dev: sync schema straight to the database
-mizzle pull                # existing database -> your schema module (or pulled_schema.py next to it)
-mizzle check               # find broken or clashing migrations
-mizzle drop                # delete the latest, unapplied migration
-mizzle typegen             # TypedDicts for insert/update values
-mizzle studio              # open Studio
+mizzle generate    # write a migration from your schema
+mizzle migrate     # apply it
+mizzle studio      # browse the data
 ```
 
-Renames: on a terminal, `generate` asks whether a new column is a rename. In CI pass
-`--rename users.name=full_name`. Changes that can lose data need confirmation or
-`--allow-data-loss`. From code: `await mizzle.kit.migrate(db, "migrations")`.
+## Learn more
 
-## Development
+The [example app](https://github.com/mizzlehq/mizzle/tree/main/examples/social) is a
+complete FastAPI service built with mizzle: schema, migrations, relational queries,
+Pydantic models, seed data and tests. Full documentation is on the way.
 
-```bash
-docker compose up -d
-export MIZZLE_TEST_URL=postgresql://mizzle:mizzle@localhost:54329/mizzle
-uv run pytest            # integration tests skip when MIZZLE_TEST_URL is unset
-uv run pyright && uv run mypy
-uv run ruff check && uv run ruff format --check
+## License
 
-cd studio-ui && pnpm install && pnpm build   # builds the UI into src/mizzle/studio/static
-pnpm dev                                     # UI dev server; proxies /api to `mizzle studio`
-pnpm check                                   # Biome: format, lint, sort imports (--write)
-```
-
-Releases: push a `v*` tag. `.github/workflows/release.yml` builds the UI, packages it into
-the wheel, and publishes to PyPI with trusted publishing.
+[MIT](https://github.com/mizzlehq/mizzle/blob/main/LICENSE)
