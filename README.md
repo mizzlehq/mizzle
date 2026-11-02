@@ -27,7 +27,7 @@ pip install "mizzle[studio]"  # + Studio (its UI downloads on first run, ~250 KB
 ```python
 # app/db/schema.py
 import enum
-from typing import final
+from typing import final, override
 
 from mizzle import Table, index, many, one, sql
 from mizzle.pg import integer, pg_enum, serial, text, timestamp, varchar
@@ -58,6 +58,7 @@ class Posts(Table, name="posts"):
     author = one(lambda: Users, fields=lambda: [Posts.author_id], references=lambda: [Users.id])
 
     @classmethod
+    @override
     def config(cls):
         return [index("posts_author_idx").on(cls.author_id)]
 ```
