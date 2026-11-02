@@ -123,7 +123,10 @@ def _safe_extract(archive: Path, target: Path) -> None:
     seen: set[str] = set()
     with zipfile.ZipFile(archive) as zf:
         for info in zf.infolist():
-            name = _check_name(info.filename.rstrip("/") if info.is_dir() else info.filename)
+            # orig_filename: on Windows, zipfile already turned "\\" into "/" in .filename,
+            # which would hide a backslash-separated (non-portable) name from the check.
+            raw = info.orig_filename
+            name = _check_name(raw.rstrip("/") if info.is_dir() else raw)
             folded = str(name).casefold()  # macOS/Windows file names ignore case
             if folded in seen:
                 raise StudioUIError(f"UI archive has names differing only by case: {name}")
