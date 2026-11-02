@@ -5,8 +5,13 @@ Dialects subclass ``Compiler`` and override hooks (``param_marker``, ``returning
 
 from __future__ import annotations
 
+import datetime
+import enum
+import json
+import uuid
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from decimal import Decimal
 from typing import TYPE_CHECKING, Any, cast
 
 from mizzle.core.errors import QueryError
@@ -68,8 +73,18 @@ class CompiledQuery:
 class Compiler:
     """Single-use per ``compile()`` call: it accumulates params while walking the tree."""
 
-    def __init__(self, casing: Casing | None = None) -> None:
+    def __init__(
+        self,
+        casing: Casing | None = None,
+        *,
+        inline_literals: bool = False,
+        qualify_columns: bool = True,
+    ) -> None:
+        """``inline_literals`` and ``qualify_columns=False`` produce DDL-safe SQL (defaults,
+        CHECK constraints, index predicates), where bind parameters are not allowed."""
         self.casing: Casing | None = casing
+        self.inline_literals = inline_literals
+        self.qualify_columns = qualify_columns
         self._params: list[Any] = []
         self._placeholders: list[Placeholder | None] = []
 
@@ -95,9 +110,33 @@ class Compiler:
         return '"' + ident.replace('"', '""') + '"'
 
     def bind(self, value: Any, placeholder: Placeholder | None = None) -> str:
+        if self.inline_literals:
+            if placeholder is not None:
+                raise QueryError("placeholders cannot be used in DDL")
+            return self.literal(value)
         self._params.append(value)
         self._placeholders.append(placeholder)
         return self.param_marker(len(self._params))
+
+    def literal(self, value: Any) -> str:
+        """An SQL literal. Only for DDL; queries always use bind parameters."""
+        match value:
+            case None:
+                return "NULL"
+            case bool():
+                return "true" if value else "false"
+            case enum.Enum():
+                return self.literal(value.value)
+            case int() | float() | Decimal():
+                return str(value)
+            case str():
+                return "'" + value.replace("'", "''") + "'"
+            case datetime.date() | datetime.time() | uuid.UUID():
+                return self.literal(str(value))
+            case dict() | list():
+                return self.literal(json.dumps(value))
+            case _:
+                raise QueryError(f"cannot write {type(value).__name__} as an SQL literal")
 
     def table_name(self, table: type[Table]) -> str:
         info = table.__table__
@@ -121,6 +160,8 @@ class Compiler:
     def visit_Column(self, node: Column[Any]) -> str:
         if node.table is None:
             raise QueryError(f"column {node.attr!r} is not attached to a table")
+        if not self.qualify_columns:
+            return self.column_name(node)
         return f"{self.quote(node.table.__table__.name)}.{self.column_name(node)}"
 
     def visit_Param(self, node: Param[Any]) -> str:
