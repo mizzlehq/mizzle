@@ -4,11 +4,11 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass, field
-from typing import Any, ClassVar, Self
+from typing import ClassVar, Self, override
 
 from mizzle.core.errors import SchemaError
 from mizzle.core.naming import Casing, snake_case
-from mizzle.core.schema.column import Column
+from mizzle.core.schema.column import ColumnBase
 from mizzle.core.schema.constraints import (
     Check,
     Constraint,
@@ -24,25 +24,22 @@ from mizzle.core.schema.relations import Relation
 class TableInfo:
     name: str
     schema: str | None
-    columns: dict[str, Column[Any]]  # attribute name -> column, in declaration order
-    relations: dict[str, Relation[Any]] = field(default_factory=dict[str, "Relation[Any]"])
+    columns: dict[str, ColumnBase]  # attribute name -> column, in declaration order
+    relations: dict[str, Relation] = field(default_factory=dict[str, Relation])
 
 
 class Table:
     __table__: ClassVar[TableInfo]
 
     def __init_subclass__(
-        cls, *, name: str | None = None, schema: str | None = None, **kwargs: Any
+        cls, *, name: str | None = None, schema: str | None = None, **kwargs: object
     ) -> None:
         super().__init_subclass__(**kwargs)
-        columns: dict[str, Column[Any]] = {
-            attr: value for attr, value in vars(cls).items() if isinstance(value, Column)
-        }
+        members: dict[str, object] = dict(vars(cls))
+        columns = {attr: v for attr, v in members.items() if isinstance(v, ColumnBase)}
         if not columns:
             raise SchemaError(f"table class {cls.__name__} declares no columns")
-        relations: dict[str, Relation[Any]] = {
-            attr: value for attr, value in vars(cls).items() if isinstance(value, Relation)
-        }
+        relations = {attr: v for attr, v in members.items() if isinstance(v, Relation)}
         cls.__table__ = TableInfo(name or snake_case(cls.__name__), schema, columns, relations)
 
     @classmethod
@@ -51,21 +48,24 @@ class Table:
         return ()
 
     @classmethod
-    def from_db(cls, values: dict[str, Any]) -> Self:
+    def from_db(cls, values: dict[str, object]) -> Self:
         """Build a row from decoded column values (attribute name -> value)."""
         row = cls.__new__(cls)
         row.__dict__.update(values)
         return row
 
+    @override
     def __repr__(self) -> str:
-        fields = ", ".join(f"{k}={v!r}" for k, v in self.__dict__.items())
+        values: dict[str, object] = self.__dict__
+        fields = ", ".join(f"{k}={v!r}" for k, v in values.items())
         return f"{type(self).__name__}({fields})"
 
+    @override
     def __eq__(self, other: object) -> bool:  # also makes rows unhashable (__hash__ = None)
         return type(self) is type(other) and self.__dict__ == other.__dict__
 
 
-def _constraint_columns(constraint: Constraint) -> tuple[Column[Any], ...]:
+def _constraint_columns(constraint: Constraint) -> tuple[ColumnBase, ...]:
     match constraint:
         case Index() | UniqueConstraint() | PrimaryKey() | ForeignKey():
             return constraint.columns

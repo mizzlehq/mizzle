@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import string
 import sys
-from typing import Any
 
 from mizzle.core.errors import QueryError
 from mizzle.core.sql.nodes import Identifier, Node, Param, Raw
@@ -25,7 +24,7 @@ def _part(value: object) -> Node:
 class _Sql:
     if sys.version_info >= (3, 14):
 
-        def __call__(self, template: str | Template, /, *args: Any) -> Raw:
+        def __call__(self, template: str | Template, /, *args: object) -> Raw:
             if isinstance(template, str):
                 return self._from_str(template, args)
             if args:
@@ -34,11 +33,11 @@ class _Sql:
 
     else:
 
-        def __call__(self, template: str, /, *args: Any) -> Raw:
+        def __call__(self, template: str, /, *args: object) -> Raw:
             return self._from_str(template, args)
 
     @staticmethod
-    def _from_str(template: str, args: tuple[Any, ...]) -> Raw:
+    def _from_str(template: str, args: tuple[object, ...]) -> Raw:
         parts: list[str | Node] = []
         used = 0
         for literal, field, spec, conversion in string.Formatter().parse(template):

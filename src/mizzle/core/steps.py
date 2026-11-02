@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import ClassVar, Literal
+from typing import ClassVar, Literal, override
 
 from mizzle.core.snapshot import (
     CheckSnap,
@@ -31,6 +31,7 @@ class Step:
 class CreateSchema(Step):
     name: str
 
+    @override
     def describe(self) -> str:
         return f"create schema {self.name}"
 
@@ -39,6 +40,7 @@ class CreateSchema(Step):
 class CreateEnum(Step):
     enum: EnumSnap
 
+    @override
     def describe(self) -> str:
         return f"create enum {self.enum['name']}"
 
@@ -51,6 +53,7 @@ class AddEnumValue(Step):
     after: str | None = None
     before: str | None = None
 
+    @override
     def describe(self) -> str:
         return f"add value {self.value!r} to enum {self.name}"
 
@@ -60,6 +63,7 @@ class DropEnum(Step):
     schema: str
     name: str
 
+    @override
     def describe(self) -> str:
         return f"drop enum {self.name}"
 
@@ -70,6 +74,7 @@ class CreateTable(Step):
 
     table: TableSnap
 
+    @override
     def describe(self) -> str:
         return f"create table {self.table['name']}"
 
@@ -80,6 +85,7 @@ class DropTable(Step):
     schema: str
     name: str
 
+    @override
     def describe(self) -> str:
         return f"drop table {self.name}"
 
@@ -90,6 +96,7 @@ class RenameTable(Step):
     old: str
     new: str
 
+    @override
     def describe(self) -> str:
         return f"rename table {self.old} to {self.new}"
 
@@ -100,6 +107,7 @@ class AddColumn(Step):
     table: str
     column: ColumnSnap
 
+    @override
     def describe(self) -> str:
         return f"add column {self.table}.{self.column['name']}"
 
@@ -111,6 +119,7 @@ class DropColumn(Step):
     table: str
     name: str
 
+    @override
     def describe(self) -> str:
         return f"drop column {self.table}.{self.name}"
 
@@ -122,6 +131,7 @@ class RenameColumn(Step):
     old: str
     new: str
 
+    @override
     def describe(self) -> str:
         return f"rename column {self.table}.{self.old} to {self.new}"
 
@@ -135,6 +145,7 @@ class AlterColumnType(Step):
     old_type: str
     new_type: str
 
+    @override
     def describe(self) -> str:
         return f"change type of {self.table}.{self.column} from {self.old_type} to {self.new_type}"
 
@@ -146,6 +157,7 @@ class AlterColumnNullability(Step):
     column: str
     not_null: bool
 
+    @override
     def describe(self) -> str:
         return f"{'set' if self.not_null else 'drop'} not null on {self.table}.{self.column}"
 
@@ -157,6 +169,7 @@ class AlterColumnDefault(Step):
     column: str
     default: str | None
 
+    @override
     def describe(self) -> str:
         return f"change default of {self.table}.{self.column}"
 
@@ -167,6 +180,7 @@ class AddPrimaryKey(Step):
     table: str
     primary_key: PrimaryKeySnap
 
+    @override
     def describe(self) -> str:
         return f"add primary key on {self.table}"
 
@@ -177,6 +191,7 @@ class AddUnique(Step):
     table: str
     unique: UniqueSnap
 
+    @override
     def describe(self) -> str:
         return f"add unique {self.unique['name']}"
 
@@ -187,6 +202,7 @@ class AddCheck(Step):
     table: str
     check: CheckSnap
 
+    @override
     def describe(self) -> str:
         return f"add check {self.check['name']}"
 
@@ -197,6 +213,7 @@ class AddForeignKey(Step):
     table: str
     foreign_key: ForeignKeySnap
 
+    @override
     def describe(self) -> str:
         return f"add foreign key {self.foreign_key['name']}"
 
@@ -208,6 +225,7 @@ class DropConstraint(Step):
     name: str
     kind: ConstraintKind
 
+    @override
     def describe(self) -> str:
         return f"drop {self.kind.replace('_', ' ')} {self.name}"
 
@@ -219,6 +237,7 @@ class RenameConstraint(Step):
     old: str
     new: str
 
+    @override
     def describe(self) -> str:
         return f"rename constraint {self.old} to {self.new}"
 
@@ -229,6 +248,7 @@ class CreateIndex(Step):
     table: str
     index: IndexSnap
 
+    @override
     def describe(self) -> str:
         return f"create index {self.index['name']}"
 
@@ -238,6 +258,7 @@ class DropIndex(Step):
     schema: str
     name: str
 
+    @override
     def describe(self) -> str:
         return f"drop index {self.name}"
 
@@ -248,6 +269,7 @@ class RenameIndex(Step):
     old: str
     new: str
 
+    @override
     def describe(self) -> str:
         return f"rename index {self.old} to {self.new}"
 

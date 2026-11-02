@@ -25,20 +25,21 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build]
 # The Studio UI is gitignored but must ship in sdists and wheels (build it first:
-# `npm ci && npm run build` in studio-ui/).
+# `pnpm install && pnpm build` in studio-ui/).
 artifacts = ["src/mizzle/studio/static/**"]
 
 [dependency-groups]
 dev = [
+    "mizzle[studio,pydantic]",  # dev and CI always have the optional extras
     "pytest>=8.3",
     "pytest-asyncio>=0.25",
     "pytest-cov>=6.0",
-    "pyright>=1.1.400",
-    "mypy>=1.15",
+        "mypy>=1.15",
     "ruff>=0.11",
     "asyncpg-stubs>=0.30",
     "httpx>=0.28.1",
     "pydantic>=2.7",
+    "basedpyright>=1.40.2",
 ]
 
 [tool.pytest.ini_options]
@@ -55,13 +56,42 @@ extend-exclude = ["docs"]
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
 
-[tool.pyright]
+[tool.basedpyright]
+# basedpyright (a stricter pyright) is the project's type checker; editors use it too.
 include = ["src", "tests"]
-strict = ["src", "tests/typing"]
-pythonVersion = "3.12"
-reportUnnecessaryTypeIgnoreComment = "error"
-enableTypeIgnoreComments = false  # "# type: ignore" is for mypy; pyright uses "# pyright: ignore"
 ignore = ["tests/**/*_py314.py"]
+pythonVersion = "3.12"
+typeCheckingMode = "all"
+failOnWarnings = true
+enableTypeIgnoreComments = false  # "# type: ignore" is for mypy; use "# pyright: ignore"
+# Off on purpose:
+reportImportCycles = false  # only `if TYPE_CHECKING:` imports form cycles; none run
+reportImplicitStringConcatenation = false  # style; long messages are split across lines
+reportUnusedCallResult = false  # e.g. rowcounts from execute() are often not needed
+reportUnreachable = false  # sys.version_info branches (t-strings on 3.14) look unreachable
+reportExplicitAny = false  # writing `Any` is allowed; reportAny still flags Any values in use
+
+[[tool.basedpyright.executionEnvironments]]
+# Tests poke at internals and build throwaway classes; keep them type-checked, not linted.
+root = "tests"
+extraPaths = ["."]
+reportAny = false
+reportExplicitAny = false
+reportUnannotatedClassAttribute = false
+reportUnknownMemberType = false
+reportUnknownVariableType = false
+reportUnknownArgumentType = false
+reportUnusedParameter = false
+reportUnusedClass = false
+reportImplicitOverride = false
+reportPrivateUsage = false
+reportMissingTypeArgument = false
+reportUnknownParameterType = false
+reportMissingParameterType = false
+reportUnknownLambdaType = false
+
+[[tool.basedpyright.executionEnvironments]]
+root = "src"
 
 [tool.mypy]
 strict = true

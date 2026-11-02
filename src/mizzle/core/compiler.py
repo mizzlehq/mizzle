@@ -12,11 +12,11 @@ import uuid
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from decimal import Decimal
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, cast
 
 from mizzle.core.errors import QueryError
 from mizzle.core.naming import Casing
-from mizzle.core.schema.column import MISSING, Column
+from mizzle.core.schema.column import MISSING, ColumnBase
 from mizzle.core.sql.nodes import (
     Between,
     BinaryOp,
@@ -39,7 +39,7 @@ from mizzle.core.sql.nodes import (
 if TYPE_CHECKING:
     from mizzle.core.query.insert import Insert, OnConflict
     from mizzle.core.query.returning import Returning
-    from mizzle.core.query.select import CteColumn, Select, Slot, Source
+    from mizzle.core.query.select import CteColumn, SelectBase, Slot, Source
     from mizzle.core.query.update import Delete, Update
     from mizzle.core.schema.table import Table
 
@@ -47,14 +47,14 @@ if TYPE_CHECKING:
 @dataclass(frozen=True)
 class CompiledQuery:
     sql: str
-    params: tuple[Any, ...]
+    params: tuple[object, ...]
     placeholders: tuple[Placeholder | None, ...]  # per param slot; set where a placeholder sits
 
     @property
     def has_placeholders(self) -> bool:
         return any(p is not None for p in self.placeholders)
 
-    def bind(self, values: Mapping[str, Any]) -> CompiledQuery:
+    def bind(self, values: Mapping[str, object]) -> CompiledQuery:
         """Fill placeholder slots with ``values`` (by placeholder name)."""
         names = {p.name for p in self.placeholders if p is not None}
         if missing := names - values.keys():
@@ -73,6 +73,14 @@ class CompiledQuery:
 class Compiler:
     """Single-use per ``compile()`` call: it accumulates params while walking the tree."""
 
+    casing: Casing | None
+    inline_literals: bool
+    qualify_columns: bool
+    _params: list[object]
+    _placeholders: list[Placeholder | None]
+    _scopes: list[dict[type[Table], str]]  # table -> alias, for aliased (relational) queries
+    _alias_count: int
+
     def __init__(
         self,
         casing: Casing | None = None,
@@ -82,13 +90,12 @@ class Compiler:
     ) -> None:
         """``inline_literals`` and ``qualify_columns=False`` produce DDL-safe SQL (defaults,
         CHECK constraints, index predicates), where bind parameters are not allowed."""
-        self.casing: Casing | None = casing
+        self.casing = casing
         self.inline_literals = inline_literals
         self.qualify_columns = qualify_columns
-        self._params: list[Any] = []
-        self._placeholders: list[Placeholder | None] = []
-        # Table -> alias maps for queries that alias tables (relational queries).
-        self._scopes: list[dict[type[Table], str]] = []
+        self._params = []
+        self._placeholders = []
+        self._scopes = []
         self._alias_count = 0
 
     def compile(self, node: Node) -> CompiledQuery:
@@ -106,13 +113,13 @@ class Compiler:
 
     # -- hooks ------------------------------------------------------------------------
 
-    def param_marker(self, index: int) -> str:
+    def param_marker(self, _index: int, /) -> str:
         return "?"
 
     def quote(self, ident: str) -> str:
         return '"' + ident.replace('"', '""') + '"'
 
-    def bind(self, value: Any, placeholder: Placeholder | None = None) -> str:
+    def bind(self, value: object, placeholder: Placeholder | None = None) -> str:
         if self.inline_literals:
             if placeholder is not None:
                 raise QueryError("placeholders cannot be used in DDL")
@@ -121,7 +128,7 @@ class Compiler:
         self._placeholders.append(placeholder)
         return self.param_marker(len(self._params))
 
-    def literal(self, value: Any) -> str:
+    def literal(self, value: object) -> str:
         """An SQL literal. Only for DDL; queries always use bind parameters."""
         match value:
             case None:
@@ -129,7 +136,8 @@ class Compiler:
             case bool():
                 return "true" if value else "false"
             case enum.Enum():
-                return self.literal(value.value)
+                member_value: object = value.value  # pyright: ignore[reportAny]  # Enum.value is Any in typeshed
+                return self.literal(member_value)
             case int() | float() | Decimal():
                 return str(value)
             case str():
@@ -150,7 +158,7 @@ class Compiler:
         name = self.quote(info.name)
         return f"{self.quote(info.schema)}.{name}" if info.schema else name
 
-    def column_name(self, column: Column[Any]) -> str:
+    def column_name(self, column: ColumnBase) -> str:
         return self.quote(column.db_name(self.casing))
 
     def operand(self, node: Node) -> str:
@@ -158,13 +166,13 @@ class Compiler:
         text = self.visit(node)
         return f"({text})" if isinstance(node, BoolOp | Not) else text
 
-    def value(self, column: Column[Any], value: Any) -> str:
+    def value(self, column: ColumnBase, value: object) -> str:
         """A value written into a column (INSERT / UPDATE SET)."""
         return self.visit(value) if isinstance(value, Node) else self.bind(column.encode(value))
 
     # -- expressions ------------------------------------------------------------------
 
-    def visit_Column(self, node: Column[Any]) -> str:
+    def visit_Column(self, node: ColumnBase) -> str:
         if node.table is None:
             raise QueryError(f"column {node.attr!r} is not attached to a table")
         if not self.qualify_columns:
@@ -174,7 +182,7 @@ class Compiler:
                 return f"{self.quote(scope[node.table])}.{self.column_name(node)}"
         return f"{self.quote(node.table.__table__.name)}.{self.column_name(node)}"
 
-    def visit_Param(self, node: Param[Any]) -> str:
+    def visit_Param(self, node: Param) -> str:
         value = node.column.encode(node.value) if node.column is not None else node.value
         return self.bind(value)
 
@@ -210,11 +218,11 @@ class Compiler:
     def visit_Exists(self, node: Exists) -> str:
         return f"{'NOT ' if node.negate else ''}EXISTS ({self.visit(node.query)})"
 
-    def visit_Func(self, node: Func[Any]) -> str:
+    def visit_Func(self, node: Func) -> str:
         args = ", ".join(self.visit(a) for a in node.args)
         return f"{node.name}({'DISTINCT ' if node.distinct else ''}{args})"
 
-    def visit_Star(self, node: Star) -> str:
+    def visit_Star(self, _node: Star) -> str:
         return "*"
 
     def visit_OrderBy(self, node: OrderBy) -> str:
@@ -227,7 +235,7 @@ class Compiler:
     def visit_Identifier(self, node: Identifier) -> str:
         return self.quote(node.name)
 
-    def visit_Excluded(self, node: Excluded[Any]) -> str:
+    def visit_Excluded(self, node: Excluded) -> str:
         return f"excluded.{self.column_name(node.column)}"
 
     # -- SELECT -----------------------------------------------------------------------
@@ -248,7 +256,7 @@ class Compiler:
     def visit_CteColumn(self, node: CteColumn) -> str:
         return f"{self.quote(node.cte.name)}.{self.quote(node.name)}"
 
-    def visit_Select(self, node: Select[Any]) -> str:
+    def visit_SelectBase(self, node: SelectBase) -> str:
         # Clauses are emitted strictly left to right so $n numbering follows the text.
         parts: list[str] = []
         if node.ctes:
@@ -288,20 +296,20 @@ class Compiler:
 
     # -- INSERT / UPDATE / DELETE -----------------------------------------------------
 
-    def returning_clause(self, table: type[Table]) -> str:
+    def returning_clause(self, _table: type[Table], /) -> str:
         raise QueryError(f"{type(self).__name__} does not support RETURNING")
 
-    def on_conflict_clause(self, table: type[Table], conflict: OnConflict) -> str:
+    def on_conflict_clause(self, _table: type[Table], _conflict: OnConflict, /) -> str:
         raise QueryError(f"{type(self).__name__} does not support ON CONFLICT")
 
-    def set_list(self, table: type[Table], values: dict[str, Any]) -> str:
+    def set_list(self, table: type[Table], values: Mapping[str, object]) -> str:
         columns = table.__table__.columns
         return ", ".join(
             f"{self.column_name(columns[k])} = {self.value(columns[k], v)}"
             for k, v in values.items()
         )
 
-    def visit_Insert(self, node: Insert[Any]) -> str:
+    def visit_Insert(self, node: Insert[Table]) -> str:
         if not node.rows:
             raise QueryError(f"insert into {node.table.__name__} has no values()")
         columns = node.table.__table__.columns
@@ -323,17 +331,17 @@ class Compiler:
             text += " " + self.on_conflict_clause(node.table, node.conflict)
         return text
 
-    def _insert_value(self, column: Column[Any], value: Any) -> str:
+    def _insert_value(self, column: ColumnBase, value: object) -> str:
         return "DEFAULT" if value is MISSING else self.value(column, value)
 
-    def _require_filter(self, node: Update[Any] | Delete[Any], verb: str) -> None:
+    def _require_filter(self, node: Update[Table] | Delete[Table], verb: str) -> None:
         if node.where_ is None and not node.all_rows_:
             raise QueryError(
                 f"{verb} on {node.table.__name__} has no .where(); "
                 "call .all_rows() to affect every row"
             )
 
-    def visit_Update(self, node: Update[Any]) -> str:
+    def visit_Update(self, node: Update[Table]) -> str:
         if not node.values_:
             raise QueryError(f"update({node.table.__name__}) needs .set(...)")
         self._require_filter(node, "update")
@@ -342,12 +350,12 @@ class Compiler:
             text += f" WHERE {self.visit(node.where_)}"
         return text
 
-    def visit_Delete(self, node: Delete[Any]) -> str:
+    def visit_Delete(self, node: Delete[Table]) -> str:
         self._require_filter(node, "delete")
         text = f"DELETE FROM {self.table_name(node.table)}"
         if node.where_ is not None:
             text += f" WHERE {self.visit(node.where_)}"
         return text
 
-    def visit_Returning(self, node: Returning[Any]) -> str:
+    def visit_Returning(self, node: Returning[Table]) -> str:
         return f"{self.visit(node.query)} {self.returning_clause(node.table)}"

@@ -14,9 +14,9 @@ jobs:
       - run: uv sync --python 3.12
       - run: uv run ruff check
       - run: uv run ruff format --check
-      - run: uv run pyright
+      - run: uv run basedpyright
       - run: uv run mypy
-      - run: uv run pyright --pythonversion 3.14
+      - run: uv run basedpyright --pythonversion 3.14
       - run: uv run mypy --python-version 3.14
 
   ui:
@@ -26,13 +26,17 @@ jobs:
         working-directory: studio-ui
     steps:
       - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          package_json_file: studio-ui/package.json
       - uses: actions/setup-node@v4
         with:
           node-version: 24
-          cache: npm
-          cache-dependency-path: studio-ui/package-lock.json
-      - run: npm ci
-      - run: npm run build
+          cache: pnpm
+          cache-dependency-path: studio-ui/pnpm-lock.yaml
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm run ci  # Biome; bare `pnpm ci` is pnpm's own clean-install command
+      - run: pnpm build
 
   test:
     runs-on: ubuntu-latest

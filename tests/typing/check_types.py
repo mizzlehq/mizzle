@@ -37,7 +37,7 @@ async def rows(qb: QueryBuilder, user: Users, post: Posts) -> None:
     )
     assert_type(
         await qb.select({"n": count()}).from_(Users).where(eq(Users.id, 1)),
-        list[dict[str, Any]],
+        list[dict[str, object]],
     )
     # select() + join filters by the join but still returns whole rows of the FROM table
     assert_type(

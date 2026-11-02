@@ -12,42 +12,45 @@ import uuid
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from decimal import Decimal
-from typing import Any, TypedDict, cast
+from typing import TypedDict, cast, override
 
 from mizzle.core.compiler import CompiledQuery
 from mizzle.core.errors import QueryError
 from mizzle.core.query.base import Executable, Row, Runner, decode_table
-from mizzle.core.schema.column import Column
+from mizzle.core.schema.column import ColumnBase
 from mizzle.core.schema.relations import Link
 from mizzle.core.schema.table import Table
-from mizzle.core.sql.nodes import Expr, OrderBy
+from mizzle.core.sql.nodes import Condition, ExprBase, Node, OrderBy
 
 
 class WithOptions(TypedDict, total=False):
-    where: Expr[bool]
-    order_by: Expr[Any] | OrderBy | Sequence[Expr[Any] | OrderBy]
+    where: Condition
+    order_by: OrderItem | Sequence[OrderItem]
     limit: int
     with_: Mapping[str, bool | WithOptions]
 
 
+type OrderItem = ExprBase | OrderBy
 type With = Mapping[str, bool | WithOptions]
-type OrderArg = Expr[Any] | OrderBy | Sequence[Expr[Any] | OrderBy] | None
+type OrderArg = OrderItem | Sequence[OrderItem] | None
+# JSON as returned by the driver's json codec (nested rows of relational queries).
+type Json = bool | int | float | str | list[Json] | dict[str, Json] | None
 
 
 @dataclass(frozen=True)
 class LoadPlan:
     table: type[Table]
-    where: Expr[bool] | None = None
-    order_by: tuple[Expr[Any] | OrderBy, ...] = ()
+    where: Condition | None = None
+    order_by: tuple[OrderItem, ...] = ()
     limit: int | None = None
     offset: int | None = None
     children: tuple[tuple[str, Link, LoadPlan], ...] = field(default=())
 
 
-def _order(arg: OrderArg) -> tuple[Expr[Any] | OrderBy, ...]:
+def _order(arg: OrderArg) -> tuple[OrderItem, ...]:
     if arg is None:
         return ()
-    if isinstance(arg, Expr | OrderBy):
+    if isinstance(arg, ExprBase | OrderBy):
         return (arg,)
     return tuple(arg)
 
@@ -61,7 +64,7 @@ def _count(name: str, value: int | None) -> int | None:
 def build_plan(
     table: type[Table],
     *,
-    where: Expr[bool] | None = None,
+    where: Condition | None = None,
     order_by: OrderArg = None,
     limit: int | None = None,
     offset: int | None = None,
@@ -102,51 +105,63 @@ def build_plan(
 # -- decoding -------------------------------------------------------------------------
 
 
-def _from_json(column: Column[Any], value: Any) -> Any:
+def _from_json(column: ColumnBase, value: Json) -> object:
     """Turn a JSON value back into the column's Python type (before ``column.decode``)."""
     if value is None:
         return None
     if column.item is not None:
+        if not isinstance(value, list):
+            raise QueryError(f"{column.qualified_name}: expected a JSON array, got {value!r}")
         return [_from_json(column.item, v) for v in value]
     kind = column.accepts[0] if column.accepts else None
     if kind is None or kind in (int, str, bool) or column.enum is not None:
         return value
+    if isinstance(value, list | dict):
+        raise QueryError(f"{column.qualified_name}: unexpected JSON value {value!r}")
     if kind is float:
         return float(value)  # also handles "NaN" / "Infinity" strings
     if kind is Decimal:
-        return Decimal(str(value))
+        return Decimal(str(value))  # numerics are sent as text: no float rounding
+    text = str(value)
     if kind is datetime.datetime:
-        return datetime.datetime.fromisoformat(value)
+        return datetime.datetime.fromisoformat(text)
     if kind is datetime.date:
-        return datetime.date.fromisoformat(value)
+        return datetime.date.fromisoformat(text)
     if kind is datetime.time:
-        return datetime.time.fromisoformat(value)
+        return datetime.time.fromisoformat(text)
     if kind is datetime.timedelta:
-        return datetime.timedelta(seconds=float(value))
+        return datetime.timedelta(seconds=float(text))
     if kind is uuid.UUID:
-        return uuid.UUID(value)
+        return uuid.UUID(text)
     if kind is bytes:
-        return bytes.fromhex(value)
+        return bytes.fromhex(text)
     if kind in (ipaddress.IPv4Address, ipaddress.IPv4Interface):
-        return ipaddress.ip_interface(value) if "/" in value else ipaddress.ip_address(value)
+        return ipaddress.ip_interface(text) if "/" in text else ipaddress.ip_address(text)
     return value
 
 
-def _decode_json_row(plan: LoadPlan, values: list[Any]) -> Table:
+def _json_list(value: Json, what: str) -> list[Json]:
+    if not isinstance(value, list):
+        raise QueryError(f"expected a JSON array for {what}, got {value!r}")
+    return value
+
+
+def _decode_json_row(plan: LoadPlan, value: Json) -> Table:
+    values = _json_list(value, plan.table.__name__)
     columns = plan.table.__table__.columns
     data = {
         attr: col.decode(_from_json(col, v))
         for (attr, col), v in zip(columns.items(), values, strict=False)
     }
     row = plan.table.from_db(data)
-    for (name, link, child), value in zip(plan.children, values[len(columns) :], strict=True):
-        row.__dict__[name] = _decode_child(link, child, value)
+    for (name, link, child), nested in zip(plan.children, values[len(columns) :], strict=True):
+        row.__dict__[name] = _decode_child(link, child, nested)
     return row
 
 
-def _decode_child(link: Link, plan: LoadPlan, value: Any) -> Any:
+def _decode_child(link: Link, plan: LoadPlan, value: Json) -> list[Table] | Table | None:
     if link.many:
-        items: list[list[Any]] = value or []
+        items = [] if value is None else _json_list(value, plan.table.__name__)
         return [_decode_json_row(plan, v) for v in items]
     return None if value is None else _decode_json_row(plan, value)
 
@@ -156,7 +171,8 @@ def decode_root(plan: LoadPlan, row: Row) -> Table:
     assert obj is not None  # a root row always has its primary key
     index = len(plan.table.__table__.columns)
     for name, link, child in plan.children:
-        obj.__dict__[name] = _decode_child(link, child, row[index])
+        nested = cast(Json, row[index])  # built with json_agg / json_build_array
+        obj.__dict__[name] = _decode_child(link, child, nested)
         index += 1
     return obj
 
@@ -165,26 +181,33 @@ def decode_root(plan: LoadPlan, row: Row) -> Table:
 
 
 @dataclass(frozen=True, eq=False)
-class RelationalSelect[T: Table](Executable[list[T]]):
+class RelationalStatement(Node):
+    """A relational query, without its result type (compilers handle this class)."""
+
     runner: Runner = field(repr=False)
     plan: LoadPlan
 
+
+@dataclass(frozen=True, eq=False)
+class RelationalSelect[T: Table](RelationalStatement, Executable[list[T]]):
+    @override
     async def run_compiled(self, compiled: CompiledQuery) -> list[T]:
         rows = await self.runner.fetch(compiled)
         return [cast(T, decode_root(self.plan, row)) for row in rows]
 
 
 @dataclass(frozen=True, eq=False)
-class RelationalFirst[T: Table](Executable[T | None]):
-    runner: Runner = field(repr=False)
-    plan: LoadPlan
-
+class RelationalFirst[T: Table](RelationalStatement, Executable[T | None]):
+    @override
     async def run_compiled(self, compiled: CompiledQuery) -> T | None:
         rows = await self.runner.fetch(compiled)
         return cast(T, decode_root(self.plan, rows[0])) if rows else None
 
 
 class RelationalQuery[T: Table]:
+    _runner: Runner
+    _table: type[T]
+
     def __init__(self, runner: Runner, table: type[T]) -> None:
         self._runner = runner
         self._table = table
@@ -192,7 +215,7 @@ class RelationalQuery[T: Table]:
     def find_many(
         self,
         *,
-        where: Expr[bool] | None = None,
+        where: Condition | None = None,
         with_: With | None = None,
         order_by: OrderArg = None,
         limit: int | None = None,
@@ -206,7 +229,7 @@ class RelationalQuery[T: Table]:
     def find_first(
         self,
         *,
-        where: Expr[bool] | None = None,
+        where: Condition | None = None,
         with_: With | None = None,
         order_by: OrderArg = None,
     ) -> RelationalFirst[T]:

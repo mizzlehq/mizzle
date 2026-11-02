@@ -15,15 +15,15 @@ from __future__ import annotations
 
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Self, overload
+from typing import TYPE_CHECKING, Self, overload, override
 
 from mizzle.core.errors import RelationNotLoaded, SchemaError
 
 if TYPE_CHECKING:
-    from mizzle.core.schema.column import Column
+    from mizzle.core.schema.column import ColumnBase
     from mizzle.core.schema.table import Table
 
-type ColumnsArg = Sequence[Column[Any]] | Callable[[], Sequence[Column[Any]]]
+type ColumnsArg = Sequence[ColumnBase] | Callable[[], Sequence[ColumnBase]]
 
 
 @dataclass(frozen=True)
@@ -33,32 +33,40 @@ class Link:
 
     source: type[Table]
     target: type[Table]
-    source_columns: tuple[Column[Any], ...]
-    target_columns: tuple[Column[Any], ...]
+    source_columns: tuple[ColumnBase, ...]
+    target_columns: tuple[ColumnBase, ...]
     many: bool
 
 
-class Relation[T: Table]:
-    def __init__(self, target: Callable[[], type[T]], relation_name: str | None) -> None:
+class Relation:
+    """Everything about a relation except the row type; ``One[T]``/``Many[T]`` add it."""
+
+    _target: Callable[[], type[Table]]
+    relation_name: str | None
+    attr: str
+    owner: type[Table] | None
+    _link: Link | None
+
+    def __init__(self, target: Callable[[], type[Table]], relation_name: str | None) -> None:
         self._target = target
         self.relation_name = relation_name
         self.attr = ""
-        self.owner: type[Table] | None = None
-        self._link: Link | None = None
+        self.owner = None
+        self._link = None
 
     def __set_name__(self, owner: type[Table], name: str) -> None:
         self.attr = name
         self.owner = owner
 
     @property
-    def target(self) -> type[T]:
+    def target_table(self) -> type[Table]:
         return self._target()
 
     @property
     def qualified_name(self) -> str:
         return f"{self.owner.__name__ if self.owner else '?'}.{self.attr}"
 
-    def _not_loaded(self, owner: type[Any]) -> RelationNotLoaded:
+    def _not_loaded(self, owner: type[object]) -> RelationNotLoaded:
         return RelationNotLoaded(
             f"{owner.__name__}.{self.attr} was not loaded; add {self.attr!r} to with_"
         )
@@ -72,18 +80,19 @@ class Relation[T: Table]:
         raise NotImplementedError
 
 
-def _columns(arg: ColumnsArg | None) -> tuple[Column[Any], ...]:
+def _columns(arg: ColumnsArg | None) -> tuple[ColumnBase, ...]:
     if arg is None:
         return ()
     return tuple(arg() if callable(arg) else arg)
 
 
-class One[T: Table](Relation[T]):
-    """A single related row. On a row it is ``T | None``."""
+class OneBase(Relation):
+    _fields: ColumnsArg | None
+    _references: ColumnsArg | None
 
     def __init__(
         self,
-        target: Callable[[], type[T]],
+        target: Callable[[], type[Table]],
         fields: ColumnsArg | None,
         references: ColumnsArg | None,
         relation_name: str | None,
@@ -93,25 +102,17 @@ class One[T: Table](Relation[T]):
         self._references = references
 
     @property
-    def fields(self) -> tuple[Column[Any], ...]:
+    def fields(self) -> tuple[ColumnBase, ...]:
         return _columns(self._fields)
 
     @property
-    def references(self) -> tuple[Column[Any], ...]:
+    def references(self) -> tuple[ColumnBase, ...]:
         return _columns(self._references)
 
-    @overload
-    def __get__(self, obj: None, owner: type[Any]) -> Self: ...
-    @overload
-    def __get__(self, obj: object, owner: type[Any]) -> T | None: ...
-    def __get__(self, obj: object | None, owner: type[Any]) -> Self | T | None:
-        if obj is None:
-            return self
-        raise self._not_loaded(owner)
-
+    @override
     def _resolve(self) -> Link:
         assert self.owner is not None
-        target = self.target
+        target = self.target_table
         if self.fields:
             if len(self.fields) != len(self.references):
                 raise SchemaError(f"{self.qualified_name}: fields and references differ in length")
@@ -121,31 +122,45 @@ class One[T: Table](Relation[T]):
         return Link(self.owner, target, back.references, back.fields, many=False)
 
 
-class Many[T: Table](Relation[T]):
-    """Related rows. On a row it is ``list[T]``."""
+class One[T: Table](OneBase):
+    """A single related row. On a row it is ``T | None``."""
 
     @overload
-    def __get__(self, obj: None, owner: type[Any]) -> Self: ...
+    def __get__(self, obj: None, owner: type[object]) -> Self: ...
     @overload
-    def __get__(self, obj: object, owner: type[Any]) -> list[T]: ...
-    def __get__(self, obj: object | None, owner: type[Any]) -> Self | list[T]:
+    def __get__(self, obj: object, owner: type[object]) -> T | None: ...
+    def __get__(self, obj: object | None, owner: type[object]) -> Self | T | None:
         if obj is None:
             return self
         raise self._not_loaded(owner)
 
+
+class Many[T: Table](Relation):
+    """Related rows. On a row it is ``list[T]``."""
+
+    @overload
+    def __get__(self, obj: None, owner: type[object]) -> Self: ...
+    @overload
+    def __get__(self, obj: object, owner: type[object]) -> list[T]: ...
+    def __get__(self, obj: object | None, owner: type[object]) -> Self | list[T]:
+        if obj is None:
+            return self
+        raise self._not_loaded(owner)
+
+    @override
     def _resolve(self) -> Link:
         assert self.owner is not None
-        back = _find_back_reference(self, self.target)
-        return Link(self.owner, self.target, back.references, back.fields, many=True)
+        back = _find_back_reference(self, self.target_table)
+        return Link(self.owner, self.target_table, back.references, back.fields, many=True)
 
 
-def _find_back_reference(relation: Relation[Any], target: type[Table]) -> One[Any]:
+def _find_back_reference(relation: Relation, target: type[Table]) -> OneBase:
     """The ``one(..., fields=...)`` on ``target`` that points back at ``relation.owner``."""
     candidates = [
         r
         for r in target.__table__.relations.values()
-        if isinstance(r, One)
-        and r.target is relation.owner
+        if isinstance(r, OneBase)
+        and r.target_table is relation.owner
         and r.fields
         and (relation.relation_name is None or r.relation_name == relation.relation_name)
     ]

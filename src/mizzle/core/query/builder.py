@@ -3,20 +3,23 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any, overload
+from typing import cast, overload
 
 from mizzle.core.errors import QueryError
 from mizzle.core.query.base import Runner
 from mizzle.core.query.insert import Insert
 from mizzle.core.query.relational import RelationalQuery
-from mizzle.core.query.select import Cte, Projection, Select
+from mizzle.core.query.select import Cte, Projection, Select, Slot
 from mizzle.core.query.update import Delete, Update
 from mizzle.core.schema.table import Table
-from mizzle.core.sql.nodes import Expr
+from mizzle.core.sql.nodes import Expr, ExprBase
 
 
 class SelectAll:
     """``db.select()``: rows of whole tables."""
+
+    _runner: Runner
+    _ctes: tuple[Cte, ...]
 
     def __init__(self, runner: Runner, ctes: tuple[Cte, ...]) -> None:
         self._runner = runner
@@ -26,23 +29,34 @@ class SelectAll:
         return Select(self._runner, None, table, self._ctes)
 
 
-class SelectFrom[R]:
-    """``db.select(cols...)``: rows shaped by the projection."""
+class SelectFromBase:
+    _runner: Runner
+    _projection: Projection
+    _ctes: tuple[Cte, ...]
 
     def __init__(self, runner: Runner, projection: Projection, ctes: tuple[Cte, ...]) -> None:
         self._runner = runner
         self._projection = projection
         self._ctes = ctes
 
+
+class SelectFrom[R](SelectFromBase):
+    """``db.select(cols...)``: rows shaped by the projection."""
+
     def from_(self, source: type[Table] | Cte) -> Select[R]:
         return Select(self._runner, self._projection, source, self._ctes)
 
 
-def _selectable(item: object) -> bool:
-    return isinstance(item, Expr) or (isinstance(item, type) and issubclass(item, Table))
+def _slot(item: object) -> Slot:
+    if isinstance(item, ExprBase) or (isinstance(item, type) and issubclass(item, Table)):
+        return item
+    raise QueryError(f"cannot select {item!r}; pass columns, expressions or tables")
 
 
 class QueryBuilder:
+    runner: Runner
+    ctes: tuple[Cte, ...]
+
     def __init__(self, runner: Runner, ctes: tuple[Cte, ...] = ()) -> None:
         self.runner = runner
         self.ctes = ctes
@@ -67,7 +81,7 @@ class QueryBuilder:
     @overload
     def select(self) -> SelectAll: ...
     @overload
-    def select(self, fields: Mapping[str, Expr[Any]], /) -> SelectFrom[dict[str, Any]]: ...
+    def select(self, fields: Mapping[str, ExprBase], /) -> SelectFrom[dict[str, object]]: ...
     @overload
     def select[A](self, c1: Expr[A] | type[A], /) -> SelectFrom[tuple[A]]: ...
     @overload
@@ -171,20 +185,21 @@ class QueryBuilder:
     ) -> SelectFrom[tuple[A, B, C, D, E, F, G, H, I, J]]: ...
     @overload
     def select(
-        self, first: Expr[Any] | type[Table], /, *rest: Expr[Any] | type[Table]
-    ) -> SelectFrom[tuple[Any, ...]]: ...
-    def select(self, *columns: Any) -> Any:
+        self, first: ExprBase | type[Table], /, *rest: ExprBase | type[Table]
+    ) -> SelectFrom[tuple[object, ...]]: ...
+    def select(self, *columns: object) -> SelectAll | SelectFromBase:
         if not columns:
             return SelectAll(self.runner, self.ctes)
         if len(columns) == 1 and isinstance(columns[0], Mapping):
-            fields: dict[str, Any] = dict(columns[0])  # pyright: ignore[reportUnknownArgumentType]
+            given = cast(Mapping[object, object], columns[0])
+            fields: dict[str, ExprBase] = {}
+            for key, value in given.items():
+                if not isinstance(key, str) or not isinstance(value, ExprBase):
+                    raise QueryError(f"select field {key!r} must map a name to an expression")
+                fields[key] = value
             if not fields:
                 raise QueryError("select({}) needs at least one field")
-            for key, value in fields.items():
-                if not isinstance(value, Expr):
-                    raise QueryError(f"select field {key!r} must be a column or expression")
-            return SelectFrom[dict[str, Any]](self.runner, fields, self.ctes)
-        for item in columns:
-            if not _selectable(item):
-                raise QueryError(f"cannot select {item!r}; pass columns, expressions or tables")
-        return SelectFrom[tuple[Any, ...]](self.runner, tuple(columns), self.ctes)
+            return SelectFrom[dict[str, object]](self.runner, fields, self.ctes)
+        return SelectFrom[tuple[object, ...]](
+            self.runner, tuple(_slot(c) for c in columns), self.ctes
+        )

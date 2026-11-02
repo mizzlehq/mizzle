@@ -4,20 +4,19 @@ from __future__ import annotations
 
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
-from typing import Any
 
-from mizzle.core.schema.column import Column, ReferentialAction
+from mizzle.core.schema.column import ColumnBase, ReferentialAction
 from mizzle.core.sql.nodes import Expr
 
 
 @dataclass(frozen=True)
 class Index:
     name: str
-    columns: tuple[Column[Any], ...] = ()
+    columns: tuple[ColumnBase, ...] = ()
     unique: bool = False
     predicate: Expr[bool] | None = None
 
-    def on(self, *columns: Column[Any]) -> Index:
+    def on(self, *columns: ColumnBase) -> Index:
         return replace(self, columns=columns)
 
     def where(self, condition: Expr[bool]) -> Index:
@@ -27,20 +26,20 @@ class Index:
 
 @dataclass(frozen=True)
 class UniqueConstraint:
-    columns: tuple[Column[Any], ...]
+    columns: tuple[ColumnBase, ...]
     name: str | None = None
 
 
 @dataclass(frozen=True)
 class PrimaryKey:
-    columns: tuple[Column[Any], ...]
+    columns: tuple[ColumnBase, ...]
     name: str | None = None
 
 
 @dataclass(frozen=True)
 class ForeignKey:
-    columns: tuple[Column[Any], ...]
-    references: Callable[[], Sequence[Column[Any]]]
+    columns: tuple[ColumnBase, ...]
+    references: Callable[[], Sequence[ColumnBase]]
     name: str | None = None
     on_delete: ReferentialAction | None = None
     on_update: ReferentialAction | None = None
@@ -63,17 +62,17 @@ def unique_index(name: str) -> Index:
     return Index(name, unique=True)
 
 
-def unique(*columns: Column[Any], name: str | None = None) -> UniqueConstraint:
+def unique(*columns: ColumnBase, name: str | None = None) -> UniqueConstraint:
     return UniqueConstraint(columns, name)
 
 
-def primary_key(*columns: Column[Any], name: str | None = None) -> PrimaryKey:
+def primary_key(*columns: ColumnBase, name: str | None = None) -> PrimaryKey:
     return PrimaryKey(columns, name)
 
 
 def foreign_key(
-    columns: Sequence[Column[Any]],
-    references: Callable[[], Sequence[Column[Any]]],
+    columns: Sequence[ColumnBase],
+    references: Callable[[], Sequence[ColumnBase]],
     *,
     name: str | None = None,
     on_delete: ReferentialAction | None = None,

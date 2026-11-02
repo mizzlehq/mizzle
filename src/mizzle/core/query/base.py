@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+from abc import ABC, abstractmethod
 from collections.abc import Generator
-from dataclasses import dataclass
-from typing import Any, Protocol
+from dataclasses import dataclass, field
+from typing import Protocol
 
 from mizzle.core.compiler import CompiledQuery
 from mizzle.core.errors import QueryError
@@ -15,7 +16,7 @@ from mizzle.core.sql.nodes import Node
 class Row(Protocol):
     """A result row. Only positional access is needed (asyncpg Record, tuple...)."""
 
-    def __getitem__(self, index: int, /) -> Any: ...
+    def __getitem__(self, index: int, /) -> object: ...
     def __len__(self) -> int: ...
 
 
@@ -27,15 +28,16 @@ class Runner(Protocol):
     async def run(self, query: CompiledQuery) -> int: ...
 
 
-class Executable[R](Node):
+@dataclass(frozen=True, eq=False)
+class Executable[R](Node, ABC):
     """A statement that can be awaited, compiled with ``to_sql()``, or prepared."""
 
-    runner: Runner
+    runner: Runner = field(repr=False)
 
-    async def run_compiled(self, compiled: CompiledQuery) -> R:
-        raise NotImplementedError
+    @abstractmethod
+    async def run_compiled(self, compiled: CompiledQuery) -> R: ...
 
-    def to_sql(self) -> tuple[str, tuple[Any, ...]]:
+    def to_sql(self) -> tuple[str, tuple[object, ...]]:
         compiled = self.runner.compile(self)
         return compiled.sql, compiled.params
 
@@ -51,7 +53,7 @@ class Executable[R](Node):
             )
         return await self.run_compiled(compiled)
 
-    def __await__(self) -> Generator[Any, None, R]:
+    def __await__(self) -> Generator[object, None, R]:
         return self.execute().__await__()
 
 
@@ -60,7 +62,7 @@ class Prepared[R]:
     query: Executable[R]
     compiled: CompiledQuery
 
-    async def execute(self, **values: Any) -> R:
+    async def execute(self, **values: object) -> R:
         return await self.query.run_compiled(self.compiled.bind(values))
 
 

@@ -120,7 +120,12 @@ def test_cte(qb: QueryBuilder) -> None:
         .where(eq(Users.role, Role.ADMIN))
         .cte("admins")
     )
-    q = qb.with_(admins).select(admins.c("email")).from_(admins).where(gt(admins.c("id"), 3))
+    q = (
+        qb.with_(admins)
+        .select(admins.c("email", str))
+        .from_(admins)
+        .where(gt(admins.c("id", int), 3))
+    )
     assert q.to_sql() == (
         'WITH "admins" AS (SELECT "users"."id", "users"."email" FROM "users" '
         'WHERE "users"."role" = $1) SELECT "admins"."email" FROM "admins" WHERE "admins"."id" > $2',

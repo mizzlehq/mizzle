@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import datetime
 from decimal import Decimal
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, override
 
 from mizzle.core.compiler import CompiledQuery, Compiler
 from mizzle.core.errors import QueryError
@@ -10,8 +10,8 @@ from mizzle.core.sql.nodes import Node
 
 if TYPE_CHECKING:
     from mizzle.core.query.insert import OnConflict
-    from mizzle.core.query.relational import LoadPlan, RelationalFirst, RelationalSelect
-    from mizzle.core.schema.column import Column
+    from mizzle.core.query.relational import LoadPlan, RelationalStatement
+    from mizzle.core.schema.column import ColumnBase
     from mizzle.core.schema.relations import Link
     from mizzle.core.schema.table import Table
 
@@ -19,9 +19,11 @@ MAX_PARAMS = 32767  # PostgreSQL wire protocol limit on bind parameters per stat
 
 
 class PostgresCompiler(Compiler):
-    def param_marker(self, index: int) -> str:
+    @override
+    def param_marker(self, index: int, /) -> str:
         return f"${index}"
 
+    @override
     def compile(self, node: Node) -> CompiledQuery:
         compiled = super().compile(node)
         if len(compiled.params) > MAX_PARAMS:
@@ -31,10 +33,12 @@ class PostgresCompiler(Compiler):
             )
         return compiled
 
-    def returning_clause(self, table: type[Table]) -> str:
+    @override
+    def returning_clause(self, table: type[Table], /) -> str:
         return "RETURNING " + ", ".join(self.visit(c) for c in table.__table__.columns.values())
 
-    def on_conflict_clause(self, table: type[Table], conflict: OnConflict) -> str:
+    @override
+    def on_conflict_clause(self, table: type[Table], conflict: OnConflict, /) -> str:
         target = ""
         if conflict.target:
             target = "(" + ", ".join(self.column_name(c) for c in conflict.target) + ") "
@@ -49,7 +53,7 @@ class PostgresCompiler(Compiler):
     # Related rows are nested as JSON arrays: json_build_array(col1, col2, ..., child1...).
     # Types JSON cannot carry exactly are cast so Python can restore them losslessly.
 
-    def json_value(self, ref: str, column: Column[Any]) -> str:
+    def json_value(self, ref: str, column: ColumnBase) -> str:
         kind = column.accepts[0] if column.accepts else None
         if column.item is not None:
             item = column.item.accepts[0] if column.item.accepts else None
@@ -110,7 +114,7 @@ class PostgresCompiler(Compiler):
         finally:
             self._scopes.pop()
 
-    def visit_RelationalSelect(self, node: RelationalSelect[Any] | RelationalFirst[Any]) -> str:
+    def visit_RelationalStatement(self, node: RelationalStatement) -> str:
         plan = node.plan
         alias = self.new_alias()
         self._scopes.append({plan.table: alias})
@@ -124,5 +128,3 @@ class PostgresCompiler(Compiler):
             return text + self._clauses(plan)[1]
         finally:
             self._scopes.pop()
-
-    visit_RelationalFirst = visit_RelationalSelect

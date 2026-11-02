@@ -100,7 +100,7 @@ async def test_cte_and_subquery(db: Database) -> None:
         .where(eq(Users.role, Role.ADMIN))
         .cte("admins")
     )
-    assert await db.with_(admins).select(admins.c("email")).from_(admins) == [("ann",)]
+    assert await db.with_(admins).select(admins.c("email", str)).from_(admins) == [("ann",)]
 
 
 async def test_prepared_query(db: Database) -> None:

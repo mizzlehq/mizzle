@@ -32,10 +32,10 @@ class DatabaseError(MizzleError):
         column: str | None = None,
     ) -> None:
         super().__init__(message if sql is None else f"{message}\nSQL: {sql}")
-        self.sql = sql
-        self.original = original
-        self.constraint = constraint
-        self.column = column
+        self.sql: str | None = sql
+        self.original: BaseException | None = original
+        self.constraint: str | None = constraint
+        self.column: str | None = column
 
 
 class UniqueViolation(DatabaseError):
