@@ -101,14 +101,18 @@ def _from_mapping(root: Path, data: dict[str, Any], source: Path) -> Config:
 
 
 def load_config(path: Path | None = None, cwd: Path | None = None) -> Config:
-    """Read ``path``, else ``mizzle.toml``, else ``pyproject.toml [tool.mizzle]``."""
+    """Read ``path``, else ``mizzle.toml``, else ``pyproject.toml [tool.mizzle]`` in ``cwd``.
+
+    Only ``cwd`` is searched, never parent folders: loading a config imports (runs) the
+    schema modules it names, so a config planted in a shared parent must not be picked up.
+    """
     cwd = cwd or Path.cwd()
     if path is not None:
         data = tomllib.loads(path.read_text(encoding="utf-8"))
         if path.name == "pyproject.toml":
             data = data.get("tool", {}).get("mizzle", {})
         return _from_mapping(path.parent.resolve(), data, path)
-    for directory in [cwd, *cwd.parents]:
+    for directory in [cwd]:
         own = directory / "mizzle.toml"
         if own.exists():
             return _from_mapping(directory, tomllib.loads(own.read_text(encoding="utf-8")), own)
@@ -117,4 +121,6 @@ def load_config(path: Path | None = None, cwd: Path | None = None) -> Config:
             tool = tomllib.loads(pyproject.read_text(encoding="utf-8")).get("tool", {})
             if "mizzle" in tool:
                 return _from_mapping(directory, tool["mizzle"], pyproject)
-    raise MigrationError("no mizzle.toml or [tool.mizzle] in pyproject.toml found")
+    raise MigrationError(
+        f"no mizzle.toml or [tool.mizzle] in {cwd}; run from the project root or pass --config"
+    )

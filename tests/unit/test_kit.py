@@ -139,3 +139,41 @@ def test_config_sources(tmp_path: Path) -> None:
     (tmp_path / "mizzle.toml").write_text('schema = "x"\nbogus = 1\n')
     with pytest.raises(MigrationError, match="unknown settings"):
         load_config(cwd=tmp_path)
+
+
+def test_config_is_not_read_from_parent_folders(tmp_path: Path) -> None:
+    (tmp_path / "mizzle.toml").write_text('schema = "planted"\n')
+    child = tmp_path / "child"
+    child.mkdir()
+    with pytest.raises(MigrationError, match="pass --config"):
+        load_config(cwd=child)
+
+
+def test_pulled_names_cannot_inject_code() -> None:
+    from mizzle.kit.codegen import render_schema_module
+
+    snapshot = empty_snapshot("postgresql")
+    evil = "x\nimport os; os.system('echo pwned')"
+    snapshot["tables"]["public.t"] = {
+        "schema": "public",
+        "name": "t",
+        "columns": {"a": {"name": "a", "type": "integer", "not_null": False, "default": None}},
+        "primary_key": None,
+        "uniques": {},
+        "checks": {},
+        "foreign_keys": {
+            evil: {
+                "name": evil,
+                "columns": ["a"],
+                "ref_schema": "other",
+                "ref_table": evil,
+                "ref_columns": ["id"],
+                "on_delete": None,
+                "on_update": None,
+            }
+        },
+        "indexes": {},
+    }
+    source = render_schema_module(snapshot)
+    assert "\nimport os" not in source
+    compile(source, "pulled.py", "exec")

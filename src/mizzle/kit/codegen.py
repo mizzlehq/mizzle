@@ -149,7 +149,8 @@ class _SchemaWriter:
             ref_key = f"{fk['ref_schema']}.{fk['ref_table']}"
             target = self.table_classes.get(ref_key)
             if target is None:
-                items.append(f"# foreign key {fk['name']} references {ref_key}, not pulled")
+                # Names come from the database: repr() keeps them on one escaped line.
+                items.append(f"# foreign key {fk['name']!r} references {ref_key!r}, not pulled")
                 continue
             refs = ", ".join(f"{target}.{self.attrs[ref_key][c]}" for c in fk["ref_columns"])
             options = "".join(f", {o}={fk[o]!r}" for o in ("on_delete", "on_update") if fk[o])
