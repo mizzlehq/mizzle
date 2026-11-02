@@ -74,7 +74,9 @@ class Table:
 
 def _constraint_columns(constraint: Constraint) -> tuple[ColumnBase, ...]:
     match constraint:
-        case Index() | UniqueConstraint() | PrimaryKey() | ForeignKey():
+        case Index():  # keys may also be expressions; only the columns are checked
+            return tuple(k for k in constraint.columns if isinstance(k, ColumnBase))
+        case UniqueConstraint() | PrimaryKey() | ForeignKey():
             return constraint.columns
         case Check():
             return ()

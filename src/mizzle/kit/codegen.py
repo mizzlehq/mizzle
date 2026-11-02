@@ -160,7 +160,8 @@ class _SchemaWriter:
             items.append(f"check({c['name']!r}, {_sql(c['expression'])})")
         for i in table["indexes"].values():
             fn = "unique_index" if i["unique"] else "index"
-            code = f"{fn}({i['name']!r}).on({cols(i['columns'])})"
+            keys = _sql(i["expression"]) if "expression" in i else cols(i["columns"])
+            code = f"{fn}({i['name']!r}).on({keys})"
             if i["where"]:
                 code += f".where({_sql(i['where'])})"
             items.append(code)

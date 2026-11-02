@@ -79,6 +79,8 @@ class Everything(Table, name="everything"):
     def config(cls) -> list[Any]:
         return [
             index("everything_label_idx").on(cls.label, cls.born),
+            index("everything_label_lower_idx").on(sql("lower(label)")),
+            unique_index("everything_flag_label_uq").on(cls.flag, sql("upper(label)")),
             unique_index("everything_uid_live").on(cls.uid).where(sql("flag")),
             unique(cls.small, cls.r, name="everything_small_r_uq"),
             check("everything_num_positive", sql("num > 0")),

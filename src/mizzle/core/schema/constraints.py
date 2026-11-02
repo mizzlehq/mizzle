@@ -6,18 +6,18 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
 
 from mizzle.core.schema.column import ColumnBase, ReferentialAction
-from mizzle.core.sql.nodes import Condition
+from mizzle.core.sql.nodes import Condition, ExprBase
 
 
 @dataclass(frozen=True)
 class Index:
     name: str
-    columns: tuple[ColumnBase, ...] = ()
+    columns: tuple[ExprBase, ...] = ()  # columns, or expressions such as sql("lower(email)")
     unique: bool = False
     predicate: Condition | None = None
 
-    def on(self, *columns: ColumnBase) -> Index:
-        return replace(self, columns=columns)
+    def on(self, *keys: ExprBase) -> Index:
+        return replace(self, columns=keys)
 
     def where(self, condition: Condition) -> Index:
         """Partial index."""

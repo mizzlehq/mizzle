@@ -96,12 +96,17 @@ def build_snapshot(
             match constraint:
                 case Index():
                     where = constraint.predicate
-                    snap["indexes"][constraint.name] = IndexSnap(
+                    keys = constraint.columns
+                    plain = [k for k in keys if isinstance(k, ColumnBase)]
+                    index = IndexSnap(
                         name=constraint.name,
-                        columns=names(constraint.columns),
+                        columns=names(plain) if len(plain) == len(keys) else [],
                         unique=constraint.unique,
                         where=dialect.expression(where, casing) if where is not None else None,
                     )
+                    if len(plain) != len(keys):  # an expression index
+                        index["expression"] = ", ".join(dialect.expression(k, casing) for k in keys)
+                    snap["indexes"][constraint.name] = index
                 case UniqueConstraint():
                     cols = names(constraint.columns)
                     name = constraint.name or trunc(f"{tname}_{'_'.join(cols)}_key")

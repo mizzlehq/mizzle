@@ -185,10 +185,8 @@ def _create_table(table: TableSnap) -> str:
 
 def _create_index(schema: str, table: str, index: IndexSnap) -> str:
     unique = "UNIQUE " if index["unique"] else ""
-    text = (
-        f"CREATE {unique}INDEX {quote(index['name'])} ON {qualified(schema, table)} "
-        f"({_columns(index['columns'])})"
-    )
+    keys = index.get("expression") or _columns(index["columns"])
+    text = f"CREATE {unique}INDEX {quote(index['name'])} ON {qualified(schema, table)} ({keys})"
     return text + (f" WHERE {index['where']}" if index["where"] else "")
 
 

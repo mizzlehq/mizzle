@@ -10,6 +10,7 @@ from typing import cast
 from mizzle.core.snapshot import (
     ColumnSnap,
     EnumSnap,
+    IndexSnap,
     Snapshot,
     TableSnap,
     empty_snapshot,
@@ -67,8 +68,12 @@ SELECT i.indrelid AS table_oid, ic.relname AS name, i.indisunique AS unique,
              JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = k.n
              ORDER BY k.ord) AS columns,
        pg_get_expr(i.indpred, i.indrelid) AS predicate,
-       i.indexprs IS NOT NULL AS has_expressions
-FROM pg_index i JOIN pg_class ic ON ic.oid = i.indexrelid
+       i.indexprs IS NOT NULL AS has_expressions,
+       pg_get_indexdef(i.indexrelid) AS definition,
+       am.amname AS method
+FROM pg_index i
+JOIN pg_class ic ON ic.oid = i.indexrelid
+JOIN pg_am am ON am.oid = ic.relam
 WHERE i.indrelid = ANY($1::oid[])
   AND NOT EXISTS (SELECT 1 FROM pg_constraint con WHERE con.conindid = i.indexrelid
                   AND con.contype IN ('p', 'u', 'x'))
@@ -126,6 +131,22 @@ def _check_expression(definition: str) -> str:
     return expr[1:-1] if expr.startswith("(") and expr.endswith(")") else expr
 
 
+def _index_keys(definition: str) -> str:
+    """The key list of ``CREATE INDEX ... USING btree (<keys>) [WHERE ...]``."""
+    start = definition.index(" USING btree (") + len(" USING btree (")
+    depth, quoted = 1, False
+    for i, ch in enumerate(definition[start:], start):
+        if ch == "'":
+            quoted = not quoted  # '' inside a literal toggles twice: still correct
+        elif not quoted and ch == "(":
+            depth += 1
+        elif not quoted and ch == ")":
+            depth -= 1
+            if depth == 0:
+                return definition[start:i]
+    raise ValueError(f"cannot read the keys of index definition {definition!r}")
+
+
 async def introspect(conn: Connection, schemas: Sequence[str] = (DEFAULT_SCHEMA,)) -> Snapshot:
     snapshot = empty_snapshot("postgresql")
     schema_list = list(schemas)
@@ -180,15 +201,20 @@ async def introspect(conn: Connection, schemas: Sequence[str] = (DEFAULT_SCHEMA,
     for row in await conn.fetch_dicts(_INDEXES, [oids]):
         table = by_oid[_int(row["table_oid"])]
         name = str(row["name"])
-        if row["has_expressions"]:
-            log.warning("skipping expression index %s (not supported yet)", name)
+        method = str(row["method"])
+        if method != "btree":
+            log.warning("skipping %s index %s (only btree indexes are supported)", method, name)
             continue
-        table["indexes"][name] = {
-            "name": name,
-            "columns": _strs(row["columns"]),
-            "unique": bool(row["unique"]),
-            "where": _opt_str(row["predicate"]),
-        }
+        index = IndexSnap(
+            name=name,
+            columns=_strs(row["columns"]),
+            unique=bool(row["unique"]),
+            where=_opt_str(row["predicate"]),
+        )
+        if row["has_expressions"]:
+            index["columns"] = []
+            index["expression"] = _index_keys(str(row["definition"]))
+        table["indexes"][name] = index
 
     for row in await conn.fetch_dicts(_ENUMS, [schema_list]):
         schema, name = str(row["schema"]), str(row["name"])

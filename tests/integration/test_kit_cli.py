@@ -38,7 +38,10 @@ class Posts(Table, name="posts"):
 
     @classmethod
     def config(cls):
-        return [index("posts_author_idx").on(cls.author_id)]
+        return [
+            index("posts_author_idx").on(cls.author_id),
+            index("posts_title_lower_idx").on(sql("lower(title)")),
+        ]
 """
 
 

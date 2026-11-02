@@ -333,9 +333,11 @@ def _diff_table(old: TableSnap, new: TableSnap, plan: _Plan, compare_expressions
     )
 
     def same_index(a: IndexSnap, b: IndexSnap) -> bool:
-        if compare_expressions:
-            return same(a, b)
-        return a["columns"] == b["columns"] and a["unique"] == b["unique"]
+        if a["columns"] != b["columns"] or a["unique"] != b["unique"]:
+            return False
+        if not compare_expressions:  # the database reformats expressions; compare shapes
+            return ("expression" in a) == ("expression" in b)
+        return a["where"] == b["where"] and a.get("expression") == b.get("expression")
 
     _diff_named(
         old["indexes"],

@@ -8,7 +8,7 @@ schema and the database it created compare equal.
 
 from __future__ import annotations
 
-from typing import TypedDict
+from typing import NotRequired, TypedDict
 
 SNAPSHOT_VERSION = 1
 
@@ -47,9 +47,12 @@ class ForeignKeySnap(TypedDict):
 
 class IndexSnap(TypedDict):
     name: str
-    columns: list[str]
+    columns: list[str]  # plain column keys; empty when ``expression`` is set
     unique: bool
     where: str | None
+    # Key list as SQL, for indexes on expressions (e.g. "lower(email)"). Absent otherwise,
+    # so snapshots written before this field existed compare equal.
+    expression: NotRequired[str]
 
 
 class TableSnap(TypedDict):

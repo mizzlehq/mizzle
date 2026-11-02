@@ -250,3 +250,13 @@ def test_schema_file(tmp_path: Path) -> None:
     (tmp_path / "app" / "db").mkdir(parents=True)
     (tmp_path / "app" / "db" / "schema.py").write_text("")
     assert config.schema_file().resolve() == (tmp_path / "app" / "db" / "schema.py").resolve()
+
+
+def test_index_key_parsing() -> None:
+    from mizzle.dialects.postgres.introspect import _index_keys
+
+    assert _index_keys("CREATE INDEX i ON public.t USING btree (lower(email))") == "lower(email)"
+    assert (
+        _index_keys("CREATE UNIQUE INDEX i ON t USING btree (a, (b || ')(')) WHERE (c > 0)")
+        == "a, (b || ')(')"
+    )
