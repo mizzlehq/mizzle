@@ -1,7 +1,8 @@
 """Raw SQL with safe parameters.
 
 ``sql(t"select * from users where id = {uid}")`` on Python 3.14+, or
-``sql("select * from users where id = {}", uid)`` on any version.
+``sql("select * from users where id = {}", uid)`` on any version. Without values,
+``sql("...")`` is taken literally, so braces in regexes or JSON need no escaping.
 Values always become bind parameters; nodes (columns, expressions) are compiled in place.
 """
 
@@ -39,6 +40,8 @@ class _Sql:
 
     @staticmethod
     def _from_str(template: str, args: tuple[object, ...]) -> Raw:
+        if not args:  # no values: the text is SQL as written, braces included (regex, JSON)
+            return Raw((template,))
         parts: list[str | Node] = []
         used = 0
         for literal, field, spec, conversion in string.Formatter().parse(template):

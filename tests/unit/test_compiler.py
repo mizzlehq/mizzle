@@ -142,3 +142,10 @@ def test_too_many_params() -> None:
 
 def test_compiled_query_is_plain_data() -> None:
     assert CompiledQuery("x", (), ()) == CompiledQuery("x", (), ())
+
+
+def test_raw_sql_without_values_is_literal() -> None:
+    assert compile_(sql("name ~ '^[a-z]{3,32}$' and data @> '{\"a\": 1}'")) == (
+        "name ~ '^[a-z]{3,32}$' and data @> '{\"a\": 1}'",
+        (),
+    )

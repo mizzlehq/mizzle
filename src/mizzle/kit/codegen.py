@@ -51,8 +51,8 @@ def _class_name(name: str) -> str:
 
 
 def _sql(text: str) -> str:
-    """A ``sql("...")`` call whose text is taken literally (braces escaped)."""
-    return f"sql({text.replace('{', '{{').replace('}', '}}')!r})"
+    """A ``sql("...")`` call; without values, sql() takes its text literally."""
+    return f"sql({text!r})"
 
 
 class _SchemaWriter:
