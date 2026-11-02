@@ -61,7 +61,7 @@ from mizzle.core.sql.operators import (
 from mizzle.core.sql.raw import sql
 from mizzle.db import Database, QueryEvent, Session
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 
 __all__ = [
     "CheckViolation",
