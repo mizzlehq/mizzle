@@ -241,3 +241,12 @@ def test_dotenv_is_loaded_without_overriding(
     assert os.environ["PLAIN"] == "value"
     assert os.environ["QUOTED"] == "a # not a comment"
     assert os.environ["ALREADY"] == "from-env"
+
+
+def test_schema_file(tmp_path: Path) -> None:
+    (tmp_path / "mizzle.toml").write_text('schema = "app.db.schema"\n')
+    config = load_config(cwd=tmp_path)
+    assert config.schema_file() == tmp_path / "app" / "db" / "schema.py"  # not created yet
+    (tmp_path / "app" / "db").mkdir(parents=True)
+    (tmp_path / "app" / "db" / "schema.py").write_text("")
+    assert config.schema_file().resolve() == (tmp_path / "app" / "db" / "schema.py").resolve()

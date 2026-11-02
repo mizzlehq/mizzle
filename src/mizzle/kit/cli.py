@@ -205,7 +205,15 @@ def cmd_push(config: Config, args: Args) -> int:
 
 
 def cmd_pull(config: Config, args: Args) -> int:
-    out = Path(args.out) if args.out else config.root / "pulled_schema.py"
+    # A new project gets the pulled tables as its schema module. An existing schema module
+    # is never overwritten: the result goes next to it, to compare and copy from.
+    schema_file = config.schema_file()
+    if args.out:
+        out = Path(args.out)
+    elif schema_file.exists():
+        out = schema_file.with_name("pulled_schema.py")
+    else:
+        out = schema_file
     if out.exists() and not args.force:
         raise MigrationError(f"{out} exists; pass --force to overwrite it")
 
@@ -214,6 +222,7 @@ def cmd_pull(config: Config, args: Args) -> int:
             return await dialect.introspect(conn, config.schema_filter)
 
     snapshot = asyncio.run(_with_driver(config, run))
+    out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(render_schema_module(snapshot), encoding="utf-8")
     print(f"Wrote {out} ({len(snapshot['tables'])} tables)")
     directory = MigrationsDir(config.out, config.dialect_name)
@@ -369,7 +378,11 @@ def _parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_push)
 
     p = sub.add_parser("pull", help="write a schema module from an existing database")
-    p.add_argument("--out")
+    p.add_argument(
+        "--out",
+        help="file to write (default: your schema module if it does not exist yet, "
+        "otherwise pulled_schema.py next to it)",
+    )
     p.add_argument("--force", action="store_true", help="overwrite the output file")
     p.set_defaults(func=cmd_pull)
 

@@ -104,7 +104,7 @@ mizzle init                # set up mizzle.toml, db/schema.py and migrations/
 mizzle generate            # write migrations/0001_.../migration.sql + snapshot.json
 mizzle migrate             # apply pending migrations (safe with many app servers)
 mizzle push                # dev: sync schema straight to the database
-mizzle pull                # write a schema module from an existing database
+mizzle pull                # existing database -> your schema module (or pulled_schema.py next to it)
 mizzle check               # find broken or clashing migrations
 mizzle drop                # delete the latest, unapplied migration
 mizzle typegen             # TypedDicts for insert/update values

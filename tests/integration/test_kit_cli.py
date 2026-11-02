@@ -218,3 +218,24 @@ def test_env_url_required(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> No
     monkeypatch.chdir(tmp_path)
     monkeypatch.delenv("DATABASE_URL", raising=False)
     assert run("migrate") == 1
+
+
+async def test_pull_into_new_project_writes_the_schema_module(
+    project: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert await cli("push", "--force") == 0
+    # A second project on the same database, with no schema file yet.
+    fresh = project / "fresh"
+    fresh.mkdir()
+    module = f"fresh_{uuid.uuid4().hex[:8]}"
+    (fresh / "mizzle.toml").write_text(f'schema = "{module}.db.schema"\nout = "migrations"\n')
+    monkeypatch.chdir(fresh)
+    assert await cli("pull") == 0
+    schema = fresh / module / "db" / "schema.py"
+    assert "class Users(Table" in schema.read_text()
+    assert not (fresh / module / "db" / "pulled_schema.py").exists()
+    assert await cli("generate") == 0
+    assert "No schema changes." in capsys.readouterr().out
+    # Pulling again keeps the schema module and writes next to it.
+    assert await cli("pull") == 0
+    assert (fresh / module / "db" / "pulled_schema.py").exists()

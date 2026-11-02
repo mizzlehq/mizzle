@@ -9,6 +9,7 @@ url_env = "DATABASE_URL"      # the URL is read from the environment, never the 
 from __future__ import annotations
 
 import importlib
+import importlib.util
 import os
 import sys
 import tomllib
@@ -55,6 +56,19 @@ class Config:
         if not url:
             raise MigrationError(f"set the {self.url_env} environment variable to the database URL")
         return url
+
+    def schema_file(self) -> Path:
+        """The file of the first schema module, even if it does not exist yet."""
+        module = self.schema[0]
+        if str(self.root) not in sys.path:
+            sys.path.insert(0, str(self.root))
+        try:
+            spec = importlib.util.find_spec(module)
+        except ModuleNotFoundError:  # a parent package is missing too
+            spec = None
+        if spec is not None and spec.origin not in (None, "namespace"):
+            return Path(spec.origin)
+        return self.root.joinpath(*module.split(".")).with_suffix(".py")
 
     def load_tables(self) -> list[type[Table]]:
         """Import the schema modules and collect every Table subclass they expose."""
