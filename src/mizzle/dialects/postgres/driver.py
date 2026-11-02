@@ -71,6 +71,15 @@ def map_error(exc: BaseException, sql: str) -> MizzleError | None:
             return None
 
 
+def _translate(exc: Exception, sql: str) -> Exception:
+    """Map ``exc``; callers raise the result ``from None`` so tracebacks do not print the
+    driver error, whose DETAIL can hold row values. It stays reachable as ``.original``."""
+    mapped = map_error(exc, sql)
+    if mapped is None:
+        return exc
+    return mapped
+
+
 def _rowcount(status: str) -> int:
     # Command tags: "INSERT 0 3", "UPDATE 2", "DELETE 1", "SELECT 5"
     last = status.rsplit(" ", 1)[-1]
@@ -85,19 +94,19 @@ class PostgresConnection:
         try:
             return list(await self._conn.fetch(sql, *params))
         except Exception as exc:
-            raise map_error(exc, sql) or exc from exc
+            raise _translate(exc, sql) from None
 
     async def fetch_dicts(self, sql: str, params: Sequence[Any]) -> list[dict[str, Any]]:
         try:
             return [dict(record) for record in await self._conn.fetch(sql, *params)]
         except Exception as exc:
-            raise map_error(exc, sql) or exc from exc
+            raise _translate(exc, sql) from None
 
     async def execute(self, sql: str, params: Sequence[Any]) -> int:
         try:
             return _rowcount(await self._conn.execute(sql, *params))
         except Exception as exc:
-            raise map_error(exc, sql) or exc from exc
+            raise _translate(exc, sql) from None
 
     @asynccontextmanager
     async def transaction(
@@ -108,7 +117,7 @@ class PostgresConnection:
             async with self._conn.transaction(isolation=level, readonly=readonly):
                 yield
         except asyncpg.PostgresError as exc:  # BEGIN / COMMIT failures (body errors are mapped)
-            raise map_error(exc, "COMMIT") or exc from exc
+            raise _translate(exc, "COMMIT") from None
 
 
 async def _init_connection(conn: asyncpg.Connection) -> None:

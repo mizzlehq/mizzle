@@ -1,5 +1,6 @@
 import asyncio
 import datetime
+import traceback
 
 import pytest
 
@@ -174,11 +175,15 @@ async def test_lock_rows_in_transaction(db: Database) -> None:
 
 
 async def test_unique_violation_hides_values(db: Database) -> None:
-    await add_user(db, "secret@x.io")
+    secret = "-".join(["very", "secret", "email"])  # not spelled out in source lines
+    await add_user(db, secret)
     with pytest.raises(UniqueViolation) as info:
-        await add_user(db, "secret@x.io")
+        await add_user(db, secret)
     assert info.value.constraint == "users_email_key"
-    assert "secret@x.io" not in str(info.value)
+    assert secret not in str(info.value)
+    # Logged tracebacks must not print the chained driver error (its DETAIL has the value).
+    assert secret not in "".join(traceback.format_exception(info.value))
+    assert info.value.original is not None  # still available on purpose
 
 
 async def test_other_violations(db: Database) -> None:
