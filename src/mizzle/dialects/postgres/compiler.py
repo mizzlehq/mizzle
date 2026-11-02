@@ -54,15 +54,16 @@ class PostgresCompiler(Compiler):
     # Types JSON cannot carry exactly are cast so Python can restore them losslessly.
 
     def json_value(self, ref: str, column: ColumnBase) -> str:
-        kind = column.accepts[0] if column.accepts else None
         if column.item is not None:
-            item = column.item.accepts[0] if column.item.accepts else None
-            if item in (Decimal, bytes, datetime.timedelta):
-                raise QueryError(
-                    f"{column.qualified_name}: arrays of {item.__name__} cannot be loaded "
-                    "through with_ yet; select them with db.select()"
-                )
-            return ref
+            item = self.json_value("x.v", column.item)
+            if item == "x.v":
+                return ref  # elements are exact in JSON already
+            # Convert each element, keeping order and NULL arrays (ARRAY(...) is never NULL).
+            elements = (
+                f"ARRAY(SELECT {item} FROM unnest({ref}) WITH ORDINALITY AS x(v, n) ORDER BY x.n)"
+            )
+            return f"CASE WHEN {ref} IS NULL THEN NULL ELSE {elements} END"
+        kind = column.accepts[0] if column.accepts else None
         if kind is Decimal:
             return f"{ref}::text"
         if kind is bytes:

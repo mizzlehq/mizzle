@@ -122,6 +122,9 @@ class Thing(Table, name="rel_thing"):
     mood = pg_enum(Mood, type_name="rel_mood")
     moods = array(pg_enum(Mood, type_name="rel_mood").not_null())
     words = array(text().not_null())
+    amounts = array(numeric(12, 4))
+    blobs = array(bytea().not_null())
+    spans = array(interval().not_null())
     owner = one(lambda: Owner, fields=lambda: [Thing.owner_id], references=lambda: [Owner.id])
 
 
@@ -150,6 +153,9 @@ async def test_every_type_survives_json(driver: PostgresDriver, pg_url: str) -> 
         "mood": Mood.DOWN,
         "moods": [Mood.UP, Mood.DOWN],
         "words": ["a", "b"],
+        "amounts": [Decimal("1.0001"), None, Decimal("99999999.9999")],
+        "blobs": [b"\x00\x01", b"\xff"],
+        "spans": [datetime.timedelta(seconds=1.5), datetime.timedelta(days=2)],
     }
     async with await Database.connect(pg_url, schema=[Owner, Thing]) as db:
         [owner] = await db.insert(Owner).values({}).returning()
@@ -161,6 +167,11 @@ async def test_every_type_survives_json(driver: PostgresDriver, pg_url: str) -> 
             assert getattr(thing, key) == expected, key
             assert getattr(thing, key) == getattr(direct, key), key
         assert thing.mood is Mood.DOWN
+
+        await db.insert(Thing).values(owner_id=owner.id)  # every array column NULL
+        [reloaded] = await db.query(Owner).find_many(with_={"things": {"order_by": Thing.id}})
+        empty = reloaded.things[1]
+        assert (empty.amounts, empty.blobs, empty.spans, empty.words) == (None, None, None, None)
 
         await db.execute(sql("DROP TABLE rel_thing, rel_owner"))
         await db.execute(sql("DROP TYPE rel_mood"))
