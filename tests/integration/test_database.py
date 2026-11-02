@@ -116,6 +116,12 @@ async def test_raw_execute(db: Database) -> None:
     assert rows == [{"email": "ann", "n": 7}]
 
 
+async def test_server_data_error_hides_value(db: Database) -> None:
+    with pytest.raises(DatabaseError, match="value hidden") as info:
+        await db.execute(sql("select {}::text::role", "secret-x"))
+    assert "secret-x" not in str(info.value)
+
+
 async def test_bad_param_type_error_hides_value(db: Database) -> None:
     with pytest.raises(DatabaseError, match="wrong type") as info:
         await db.execute(sql("select {}::int", "secret-value"))

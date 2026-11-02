@@ -24,9 +24,9 @@ class Role(enum.StrEnum):
 
 
 class Users(Table, name="users"):
-    id = serial().primary_key()                         # Column[int]
-    email = varchar(255).not_null().unique()            # Column[str]
-    bio = text()                                        # Column[str | None]
+    id = serial().primary_key()  # Column[int]
+    email = varchar(255).not_null().unique()  # Column[str]
+    bio = text()  # Column[str | None]
     role = pg_enum(Role).not_null().default(Role.USER)  # Column[Role]
     created_at = timestamp(tz=True).not_null().default(sql("now()"))
 
@@ -39,7 +39,7 @@ class Posts(Table, name="posts"):
 
 async def main() -> None:
     async with await Database.connect("postgresql://...", schema=[Users, Posts]) as db:
-        [ann] = await db.insert(Users).values(email="ann@x.io").returning()   # Users
+        [ann] = await db.insert(Users).values(email="ann@x.io").returning()  # Users
         admins = await db.select().from_(Users).where(eq(Users.role, Role.ADMIN))  # list[Users]
         pairs = await (
             db.select(Users, Posts)
@@ -55,7 +55,7 @@ async def main() -> None:
 ## Raw SQL
 
 ```python
-await db.execute(sql(t"select * from users where id = {user_id}"))   # Python 3.14+
+await db.execute(sql(t"select * from users where id = {user_id}"))  # Python 3.14+
 await db.execute(sql("select * from users where id = {}", user_id))  # any version
 ```
 

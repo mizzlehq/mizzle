@@ -54,12 +54,19 @@ def map_error(exc: BaseException, sql: str) -> MizzleError | None:
             return SerializationFailure(exc.message, sql=sql, original=exc)
         case pg.PostgresConnectionError() | pg.ConnectionDoesNotExistError() | OSError():
             return DbConnectionError(f"{type(exc).__name__}: {exc}", sql=sql, original=exc)
-        case asyncpg.PostgresError() if exc.message:
-            return DatabaseError(exc.message, sql=sql, original=exc)
-        case asyncpg.PostgresError():
+        case asyncpg.PostgresError() if not exc.message:
             # Raised client-side by asyncpg while encoding params; its text includes the value.
             message = f"{type(exc).__name__}: a query parameter has the wrong type (value hidden)"
             return DatabaseError(message, sql=sql, original=exc)
+        case asyncpg.PostgresError() if (exc.sqlstate or "").startswith("22"):
+            # SQLSTATE class 22 (data exception) messages quote the bad value, e.g.
+            # 'invalid input value for enum role: "x"'. The full text stays on .original.
+            message = (
+                f"{type(exc).__name__} (SQLSTATE {exc.sqlstate}): invalid value (value hidden)"
+            )
+            return DatabaseError(message, sql=sql, original=exc)
+        case asyncpg.PostgresError():
+            return DatabaseError(exc.message, sql=sql, original=exc)
         case _:
             return None
 
