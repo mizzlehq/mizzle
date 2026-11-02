@@ -38,6 +38,19 @@ jobs:
       - run: pnpm run ci  # Biome; bare `pnpm ci` is pnpm's own clean-install command
       - run: pnpm build
 
+  studio-assets:
+    # The Studio UI zip is unpacked by mizzle on every OS: prove it on each one.
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - run: uv sync --python 3.12
+      - run: uv run pytest tests/unit/test_studio_assets.py -v
+
   test:
     runs-on: ubuntu-latest
     strategy:

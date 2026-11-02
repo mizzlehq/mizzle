@@ -1,6 +1,7 @@
 name: Release
 
-# Push a tag like v0.2.0 to build the Studio UI, package it into the wheel, and publish.
+# Push a tag like v0.2.0: builds the Studio UI as a GitHub Release asset (downloaded by
+# `mizzle studio` on first run, verified by SHA-256), then publishes the wheel to PyPI.
 on:
   push:
     tags: ["v*"]
@@ -18,20 +19,51 @@ jobs:
           node-version: 24
           cache: pnpm
           cache-dependency-path: studio-ui/pnpm-lock.yaml
-      - name: Build Studio UI into src/mizzle/studio/static
+      - name: Build Studio UI
         working-directory: studio-ui
         run: pnpm install --frozen-lockfile && pnpm build
       - uses: astral-sh/setup-uv@v6
+      - name: Package the UI as a release asset and write ui.json (URL + SHA-256)
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          PACKAGE_VERSION="$(uv run python -c 'import mizzle; print(mizzle.__version__)')"
+          test "$VERSION" = "$PACKAGE_VERSION" || { echo "tag $GITHUB_REF_NAME != mizzle $PACKAGE_VERSION"; exit 1; }
+          ZIP="mizzle-studio-$VERSION.zip"
+          URL="https://github.com/$GITHUB_REPOSITORY/releases/download/$GITHUB_REF_NAME/$ZIP"
+          uv run python -m mizzle.studio.assets src/mizzle/studio/static "$ZIP" --version "$VERSION" --url "$URL"
+          mkdir -p release && mv "$ZIP" release/
+          rm -rf src/mizzle/studio/static  # the UI is downloaded, never shipped in the wheel
       - run: uv build
-      - name: Check the wheel contains the UI
-        run: unzip -l dist/*.whl | grep -q "mizzle/studio/static/index.html"
+      - name: Check the wheel has ui.json and no UI files
+        run: |
+          unzip -l dist/*.whl | grep -q "mizzle/studio/ui.json"
+          ! unzip -l dist/*.whl | grep -q "mizzle/studio/static/"
       - uses: actions/upload-artifact@v4
         with:
           name: dist
           path: dist/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: studio-ui
+          path: release/
+
+  github-release:
+    # The UI archive must be downloadable before the wheel that points to it is published.
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: studio-ui
+          path: release/
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: release/*.zip
 
   publish:
-    needs: build
+    needs: [build, github-release]
     runs-on: ubuntu-latest
     environment: pypi
     permissions:

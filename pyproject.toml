@@ -24,9 +24,13 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build]
-# The Studio UI is gitignored but must ship in sdists and wheels (build it first:
-# `pnpm install && pnpm build` in studio-ui/).
-artifacts = ["src/mizzle/studio/static/**"]
+# The Studio UI is NOT shipped: `mizzle studio` downloads it on first run from the GitHub
+# Release, verified by the SHA-256 in ui.json. ui.json is written by the release workflow
+# (gitignored), so it is listed here to be included in the wheel.
+artifacts = ["src/mizzle/studio/ui.json"]
+
+[tool.hatch.build.targets.sdist]
+exclude = ["studio-ui", ".github", "docs", "docker-compose.yml"]
 
 [dependency-groups]
 dev = [

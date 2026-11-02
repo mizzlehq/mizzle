@@ -39,6 +39,7 @@ class Args(Protocol):
     port: int
     read_only: bool
     no_open: bool
+    ui_path: str | None
 
 
 def _interactive() -> bool:
@@ -294,7 +295,13 @@ def cmd_studio(config: Config, args: Args) -> int:
         from mizzle.studio.server import serve
     except ImportError as exc:
         raise MigrationError("Studio needs extra packages: pip install 'mizzle[studio]'") from exc
-    serve(config, port=args.port, read_only=args.read_only, open_browser=not args.no_open)
+    serve(
+        config,
+        port=args.port,
+        read_only=args.read_only,
+        open_browser=not args.no_open,
+        ui_dir=args.ui_path,
+    )
     return 0
 
 
@@ -349,6 +356,10 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--port", type=int, default=4983)
     p.add_argument("--read-only", action="store_true")
     p.add_argument("--no-open", action="store_true", help="do not open a browser")
+    p.add_argument(
+        "--ui-path",
+        help="folder with a built Studio UI (offline use; default: download on first run)",
+    )
     p.set_defaults(func=cmd_studio)
     return parser
 

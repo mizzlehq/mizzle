@@ -19,7 +19,7 @@ Built for PostgreSQL first; other SQL databases plug in through the dialect laye
 
 ```bash
 pip install mizzle            # ORM + migration CLI
-pip install "mizzle[studio]"  # + Studio
+pip install "mizzle[studio]"  # + Studio (its UI downloads on first run, ~250 KB)
 ```
 
 ## Schema

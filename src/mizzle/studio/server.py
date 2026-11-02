@@ -427,9 +427,19 @@ def create_app(
     )
 
 
-def serve(config: Config, *, port: int, read_only: bool, open_browser: bool) -> None:
+def serve(
+    config: Config,
+    *,
+    port: int,
+    read_only: bool,
+    open_browser: bool,
+    ui_dir: str | None = None,
+) -> None:
     import uvicorn
 
+    from mizzle.studio.assets import ui_path
+
+    static_dir = ui_path(ui_dir)  # downloads and verifies the UI on first run
     token = secrets.token_urlsafe(32)
     app = create_app(
         dialect=config.dialect(),
@@ -438,6 +448,7 @@ def serve(config: Config, *, port: int, read_only: bool, open_browser: bool) -> 
         token=token,
         allowed_hosts={f"127.0.0.1:{port}", f"localhost:{port}"},
         read_only=read_only,
+        static_dir=static_dir,
     )
     link = f"http://127.0.0.1:{port}/#token={token}"
     mode = " (read-only)" if read_only else ""
