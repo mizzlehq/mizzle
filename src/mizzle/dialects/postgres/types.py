@@ -91,6 +91,7 @@ def array[T](item: Column[T], name: str | None = None) -> Column[list[T] | None]
         decoder=decode if item.decoder else None,
     )
     column.enum = item.enum
+    column.item = item
     return column
 
 

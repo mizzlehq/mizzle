@@ -56,6 +56,7 @@ class Column[T](Expr[T]):
         self.attr = ""
         self.table: type[Table] | None = None
         self.enum: type[enum.Enum] | None = None
+        self.item: Column[Any] | None = None  # element column of an array
         self.is_primary_key = False
         self.is_unique = False
         self.unique_name: str | None = None

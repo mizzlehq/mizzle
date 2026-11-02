@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, ClassVar, Self
 
 from mizzle.core.errors import SchemaError
@@ -17,6 +17,7 @@ from mizzle.core.schema.constraints import (
     PrimaryKey,
     UniqueConstraint,
 )
+from mizzle.core.schema.relations import Relation
 
 
 @dataclass(frozen=True)
@@ -24,6 +25,7 @@ class TableInfo:
     name: str
     schema: str | None
     columns: dict[str, Column[Any]]  # attribute name -> column, in declaration order
+    relations: dict[str, Relation[Any]] = field(default_factory=dict[str, "Relation[Any]"])
 
 
 class Table:
@@ -38,7 +40,10 @@ class Table:
         }
         if not columns:
             raise SchemaError(f"table class {cls.__name__} declares no columns")
-        cls.__table__ = TableInfo(name or snake_case(cls.__name__), schema, columns)
+        relations: dict[str, Relation[Any]] = {
+            attr: value for attr, value in vars(cls).items() if isinstance(value, Relation)
+        }
+        cls.__table__ = TableInfo(name or snake_case(cls.__name__), schema, columns, relations)
 
     @classmethod
     def config(cls) -> Sequence[Constraint]:
@@ -112,6 +117,14 @@ def validate_tables(tables: Sequence[type[Table]], casing: Casing | None = None)
                 raise SchemaError(
                     f"{column.qualified_name} references {target.qualified_name}, "
                     f"but {target.table.__name__} is not in the schema"
+                )
+
+        for relation in info.relations.values():
+            link = relation.link()
+            if link.target not in registered:
+                raise SchemaError(
+                    f"{relation.qualified_name} points to {link.target.__name__}, "
+                    "which is not in the schema"
                 )
 
         for constraint in constraints:

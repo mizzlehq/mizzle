@@ -47,3 +47,11 @@ async def rows(qb: QueryBuilder, user: Users, post: Posts) -> None:
 
 def errors() -> None:
     eq(Users.id, "x")  # type: ignore[misc]  # pyright: ignore[reportArgumentType]
+
+
+async def relational(qb: QueryBuilder) -> None:
+    users = await qb.query(Users).find_many(with_={"posts": {"with_": {"author": True}}})
+    assert_type(users, list[Users])
+    assert_type(users[0].posts, list[Posts])
+    assert_type(users[0].posts[0].author, Users | None)
+    assert_type(await qb.query(Users).find_first(), Users | None)

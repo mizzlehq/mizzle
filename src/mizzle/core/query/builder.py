@@ -8,6 +8,7 @@ from typing import Any, overload
 from mizzle.core.errors import QueryError
 from mizzle.core.query.base import Runner
 from mizzle.core.query.insert import Insert
+from mizzle.core.query.relational import RelationalQuery
 from mizzle.core.query.select import Cte, Projection, Select
 from mizzle.core.query.update import Delete, Update
 from mizzle.core.schema.table import Table
@@ -49,6 +50,10 @@ class QueryBuilder:
     def with_(self, *ctes: Cte) -> QueryBuilder:
         """``WITH`` clause: ``db.with_(cte).select(...).from_(cte)``."""
         return QueryBuilder(self.runner, (*self.ctes, *ctes))
+
+    def query[T: Table](self, table: type[T]) -> RelationalQuery[T]:
+        """Relational queries: ``db.query(Users).find_many(with_={"posts": True})``."""
+        return RelationalQuery(self.runner, table)
 
     def insert[T: Table](self, table: type[T]) -> Insert[T]:
         return Insert(self.runner, table)

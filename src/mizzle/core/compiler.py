@@ -87,6 +87,9 @@ class Compiler:
         self.qualify_columns = qualify_columns
         self._params: list[Any] = []
         self._placeholders: list[Placeholder | None] = []
+        # Table -> alias maps for queries that alias tables (relational queries).
+        self._scopes: list[dict[type[Table], str]] = []
+        self._alias_count = 0
 
     def compile(self, node: Node) -> CompiledQuery:
         self._params, self._placeholders = [], []
@@ -138,6 +141,10 @@ class Compiler:
             case _:
                 raise QueryError(f"cannot write {type(value).__name__} as an SQL literal")
 
+    def new_alias(self) -> str:
+        self._alias_count += 1
+        return f"t{self._alias_count}"
+
     def table_name(self, table: type[Table]) -> str:
         info = table.__table__
         name = self.quote(info.name)
@@ -162,6 +169,9 @@ class Compiler:
             raise QueryError(f"column {node.attr!r} is not attached to a table")
         if not self.qualify_columns:
             return self.column_name(node)
+        for scope in reversed(self._scopes):
+            if node.table in scope:
+                return f"{self.quote(scope[node.table])}.{self.column_name(node)}"
         return f"{self.quote(node.table.__table__.name)}.{self.column_name(node)}"
 
     def visit_Param(self, node: Param[Any]) -> str:

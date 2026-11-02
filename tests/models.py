@@ -3,6 +3,7 @@
 import enum
 from typing import Any
 
+from mizzle.core.schema.relations import many, one
 from mizzle.core.schema.table import Table
 from mizzle.core.schema.types import integer, text, timestamp, varchar
 from mizzle.core.sql.raw import sql
@@ -21,9 +22,13 @@ class Users(Table, name="users"):
     role = pg_enum(Role).not_null().default(Role.USER)
     created_at = timestamp(tz=True).not_null().default(sql("now()"))
 
+    posts = many(lambda: Posts)
+
 
 class Posts(Table, name="posts"):
     id = serial().primary_key()
     author_id = integer().not_null().references(lambda: Users.id, on_delete="cascade")
     title = text().not_null()
     meta = jsonb[dict[str, Any]]()
+
+    author = one(lambda: Users, fields=lambda: [Posts.author_id], references=lambda: [Users.id])

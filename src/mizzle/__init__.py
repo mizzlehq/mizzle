@@ -26,6 +26,7 @@ from mizzle.core.schema.constraints import (
     unique,
     unique_index,
 )
+from mizzle.core.schema.relations import many, one
 from mizzle.core.schema.table import Table
 from mizzle.core.sql.operators import (
     and_,
@@ -103,12 +104,14 @@ __all__ = [
     "like",
     "lt",
     "lte",
+    "many",
     "max_",
     "min_",
     "ne",
     "not_",
     "not_exists",
     "not_in",
+    "one",
     "or_",
     "placeholder",
     "primary_key",
