@@ -14,3 +14,6 @@ src/mizzle/studio/ui.json
 
 # Local secrets (database URLs, passwords)
 .env
+
+# Local AI-assistant working notes (design specs, plans)
+docs/superpowers/

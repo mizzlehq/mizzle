@@ -13,7 +13,7 @@ Drizzle-style, fully typed, async ORM for Python and PostgreSQL.
   never include row values.
 
 Built for PostgreSQL first; other SQL databases plug in through the dialect layer
-(`src/mizzle/dialects/`). Design: `docs/superpowers/specs/2026-11-03-mizzle-design.md`.
+(`src/mizzle/dialects/`).
 
 ## Install
 
