@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 from dataclasses import replace
-from typing import Any, Literal, cast
+from typing import Any, Literal
 
 from mizzle.core.errors import QueryError
 from mizzle.core.schema.column import Column
@@ -30,9 +30,9 @@ from mizzle.core.sql.nodes import (
 )
 
 
-def _wrap(value: object, like: Node) -> Node:
+def _wrap(value: object, like: Expr[Any]) -> Node:
     """Turn a Python value into a Param; the column on the other side encodes it."""
-    column = cast("Column[Any]", like) if isinstance(like, Column) else None
+    column = like if isinstance(like, Column) else None
     if isinstance(value, Placeholder) and column is not None and value.column is None:
         return replace(value, column=column)
     if isinstance(value, Node):
