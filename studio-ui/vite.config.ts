@@ -11,7 +11,7 @@ export default defineConfig({
     outDir: resolve(import.meta.dirname, "../src/mizzle/studio/static"),
     emptyOutDir: true,
   },
-  // During `npm run dev`, forward API calls to a running `mizzle studio --port 4983`.
+  // During `pnpm dev`, forward API calls to a running `mizzle studio --port 4983`.
   server: { proxy: { "/api": "http://127.0.0.1:4983" } },
   resolve: {
     alias: {

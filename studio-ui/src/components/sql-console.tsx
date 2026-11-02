@@ -1,5 +1,5 @@
-import { useState } from "react"
 import { PlayIcon } from "lucide-react"
+import { useState } from "react"
 
 import {
   AlertDialog,
@@ -68,7 +68,7 @@ export function SqlConsole({ readOnly }: { readOnly: boolean }) {
           aria-label="SQL"
           className="min-h-32 font-mono text-sm"
         />
-        <div className="flex items-center gap-2 text-sm text-muted-foreground">
+        <div className="flex items-center gap-2 text-muted-foreground text-sm">
           <Button onClick={run} disabled={running}>
             <PlayIcon />
             {running ? "Running…" : "Run"}
@@ -83,7 +83,7 @@ export function SqlConsole({ readOnly }: { readOnly: boolean }) {
         </div>
       </div>
       {error && (
-        <div role="alert" className="border-b bg-destructive/10 px-4 py-2 text-sm text-destructive">
+        <div role="alert" className="border-b bg-destructive/10 px-4 py-2 text-destructive text-sm">
           {error}
         </div>
       )}
@@ -117,7 +117,7 @@ export function SqlConsole({ readOnly }: { readOnly: boolean }) {
           </Table>
         )}
         {result && result.columns.length === 0 && (
-          <p className="p-4 text-sm text-muted-foreground">Done. The statement returned no rows.</p>
+          <p className="p-4 text-muted-foreground text-sm">Done. The statement returned no rows.</p>
         )}
       </div>
       <AlertDialog open={confirm} onOpenChange={setConfirm}>

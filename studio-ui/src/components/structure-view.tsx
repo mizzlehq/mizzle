@@ -51,7 +51,7 @@ export function StructureView({ table }: { table: TableInfo }) {
   return (
     <div className="space-y-6 p-4">
       <section>
-        <h2 className="mb-2 text-sm font-medium">Columns</h2>
+        <h2 className="mb-2 font-medium text-sm">Columns</h2>
         <div className="rounded-lg border">
           <Table>
             <TableHeader>
@@ -70,7 +70,10 @@ export function StructureView({ table }: { table: TableInfo }) {
                     <TableCell className="font-medium">
                       <span className="inline-flex items-center gap-1.5">
                         {pk.has(c.name) && (
-                          <KeyRoundIcon className="size-3.5 text-amber-500" aria-label="primary key" />
+                          <KeyRoundIcon
+                            className="size-3.5 text-amber-500"
+                            aria-label="primary key"
+                          />
                         )}
                         {c.name}
                         {unique.has(c.name) && <Badge variant="outline">unique</Badge>}
@@ -84,7 +87,7 @@ export function StructureView({ table }: { table: TableInfo }) {
                     </TableCell>
                     <TableCell className="font-mono text-xs">{c.type}</TableCell>
                     <TableCell>{c.not_null ? "no" : "yes"}</TableCell>
-                    <TableCell className="font-mono text-xs text-muted-foreground">
+                    <TableCell className="font-mono text-muted-foreground text-xs">
                       {c.default ?? "—"}
                     </TableCell>
                   </TableRow>
@@ -95,9 +98,9 @@ export function StructureView({ table }: { table: TableInfo }) {
         </div>
       </section>
       <section>
-        <h2 className="mb-2 text-sm font-medium">Constraints and indexes</h2>
+        <h2 className="mb-2 font-medium text-sm">Constraints and indexes</h2>
         {constraints.length === 0 ? (
-          <p className="text-sm text-muted-foreground">None.</p>
+          <p className="text-muted-foreground text-sm">None.</p>
         ) : (
           <div className="rounded-lg border">
             <Table>

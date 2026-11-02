@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react"
+import { cn } from "cn"
 import {
   ArrowDownIcon,
   ArrowUpIcon,
@@ -10,9 +10,9 @@ import {
   Trash2Icon,
   XIcon,
 } from "lucide-react"
+import { useCallback, useEffect, useMemo, useState } from "react"
 import { toast } from "sonner"
-import { cn } from "cn"
-
+import { RowDialog } from "@/components/row-dialog"
 import {
   AlertDialog,
   AlertDialogCancel,
@@ -41,16 +41,15 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table"
-import { RowDialog } from "@/components/row-dialog"
 import {
   api,
   editText,
-  formatValue,
-  toDbText,
   type Filter,
   type FilterOp,
+  formatValue,
   type Row,
   type TableInfo,
+  toDbText,
 } from "@/lib/api"
 
 const PAGE_SIZE = 50
@@ -266,19 +265,24 @@ export function DataGrid({ table, readOnly }: { table: TableInfo; readOnly: bool
               Add row
             </Button>
           )}
-          <Button size="icon-sm" variant="ghost" onClick={() => void load()} aria-label="Reload rows">
+          <Button
+            size="icon-sm"
+            variant="ghost"
+            onClick={() => void load()}
+            aria-label="Reload rows"
+          >
             <RefreshCwIcon className={cn(loading && "animate-spin")} />
           </Button>
         </div>
       </div>
 
       {error && (
-        <div role="alert" className="border-b bg-destructive/10 px-4 py-2 text-sm text-destructive">
+        <div role="alert" className="border-b bg-destructive/10 px-4 py-2 text-destructive text-sm">
           {error}
         </div>
       )}
       {!readOnly && table.primary_key === null && (
-        <div className="border-b bg-muted px-4 py-2 text-xs text-muted-foreground">
+        <div className="border-b bg-muted px-4 py-2 text-muted-foreground text-xs">
           This table has no primary key, so rows cannot be edited or deleted here. Use the SQL
           console.
         </div>
@@ -304,7 +308,7 @@ export function DataGrid({ table, readOnly }: { table: TableInfo; readOnly: bool
                   <button
                     type="button"
                     onClick={() => sortBy(c.name)}
-                    className="inline-flex items-center gap-1 font-sans font-medium"
+                    className="inline-flex items-center gap-1 font-medium font-sans"
                     title={c.type}
                   >
                     {c.name}
@@ -394,7 +398,7 @@ export function DataGrid({ table, readOnly }: { table: TableInfo; readOnly: bool
         </Table>
       </div>
 
-      <div className="flex items-center gap-2 border-t px-4 py-2 text-sm text-muted-foreground">
+      <div className="flex items-center gap-2 border-t px-4 py-2 text-muted-foreground text-sm">
         {editable && <span>Double-click a cell to edit it.</span>}
         <span className="ml-auto">
           {total === 0 ? "0 rows" : `${offset + 1}–${offset + rows.length} of ${total}`}

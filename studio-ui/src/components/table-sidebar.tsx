@@ -1,12 +1,12 @@
-import { useMemo, useState } from "react"
-import { DatabaseIcon, RefreshCwIcon, SearchIcon, TableIcon, TerminalIcon } from "lucide-react"
 import { cn } from "cn"
+import { DatabaseIcon, RefreshCwIcon, SearchIcon, TableIcon, TerminalIcon } from "lucide-react"
+import { useMemo, useState } from "react"
 
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { ScrollArea } from "@/components/ui/scroll-area"
-import { tableKey, type TableInfo } from "@/lib/api"
+import { type TableInfo, tableKey } from "@/lib/api"
 
 type Props = {
   tables: TableInfo[]
@@ -68,7 +68,7 @@ export function TableSidebar({
         <nav className="px-2 pb-2">
           {groups.map(([schema, items]) => (
             <div key={schema} className="mb-2">
-              <div className="px-2 py-1 text-xs font-medium tracking-wide text-muted-foreground uppercase">
+              <div className="px-2 py-1 font-medium text-muted-foreground text-xs uppercase tracking-wide">
                 {schema}
               </div>
               {items.map((table) => {
@@ -93,7 +93,7 @@ export function TableSidebar({
             </div>
           ))}
           {groups.length === 0 && (
-            <p className="px-2 py-4 text-sm text-muted-foreground">No tables found.</p>
+            <p className="px-2 py-4 text-muted-foreground text-sm">No tables found.</p>
           )}
         </nav>
       </ScrollArea>

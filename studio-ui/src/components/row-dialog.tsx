@@ -11,7 +11,7 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog"
 import { Input } from "@/components/ui/input"
-import { api, toDbText, type Row, type TableInfo } from "@/lib/api"
+import { api, type Row, type TableInfo, toDbText } from "@/lib/api"
 
 type Props = {
   table: TableInfo
@@ -61,10 +61,12 @@ export function RowDialog({ table, open, onOpenChange, onCreated }: Props) {
               <label key={column.name} className="grid gap-1 text-sm">
                 <span className="flex items-baseline gap-2">
                   <span className="font-medium">{column.name}</span>
-                  <span className="font-mono text-xs text-muted-foreground">{column.type}</span>
-                  {column.not_null && column.default === null && !column.type.endsWith("serial") && (
-                    <span className="text-xs text-destructive">required</span>
-                  )}
+                  <span className="font-mono text-muted-foreground text-xs">{column.type}</span>
+                  {column.not_null &&
+                    column.default === null &&
+                    !column.type.endsWith("serial") && (
+                      <span className="text-destructive text-xs">required</span>
+                    )}
                 </span>
                 <Input
                   value={values[column.name] ?? ""}

@@ -1,5 +1,5 @@
-import { useCallback, useEffect, useState } from "react"
 import { DatabaseIcon } from "lucide-react"
+import { useCallback, useEffect, useState } from "react"
 
 import { DataGrid } from "@/components/data-grid"
 import { SqlConsole } from "@/components/sql-console"
@@ -7,7 +7,7 @@ import { StructureView } from "@/components/structure-view"
 import { TableSidebar } from "@/components/table-sidebar"
 import { Toaster } from "@/components/ui/sonner"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
-import { ApiError, api, tableKey, type Meta, type TableInfo } from "@/lib/api"
+import { ApiError, api, type Meta, type TableInfo, tableKey } from "@/lib/api"
 
 export function App() {
   const [meta, setMeta] = useState<Meta | null>(null)
@@ -46,8 +46,8 @@ export function App() {
       <div className="flex h-svh items-center justify-center bg-background p-6 text-foreground">
         <div className="max-w-md space-y-2 text-center">
           <DatabaseIcon className="mx-auto size-8 text-muted-foreground" />
-          <h1 className="font-heading text-lg font-semibold">mizzle studio</h1>
-          <p className="text-sm text-muted-foreground">{error}</p>
+          <h1 className="font-heading font-semibold text-lg">mizzle studio</h1>
+          <p className="text-muted-foreground text-sm">{error}</p>
         </div>
       </div>
     )
@@ -76,7 +76,11 @@ export function App() {
             <SqlConsole readOnly={readOnly} />
           </>
         ) : table ? (
-          <Tabs key={tableKey(table)} defaultValue="data" className="flex min-h-0 flex-1 flex-col gap-0">
+          <Tabs
+            key={tableKey(table)}
+            defaultValue="data"
+            className="flex min-h-0 flex-1 flex-col gap-0"
+          >
             <header className="flex items-center gap-4 border-b px-4 py-2">
               <h1 className="font-heading font-semibold">
                 <span className="text-muted-foreground">{table.schema}.</span>
@@ -95,7 +99,7 @@ export function App() {
             </TabsContent>
           </Tabs>
         ) : (
-          <div className="flex flex-1 items-center justify-center text-sm text-muted-foreground">
+          <div className="flex flex-1 items-center justify-center text-muted-foreground text-sm">
             No tables in this database yet. Run `mizzle push` or `mizzle migrate`.
           </div>
         )}

@@ -118,8 +118,9 @@ uv run pytest            # integration tests skip when MIZZLE_TEST_URL is unset
 uv run pyright && uv run mypy
 uv run ruff check && uv run ruff format --check
 
-cd studio-ui && npm ci && npm run build   # builds the UI into src/mizzle/studio/static
-npm run dev                               # UI dev server; proxies /api to `mizzle studio`
+cd studio-ui && pnpm install && pnpm build   # builds the UI into src/mizzle/studio/static
+pnpm dev                                     # UI dev server; proxies /api to `mizzle studio`
+pnpm check                                   # Biome: format, lint, sort imports (--write)
 ```
 
 Releases: push a `v*` tag. `.github/workflows/release.yml` builds the UI, packages it into
