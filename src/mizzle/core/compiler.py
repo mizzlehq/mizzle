@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING, Any, cast
 
 from mizzle.core.errors import QueryError
 from mizzle.core.naming import Casing
-from mizzle.core.schema.column import Column
+from mizzle.core.schema.column import MISSING, Column
 from mizzle.core.sql.nodes import (
     Between,
     BinaryOp,
@@ -32,7 +32,10 @@ from mizzle.core.sql.nodes import (
 )
 
 if TYPE_CHECKING:
+    from mizzle.core.query.insert import Insert, OnConflict
+    from mizzle.core.query.returning import Returning
     from mizzle.core.query.select import CteColumn, Select, Slot, Source
+    from mizzle.core.query.update import Delete, Update
     from mizzle.core.schema.table import Table
 
 
@@ -231,3 +234,69 @@ class Compiler:
                 lock += " NOWAIT"
             parts.append(lock)
         return " ".join(parts)
+
+    # -- INSERT / UPDATE / DELETE -----------------------------------------------------
+
+    def returning_clause(self, table: type[Table]) -> str:
+        raise QueryError(f"{type(self).__name__} does not support RETURNING")
+
+    def on_conflict_clause(self, table: type[Table], conflict: OnConflict) -> str:
+        raise QueryError(f"{type(self).__name__} does not support ON CONFLICT")
+
+    def set_list(self, table: type[Table], values: dict[str, Any]) -> str:
+        columns = table.__table__.columns
+        return ", ".join(
+            f"{self.column_name(columns[k])} = {self.value(columns[k], v)}"
+            for k, v in values.items()
+        )
+
+    def visit_Insert(self, node: Insert[Any]) -> str:
+        if not node.rows:
+            raise QueryError(f"insert into {node.table.__name__} has no values()")
+        columns = node.table.__table__.columns
+        used = [attr for attr in columns if any(attr in row for row in node.rows)]
+        head = f"INSERT INTO {self.table_name(node.table)}"
+        if not used and len(node.rows) == 1:
+            text = f"{head} DEFAULT VALUES"
+        else:
+            used = used or [next(iter(columns))]  # several all-default rows: VALUES (DEFAULT)
+            names = ", ".join(self.column_name(columns[a]) for a in used)
+            rows = ", ".join(
+                "("
+                + ", ".join(self._insert_value(columns[a], row.get(a, MISSING)) for a in used)
+                + ")"
+                for row in node.rows
+            )
+            text = f"{head} ({names}) VALUES {rows}"
+        if node.conflict is not None:
+            text += " " + self.on_conflict_clause(node.table, node.conflict)
+        return text
+
+    def _insert_value(self, column: Column[Any], value: Any) -> str:
+        return "DEFAULT" if value is MISSING else self.value(column, value)
+
+    def _require_filter(self, node: Update[Any] | Delete[Any], verb: str) -> None:
+        if node.where_ is None and not node.all_rows_:
+            raise QueryError(
+                f"{verb} on {node.table.__name__} has no .where(); "
+                "call .all_rows() to affect every row"
+            )
+
+    def visit_Update(self, node: Update[Any]) -> str:
+        if not node.values_:
+            raise QueryError(f"update({node.table.__name__}) needs .set(...)")
+        self._require_filter(node, "update")
+        text = f"UPDATE {self.table_name(node.table)} SET {self.set_list(node.table, node.values_)}"
+        if node.where_ is not None:
+            text += f" WHERE {self.visit(node.where_)}"
+        return text
+
+    def visit_Delete(self, node: Delete[Any]) -> str:
+        self._require_filter(node, "delete")
+        text = f"DELETE FROM {self.table_name(node.table)}"
+        if node.where_ is not None:
+            text += f" WHERE {self.visit(node.where_)}"
+        return text
+
+    def visit_Returning(self, node: Returning[Any]) -> str:
+        return f"{self.visit(node.query)} {self.returning_clause(node.table)}"

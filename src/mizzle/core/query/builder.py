@@ -1,4 +1,4 @@
-"""Entry points for building statements: ``select``, ``with_`` (and later insert/update/delete)."""
+"""Entry points for building statements: select, insert, update, delete, with_."""
 
 from __future__ import annotations
 
@@ -7,7 +7,9 @@ from typing import Any, overload
 
 from mizzle.core.errors import QueryError
 from mizzle.core.query.base import Runner
+from mizzle.core.query.insert import Insert
 from mizzle.core.query.select import Cte, Projection, Select
+from mizzle.core.query.update import Delete, Update
 from mizzle.core.schema.table import Table
 from mizzle.core.sql.nodes import Expr
 
@@ -47,6 +49,15 @@ class QueryBuilder:
     def with_(self, *ctes: Cte) -> QueryBuilder:
         """``WITH`` clause: ``db.with_(cte).select(...).from_(cte)``."""
         return QueryBuilder(self.runner, (*self.ctes, *ctes))
+
+    def insert[T: Table](self, table: type[T]) -> Insert[T]:
+        return Insert(self.runner, table)
+
+    def update[T: Table](self, table: type[T]) -> Update[T]:
+        return Update(self.runner, table)
+
+    def delete[T: Table](self, table: type[T]) -> Delete[T]:
+        return Delete(self.runner, table)
 
     @overload
     def select(self) -> SelectAll: ...
