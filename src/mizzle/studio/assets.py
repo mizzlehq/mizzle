@@ -8,7 +8,8 @@ HTTPS, checked against that hash, unpacked safely, and cached per version.
 Lookup order:
 1. ``--ui-path`` / ``MIZZLE_STUDIO_UI``: a folder with a built UI (offline use).
 2. ``src/mizzle/studio/static``: a local ``pnpm build`` (development).
-3. The per-version cache, downloading into it if needed.
+3. ``<venv>/share/mizzle/studio`` (or the user cache outside a venv), downloading into
+   it if needed.
 """
 
 from __future__ import annotations
@@ -66,6 +67,25 @@ def read_manifest(path: Path = MANIFEST) -> Manifest | None:
     if len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
         raise StudioUIError(f"{path}: sha256 must be 64 lowercase hex characters")
     return Manifest(version, url, digest)
+
+
+def _writable(path: Path) -> bool:
+    """True if ``path`` (or its nearest existing parent) can be written to."""
+    probe = path
+    while not probe.exists():
+        probe = probe.parent
+    return os.access(probe, os.W_OK)
+
+
+def install_root() -> Path:
+    """Where the downloaded UI lives: inside the active virtual environment (removed
+    with it, one copy per project), else the per-user cache. Read-only venvs, as in
+    some container images, also fall back to the user cache."""
+    if sys.prefix != sys.base_prefix:  # running inside a venv
+        venv_dir = Path(sys.prefix) / "share" / "mizzle" / "studio"
+        if _writable(venv_dir):
+            return venv_dir
+    return cache_root()
 
 
 def cache_root() -> Path:
@@ -192,7 +212,7 @@ def ui_path(override: str | None = None, *, fetch: Fetch = _https_fetch) -> Path
             "`pnpm install && pnpm build` in studio-ui/, or pass --ui-path"
         )
     try:
-        return download(manifest, cache_root(), fetch)
+        return download(manifest, install_root(), fetch)
     except OSError as exc:
         raise StudioUIError(
             f"could not download the Studio UI from {manifest.url}: {exc}. "

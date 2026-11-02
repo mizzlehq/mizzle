@@ -32,7 +32,11 @@ def make_dist(root: Path) -> Path:
 def zip_with(path: Path, entries: dict[str, bytes], *, symlink: str | None = None) -> bytes:
     with zipfile.ZipFile(path, "w") as zf:
         for name, data in entries.items():
-            zf.writestr(name, data)
+            # Set .filename directly: ZipInfo(name) turns "\\" into "/" on Windows,
+            # which would silently drop the backslash this test needs to write.
+            info = zipfile.ZipInfo("placeholder")
+            info.filename = name
+            zf.writestr(info, data)
         if symlink is not None:
             info = zipfile.ZipInfo(symlink)
             info.external_attr = (stat.S_IFLNK | 0o777) << 16
@@ -150,3 +154,15 @@ def test_ui_path_lookup_order(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -
 def test_non_https_download_is_refused() -> None:
     with pytest.raises(StudioUIError, match="non-https"):
         assets._https_fetch("http://example.com/ui.zip")
+
+
+def test_install_root_prefers_the_venv(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import sys
+
+    monkeypatch.setattr(sys, "prefix", str(tmp_path / "venv"))
+    monkeypatch.setattr(sys, "base_prefix", str(tmp_path / "python"))
+    assert assets.install_root() == tmp_path / "venv" / "share" / "mizzle" / "studio"
+    monkeypatch.setattr(assets, "_writable", lambda _path: False)  # read-only venv
+    assert assets.install_root() == assets.cache_root()
+    monkeypatch.setattr(sys, "prefix", sys.base_prefix)  # no venv
+    assert assets.install_root() == assets.cache_root()

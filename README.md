@@ -31,7 +31,7 @@ A complete example app (FastAPI, migrations, seed data, tests) lives in
 
 ```bash
 pip install mizzle            # ORM + migration CLI
-pip install "mizzle[studio]"  # + Studio (its UI downloads on first run, ~250 KB)
+pip install "mizzle[studio]"  # + Studio (its UI downloads into your venv on first run, ~250 KB)
 ```
 
 ## Schema
