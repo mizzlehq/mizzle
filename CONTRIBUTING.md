@@ -34,7 +34,9 @@ the GitHub Release and verifies its SHA-256.
 ## Releasing
 
 1. Bump the version in `pyproject.toml` and `src/mizzle/__init__.py`.
-2. Push a tag: `git tag -a vX.Y.Z -m "mizzle X.Y.Z" && git push origin vX.Y.Z`.
+2. Add a `## X.Y.Z` section to `CHANGELOG.md`. It becomes the GitHub Release notes, and the
+   release stops early if it is missing.
+3. Push a tag: `git tag -a vX.Y.Z -m "mizzle X.Y.Z" && git push origin vX.Y.Z`.
 
 `.github/workflows/release.yml` builds the UI archive, attaches it to a GitHub Release, and
 publishes the wheel to PyPI with trusted publishing.

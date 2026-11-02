@@ -11,6 +11,15 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Release notes from CHANGELOG.md (stop if this version has none)
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          mkdir -p release
+          awk -v v="$VERSION" '$0 == "## " v {f=1; next} /^## /{f=0} f' CHANGELOG.md > release/notes.md
+          if ! grep -q '[^[:space:]]' release/notes.md; then
+            echo "CHANGELOG.md has no '## $VERSION' section; add release notes first."; exit 1
+          fi
+          cat release/notes.md
       - uses: pnpm/action-setup@v4
         with:
           package_json_file: studio-ui/package.json
@@ -31,7 +40,7 @@ jobs:
           ZIP="mizzle-studio-$VERSION.zip"
           URL="https://github.com/$GITHUB_REPOSITORY/releases/download/$GITHUB_REF_NAME/$ZIP"
           uv run python -m mizzle.studio.assets src/mizzle/studio/static "$ZIP" --version "$VERSION" --url "$URL"
-          mkdir -p release && mv "$ZIP" release/
+          mv "$ZIP" release/
           rm -rf src/mizzle/studio/static  # the UI is downloaded, never shipped in the wheel
       - run: uv build
       - name: Check the wheel has ui.json and no UI files
@@ -60,6 +69,7 @@ jobs:
           path: release/
       - uses: softprops/action-gh-release@v2
         with:
+          body_path: release/notes.md
           files: release/*.zip
 
   publish:
