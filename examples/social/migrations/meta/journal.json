@@ -1,0 +1,18 @@
+{
+  "version": 1,
+  "dialect": "postgresql",
+  "entries": [
+    {
+      "index": 1,
+      "name": "0001_social_schema",
+      "hash": "677d274c1857b9d6687b9e559c6c68178c7b501ef8422486f18fe9d6f4084ad1",
+      "created_at": "2026-11-02T22:04:07+00:00"
+    },
+    {
+      "index": 2,
+      "name": "0002_create_table_bookmarks",
+      "hash": "4681b68d74f1f09b3b61873273c6c2f2833ae5e4cc391744542ada2861526869",
+      "created_at": "2026-11-02T22:06:07+00:00"
+    }
+  ]
+}

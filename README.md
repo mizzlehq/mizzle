@@ -15,6 +15,9 @@ Drizzle-style, fully typed, async ORM for Python and PostgreSQL.
 Built for PostgreSQL first; other SQL databases plug in through the dialect layer
 (`src/mizzle/dialects/`).
 
+A complete example app (FastAPI, migrations, seed data, tests) lives in
+[`examples/social`](examples/social).
+
 ## Install
 
 ```bash

@@ -80,3 +80,6 @@ jobs:
       - uses: astral-sh/setup-uv@v6
       - run: uv sync --python ${{ matrix.python }}
       - run: uv run pytest --cov --cov-report=term-missing
+      - name: Example app (examples/social) against Postgres
+        working-directory: examples/social
+        run: uv sync && uv run basedpyright && uv run pytest

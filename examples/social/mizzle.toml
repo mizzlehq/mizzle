@@ -1,0 +1,6 @@
+# Module(s) with your Table classes.
+schema = "social.schema"
+# Migrations folder. Commit it.
+out = "migrations"
+# Environment variable holding the database URL (never put the URL in this file).
+url_env = "DATABASE_URL"
