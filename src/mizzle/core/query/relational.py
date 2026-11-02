@@ -16,7 +16,7 @@ from typing import TypedDict, cast, override
 
 from mizzle.core.compiler import CompiledQuery
 from mizzle.core.errors import QueryError
-from mizzle.core.query.base import Executable, Row, Runner, decode_table
+from mizzle.core.query.base import Executable, Row, Runner
 from mizzle.core.schema.column import ColumnBase
 from mizzle.core.schema.relations import Link
 from mizzle.core.schema.table import Table
@@ -24,6 +24,7 @@ from mizzle.core.sql.nodes import Condition, ExprBase, Node, OrderBy
 
 
 class WithOptions(TypedDict, total=False):
+    columns: Sequence[ColumnBase]
     where: Condition
     order_by: OrderItem | Sequence[OrderItem]
     limit: int
@@ -40,6 +41,7 @@ type Json = bool | int | float | str | list[Json] | dict[str, Json] | None
 @dataclass(frozen=True)
 class LoadPlan:
     table: type[Table]
+    columns: tuple[tuple[str, ColumnBase], ...]  # (attribute, column) actually loaded
     where: Condition | None = None
     order_by: tuple[OrderItem, ...] = ()
     limit: int | None = None
@@ -61,9 +63,26 @@ def _count(name: str, value: int | None) -> int | None:
     return value
 
 
+def _columns(
+    table: type[Table], columns: Sequence[ColumnBase] | None
+) -> tuple[tuple[str, ColumnBase], ...]:
+    """All columns, or only the requested ones (in table order, each once)."""
+    available = table.__table__.columns
+    if columns is None:
+        return tuple(available.items())
+    if not columns:
+        raise QueryError(f"columns for {table.__name__} must not be empty")
+    for column in columns:
+        if column.table is not table:
+            raise QueryError(f"{column.qualified_name} is not a column of {table.__name__}")
+    wanted = {id(c) for c in columns}
+    return tuple((attr, c) for attr, c in available.items() if id(c) in wanted)
+
+
 def build_plan(
     table: type[Table],
     *,
+    columns: Sequence[ColumnBase] | None = None,
     where: Condition | None = None,
     order_by: OrderArg = None,
     limit: int | None = None,
@@ -86,6 +105,7 @@ def build_plan(
             )
         child = build_plan(
             link.target,
+            columns=opts.get("columns"),
             where=opts.get("where"),
             order_by=opts.get("order_by"),
             limit=opts.get("limit"),
@@ -94,6 +114,7 @@ def build_plan(
         children.append((name, link, child))
     return LoadPlan(
         table,
+        _columns(table, columns),
         where,
         _order(order_by),
         _count("limit", limit),
@@ -148,13 +169,13 @@ def _json_list(value: Json, what: str) -> list[Json]:
 
 def _decode_json_row(plan: LoadPlan, value: Json) -> Table:
     values = _json_list(value, plan.table.__name__)
-    columns = plan.table.__table__.columns
     data = {
         attr: col.decode(_from_json(col, v))
-        for (attr, col), v in zip(columns.items(), values, strict=False)
+        for (attr, col), v in zip(plan.columns, values, strict=False)
     }
     row = plan.table.from_db(data)
-    for (name, link, child), nested in zip(plan.children, values[len(columns) :], strict=True):
+    nested_values = values[len(plan.columns) :]
+    for (name, link, child), nested in zip(plan.children, nested_values, strict=True):
         row.__dict__[name] = _decode_child(link, child, nested)
     return row
 
@@ -167,9 +188,11 @@ def _decode_child(link: Link, plan: LoadPlan, value: Json) -> list[Table] | Tabl
 
 
 def decode_root(plan: LoadPlan, row: Row) -> Table:
-    obj = decode_table(plan.table, row, 0)
-    assert obj is not None  # a root row always has its primary key
-    index = len(plan.table.__table__.columns)
+    # Columns that were not loaded are absent; reading them raises a clear AttributeError.
+    obj = plan.table.from_db(
+        {attr: col.decode(row[i]) for i, (attr, col) in enumerate(plan.columns)}
+    )
+    index = len(plan.columns)
     for name, link, child in plan.children:
         nested = cast(Json, row[index])  # built with json_agg / json_build_array
         obj.__dict__[name] = _decode_child(link, child, nested)
@@ -215,23 +238,34 @@ class RelationalQuery[T: Table]:
     def find_many(
         self,
         *,
+        columns: Sequence[ColumnBase] | None = None,
         where: Condition | None = None,
         with_: With | None = None,
         order_by: OrderArg = None,
         limit: int | None = None,
         offset: int | None = None,
     ) -> RelationalSelect[T]:
+        """``columns=[...]`` loads only those columns; reading others raises AttributeError."""
         plan = build_plan(
-            self._table, where=where, order_by=order_by, limit=limit, offset=offset, with_=with_
+            self._table,
+            columns=columns,
+            where=where,
+            order_by=order_by,
+            limit=limit,
+            offset=offset,
+            with_=with_,
         )
         return RelationalSelect(self._runner, plan)
 
     def find_first(
         self,
         *,
+        columns: Sequence[ColumnBase] | None = None,
         where: Condition | None = None,
         with_: With | None = None,
         order_by: OrderArg = None,
     ) -> RelationalFirst[T]:
-        plan = build_plan(self._table, where=where, order_by=order_by, limit=1, with_=with_)
+        plan = build_plan(
+            self._table, columns=columns, where=where, order_by=order_by, limit=1, with_=with_
+        )
         return RelationalFirst(self._runner, plan)

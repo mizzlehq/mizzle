@@ -88,10 +88,7 @@ class PostgresCompiler(Compiler):
             a = self.quote(alias)
             # ponytail: json_build_array takes at most 100 arguments, so a table loaded
             # through with_ can have at most 100 columns + relations.
-            values = [
-                self.json_value(f"{a}.{self.column_name(c)}", c)
-                for c in plan.table.__table__.columns.values()
-            ]
+            values = [self.json_value(f"{a}.{self.column_name(c)}", c) for _, c in plan.columns]
             values += [self._child(lk, child, alias) for _, lk, child in plan.children]
             row = f"json_build_array({', '.join(values)})"
             conditions = [
@@ -120,7 +117,7 @@ class PostgresCompiler(Compiler):
         alias = self.new_alias()
         self._scopes.append({plan.table: alias})
         try:
-            columns = [self.visit(c) for c in plan.table.__table__.columns.values()]
+            columns = [self.visit(c) for _, c in plan.columns]
             columns += [self._child(link, child, alias) for _, link, child in plan.children]
             text = f"SELECT {', '.join(columns)} FROM {self.table_name(plan.table)} AS "
             text += self.quote(alias)

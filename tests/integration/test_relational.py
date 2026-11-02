@@ -89,9 +89,28 @@ async def test_one_relation_and_not_loaded(db: Database) -> None:
         _ = posts[0].author.posts if posts[0].author else None
 
 
+async def test_columns_load_only_what_is_asked(db: Database) -> None:
+    await seed(db)
+    [ann] = await db.query(Users).find_many(
+        columns=[Users.email, Users.id],
+        where=eq(Users.email, "ann"),
+        with_={"posts": {"columns": [Posts.title], "order_by": Posts.title}},
+    )
+    assert (ann.id, ann.email) == (ann.id, "ann")
+    assert [p.title for p in ann.posts] == ["a1", "a2", "a3"]
+    with pytest.raises(AttributeError, match=r"Users\.bio was not selected"):
+        _ = ann.bio
+    with pytest.raises(AttributeError, match=r"Posts\.id was not selected"):
+        _ = ann.posts[0].id
+
+
 def test_bad_with_options(db: Database) -> None:
     with pytest.raises(QueryError, match="no relation 'comments'"):
         db.query(Users).find_many(with_={"comments": True})
+    with pytest.raises(QueryError, match="not a column of Users"):
+        db.query(Users).find_many(columns=[Posts.id])
+    with pytest.raises(QueryError, match="must not be empty"):
+        db.query(Users).find_many(columns=[])
     with pytest.raises(QueryError, match="limit/order_by need many"):
         db.query(Posts).find_many(with_={"author": {"limit": 1}})
 
