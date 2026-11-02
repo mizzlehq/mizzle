@@ -34,6 +34,7 @@ testpaths = ["tests"]
 line-length = 100
 target-version = "py312"
 per-file-target-version = { "tests/**/*_py314.py" = "py314" }
+extend-exclude = ["docs"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
@@ -48,7 +49,7 @@ ignore = ["tests/**/*_py314.py"]
 [tool.mypy]
 strict = true
 python_version = "3.12"
-files = ["src", "tests/typing"]
+files = ["src"]
 
 [tool.coverage.run]
 source = ["mizzle"]
