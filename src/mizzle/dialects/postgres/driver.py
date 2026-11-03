@@ -17,6 +17,7 @@ from mizzle.core.errors import (
     ForeignKeyViolation,
     MizzleError,
     NotNullViolation,
+    QueryTimeout,
     SerializationFailure,
     UniqueViolation,
 )
@@ -52,6 +53,10 @@ def map_error(exc: BaseException, sql: str) -> MizzleError | None:
             )
         case pg.SerializationError() | pg.DeadlockDetectedError():
             return SerializationFailure(exc.message, sql=sql, original=exc)
+        case pg.QueryCanceledError():  # statement_timeout on the server
+            return QueryTimeout(exc.message, sql=sql, original=exc)
+        case TimeoutError():  # client-side timeout; asyncpg cancels the statement
+            return QueryTimeout("query timed out", sql=sql, original=exc)
         case pg.PostgresConnectionError() | pg.ConnectionDoesNotExistError() | OSError():
             return DbConnectionError(f"{type(exc).__name__}: {exc}", sql=sql, original=exc)
         case asyncpg.PostgresError() if not exc.message:
@@ -92,21 +97,29 @@ class PostgresConnection:
     def __init__(self, conn: asyncpg.Connection | PoolConnectionProxy) -> None:
         self._conn = conn
 
-    async def fetch(self, sql: str, params: Sequence[object]) -> list[Row]:
+    async def fetch(
+        self, sql: str, params: Sequence[object], timeout: float | None = None
+    ) -> list[Row]:
         try:
-            return list(await self._conn.fetch(sql, *params))
+            return list(await self._conn.fetch(sql, *params, timeout=timeout))
         except Exception as exc:
             raise _translate(exc, sql) from None
 
-    async def fetch_dicts(self, sql: str, params: Sequence[object]) -> list[dict[str, object]]:
+    async def fetch_dicts(
+        self, sql: str, params: Sequence[object], timeout: float | None = None
+    ) -> list[dict[str, object]]:
         try:
-            return [dict(record) for record in await self._conn.fetch(sql, *params)]
+            return [
+                dict(record) for record in await self._conn.fetch(sql, *params, timeout=timeout)
+            ]
         except Exception as exc:
             raise _translate(exc, sql) from None
 
-    async def execute(self, sql: str, params: Sequence[object]) -> int:
+    async def execute(
+        self, sql: str, params: Sequence[object], timeout: float | None = None
+    ) -> int:
         try:
-            return _rowcount(await self._conn.execute(sql, *params))
+            return _rowcount(await self._conn.execute(sql, *params, timeout=timeout))
         except Exception as exc:
             raise _translate(exc, sql) from None
 
@@ -135,14 +148,24 @@ class PostgresDriver:
 
     @classmethod
     async def connect(
-        cls, url: str, *, pool_size: int = 10, statement_cache_size: int = 100
+        cls,
+        url: str,
+        *,
+        pool_size: int = 10,
+        statement_cache_size: int = 100,
+        pool_min_size: int = 1,
+        max_idle: float = 300.0,
+        query_timeout: float | None = None,
     ) -> PostgresDriver:
-        """``statement_cache_size=0`` is needed behind PgBouncer in transaction mode."""
+        """``statement_cache_size=0`` is needed behind PgBouncer in transaction mode.
+        ``max_idle`` closes connections unused for that many seconds (0 keeps them)."""
         try:
             pool = await asyncpg.create_pool(
                 url,
-                min_size=1,
+                min_size=pool_min_size,
                 max_size=pool_size,
+                max_inactive_connection_lifetime=max_idle,
+                command_timeout=query_timeout,
                 statement_cache_size=statement_cache_size,
                 init=_init_connection,
             )

@@ -28,10 +28,22 @@ class PostgresDialect:
         return PostgresCompiler(casing)
 
     async def connect(
-        self, url: str, *, pool_size: int, statement_cache_size: int
+        self,
+        url: str,
+        *,
+        pool_size: int,
+        statement_cache_size: int,
+        pool_min_size: int = 1,
+        max_idle: float = 300.0,
+        query_timeout: float | None = None,
     ) -> PostgresDriver:
         return await PostgresDriver.connect(
-            url, pool_size=pool_size, statement_cache_size=statement_cache_size
+            url,
+            pool_size=pool_size,
+            statement_cache_size=statement_cache_size,
+            pool_min_size=pool_min_size,
+            max_idle=max_idle,
+            query_timeout=query_timeout,
         )
 
     def column_type(self, column: ColumnBase) -> str:

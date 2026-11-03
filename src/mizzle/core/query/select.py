@@ -211,4 +211,6 @@ class Select[R](SelectBase, Executable[list[R]]):
     @override
     async def run_compiled(self, compiled: CompiledQuery) -> list[R]:
         # decode() builds exactly the shape R describes (rows, tuples or dicts).
-        return [cast(R, self.decode(row)) for row in await self.runner.fetch(compiled)]
+        # FOR UPDATE takes row locks, so only a lock-free SELECT may go to a replica.
+        rows = await self.runner.fetch(compiled, read_only=self.lock is None)
+        return [cast(R, self.decode(row)) for row in rows]

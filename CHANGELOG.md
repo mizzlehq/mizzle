@@ -1,5 +1,32 @@
 # Changelog
 
+## 0.2.0
+
+**Read replicas**
+
+- `Database.connect(url, replicas=[...])` opens a pool to each read replica. Plain selects
+  and relational queries go to the replicas in turn. Writes, `FOR UPDATE`, raw `execute()`,
+  transactions and migrations always use the primary.
+- `db.primary` sends a query to the primary, for reading your own writes while replicas lag:
+  `await db.primary.select().from_(Users)`.
+- If a replica cannot give a connection, the read goes to the primary.
+
+**Pool settings**
+
+- `pool_min_size` (default 1) and `max_idle` (seconds before an unused connection closes,
+  default 300) join `pool_size`.
+
+**Query timeouts**
+
+- `query_timeout=` on `Database.connect` cancels any statement that runs longer.
+- `db.with_timeout(seconds)` changes it for some queries, also inside a transaction.
+- A timeout raises the new `QueryTimeout` error. Postgres `statement_timeout` raises it too.
+
+**Retries**
+
+- `await db.retry(fn, attempts=3)` runs `fn` again on `SerializationFailure` (serialization
+  conflicts and deadlocks), with backoff. `fn` should open its own transaction.
+
 ## 0.1.1
 
 - PyPI page: the README now shows the logo and its links work (they used repo-relative paths).

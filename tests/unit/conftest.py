@@ -16,12 +16,14 @@ class FakeRunner:
         self.rows: list[tuple[Any, ...]] = []
         self.rowcount = 0
         self.executed: list[CompiledQuery] = []
+        self.read_only: list[bool] = []
 
     def compile(self, node: Node) -> CompiledQuery:
         return PostgresCompiler().compile(node)
 
-    async def fetch(self, query: CompiledQuery) -> list[Row]:
+    async def fetch(self, query: CompiledQuery, *, read_only: bool = False) -> list[Row]:
         self.executed.append(query)
+        self.read_only.append(read_only)
         return list(self.rows)
 
     async def run(self, query: CompiledQuery) -> int:

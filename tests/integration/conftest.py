@@ -9,6 +9,7 @@ from tests.models import Posts, Users
 
 # Until the migration kit exists, tests create the schema with plain DDL.
 DDL = """
+DROP SCHEMA IF EXISTS replica CASCADE;  -- left by test_replicas if it fails
 DROP TABLE IF EXISTS posts, users CASCADE;
 DROP TYPE IF EXISTS role;
 CREATE TYPE role AS ENUM ('admin', 'user');

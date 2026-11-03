@@ -1,6 +1,6 @@
 [project]
 name = "mizzle"
-version = "0.1.1"
+version = "0.2.0"
 description = "Fully typed async ORM for PostgreSQL: SQL-like queries, schema-driven migrations and a data studio"
 keywords = ["orm", "postgresql", "asyncpg", "async", "sql", "query-builder", "migrations", "typed"]
 classifiers = [

@@ -12,6 +12,7 @@ from mizzle.core.errors import (
     MizzleError,
     NotNullViolation,
     QueryError,
+    QueryTimeout,
     RelationNotLoaded,
     SchemaError,
     SerializationFailure,
@@ -61,7 +62,7 @@ from mizzle.core.sql.operators import (
 from mizzle.core.sql.raw import sql
 from mizzle.db import Database, QueryEvent, Session
 
-__version__ = "0.1.1"
+__version__ = "0.2.0"
 
 __all__ = [
     "CheckViolation",
@@ -78,6 +79,7 @@ __all__ = [
     "NotNullViolation",
     "QueryError",
     "QueryEvent",
+    "QueryTimeout",
     "RelationNotLoaded",
     "SchemaError",
     "SerializationFailure",

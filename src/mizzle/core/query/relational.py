@@ -215,7 +215,7 @@ class RelationalStatement(Node):
 class RelationalSelect[T: Table](RelationalStatement, Executable[list[T]]):
     @override
     async def run_compiled(self, compiled: CompiledQuery) -> list[T]:
-        rows = await self.runner.fetch(compiled)
+        rows = await self.runner.fetch(compiled, read_only=True)
         return [cast(T, decode_root(self.plan, row)) for row in rows]
 
 
@@ -223,7 +223,7 @@ class RelationalSelect[T: Table](RelationalStatement, Executable[list[T]]):
 class RelationalFirst[T: Table](RelationalStatement, Executable[T | None]):
     @override
     async def run_compiled(self, compiled: CompiledQuery) -> T | None:
-        rows = await self.runner.fetch(compiled)
+        rows = await self.runner.fetch(compiled, read_only=True)
         return cast(T, decode_root(self.plan, rows[0])) if rows else None
 
 

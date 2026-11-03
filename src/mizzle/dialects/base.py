@@ -21,11 +21,18 @@ type IsolationLevel = Literal["read committed", "repeatable read", "serializable
 
 
 class Connection(Protocol):
-    """One database connection. Errors are raised as mizzle errors, with SQL attached."""
+    """One database connection. Errors are raised as mizzle errors, with SQL attached.
+    ``timeout`` (seconds) overrides the pool's ``query_timeout`` for one statement."""
 
-    async def fetch(self, sql: str, params: Sequence[object]) -> list[Row]: ...
-    async def fetch_dicts(self, sql: str, params: Sequence[object]) -> list[dict[str, object]]: ...
-    async def execute(self, sql: str, params: Sequence[object]) -> int: ...
+    async def fetch(
+        self, sql: str, params: Sequence[object], timeout: float | None = None
+    ) -> list[Row]: ...
+    async def fetch_dicts(
+        self, sql: str, params: Sequence[object], timeout: float | None = None
+    ) -> list[dict[str, object]]: ...
+    async def execute(
+        self, sql: str, params: Sequence[object], timeout: float | None = None
+    ) -> int: ...
     def transaction(
         self, isolation: IsolationLevel | None = None, readonly: bool = False
     ) -> AbstractAsyncContextManager[None]: ...
@@ -44,7 +51,16 @@ class Dialect(Protocol):
 
     # -- queries ----------------------------------------------------------------------
     def compiler(self, casing: Casing | None = None) -> Compiler: ...
-    async def connect(self, url: str, *, pool_size: int, statement_cache_size: int) -> Driver: ...
+    async def connect(
+        self,
+        url: str,
+        *,
+        pool_size: int,
+        statement_cache_size: int,
+        pool_min_size: int = 1,
+        max_idle: float = 300.0,
+        query_timeout: float | None = None,
+    ) -> Driver: ...
 
     # -- schema snapshots (normalized so a schema and its database compare equal) -----
     def column_type(self, column: ColumnBase) -> str: ...

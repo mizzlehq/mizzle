@@ -62,6 +62,10 @@ class ConnectionError(DatabaseError):
     pass
 
 
+class QueryTimeout(DatabaseError):
+    """The statement ran longer than its timeout and was cancelled."""
+
+
 class MigrationError(MizzleError):
     pass
 
