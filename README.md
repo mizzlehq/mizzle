@@ -91,6 +91,14 @@ Writes, transactions and `FOR UPDATE` always use the primary. Behind PgBouncer i
 transaction mode, pass `statement_cache_size=0`. CI tests a real streaming replica and
 PgBouncer on every change.
 
+## What else is in the box
+
+Joins, subqueries, CTEs, window functions, `UNION`, `CASE` and typed SQL functions;
+identity, generated and auto-updated columns; pgvector and full-text search; views, row-level
+security, roles, functions and triggers in migrations; streaming, `COPY`, `LISTEN`/`NOTIFY`;
+read replicas, timeouts and retries. See the
+[changelog](https://github.com/mizzlehq/mizzle/blob/main/CHANGELOG.md) for examples.
+
 ## Learn more
 
 The [example app](https://github.com/mizzlehq/mizzle/tree/main/examples/social) is a

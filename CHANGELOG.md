@@ -2,6 +2,63 @@
 
 ## 0.2.0
 
+**Upgrading from 0.1**
+
+- Generated constraint names longer than 63 bytes now keep their `_key`/`_fkey`/`_pkey`
+  suffix. The first `generate` after upgrading renames those constraints (nothing is
+  dropped).
+- `push` and `generate` now see non-btree indexes (GIN, GiST, HNSW...). One that exists in
+  the database but not in the schema is dropped, like btree indexes always were.
+
+**Queries**
+
+- Arithmetic on number columns: `db.update(Items).set(stock=Items.stock - 1)`.
+- `case_().when(cond, value).else_(default)`, `coalesce`, `nullif`, `greatest`, `least`,
+  `cast(expr, text())`.
+- Functions: `lower`, `upper`, `trim`, `length`, `concat`, `abs_`, `round_`, `now`,
+  `current_date`, `date_trunc`, `extract`, and `func[T]("name", ...)` for any other
+  function (the name is checked, values are always bound).
+- `q1.union(q2)`, `union_all`, `intersect`, `intersect_all`, `except_`, `except_all`.
+- Window functions: `row_number()`, `rank()`, `dense_rank()`, `lag`, `lead`,
+  `first_value`... and aggregates with `.over(partition_by=..., order_by=..., frame=...)`.
+- Table aliases for self-joins: `manager = alias(Employees, "manager")`.
+- Full-text search: `to_tsvector`, `websearch_to_tsquery` (and friends), `ts_rank`,
+  `matches(vector, query)`.
+- `not_like`, `not_ilike`, `regex`, `not_regex`.
+
+**Columns**
+
+- Identity columns: `integer().generated_always_as_identity()`,
+  `.generated_by_default_as_identity(start=, increment=)`.
+- Generated columns: `.generated_always_as(sql("..."))`, stored or virtual (PostgreSQL 18).
+- `.on_update(fn)` and `.on_update_now()`: set on every `update()` and upsert, like
+  Prisma's `@updatedAt`.
+- pgvector: `vector(1536)`, `halfvec(n)`, `l2_distance`, `cosine_distance`,
+  `inner_product`; migrations create the extension.
+- `tsvector()` and `tsquery()` columns.
+- `timestamp()` and `time()` take `precision=`.
+- `index(...).using("gin" | "hnsw" | ..., opclass)` and `.with_(...)` storage options.
+
+**Database objects in migrations**
+
+- Extensions: `extension("pg_trgm")`.
+- Views and materialized views (`db.refresh(View)`), queryable like tables.
+- Row-level security: `rls()` and `policy(...)` in `config()`.
+- Roles: `role("admin", create_role=True)`; mizzle never drops roles it does not manage.
+- Functions and triggers: `function(...)`, `trigger(...)`.
+- `mizzle.supabase`: Supabase roles, `auth_uid()`, `auth_jwt()`, `auth_role()`, and
+  `crud_policy(...)` like Drizzle's.
+
+**Bulk and streaming**
+
+- `async for row in query.stream(batch_size=1000)` reads any number of rows with little
+  memory (selects and relational queries).
+- `db.copy_into(Users, rows)` loads rows with COPY (~3x faster than INSERT);
+  `db.copy_from(query, "out.csv")` exports.
+- `db.insert_many(Users, rows)` splits big inserts into batches in one transaction.
+- `db.listen("channel")` and `db.notify("channel", payload)`. LISTEN does not work through
+  PgBouncer in transaction mode.
+
 **Read replicas**
 
 - `Database.connect(url, replicas=[...])` opens a pool to each read replica. Plain selects
