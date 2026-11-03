@@ -57,5 +57,9 @@ def date(name: str | None = None) -> Column[_date | None]:
     return Column("date", (_date,), name)
 
 
-def timestamp(name: str | None = None, *, tz: bool = False) -> Column[_datetime | None]:
-    return Column("timestamptz" if tz else "timestamp", (_datetime,), name)
+def timestamp(
+    name: str | None = None, *, tz: bool = False, precision: int | None = None
+) -> Column[_datetime | None]:
+    """``precision``: digits of fractional seconds kept, 0-6 (default 6)."""
+    digits = f"({precision})" if precision is not None else ""
+    return Column(f"timestamp{'tz' if tz else ''}{digits}", (_datetime,), name)

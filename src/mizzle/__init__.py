@@ -20,6 +20,7 @@ from mizzle.core.errors import (
 )
 from mizzle.core.schema.column import Column
 from mizzle.core.schema.constraints import (
+    Constraint,
     check,
     foreign_key,
     index,
@@ -68,6 +69,7 @@ __all__ = [
     "CheckViolation",
     "Column",
     "ConnectionError",
+    "Constraint",
     "DataLossBlocked",
     "Database",
     "DatabaseError",

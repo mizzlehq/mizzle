@@ -47,7 +47,52 @@ def _identifier(name: str) -> str:
 
 
 def _class_name(name: str) -> str:
-    return "".join(part.capitalize() for part in re.split(r"[^a-zA-Z0-9]+", name) if part) or "T"
+    # Upper-case only the first letter of each part: NotificationStatus stays as it is.
+    parts = re.split(r"[^a-zA-Z0-9]+", name)
+    return "".join(part[0].upper() + part[1:] for part in parts if part) or "T"
+
+
+def _words(name: str) -> list[str]:
+    """``teamMember``, ``team_member`` and ``TeamMember`` -> ``["team", "member"]``."""
+    spaced = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", name)
+    return [w.lower() for w in re.split(r"[^a-zA-Z0-9]+", spaced) if w]
+
+
+def _styled(words: list[str], camel: bool) -> str:
+    if not camel:
+        return "_".join(words)
+    return words[0] + "".join(w.capitalize() for w in words[1:]) if words else ""
+
+
+def _plural(word: str) -> str:
+    """Simple English plural; names that already end in s are kept (users, posts)."""
+    if word.endswith("s"):
+        return word
+    if re.search(r"[^aeiou]y$", word):
+        return word[:-1] + "ies"
+    if re.search(r"(x|z|ch|sh)$", word):
+        return word + "es"
+    return word + "s"
+
+
+def _singular(word: str) -> str:
+    """Undo _plural for table names (users -> user, categories -> category, status kept)."""
+    if word.endswith("ies") and len(word) > 3:
+        return word[:-3] + "y"
+    if re.search(r"(x|z|ch|sh)es$", word):
+        return word[:-2]
+    if word.endswith("s") and not word.endswith(("ss", "us", "is")):
+        return word[:-1]
+    return word
+
+
+def _is_camel(columns: Sequence[str]) -> bool:
+    """Whether a table names its columns in camelCase (createdAt) rather than snake_case."""
+    return any(re.search(r"[a-z][A-Z]", c) for c in columns) and not any("_" in c for c in columns)
+
+
+# A foreign key column named after what it points to: userId, user_id, userID -> "user".
+_FK_SUFFIX = re.compile(r"^(.*[a-zA-Z0-9])(?:_id|Id|ID)$")
 
 
 def _sql(text: str) -> str:
@@ -60,10 +105,13 @@ class _SchemaWriter:
         self.snapshot: Snapshot = snapshot
         self.pg_imports: set[str] = set()
         self.enum_classes: dict[str, str] = {}  # db type name -> class name
+        self.enum_values: dict[str, list[str]] = {}  # db type name -> values
         self.table_classes: dict[str, str] = {}  # "schema.table" -> class name
         self.attrs: dict[str, dict[str, str]] = {}  # "schema.table" -> column -> attribute
         self.uses_column: bool = False
         self.uses_any: bool = False
+        self.uses_relations: set[str] = set()
+        self.relations: dict[str, list[str]] = {}  # "schema.table" -> relation lines
 
     def factory(self, sql_type: str, kwargs: str) -> str:
         if sql_type.endswith("[]"):
@@ -79,14 +127,15 @@ class _SchemaWriter:
             self.pg_imports.add(sql_type)
             self.uses_any = True
             return f"{sql_type}[Any]({kwargs})"
-        if match := re.fullmatch(r"timestamp(\(\d+\))? (with|without) time zone", sql_type):
-            self.pg_imports.add("timestamp")
-            args = ["tz=True"] if match.group(2) == "with" else []
-            return f"timestamp({', '.join([*args, kwargs] if kwargs else args)})"
-        if match := re.fullmatch(r"time (with|without) time zone", sql_type):
-            self.pg_imports.add("time")
-            args = ["tz=True"] if match.group(1) == "with" else []
-            return f"time({', '.join([*args, kwargs] if kwargs else args)})"
+        if match := re.fullmatch(
+            r"(timestamp|time)(?:\((\d+)\))? (with|without) time zone", sql_type
+        ):
+            fn = match.group(1)
+            self.pg_imports.add(fn)
+            args = ["tz=True"] if match.group(3) == "with" else []
+            if match.group(2) is not None:
+                args.append(f"precision={match.group(2)}")
+            return f"{fn}({', '.join([*args, kwargs] if kwargs else args)})"
         if match := re.fullmatch(r"(character varying|numeric)\(([\d,]+)\)", sql_type):
             fn = _SIMPLE_TYPES[match.group(1)]
             self.pg_imports.add(fn)
@@ -99,7 +148,7 @@ class _SchemaWriter:
         self.uses_column = True
         self.uses_any = True
         extra = f", {kwargs}" if kwargs else ""
-        return f"ColumnBase({sql_type!r}, None{extra})"
+        return f"Column[Any]({sql_type!r}, None{extra})"
 
     def column(self, table: TableSnap, column: ColumnSnap, attr: str) -> str:
         kwargs = f"name={column['name']!r}" if attr != column["name"] else ""
@@ -115,7 +164,7 @@ class _SchemaWriter:
         if unique is not None and unique["columns"] == [cname]:
             code += ".unique()"
         if column["default"] is not None:
-            code += f".default({_sql(column['default'])})"
+            code += f".default({self.default(column)})"
         fk = table["foreign_keys"].get(f"{tname}_{cname}_fkey")
         if fk is not None and fk["columns"] == [cname] and len(fk["ref_columns"]) == 1:
             target = self.table_classes.get(f"{fk['ref_schema']}.{fk['ref_table']}")
@@ -126,6 +175,109 @@ class _SchemaWriter:
                 )
                 code += f".references(lambda: {target}.{ref_attr}{options})"
         return code
+
+    def default(self, column: ColumnSnap) -> str:
+        """An enum member for a literal enum default ('UNREAD'), else raw SQL."""
+        default = column["default"]
+        assert default is not None
+        cls = self.enum_classes.get(column["type"])
+        match = re.fullmatch(r"'((?:[^']|'')*)'(?:::.+)?", default)
+        if cls is not None and match is not None:
+            value = match.group(1).replace("''", "'")
+            if value in self.enum_values[column["type"]]:
+                return f"{cls}.{_identifier(value).upper()}"
+        return _sql(default)
+
+    def add_relations(self) -> None:
+        """``one()`` for every foreign key to a pulled table, and the reverse ``many()``
+        (or ``one()`` when the key columns are unique) on the table it points to.
+
+        Names are guesses from the key column (userId -> user) and the referencing table
+        (comment -> comments); rename freely, queries only depend on the columns."""
+        tables = self.snapshot["tables"]
+        taken = {k: {*self.attrs[k].values(), *_RESERVED_ATTRS} for k in tables}
+        camel = {k: _is_camel(list(t["columns"])) for k, t in tables.items()}
+
+        def claim(key: str, name: str, fallback: str) -> str:
+            name = _identifier(name)
+            for candidate in (
+                name,
+                _identifier(
+                    f"{name}_{fallback}"
+                    if not camel[key]
+                    else name + fallback[:1].upper() + fallback[1:]
+                ),
+            ):
+                if candidate not in taken[key]:
+                    taken[key].add(candidate)
+                    return candidate
+            n = 2
+            while f"{name}{n}" in taken[key]:
+                n += 1
+            taken[key].add(f"{name}{n}")
+            return f"{name}{n}"
+
+        links = [
+            (k, fk)
+            for k, t in tables.items()
+            for fk in t["foreign_keys"].values()
+            if f"{fk['ref_schema']}.{fk['ref_table']}" in self.table_classes
+        ]
+        pair_count: dict[tuple[str, str], int] = {}
+        for k, fk in links:
+            pair = (k, f"{fk['ref_schema']}.{fk['ref_table']}")
+            pair_count[pair] = pair_count.get(pair, 0) + 1
+
+        for k, fk in links:
+            target = f"{fk['ref_schema']}.{fk['ref_table']}"
+            source_cls, target_cls = self.table_classes[k], self.table_classes[target]
+            source_words = _words(tables[k]["name"])
+            source_words[-1] = _singular(source_words[-1])
+            target_words = _words(tables[target]["name"])
+            target_words[-1] = _singular(target_words[-1])
+            single = fk["columns"][0] if len(fk["columns"]) == 1 else None
+            stem = _FK_SUFFIX.match(single) if single else None
+            # userId -> user; a key column without an Id suffix (author) is itself a column
+            # name, so claim() falls back to author_user.
+            one_name = claim(
+                k,
+                stem.group(1) if stem else (single or _styled(target_words, camel[k])),
+                _styled(target_words, camel[k]),
+            )
+            ambiguous = pair_count[(k, target)] > 1 or k == target
+            rel = f", relation_name={one_name!r}" if ambiguous else ""
+            fields = ", ".join(f"{source_cls}.{self.attrs[k][c]}" for c in fk["columns"])
+            refs = ", ".join(f"{target_cls}.{self.attrs[target][c]}" for c in fk["ref_columns"])
+            self.relations.setdefault(k, []).append(
+                f"{one_name} = one(lambda: {target_cls}, fields=lambda: [{fields}], "
+                f"references=lambda: [{refs}]{rel})"
+            )
+
+            key_columns = sorted(fk["columns"])
+            table = tables[k]
+            pk = table["primary_key"]
+            unique = (
+                (pk is not None and sorted(pk["columns"]) == key_columns)
+                or any(sorted(u["columns"]) == key_columns for u in table["uniques"].values())
+                or any(
+                    i["unique"]
+                    and not i["where"]
+                    and "expression" not in i
+                    and sorted(i["columns"]) == key_columns
+                    for i in table["indexes"].values()
+                )
+            )
+            back = source_words if unique else [*source_words[:-1], _plural(source_words[-1])]
+            if ambiguous:
+                back = [*back, "by", *_words(one_name)]
+            back_name = claim(
+                target, _styled(back, camel[target]), _styled(source_words, camel[target])
+            )
+            kind = "one" if unique else "many"
+            self.uses_relations |= {"one", kind}
+            self.relations.setdefault(target, []).append(
+                f"{back_name} = {kind}(lambda: {source_cls}{rel})"
+            )
 
     def config_items(self, table: TableSnap, attrs: dict[str, str]) -> list[str]:
         tname = table["name"]
@@ -173,6 +325,8 @@ class _SchemaWriter:
             cls = _class_name(enum["name"])
             self.enum_classes[enum["name"]] = cls
             self.enum_classes[f'"{enum["name"]}"'] = cls
+            self.enum_values[enum["name"]] = list(enum["values"])
+            self.enum_values[f'"{enum["name"]}"'] = list(enum["values"])
             members = [f"    {_identifier(v).upper()} = {v!r}" for v in enum["values"]]
             enums_code.append(f"class {cls}(enum.StrEnum):\n" + "\n".join(members))
 
@@ -182,6 +336,7 @@ class _SchemaWriter:
                 name = _class_name(f"{table['schema']}_{table['name']}")
             self.table_classes[k] = name
             self.attrs[k] = {c: _identifier(c) for c in table["columns"]}
+        self.add_relations()
 
         tables_code: list[str] = []
         uses_config: set[str] = set()
@@ -194,6 +349,10 @@ class _SchemaWriter:
             lines = ["@final", f"class {self.table_classes[k]}(Table, {kw}):"]
             for cname, column in table["columns"].items():
                 lines.append(f"    {attrs[cname]} = {self.column(table, column, attrs[cname])}")
+            if relations := self.relations.get(k):
+                # Forward one(..., fields=...) first, then the reverse sides.
+                relations = sorted(relations, key=lambda r: "fields=" not in r)
+                lines += ["", *(f"    {r}" for r in relations)]
             items = self.config_items(table, attrs)
             if items:
                 for fn in (
@@ -206,7 +365,6 @@ class _SchemaWriter:
                 ):
                     if any(i.startswith(f"{fn}(") for i in items):
                         uses_config.add(fn)
-                self.uses_any = True
                 body = "".join(
                     f"            {i}\n" if i.startswith("#") else f"            {i},\n"
                     for i in items
@@ -216,7 +374,7 @@ class _SchemaWriter:
                     "",
                     "    @classmethod",
                     "    @override",
-                    "    def config(cls) -> list[Any]:",
+                    "    def config(cls) -> list[Constraint]:",
                     "        return [\n" + body + "        ]",
                 ]
             tables_code.append("\n".join(lines))
@@ -231,10 +389,12 @@ class _SchemaWriter:
             typing_names.add("override")
         header.append(f"from typing import {', '.join(sorted(typing_names))}")
         header.append("")
-        mizzle_names = sorted(
-            {"Table", "sql", *uses_config} | ({"Column"} if self.uses_column else set())
-        )
-        header.append(f"from mizzle import {', '.join(mizzle_names)}")
+        mizzle_names: set[str] = {"Table", "sql", *uses_config, *self.uses_relations}
+        if self.uses_column:
+            mizzle_names.add("Column")
+        if has_config:
+            mizzle_names.add("Constraint")
+        header.append(f"from mizzle import {', '.join(sorted(mizzle_names))}")
         if self.pg_imports:
             header.append(f"from mizzle.pg import {', '.join(sorted(self.pg_imports))}")
         return "\n".join(header) + "\n\n\n" + "\n\n\n".join([*enums_code, *tables_code]) + "\n"

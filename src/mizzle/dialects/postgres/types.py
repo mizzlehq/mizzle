@@ -55,8 +55,12 @@ def interval(name: str | None = None) -> Column[_dt.timedelta | None]:
     return Column("interval", (_dt.timedelta,), name)
 
 
-def time(name: str | None = None, *, tz: bool = False) -> Column[_dt.time | None]:
-    return Column("timetz" if tz else "time", (_dt.time,), name)
+def time(
+    name: str | None = None, *, tz: bool = False, precision: int | None = None
+) -> Column[_dt.time | None]:
+    """``precision``: digits of fractional seconds kept, 0-6 (default 6)."""
+    digits = f"({precision})" if precision is not None else ""
+    return Column(f"time{'tz' if tz else ''}{digits}", (_dt.time,), name)
 
 
 def inet(name: str | None = None) -> Column[IPAddress | None]:
