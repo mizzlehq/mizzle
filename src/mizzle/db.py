@@ -136,7 +136,7 @@ class Session(QueryBuilder):
     ) -> AsyncGenerator[list[Row]]:
         if batch_size < 1:
             raise QueryError("stream() needs batch_size >= 1")
-        safe = not query.raw
+        safe = query.session_safe
         with self._logged(query):
             if self._conn is not None:
                 # Locked per batch, not for the whole loop: its body may run other
@@ -253,7 +253,7 @@ class Session(QueryBuilder):
                         format,
                         header,
                         self._timeout,
-                        session_safe=not compiled.raw,
+                        session_safe=compiled.session_safe,
                     )
             except DbConnectionError:
                 await self._after_lost_connection(compiled, False)
@@ -611,7 +611,7 @@ class Session(QueryBuilder):
         self, conn: Connection, query: CompiledQuery, kind: _CallKind
     ) -> Awaitable[list[Row] | int | list[dict[str, object]]]:
         # A plain function returning the driver's coroutine: no extra await layer.
-        safe = not query.raw
+        safe = query.session_safe
         if kind == "fetch":
             return conn.fetch(query.sql, query.params, self._timeout, session_safe=safe)
         if kind == "execute":
@@ -814,7 +814,7 @@ class Database(Session):
         max_idle: float = 300.0,
         query_timeout: float | None = None,
         statement_cache_size: int = 100,
-        reset_connections: ResetMode = "always",
+        reset_connections: ResetMode = "auto",
         casing: Casing | None = None,
         logger: QueryLogger | None = None,
         log_params: bool = False,
@@ -825,11 +825,13 @@ class Database(Session):
         cancels statements that run longer (seconds; None: no limit).
         ``statement_cache_size=0`` is needed behind PgBouncer in transaction mode.
 
-        ``reset_connections="auto"`` makes small queries up to ~40% faster: the session reset
-        that normally follows every query is skipped when mizzle built the statement itself
-        (raw SQL still resets). Leave it at ``"always"`` if triggers or functions your
-        queries call change session settings (``set_config(..., false)``, ``SET``), because
-        mizzle cannot see those."""
+        ``reset_connections="auto"`` (the default) resets a connection's session state when
+        it goes back to the pool only after a statement that may have changed it: raw
+        ``sql(...)``, a function named with ``func()``, ``listen()``, direct connection use.
+        Skipping the reset after mizzle-built statements saves a round trip per query (2x on
+        a real network). Use ``"always"`` if triggers or database functions change session
+        settings themselves (``SET`` or ``set_config(..., false)`` without LOCAL, session
+        advisory locks, temp tables), because mizzle cannot see inside them."""
         dialect = dialect_for_url(url)
         for replica in replicas:
             if dialect_for_url(replica).name != dialect.name:

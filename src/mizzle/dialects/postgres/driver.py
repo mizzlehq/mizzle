@@ -681,7 +681,7 @@ class PostgresDriver:
         pool_min_size: int = 1,
         max_idle: float = 300.0,
         query_timeout: float | None = None,
-        reset_connections: ResetMode = "always",
+        reset_connections: ResetMode = "auto",
     ) -> PostgresDriver:
         """``statement_cache_size=0`` is needed behind PgBouncer in transaction mode.
         ``max_idle`` closes connections unused for that many seconds (0 keeps them)."""

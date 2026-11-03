@@ -17,6 +17,7 @@ from mizzle import (
     desc,
     eq,
     exists,
+    func,
     lag,
     lower,
     not_similar_to,
@@ -33,7 +34,8 @@ from mizzle import (
 from mizzle.core.errors import QueryError
 from mizzle.core.query.builder import QueryBuilder
 from mizzle.core.schema.table import Table
-from mizzle.core.sql.nodes import ExprBase
+from mizzle.core.sql.nodes import ExprBase, Node
+from mizzle.dialects.postgres.compiler import PostgresCompiler
 from mizzle.pg import date, integer, serial, text
 from tests.models import Posts, Role, Users
 from tests.unit.conftest import FakeRunner
@@ -251,3 +253,15 @@ def test_raw_sql_reused_in_casts(qb: QueryBuilder) -> None:
         'SELECT CAST($1 AS integer), CAST($2 AS text), CAST($1 AS integer) FROM "users"',
         (None, None),
     )
+
+
+def test_user_named_functions_are_not_session_safe(qb: QueryBuilder) -> None:
+    # func() may change the session (reset after it) but stays a plain read (retried after a
+    # lost connection); built-in functions are safe; raw SQL is neither.
+    def flags(node: Node) -> tuple[bool, bool]:
+        compiled = PostgresCompiler().compile(node)
+        return compiled.session_safe, compiled.raw
+
+    assert flags(qb.select(lower(Users.email)).from_(Users)) == (True, False)
+    assert flags(qb.select(func[bool]("pg_is_in_recovery")).from_(Users)) == (False, False)
+    assert flags(qb.select(sql("1")).from_(Users)) == (False, True)

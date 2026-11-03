@@ -20,6 +20,7 @@ from mizzle import (
     desc,
     eq,
     first_value,
+    func,
     lag,
     lower,
     not_similar_to,
@@ -264,3 +265,20 @@ async def test_cross_join(db: Database) -> None:
     assert len(rows) == 9
     # A nullable column against a non-null one: types check, and the SQL runs.
     assert await db.select(Users.id).from_(Users).where(eq(Users.bio, Users.email)) == []
+
+
+async def test_auto_reset_after_a_user_named_function(db: Database, pg_url: str) -> None:
+    # func("set_config", ..., false) changes the session; mizzle cannot know that of a
+    # function you name, so reset_connections="auto" resets the connection after it.
+    await seed(db)
+    async with await Database.connect(
+        pg_url, schema=[Users, Posts], pool_size=1, reset_connections="auto"
+    ) as auto:
+        leak = func[str]("set_config", "application_name", "leaked", False)
+        assert await auto.select(leak).from_(Users).limit(1) == [("leaked",)]
+        [(name,)] = (
+            await auto.select(func[str]("current_setting", "application_name"))
+            .from_(Users)
+            .limit(1)
+        )
+        assert name != "leaked"

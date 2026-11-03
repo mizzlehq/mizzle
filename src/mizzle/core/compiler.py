@@ -68,6 +68,14 @@ class CompiledQuery:
     # True when a Python .on_update() hook supplied a value: a prepared query must compile
     # again on each execution so the hook runs every time, not once at prepare().
     dynamic: bool = False
+    # True when it calls a function named with func(): mizzle cannot know it leaves the
+    # session alone (set_config, pg_advisory_lock...), so the connection is reset after it.
+    # Unlike raw, a read using one may still be retried after a lost connection.
+    opaque: bool = False
+
+    @property
+    def session_safe(self) -> bool:
+        return not (self.raw or self.opaque)
 
     @property
     def has_placeholders(self) -> bool:
@@ -87,7 +95,13 @@ class CompiledQuery:
             for value, p in zip(self.params, self.placeholders, strict=True)
         )
         return CompiledQuery(
-            self.sql, params, (None,) * len(params), self.raw, self.locking, self.dynamic
+            self.sql,
+            params,
+            (None,) * len(params),
+            self.raw,
+            self.locking,
+            self.dynamic,
+            self.opaque,
         )
 
 
@@ -119,6 +133,7 @@ class Compiler:
     _raw: bool
     _locking: bool
     _dynamic: bool
+    _opaque: bool
     # (id(Param), SQL type it is compared with) -> its marker: a reused node reuses its
     # parameter, unless raw SQL holding it sits next to values of different types.
     _bound: dict[tuple[int, str | None], str]
@@ -144,6 +159,7 @@ class Compiler:
         self._raw = False
         self._locking = False
         self._dynamic = False
+        self._opaque = False
         self._bound = {}
         self._context = None
         self._scopes = []
@@ -152,6 +168,7 @@ class Compiler:
     def compile(self, node: Node) -> CompiledQuery:
         self._params, self._placeholders, self._raw, self._locking = [], [], False, False
         self._dynamic = False
+        self._opaque = False
         self._bound = {}
         self._context = None
         text = self.visit(node)
@@ -162,6 +179,7 @@ class Compiler:
             self._raw,
             self._locking,
             self._dynamic,
+            self._opaque,
         )
 
     def visit(self, node: Node) -> str:
@@ -314,6 +332,7 @@ class Compiler:
         return f"{'NOT ' if node.negate else ''}EXISTS ({self.visit(node.query)})"
 
     def visit_Func(self, node: Func) -> str:
+        self._opaque |= node.opaque
         args = ", ".join(self.visit(a) for a in node.args)
         return f"{node.name}({'DISTINCT ' if node.distinct else ''}{args})"
 

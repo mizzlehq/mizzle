@@ -20,9 +20,10 @@ from mizzle.core.sql.nodes import Node
 from mizzle.core.steps import Statement, Step
 
 type IsolationLevel = Literal["read committed", "repeatable read", "serializable"]
-# "always": reset session state (SET, LISTEN, advisory locks...) whenever a connection goes
-# back to the pool. "auto": skip it after statements mizzle built itself (faster; see
-# Database.connect for the one case it cannot see).
+# "auto" (default): reset session state (SET, LISTEN, advisory locks...) when a connection
+# goes back to the pool only after statements that may have changed it: raw SQL, functions
+# named with func(), direct connection use. "always": after every use (see Database.connect
+# for the one case "auto" cannot see).
 type ResetMode = Literal["always", "auto"]
 type CopyFormat = Literal["csv", "text", "binary"]
 # What a listener does when ``max_queue`` notifications wait unread: "raise" ends the
@@ -157,7 +158,7 @@ class Dialect(Protocol):
         pool_min_size: int = 1,
         max_idle: float = 300.0,
         query_timeout: float | None = None,
-        reset_connections: ResetMode = "always",
+        reset_connections: ResetMode = "auto",
     ) -> Driver: ...
 
     # -- schema snapshots (normalized so a schema and its database compare equal) -----

@@ -36,7 +36,7 @@ class PostgresDialect:
         pool_min_size: int = 1,
         max_idle: float = 300.0,
         query_timeout: float | None = None,
-        reset_connections: ResetMode = "always",
+        reset_connections: ResetMode = "auto",
     ) -> PostgresDriver:
         return await PostgresDriver.connect(
             url,

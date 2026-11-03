@@ -100,7 +100,7 @@ async def test_auto_reset_only_after_raw_sql(
         assert resets == ["reset"]
 
 
-async def test_default_always_resets(
+async def test_always_resets_and_default_is_auto(
     pg_url: str, driver: PostgresDriver, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     resets: list[str] = []
@@ -111,8 +111,13 @@ async def test_default_always_resets(
         return original(self)
 
     monkeypatch.setattr(asyncpg.Connection, "get_reset_query", counting)
-    async with await Database.connect(pg_url, schema=[Users, Posts], pool_size=1) as db:
+    async with await Database.connect(
+        pg_url, schema=[Users, Posts], pool_size=1, reset_connections="always"
+    ) as db:
         await db.select().from_(Users)
+    assert resets == ["reset"]
+    async with await Database.connect(pg_url, schema=[Users, Posts], pool_size=1) as db:
+        await db.select().from_(Users)  # mizzle built it: no reset
     assert resets == ["reset"]
 
 

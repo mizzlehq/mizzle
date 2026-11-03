@@ -455,7 +455,7 @@ class func[T](TypedFunc[T]):
 
     def __init__(self, name: str, /, *args: object) -> None:
         nodes = tuple(a if isinstance(a, Node) else Param(a) for a in args)
-        super().__init__(_identifier("function", name), nodes)
+        super().__init__(_identifier("function", name), nodes, opaque=True)
 
 
 # -- window functions -----------------------------------------------------------------

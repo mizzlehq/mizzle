@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.2.3
+
+- `reset_connections="auto"` is the default: a connection's session state is reset when it
+  goes back to the pool only after a statement that may have changed it (raw `sql(...)`, a
+  function named with `func()`, `listen()`, direct connection use). This saves a round trip
+  per query: about 2x faster single-row work over a real network. Open transactions are
+  still always rolled back. Pass `reset_connections="always"` if triggers or database
+  functions change session settings themselves (`SET` or `set_config(..., false)` without
+  `LOCAL`, session advisory locks, temp tables).
+- A function named with `func("...")` now counts as possibly changing the session, so the
+  connection is reset after it (before, `func("set_config", ..., False)` with `"auto"`
+  could leak a setting to the next user).
+- Benchmarks against Tortoise, SQLAlchemy (ORM and Core), Piccolo and Django, with 50
+  concurrent clients and network latency (`BENCH_CLIENTS`, `BENCH_POOL`, Toxiproxy).
+
 ## 0.2.2
 
 - `mizzle pull --update`: follow a schema another app owns (microservices on one

@@ -379,6 +379,9 @@ class Func(ExprBase):
     # The result has the type of its arguments (min, coalesce, lag...): a column among them
     # decodes it (e.g. back into an enum).
     keeps_type: bool = False
+    # Named by the user (func[T]("name")): mizzle cannot know it leaves the session alone
+    # (set_config, pg_advisory_lock...), so reset_connections="auto" resets after it.
+    opaque: bool = False
 
 
 @dataclass(frozen=True)

@@ -22,6 +22,22 @@ await db.retry(transfer)  # re-run a transaction on a serialization conflict
   `NotNullViolation`, `QueryTimeout`, `ConnectionError`...). `DatabaseError.sqlstate` holds
   the PostgreSQL code. Error messages never include your parameter values.
 
+## Connection reset
+
+When a connection goes back to the pool, mizzle resets its session state (`RESET ALL`,
+`UNLISTEN *`, advisory locks, cursors) only after a statement that may have changed it: raw
+`sql(...)`, a function you name with `func()`, `listen()`, or direct connection use. After
+the statements mizzle builds itself it skips the reset, which saves a round trip per query
+(2x on a real network). Open transactions are always rolled back.
+
+mizzle cannot see inside the database: if a trigger or function changes the session itself
+(`SET` or `set_config(..., false)` without `LOCAL`, a session advisory lock, a temp table),
+reset every time:
+
+```python
+db = await Database.connect(url, reset_connections="always")
+```
+
 ## PgBouncer
 
 - **Transaction mode:** pass `statement_cache_size=0`. `db.listen()` refuses to run here,

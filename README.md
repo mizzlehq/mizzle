@@ -91,6 +91,50 @@ Writes, transactions and `FOR UPDATE` always use the primary. Behind PgBouncer i
 transaction mode, pass `statement_cache_size=0`. CI tests a real streaming replica and
 PgBouncer on every change.
 
+## Benchmarks
+
+Operations per second, higher is better: the same queries on the same PostgreSQL 18 database,
+median of 5 rounds ([benchmarks/bench.py](https://github.com/mizzlehq/mizzle/blob/main/benchmarks/bench.py)).
+
+**A busy app:** 50 concurrent clients, 8 connections per library, and 1 ms of network
+latency each way (2.2 ms round trip, like a database on another server):
+
+| | mizzle | Tortoise | SQLAlchemy ORM | SQLAlchemy Core | Piccolo | Django |
+|---|---:|---:|---:|---:|---:|---:|
+| insert 1 row | **3,040** | 1,587 | 935 | 921 | 1,577 | 427 |
+| bulk insert 1000 rows | 448 | 180 | 223 | **462** | 76 | 111 |
+| get by primary key | **3,078** | 1,566 | 942 | 952 | 1,565 | 413 |
+| select 1000 rows | **728** | 362 | 268 | 680\* | 331 | 239 |
+| update by primary key | **3,035** | 1,566 | 935 | 923 | 1,573 | 426 |
+| 100 users with their posts | **1,358** | 392 | 245 | 549 | 369 | 110 |
+
+**One client, database on the same machine** (0.04 ms round trip, 4 connections):
+
+| | mizzle | Tortoise | SQLAlchemy ORM | SQLAlchemy Core | Piccolo | Django |
+|---|---:|---:|---:|---:|---:|---:|
+| insert 1 row | **9,831** | 6,207 | 2,226 | 2,827 | 5,651 | 4,588 |
+| bulk insert 1000 rows | **215** | 120 | 156 | 194 | 66 | 132 |
+| get by primary key | **10,112** | 4,516 | 2,623 | 3,182 | 4,706 | 3,467 |
+| select 1000 rows | **898** | 356 | 300 | 846\* | 390 | 336 |
+| update by primary key | **10,516** | 4,234 | 2,085 | 2,779 | 5,345 | 4,061 |
+| 100 users with their posts | **655** | 336 | 234 | 472 | 320 | 218 |
+
+\* SQLAlchemy Core returns plain tuples; the ORMs build full row objects.
+
+mizzle loads nested rows in one statement, so it pays one round trip where the others pay
+two. Raw asyncpg, the driver under mizzle, is the upper limit: on single-row work mizzle
+reaches 97% of it over the network and 67–84% on the same machine. Python 3.14, mizzle 0.2.3, Tortoise 1.1.9,
+SQLAlchemy 2.1.6, Piccolo 1.39.0, Django 6.1.3 (its async ORM runs queries in one thread, on
+psycopg). The script's docstring explains each library's setup and the latency proxy. Run
+it yourself:
+
+```bash
+docker compose up -d
+uv run --with tortoise-orm --with "sqlalchemy[asyncio]" --with piccolo --with django \
+  --with "psycopg[binary,pool]" python benchmarks/bench.py
+BENCH_CLIENTS=50 BENCH_POOL=8 uv run ...  # the concurrent run
+```
+
 ## What else is in the box
 
 Joins, subqueries, CTEs, window functions, `UNION`, `CASE` and typed SQL functions;
