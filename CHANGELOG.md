@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.2.1
+
+- `cross_join(Table)`: `CROSS JOIN`, every row with every row of the other table.
+- Comparisons (`eq`, `ne`, `gt`, `gte`, `lt`, `lte`) type-check with a nullable column on one
+  side and a non-null value or column on the other: `eq(Users.manager_id, boss.id)`.
+- `mizzle typegen` imports only the `typing` names it uses, so strict checkers accept it.
+- A `listen(reconnect=True)` whose connection the server killed no longer logs a warning
+  with a traceback when that connection cannot go back to the pool.
+- Docs on Read the Docs: <https://mizzle.readthedocs.io>, with `llms.txt` and
+  `llms-full.txt` for LLM tools.
+
 ## 0.2.0
 
 **Upgrading from 0.1**

@@ -67,10 +67,20 @@ plugins:
             heading_level: 2
             members_order: source
             filters: ["!^_"]
+            show_if_no_docstring: true
 
 nav:
   - Home: index.md
   - Getting started: getting-started.md
+  - Guide:
+      - Schema: guide/schema.md
+      - Queries: guide/queries.md
+      - Relational queries: guide/relational.md
+      - Transactions and errors: guide/transactions.md
+      - Migrations and database objects: guide/migrations.md
+      - Bulk, streaming and LISTEN: guide/bulk.md
+      - pgvector: guide/extensions.md
+      - Pydantic, Supabase, Studio: guide/integrations.md
   - CLI: cli.md
   - Production: production.md
   - API reference:

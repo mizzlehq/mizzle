@@ -1,0 +1,32 @@
+# mizzle
+
+> mizzle is a fully typed async ORM for Python 3.12+ and PostgreSQL 14+, built on asyncpg. Tables are Python classes; queries read like the SQL they produce; every row comes back typed. It ships a migration CLI (`mizzle generate`, `mizzle migrate`, `mizzle push`, `mizzle pull`) and a data browser (`mizzle studio`).
+
+Install: `pip install mizzle`. Import everything from `mizzle`; column types from `mizzle.pg`. Values are always bind parameters. `update` and `delete` need a `where`. Every page below is also in one file: [llms-full.txt](https://mizzle.readthedocs.io/en/latest/llms-full.txt).
+
+## Docs
+
+- [Getting started](https://mizzle.readthedocs.io/en/latest/getting-started/): install, project setup, first table, first migration, first queries
+- [Schema](https://mizzle.readthedocs.io/en/latest/guide/schema/): column types, keys, constraints, indexes, enums, identity and generated columns, relations
+- [Queries](https://mizzle.readthedocs.io/en/latest/guide/queries/): select, joins, operators, aggregates, subqueries, CTEs, window functions, set operations, insert/upsert, update, delete, locking, full-text search
+- [Relational queries](https://mizzle.readthedocs.io/en/latest/guide/relational/): `db.query(Table).find_many(with_=...)`, nested rows in one statement
+- [Transactions and errors](https://mizzle.readthedocs.io/en/latest/guide/transactions/): transactions, retries, timeouts, error classes, SQLSTATE
+- [Migrations and database objects](https://mizzle.readthedocs.io/en/latest/guide/migrations/): migration workflow, views, row-level security, roles, grants, functions, triggers, extensions
+- [Bulk, streaming and LISTEN](https://mizzle.readthedocs.io/en/latest/guide/bulk/): COPY, insert_many, stream, LISTEN/NOTIFY
+- [pgvector](https://mizzle.readthedocs.io/en/latest/guide/extensions/): vector types, distance operators, indexes
+- [Pydantic, Supabase, Studio](https://mizzle.readthedocs.io/en/latest/guide/integrations/): Pydantic models, Supabase roles and policies, mizzle studio, typegen
+- [CLI](https://mizzle.readthedocs.io/en/latest/cli/): every `mizzle` command and option
+- [Production](https://mizzle.readthedocs.io/en/latest/production/): pools, read replicas, timeouts, retries, PgBouncer
+
+## API reference
+
+- [mizzle](https://mizzle.readthedocs.io/en/latest/reference/mizzle/): Database, Table, query builders, operators, functions, errors
+- [mizzle.pg](https://mizzle.readthedocs.io/en/latest/reference/pg/): PostgreSQL column types
+- [mizzle.pydantic](https://mizzle.readthedocs.io/en/latest/reference/pydantic/)
+- [mizzle.supabase](https://mizzle.readthedocs.io/en/latest/reference/supabase/)
+
+## Optional
+
+- [Changelog](https://mizzle.readthedocs.io/en/latest/changelog/): examples for every feature by version
+- [examples/social](https://github.com/mizzlehq/mizzle/tree/main/examples/social): a complete FastAPI app
+- [examples/shop](https://github.com/mizzlehq/mizzle/tree/main/examples/shop): a FastAPI marketplace using every 0.2 feature

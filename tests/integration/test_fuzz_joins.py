@@ -169,7 +169,7 @@ RELATIONS: dict[str, dict[str, tuple[str, bool, str, str]]] = {
     "t": {"child": ("c", False, "child_id", "id")},
 }
 OPS = {"=": eq, "<>": ne, "<": lt, "<=": lte, ">": gt, ">=": gte}
-KINDS: list[JoinKind] = ["INNER", "LEFT", "RIGHT", "FULL"]
+KINDS: list[JoinKind] = ["INNER", "LEFT", "RIGHT", "FULL", "CROSS"]
 NULLS: list[Nulls] = [None, "first", "last"]
 
 
@@ -444,7 +444,7 @@ def model_join(
         env: Env = dict(zip(aliases, row, strict=True))
         hit = False
         for i, r in enumerate(right):
-            if on.eval({**env, alias: r}) is True:
+            if kind == "CROSS" or on.eval({**env, alias: r}) is True:
                 out.append((*row, r))
                 matched.add(i)
                 hit = True
@@ -465,6 +465,8 @@ def joined[R](q: Select[R], kind: JoinKind, source: Source, on: Condition) -> Se
             return q.right_join(source, on)
         case "FULL":
             return q.full_join(source, on)
+        case "CROSS":  # the condition is not used
+            return q.cross_join(source)
 
 
 @dataclass(frozen=True)

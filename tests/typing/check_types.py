@@ -12,7 +12,7 @@ from typing import Any, assert_type
 from mizzle.core.query.builder import QueryBuilder
 from mizzle.core.schema.column import Column
 from mizzle.core.sql.nodes import Expr
-from mizzle.core.sql.operators import count, eq, nullable
+from mizzle.core.sql.operators import count, eq, lt, nullable
 from tests.models import Posts, Role, Users
 
 
@@ -47,7 +47,7 @@ async def rows(qb: QueryBuilder, user: Users, post: Posts) -> None:
 
 
 def errors() -> None:
-    eq(Users.id, "x")  # type: ignore[misc]  # pyright: ignore[reportArgumentType]
+    eq(Users.id, "x")  # type: ignore[arg-type, misc]  # pyright: ignore[reportCallIssue, reportArgumentType]
 
 
 async def relational(qb: QueryBuilder) -> None:
@@ -146,7 +146,7 @@ async def expressions(qb: QueryBuilder) -> None:
     assert_type(lag(Users.email).over(order_by=Users.id), Expr[str | None])
     assert_type(lag(Users.email, 1, "").over(order_by=Users.id), Expr[str])
     assert_type(sum_(Users.id).over(partition_by=Users.role), Expr[int | Decimal | None])
-    eq(row_number(), 1)  # type: ignore[arg-type]  # pyright: ignore[reportArgumentType]
+    eq(row_number(), 1)  # type: ignore[call-overload]  # pyright: ignore[reportCallIssue, reportArgumentType]
 
     vector = to_tsvector(Posts.title, config="english")
     assert_type(vector, Expr[str])
@@ -196,3 +196,12 @@ def date_time_and_text_operators(
     assert_type("<" + Users.bio, Expr[str | None])
     assert_type(Users.id + 1, Expr[int])
     _ = stamp + 1  # type: ignore[operator]  # pyright: ignore[reportOperatorIssue]
+
+
+def nullable_comparisons(user: Users) -> None:
+    # A nullable column meets a non-null value or column, either way round.
+    assert_type(eq(Users.bio, user.email), Expr[bool])
+    assert_type(eq(Users.bio, Users.email), Expr[bool])
+    assert_type(eq(Users.email, Users.bio), Expr[bool])
+    assert_type(lt(Users.bio, "m"), Expr[bool])
+    eq(Users.bio, 1)  # type: ignore[misc]  # pyright: ignore[reportCallIssue, reportArgumentType]

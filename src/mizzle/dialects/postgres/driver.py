@@ -649,8 +649,18 @@ class _Acquire:
                 # The connection was lost (the proxy is detached: AttributeError) or its
                 # reset after use failed; either way asyncpg has terminated it already.
                 # Not raised: the statement itself finished, and raising here would make a
-                # completed write look failed.
-                log.warning("mizzle: could not return a connection to the pool", exc_info=True)
+                # completed write look failed. A connection the server already closed (a
+                # killed backend, a restart) is expected to fail here: not worth a warning.
+                closed = _is_closed(conn)
+                level = logging.DEBUG if closed else logging.WARNING
+                log.log(level, "mizzle: could not return a connection to the pool", exc_info=True)
+
+
+def _is_closed(conn: asyncpg.Connection | PoolConnectionProxy) -> bool:
+    try:
+        return conn.is_closed()
+    except Exception:  # a detached pool proxy: its connection is gone
+        return True
 
 
 class PostgresDriver:

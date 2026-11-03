@@ -37,7 +37,7 @@ from mizzle.core.sql.nodes import (
 )
 from mizzle.core.sql.operators import and_
 
-type JoinKind = Literal["INNER", "LEFT", "RIGHT", "FULL"]
+type JoinKind = Literal["INNER", "LEFT", "RIGHT", "FULL", "CROSS"]
 type Source = type[Table] | Cte
 type Slot = ExprBase | type[Table]
 # None: whole rows of the source table. Tuple: one result slot per item. Dict: named fields.
@@ -48,7 +48,7 @@ type Projection = tuple[Slot, ...] | dict[str, ExprBase] | None
 class Join:
     kind: JoinKind
     source: Source
-    on: Condition
+    on: Condition | None  # None: CROSS JOIN
 
 
 @dataclass(frozen=True)
@@ -128,7 +128,7 @@ class SelectBase(Node):
         combined = condition if self.where_ is None else and_(self.where_, condition)
         return evolve(self, where_=combined)
 
-    def _join(self, kind: JoinKind, source: Source, on: Condition) -> Self:
+    def _join(self, kind: JoinKind, source: Source, on: Condition | None) -> Self:
         if kind in ("RIGHT", "FULL") and self.projection is None:
             raise QueryError(
                 f"{kind.lower()} join needs an explicit select(A, B) so missing rows are typed"
@@ -137,6 +137,10 @@ class SelectBase(Node):
 
     def join(self, source: Source, on: Condition) -> Self:
         return self._join("INNER", source, on)
+
+    def cross_join(self, source: Source) -> Self:
+        """Every row paired with every row of ``source`` (``CROSS JOIN``, no condition)."""
+        return self._join("CROSS", source, None)
 
     def group_by(self, *exprs: ExprBase) -> Self:
         return evolve(self, group_by_=(*self.group_by_, *exprs))

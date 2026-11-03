@@ -35,11 +35,12 @@ In a `--custom` migration, separate statements with `-- mizzle:breakpoint`.
 
 ```bash
 mizzle migrate
-mizzle migrate --lock-timeout 5   # seconds to wait for table locks (default 60)
+mizzle migrate --lock-timeout 5   # seconds to wait for another server's migration (default 60)
 ```
 
 Each migration runs in one transaction. Many app servers can run `migrate` at the same time:
-an advisory lock lets one apply and the others wait.
+an advisory lock lets one apply and the others wait. A server that waits longer than
+`--lock-timeout` stops with `MigrationLockTimeout`.
 
 ## push
 

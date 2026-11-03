@@ -18,7 +18,7 @@ jobs:
       - run: uv run mypy
       - run: uv run basedpyright --pythonversion 3.14
       - run: uv run mypy --python-version 3.14
-      - run: uv run --group docs zensical build --strict --clean  # Read the Docs
+      - run: uv run --group docs zensical build --strict --clean && uv run python scripts/llms_full.py  # Read the Docs
 
   ui:
     runs-on: ubuntu-latest

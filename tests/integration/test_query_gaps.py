@@ -251,3 +251,16 @@ async def test_overriding_identity_values(db: Database, driver: PostgresDriver) 
     finally:
         async with driver.acquire() as conn:
             await conn.execute("DROP TABLE tickets", [])
+
+
+async def test_cross_join(db: Database) -> None:
+    await seed(db)
+    rows = await (
+        db.select(Users.email, Posts.id).from_(Users).cross_join(Posts).order_by(Users.id, Posts.id)
+    )
+    users = await db.select(Users.email).from_(Users).order_by(Users.id)
+    posts = await db.select(Posts.id).from_(Posts).order_by(Posts.id)
+    assert rows == [(u, p) for (u,) in users for (p,) in posts]
+    assert len(rows) == 9
+    # A nullable column against a non-null one: types check, and the SQL runs.
+    assert await db.select(Users.id).from_(Users).where(eq(Users.bio, Users.email)) == []

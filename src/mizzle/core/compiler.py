@@ -480,7 +480,8 @@ class Compiler:
         parts.append(", ".join(items))
         parts.append(f"FROM {self.source(node.source)}")
         for join in node.joins:
-            parts.append(f"{join.kind} JOIN {self.source(join.source)} ON {self.visit(join.on)}")
+            on = "" if join.on is None else f" ON {self.visit(join.on)}"
+            parts.append(f"{join.kind} JOIN {self.source(join.source)}{on}")
         if node.where_ is not None:
             parts.append(f"WHERE {self.visit(node.where_)}")
         if node.group_by_:

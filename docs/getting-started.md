@@ -85,14 +85,16 @@ async with await Database.connect(url, schema=[Users, Posts]) as db:
     posts = await db.query(Posts).find_many(
         with_={"author": True}, order_by=desc(Posts.id), limit=20
     )
-    print(posts[0].author.email)
+    if (author := posts[0].author) is not None:  # a one() relation can be missing
+        print(author.email)
 
     # transactions: commit at the end of the block, roll back on an exception
     async with db.transaction() as tx:
         await tx.delete(Posts).where(eq(Posts.author_id, ann.id))
 ```
 
-Every row is typed: your editor knows `posts[0].author.email` is a `str`.
+Every row is typed: your editor knows `author` is `Users | None` and `author.email` is a
+`str`.
 
 ## Next
 

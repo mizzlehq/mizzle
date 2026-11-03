@@ -208,7 +208,7 @@ wheels = [
 
 [[package]]
 name = "mizzle"
-version = "0.2.0"
+version = "0.2.1"
 source = { editable = "../../" }
 dependencies = [
     { name = "asyncpg" },
@@ -244,9 +244,9 @@ dev = [
     { name = "ruff", specifier = ">=0.11" },
 ]
 docs = [
-    { name = "mkdocs-material", specifier = ">=9.6" },
     { name = "mkdocstrings", extras = ["python"], specifier = ">=0.29" },
     { name = "ruff", specifier = ">=0.11" },
+    { name = "zensical", specifier = ">=0.0.74" },
 ]
 
 [[package]]

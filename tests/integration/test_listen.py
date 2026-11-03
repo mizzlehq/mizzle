@@ -165,6 +165,17 @@ async def test_reconnect_signals_the_gap(db: Database, driver: PostgresDriver) -
     assert_no_leak(db)
 
 
+async def test_reconnect_does_not_warn_about_the_dead_connection(
+    db: Database, driver: PostgresDriver, caplog: pytest.LogCaptureFixture
+) -> None:
+    # The killed connection cannot go back to the pool; that is expected, not a warning.
+    async with db.listen("re3", reconnect=True) as events:
+        await kill_listener(driver)
+        assert isinstance((await take(events, 1))[0], Reconnected)
+    assert "could not return a connection" not in caplog.text
+    assert "reconnecting" in caplog.text
+
+
 async def test_reconnect_survives_a_cancelled_wait(db: Database, driver: PostgresDriver) -> None:
     async with db.listen("re2", reconnect=True) as events:
         with pytest.raises(TimeoutError):

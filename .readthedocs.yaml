@@ -11,4 +11,5 @@ build:
     - asdf global uv latest
     - uv sync --frozen --only-group docs
     - uv run --frozen --only-group docs zensical build --strict --clean
+    - uv run --frozen --only-group docs python scripts/llms_full.py
     - mkdir -p $READTHEDOCS_OUTPUT && mv site $READTHEDOCS_OUTPUT/html

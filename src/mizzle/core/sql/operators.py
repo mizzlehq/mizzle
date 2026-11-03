@@ -49,33 +49,59 @@ def _wrap(value: object, like: ExprBase) -> Node:
     return Param(value, column)
 
 
-def _compare[T](left: Expr[T], op: str, right: Operand[T]) -> Expr[bool]:
+def _compare(left: ExprBase, op: str, right: object) -> Expr[bool]:
     if right is None:
         raise QueryError(f"comparing with None using {op!r} is never true in SQL; use is_null()")
     return BinaryOp(left, op, _wrap(right, left))
 
 
-def eq[T](left: Expr[T], right: Operand[T]) -> Expr[bool]:
+# The first overload lets a nullable column meet a non-null value or column
+# (eq(Users.manager_id, boss.id)); Expr is invariant, so Expr[int] is not an Expr[int | None].
+@overload
+def eq[T](left: Expr[T | None], right: Operand[T]) -> Expr[bool]: ...
+@overload
+def eq[T](left: Expr[T], right: Operand[T] | Expr[T | None]) -> Expr[bool]: ...
+def eq(left: ExprBase, right: object) -> Expr[bool]:
     return _compare(left, "=", right)
 
 
-def ne[T](left: Expr[T], right: Operand[T]) -> Expr[bool]:
+@overload
+def ne[T](left: Expr[T | None], right: Operand[T]) -> Expr[bool]: ...
+@overload
+def ne[T](left: Expr[T], right: Operand[T] | Expr[T | None]) -> Expr[bool]: ...
+def ne(left: ExprBase, right: object) -> Expr[bool]:
     return _compare(left, "<>", right)
 
 
-def gt[T](left: Expr[T], right: Operand[T]) -> Expr[bool]:
+@overload
+def gt[T](left: Expr[T | None], right: Operand[T]) -> Expr[bool]: ...
+@overload
+def gt[T](left: Expr[T], right: Operand[T] | Expr[T | None]) -> Expr[bool]: ...
+def gt(left: ExprBase, right: object) -> Expr[bool]:
     return _compare(left, ">", right)
 
 
-def gte[T](left: Expr[T], right: Operand[T]) -> Expr[bool]:
+@overload
+def gte[T](left: Expr[T | None], right: Operand[T]) -> Expr[bool]: ...
+@overload
+def gte[T](left: Expr[T], right: Operand[T] | Expr[T | None]) -> Expr[bool]: ...
+def gte(left: ExprBase, right: object) -> Expr[bool]:
     return _compare(left, ">=", right)
 
 
-def lt[T](left: Expr[T], right: Operand[T]) -> Expr[bool]:
+@overload
+def lt[T](left: Expr[T | None], right: Operand[T]) -> Expr[bool]: ...
+@overload
+def lt[T](left: Expr[T], right: Operand[T] | Expr[T | None]) -> Expr[bool]: ...
+def lt(left: ExprBase, right: object) -> Expr[bool]:
     return _compare(left, "<", right)
 
 
-def lte[T](left: Expr[T], right: Operand[T]) -> Expr[bool]:
+@overload
+def lte[T](left: Expr[T | None], right: Operand[T]) -> Expr[bool]: ...
+@overload
+def lte[T](left: Expr[T], right: Operand[T] | Expr[T | None]) -> Expr[bool]: ...
+def lte(left: ExprBase, right: object) -> Expr[bool]:
     return _compare(left, "<=", right)
 
 

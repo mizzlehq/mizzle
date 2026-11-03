@@ -80,6 +80,8 @@ def test_pydantic_and_typegen() -> None:
     source = render_types_module([Embeddings])
     assert "    sparse: dict[int, float] | None" in source
     assert "    dense: list[float] | None" in source
+    # Only used names are imported (strict checkers flag the rest).
+    assert "from typing import NotRequired, TypedDict\n" in source
 
 
 @pytest.mark.parametrize(
