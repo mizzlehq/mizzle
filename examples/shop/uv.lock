@@ -247,6 +247,11 @@ dev = [
     { name = "pytest-cov", specifier = ">=6.0" },
     { name = "ruff", specifier = ">=0.11" },
 ]
+docs = [
+    { name = "mkdocstrings", extras = ["python"], specifier = ">=0.29" },
+    { name = "ruff", specifier = ">=0.11" },
+    { name = "zensical", specifier = ">=0.0.74" },
+]
 
 [[package]]
 name = "mizzle-example-shop"

@@ -21,7 +21,7 @@ lint() {
     uv run ruff check && uv run ruff format --check &&
     uv run basedpyright && uv run mypy &&
     uv run basedpyright --pythonversion 3.14 && uv run mypy --python-version 3.14 &&
-    NO_MKDOCS_2_WARNING=1 uv run --group docs mkdocs build --strict -d "$VENVS/site"
+    uv run --group docs zensical build --strict --clean
 }
 
 ui() {
