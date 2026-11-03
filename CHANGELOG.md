@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.2.4
 
 - Faster row building: each table's row decoder is generated once (fixed column positions
   in a dict display) and cached. Selecting 1000 rows is about 1.75x faster, nested
