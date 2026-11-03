@@ -118,6 +118,14 @@ class EnumSnap(TypedDict):
     values: list[str]
 
 
+class RoleSnap(TypedDict):
+    name: str
+    login: bool
+    create_db: bool
+    create_role: bool
+    inherit: bool
+
+
 class ExtensionSnap(TypedDict):
     name: str
     # Absent: not declared, so whatever the database has is accepted.
@@ -156,6 +164,7 @@ class Snapshot(TypedDict):
     tables: dict[str, TableSnap]  # "schema.name" -> table
     # Absent unless used, so snapshots written before these fields existed compare equal.
     extensions: NotRequired[dict[str, ExtensionSnap]]  # name -> extension
+    roles: NotRequired[dict[str, RoleSnap]]  # name -> role (managed ones only)
     functions: NotRequired[dict[str, FunctionSnap]]  # "schema.name" -> function
     views: NotRequired[dict[str, ViewSnap]]  # "schema.name" -> view
 

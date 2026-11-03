@@ -18,15 +18,18 @@ The roles below already exist in every Supabase project.
 
 from __future__ import annotations
 
-from mizzle.core.schema.constraints import Policy, policy
+from collections.abc import Sequence
+
+from mizzle.core.schema.constraints import Policy, Role, policy, role
 from mizzle.core.sql.nodes import Condition, Raw
 from mizzle.core.sql.raw import sql
 
-ANON = "anon"
-AUTHENTICATED = "authenticated"
-SERVICE_ROLE = "service_role"
-POSTGRES = "postgres"
-SUPABASE_AUTH_ADMIN = "supabase_auth_admin"
+# Supabase creates these roles; existing=True: migrations never create or change them.
+ANON = role("anon", existing=True)
+AUTHENTICATED = role("authenticated", existing=True)
+SERVICE_ROLE = role("service_role", existing=True)
+POSTGRES = role("postgres", existing=True)
+SUPABASE_AUTH_ADMIN = role("supabase_auth_admin", existing=True)
 
 
 def auth_uid() -> Raw:
@@ -54,7 +57,7 @@ def _condition(rule: Condition | bool) -> Condition:
 def crud_policy(
     name: str,
     *,
-    to: list[str],
+    to: Sequence[str | Role],
     read: Condition | bool | None = None,
     modify: Condition | bool | None = None,
 ) -> list[Policy]:

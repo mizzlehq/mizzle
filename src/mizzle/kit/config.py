@@ -19,6 +19,7 @@ from typing import cast
 
 from mizzle.core.errors import MigrationError
 from mizzle.core.naming import Casing
+from mizzle.core.schema.constraints import Role
 from mizzle.core.schema.objects import Extension, Function, SchemaObject, Trigger
 from mizzle.core.schema.table import Table
 from mizzle.dialects.base import Dialect
@@ -100,10 +101,10 @@ class Config:
         return tables
 
     def load_objects(self) -> list[SchemaObject]:
-        """The extensions, functions and triggers the schema modules expose."""
+        """The extensions, functions, triggers and roles the schema modules expose."""
         objects: list[SchemaObject] = []
         for value in self._members():
-            if isinstance(value, Extension | Function | Trigger) and value not in objects:
+            if isinstance(value, Extension | Function | Trigger | Role) and value not in objects:
                 objects.append(value)
         return objects
 

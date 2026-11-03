@@ -17,6 +17,7 @@ from mizzle.core.snapshot import (
     IdentitySnap,
     IndexSnap,
     PolicySnap,
+    RoleSnap,
     TableSnap,
     TriggerSnap,
 )
@@ -35,11 +36,13 @@ from mizzle.core.steps import (
     AlterColumnType,
     AlterExtension,
     AlterPolicy,
+    AlterRole,
     CreateEnum,
     CreateExtension,
     CreateFunction,
     CreateIndex,
     CreatePolicy,
+    CreateRole,
     CreateSchema,
     CreateTable,
     CreateTrigger,
@@ -51,6 +54,7 @@ from mizzle.core.steps import (
     DropFunction,
     DropIndex,
     DropPolicy,
+    DropRole,
     DropTable,
     DropTrigger,
     DropView,
@@ -330,6 +334,18 @@ def _create_index(schema: str, table: str, index: IndexSnap) -> str:
     return text + (f" WHERE {index['where']}" if index["where"] else "")
 
 
+def _role_options(role: RoleSnap) -> str:
+    return " ".join(
+        word if on else f"NO{word}"
+        for word, on in (
+            ("LOGIN", role["login"]),
+            ("CREATEDB", role["create_db"]),
+            ("CREATEROLE", role["create_role"]),
+            ("INHERIT", role["inherit"]),
+        )
+    )
+
+
 def _literal(text: str) -> str:
     return "'" + text.replace("'", "''") + "'"
 
@@ -453,6 +469,19 @@ def render_step(step: Step) -> Statement:
             return Statement(f"DROP INDEX {qualified(schema, name)}")
         case RenameIndex(schema=schema, old=old, new=new):
             return Statement(f"ALTER INDEX {qualified(schema, old)} RENAME TO {quote(new)}")
+        case CreateRole(role=role):
+            # Roles are shared by all databases on the server: another database (or an
+            # earlier run) may have made it already. ALTER then sets the options.
+            name = quote(role["name"])
+            return Statement(  # one statement, so migration files keep one per step
+                "DO $mizzle$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = "
+                f"{_literal(role['name'])}) THEN CREATE ROLE {name}; END IF; "
+                f"ALTER ROLE {name} {_role_options(role)}; END $mizzle$"
+            )
+        case AlterRole(role=role):
+            return Statement(f"ALTER ROLE {quote(role['name'])} {_role_options(role)}")
+        case DropRole(name=name):
+            return Statement(f"DROP ROLE IF EXISTS {quote(name)}")
         case CreateExtension(extension=ext):
             text = f"CREATE EXTENSION IF NOT EXISTS {type_ident(ext['name'])}"
             if "schema" in ext:

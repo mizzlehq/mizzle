@@ -29,6 +29,7 @@ from mizzle.core.schema.constraints import (
     policy,
     primary_key,
     rls,
+    role,
     unique,
     unique_index,
 )
@@ -213,6 +214,7 @@ __all__ = [
     "rank",
     "regex",
     "rls",
+    "role",
     "round_",
     "row_number",
     "rows_between",

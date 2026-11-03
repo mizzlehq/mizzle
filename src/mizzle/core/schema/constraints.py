@@ -85,6 +85,35 @@ type PolicyCommand = Literal["all", "select", "insert", "update", "delete"]
 
 
 @dataclass(frozen=True)
+class Role:
+    """A database role. Migrations create it (if missing) and keep its options in sync;
+    ``existing=True`` only references a role that something else manages (Supabase's
+    ``anon``, ``authenticated``...). Roles belong to the whole server, so mizzle never
+    drops one it does not manage."""
+
+    name: str
+    login: bool = False
+    create_db: bool = False
+    create_role: bool = False
+    inherit: bool = True
+    existing: bool = False
+
+
+def role(
+    name: str,
+    *,
+    login: bool = False,
+    create_db: bool = False,
+    create_role: bool = False,
+    inherit: bool = True,
+    existing: bool = False,
+) -> Role:
+    """``role("admin", create_role=True)``. Passwords are not managed: set them outside
+    the schema (they are secrets)."""
+    return Role(name, login, create_db, create_role, inherit, existing)
+
+
+@dataclass(frozen=True)
 class Policy:
     """A row-level security policy (``CREATE POLICY``); applies once ``rls()`` is on."""
 
@@ -94,6 +123,7 @@ class Policy:
     using: Condition | None = None
     with_check: Condition | None = None
     permissive: bool = True
+    declared_roles: tuple[Role, ...] = ()  # Role objects in ``to``, created by migrations
 
 
 @dataclass(frozen=True)
@@ -147,7 +177,7 @@ def policy(
     name: str,
     *,
     for_: PolicyCommand = "all",
-    to: Sequence[str] = ("public",),
+    to: Sequence[str | Role] = ("public",),
     using: Condition | None = None,
     with_check: Condition | None = None,
     as_: Literal["permissive", "restrictive"] = "permissive",
@@ -156,6 +186,8 @@ def policy(
     The roles must exist; ``"public"`` means every role."""
     if not to:
         raise SchemaError(f"policy {name!r} needs at least one role")
+    names = [r.name if isinstance(r, Role) else r for r in to]
+    managed = tuple(r for r in to if isinstance(r, Role) and not r.existing)
     # PostgreSQL ignores the other roles when PUBLIC is one of them.
-    roles = ("public",) if "public" in to else tuple(sorted(set(to)))
-    return Policy(name, for_, roles, using, with_check, as_ == "permissive")
+    roles = ("public",) if "public" in names else tuple(sorted(set(names)))
+    return Policy(name, for_, roles, using, with_check, as_ == "permissive", managed)

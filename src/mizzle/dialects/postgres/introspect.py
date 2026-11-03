@@ -18,6 +18,7 @@ from mizzle.core.snapshot import (
     IndexSnap,
     PolicySnap,
     RlsSnap,
+    RoleSnap,
     Snapshot,
     TableSnap,
     TriggerSnap,
@@ -168,6 +169,11 @@ WHERE p.polrelid = ANY($1::oid[])
 ORDER BY p.polrelid, p.polname
 """
 
+_ROLES = """
+SELECT rolname AS name, rolcanlogin AS login, rolcreatedb AS create_db,
+       rolcreaterole AS create_role, rolinherit AS inherit
+FROM pg_roles WHERE rolname = any($1::text[])
+"""
 _EXTENSIONS = """
 SELECT e.extname AS name, n.nspname AS schema, e.extversion AS version
 FROM pg_extension e JOIN pg_namespace n ON n.oid = e.extnamespace
@@ -284,7 +290,9 @@ def _check_expression(definition: str) -> str:
     return expr[1:-1] if expr.startswith("(") and expr.endswith(")") else expr
 
 
-async def introspect(conn: Connection, schemas: Sequence[str] = (DEFAULT_SCHEMA,)) -> Snapshot:
+async def introspect(
+    conn: Connection, schemas: Sequence[str] = (DEFAULT_SCHEMA,), roles: Sequence[str] = ()
+) -> Snapshot:
     snapshot = empty_snapshot("postgresql")
     schema_list = list(schemas)
     tables = await conn.fetch_dicts(_TABLES, [schema_list, MIGRATIONS_TABLE])
@@ -356,7 +364,7 @@ async def introspect(conn: Connection, schemas: Sequence[str] = (DEFAULT_SCHEMA,
         trigger = _trigger(row)
         by_oid[_int(row["table_oid"])].setdefault("triggers", {})[trigger["name"]] = trigger
 
-    await _introspect_objects(conn, schema_list, snapshot)
+    await _introspect_objects(conn, schema_list, snapshot, roles)
 
     for row in await conn.fetch_dicts(_ENUMS, [schema_list]):
         schema, name = str(row["schema"]), str(row["name"])
@@ -370,7 +378,9 @@ def _add_schema(snapshot: Snapshot, schema: str) -> None:
         snapshot["schemas"].append(schema)
 
 
-async def _introspect_objects(conn: Connection, schemas: list[str], snapshot: Snapshot) -> None:
+async def _introspect_objects(
+    conn: Connection, schemas: list[str], snapshot: Snapshot, roles: Sequence[str]
+) -> None:
     """Views, functions and extensions."""
     views: dict[int, ViewSnap] = {}
     for row in await conn.fetch_dicts(_VIEWS, [schemas]):
@@ -410,6 +420,18 @@ async def _introspect_objects(conn: Connection, schemas: list[str], snapshot: Sn
             ),
         )
         _add_schema(snapshot, schema)
+
+    # Only the named roles: the others belong to the server (and other databases), and a
+    # pulled baseline must never contain them, or the next generate would drop them.
+    for row in await conn.fetch_dicts(_ROLES, [list(roles)]) if roles else []:
+        name = str(row["name"])
+        snapshot.setdefault("roles", {})[name] = RoleSnap(
+            name=name,
+            login=bool(row["login"]),
+            create_db=bool(row["create_db"]),
+            create_role=bool(row["create_role"]),
+            inherit=bool(row["inherit"]),
+        )
 
     for row in await conn.fetch_dicts(_EXTENSIONS, []):
         ext = ExtensionSnap(name=str(row["name"]), schema=str(row["schema"]))

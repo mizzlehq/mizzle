@@ -17,6 +17,7 @@ from mizzle.core.snapshot import (
     IndexSnap,
     PolicySnap,
     PrimaryKeySnap,
+    RoleSnap,
     TableSnap,
     TriggerSnap,
     UniqueSnap,
@@ -312,6 +313,33 @@ class RenameIndex(Step):
     @override
     def describe(self) -> str:
         return f"rename index {self.old} to {self.new}"
+
+
+@dataclass(frozen=True)
+class CreateRole(Step):
+    role: RoleSnap
+
+    @override
+    def describe(self) -> str:
+        return f"create role {self.role['name']}"
+
+
+@dataclass(frozen=True)
+class AlterRole(Step):
+    role: RoleSnap
+
+    @override
+    def describe(self) -> str:
+        return f"change options of role {self.role['name']}"
+
+
+@dataclass(frozen=True)
+class DropRole(Step):
+    name: str
+
+    @override
+    def describe(self) -> str:
+        return f"drop role {self.name}"
 
 
 @dataclass(frozen=True)

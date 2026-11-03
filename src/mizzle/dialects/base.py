@@ -149,7 +149,13 @@ class Dialect(Protocol):
         """The extension a column type needs (``vector`` -> ``"vector"``), if any."""
         ...
 
-    async def introspect(self, conn: Connection, schemas: Sequence[str]) -> Snapshot: ...
+    async def introspect(
+        self, conn: Connection, schemas: Sequence[str], roles: Sequence[str] = ()
+    ) -> Snapshot:
+        """The database's schema. ``roles``: the role names to read (roles belong to the
+        whole server, so only the ones a schema manages are ever read)."""
+        ...
+
     async def normalize_snapshot(self, conn: Connection, snapshot: Snapshot) -> Snapshot:
         """``snapshot`` with view queries and other expressions as the database prints
         them back, so it compares equal to an introspected one. Nothing is changed."""

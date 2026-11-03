@@ -183,7 +183,9 @@ def cmd_push(config: Config, args: Args) -> int:
     async def run(driver: Driver, dialect: Dialect) -> int:
         desired = build_snapshot(tables, dialect, config.casing, objects=objects)
         async with driver.acquire() as conn:
-            live = await dialect.introspect(conn, _schemas(config, desired))
+            live = await dialect.introspect(
+                conn, _schemas(config, desired), list(desired.get("roles", {}))
+            )
             # View queries and expressions as the database prints them, to compare.
             desired = await dialect.normalize_snapshot(conn, desired)
             steps = diff(live, desired, _resolver(args, dialect), compare_expressions=False)

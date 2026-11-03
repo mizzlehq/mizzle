@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from typing import Literal
 
 from mizzle.core.errors import SchemaError
+from mizzle.core.schema.constraints import Role
 from mizzle.core.schema.table import Table
 from mizzle.core.sql.nodes import Condition
 
@@ -55,7 +56,7 @@ class Trigger:
     when: Condition | None = None
 
 
-type SchemaObject = Extension | Function | Trigger
+type SchemaObject = Extension | Function | Trigger | Role
 
 
 def extension(name: str, *, schema: str | None = None, version: str | None = None) -> Extension:

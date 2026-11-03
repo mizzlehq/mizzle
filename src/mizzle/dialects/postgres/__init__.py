@@ -66,8 +66,10 @@ class PostgresDialect:
     def type_extension(self, sql_type: str) -> str | None:
         return ddl.type_extension(sql_type)
 
-    async def introspect(self, conn: Connection, schemas: Sequence[str]) -> Snapshot:
-        return await introspect(conn, schemas)
+    async def introspect(
+        self, conn: Connection, schemas: Sequence[str], roles: Sequence[str] = ()
+    ) -> Snapshot:
+        return await introspect(conn, schemas, roles)
 
     async def normalize_snapshot(self, conn: Connection, snapshot: Snapshot) -> Snapshot:
         return await normalize_snapshot(conn, snapshot)

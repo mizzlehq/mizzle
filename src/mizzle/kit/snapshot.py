@@ -15,6 +15,7 @@ from mizzle.core.schema.constraints import (
     Index,
     Policy,
     PrimaryKey,
+    Role,
     RowLevelSecurity,
     UniqueConstraint,
 )
@@ -34,6 +35,7 @@ from mizzle.core.snapshot import (
     PolicySnap,
     PrimaryKeySnap,
     RlsSnap,
+    RoleSnap,
     Snapshot,
     TableSnap,
     TriggerSnap,
@@ -54,7 +56,8 @@ def build_snapshot(
     prev_id: str | None = None,
     objects: Sequence[SchemaObject] = (),
 ) -> Snapshot:
-    """``tables`` may include views; ``objects`` are extensions, functions and triggers."""
+    """``tables`` may include views; ``objects`` are extensions, functions, triggers and
+    roles."""
     validate_tables(tables, casing)
     snapshot = empty_snapshot(dialect.name, str(uuid.uuid4()))
     snapshot["prev_id"] = prev_id
@@ -186,6 +189,8 @@ def build_snapshot(
                     snap.setdefault("policies", {})[constraint.name] = _policy(
                         constraint, dialect, casing
                     )
+                    for declared in constraint.declared_roles:
+                        _add_role(snapshot, declared)
                 case RowLevelSecurity():
                     if constraint.enabled or constraint.force:
                         snap["rls"] = RlsSnap(enabled=constraint.enabled, force=constraint.force)
@@ -202,6 +207,8 @@ def build_snapshot(
 
     for obj in [*objects, *(o.execute for o in objects if isinstance(o, Trigger))]:
         match obj:
+            case Role():
+                _add_role(snapshot, obj)
             case Extension():
                 ext = ExtensionSnap(name=obj.name)
                 if obj.schema is not None:  # created with it (see render)
@@ -325,3 +332,19 @@ def _add_enum(snapshot: Snapshot, schema: str, column: ColumnBase) -> None:
     if existing is not None and existing["values"] != values:
         raise SchemaError(f"enum type {name!r} is declared twice with different values")
     snapshot["enums"][key(schema, name)] = EnumSnap(schema=schema, name=name, values=values)
+
+
+def _add_role(snapshot: Snapshot, role: Role) -> None:
+    if role.existing:  # managed elsewhere: only referenced by name
+        return
+    snap = RoleSnap(
+        name=role.name,
+        login=role.login,
+        create_db=role.create_db,
+        create_role=role.create_role,
+        inherit=role.inherit,
+    )
+    roles = snapshot.setdefault("roles", {})
+    if roles.get(role.name, snap) != snap:
+        raise SchemaError(f"role {role.name!r} is declared twice with different options")
+    roles[role.name] = snap

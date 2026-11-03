@@ -24,12 +24,14 @@ from mizzle.core.steps import (
     AlterColumnType,
     AlterExtension,
     AlterPolicy,
+    AlterRole,
     ConstraintKind,
     CreateEnum,
     CreateExtension,
     CreateFunction,
     CreateIndex,
     CreatePolicy,
+    CreateRole,
     CreateSchema,
     CreateTable,
     CreateTrigger,
@@ -41,6 +43,7 @@ from mizzle.core.steps import (
     DropFunction,
     DropIndex,
     DropPolicy,
+    DropRole,
     DropTable,
     DropTrigger,
     DropView,
@@ -149,6 +152,8 @@ class _Plan:
     drop_tables: list[Step] = field(default_factory=list[Step])
     drop_enums: list[Step] = field(default_factory=list[Step])
     drop_extensions: list[Step] = field(default_factory=list[Step])
+    roles: list[Step] = field(default_factory=list[Step])
+    drop_roles: list[Step] = field(default_factory=list[Step])
 
     def steps(self) -> list[Step]:
         # Order matters: renames first (later steps use new names), drops of dependent
@@ -156,6 +161,7 @@ class _Plan:
         # Extensions -> types -> tables -> functions -> views -> policies and triggers;
         # the reverse when dropping.
         return [
+            *self.roles,  # before the policies that name them
             *self.schemas,
             *self.extensions,
             *self.enums,
@@ -182,6 +188,7 @@ class _Plan:
             *self.drop_tables,
             *self.drop_enums,
             *self.drop_extensions,
+            *self.drop_roles,  # after the policies that named them are gone
         ]
 
 
@@ -472,6 +479,7 @@ def diff(
             ]
     _recreate_dependent_fks(old_tables, new, plan)
     _diff_extensions(old, new, plan, drop_unlisted=compare_expressions)
+    _diff_roles(old, new, plan, drop_unlisted=compare_expressions)
     touched = _diff_functions(old, new, plan)
     touched |= _changed_tables(plan)
     touched |= _diff_views(old, new, plan, touched)
@@ -505,6 +513,20 @@ def _empty_like(table: TableSnap) -> TableSnap:
         foreign_keys={},
         indexes={},
     )
+
+
+def _diff_roles(old: Snapshot, new: Snapshot, plan: _Plan, drop_unlisted: bool) -> None:
+    before, after = old.get("roles", {}), new.get("roles", {})
+    for name, role in after.items():
+        prev = before.get(name)
+        if prev is None:
+            plan.roles.append(CreateRole(role))
+        elif prev != role:
+            plan.roles.append(AlterRole(role))
+    # A live database lists every role on the server: only roles a previous snapshot
+    # managed are ever dropped.
+    if drop_unlisted:
+        plan.drop_roles += [DropRole(n) for n in before if n not in after]
 
 
 def _diff_extensions(old: Snapshot, new: Snapshot, plan: _Plan, drop_unlisted: bool) -> None:
