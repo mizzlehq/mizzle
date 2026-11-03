@@ -8,7 +8,7 @@ from typing import cast
 
 from mizzle.core.errors import SchemaError
 from mizzle.core.naming import Casing
-from mizzle.core.schema.column import ColumnBase
+from mizzle.core.schema.column import ColumnBase, ReferentialAction
 from mizzle.core.schema.constraints import Check, ForeignKey, Index, PrimaryKey, UniqueConstraint
 from mizzle.core.schema.table import Table, validate_tables
 from mizzle.core.snapshot import (
@@ -48,7 +48,16 @@ def build_snapshot(
     for table in tables:
         info = table.__table__
         schema, tname = schema_of(table), info.name
-        trunc = dialect.truncate_name
+
+        def trunc(name: str) -> str:
+            # Shorten the middle, keeping the "_key" / "_fkey" / ... suffix: cutting it off
+            # can give a unique and a foreign key on the same columns the same name.
+            over = len(name) - len(dialect.truncate_name(name))
+            if over == 0:
+                return name
+            base, _, suffix = name.rpartition("_")
+            return dialect.truncate_name(f"{base[:-over]}_{suffix}")
+
         snap = TableSnap(
             schema=schema,
             name=tname,
@@ -88,8 +97,8 @@ def build_snapshot(
                     ref_schema=schema_of(target.table),
                     ref_table=target.table.__table__.name,
                     ref_columns=[target.db_name(casing)],
-                    on_delete=column.reference.on_delete,
-                    on_update=column.reference.on_update,
+                    on_delete=_action(column.reference.on_delete),
+                    on_update=_action(column.reference.on_update),
                 )
 
         for constraint in table.config():
@@ -116,6 +125,8 @@ def build_snapshot(
                     snap["primary_key"] = PrimaryKeySnap(
                         name=name, columns=names(constraint.columns)
                     )
+                    for cname in names(constraint.columns):  # the database enforces this
+                        snap["columns"][cname]["not_null"] = True
                 case ForeignKey():
                     cols = names(constraint.columns)
                     refs = list(constraint.references())
@@ -131,8 +142,8 @@ def build_snapshot(
                         ref_schema=schema_of(ref_table),
                         ref_table=ref_table.__table__.name,
                         ref_columns=names(refs),
-                        on_delete=constraint.on_delete,
-                        on_update=constraint.on_update,
+                        on_delete=_action(constraint.on_delete),
+                        on_update=_action(constraint.on_update),
                     )
                 case Check():
                     expression = dialect.expression(constraint.condition, casing)
@@ -140,10 +151,19 @@ def build_snapshot(
                         name=constraint.name, expression=expression
                     )
 
+        if pk := snap["primary_key"]:  # CREATE TABLE drops a UNIQUE that repeats the key
+            snap["uniques"] = {
+                n: u for n, u in snap["uniques"].items() if u["columns"] != pk["columns"]
+            }
         if schema != default_schema and schema not in snapshot["schemas"]:
             snapshot["schemas"].append(schema)
         snapshot["tables"][key(schema, tname)] = snap
     return snapshot
+
+
+def _action(action: ReferentialAction | None) -> ReferentialAction | None:
+    # "no action" is the database default; introspection reports it as None.
+    return None if action == "no action" else action
 
 
 def _add_enum(snapshot: Snapshot, schema: str, column: ColumnBase) -> None:

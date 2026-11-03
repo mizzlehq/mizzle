@@ -166,7 +166,12 @@ def _diff_enums(old: Snapshot, new: Snapshot, plan: _Plan) -> None:
             if value in old_values:
                 continue
             after = new_values[i - 1] if i > 0 else None
-            before_value = new_values[i + 1] if after is None and len(new_values) > 1 else None
+            # Anchor a value added first on an existing one: later new values follow it.
+            before_value = (
+                next((v for v in new_values[i + 1 :] if v in old_values), None)
+                if after is None
+                else None
+            )
             plan.enums.append(
                 AddEnumValue(enum["schema"], enum["name"], value, after, before_value)
             )
@@ -270,7 +275,11 @@ def _diff_table(old: TableSnap, new: TableSnap, plan: _Plan, compare_expressions
         if before is None:
             plan.add_columns.append(AddColumn(schema, name, column))
             continue
+        old_default = before["default"]
         if before["type"] != column["type"]:
+            if old_default is not None:  # it may not cast to the new type; set it again after
+                plan.alter_columns.append(AlterColumnDefault(schema, name, cname, None))
+                old_default = None
             plan.alter_columns.append(
                 AlterColumnType(schema, name, cname, before["type"], column["type"])
             )
@@ -278,7 +287,7 @@ def _diff_table(old: TableSnap, new: TableSnap, plan: _Plan, compare_expressions
             plan.alter_columns.append(
                 AlterColumnNullability(schema, name, cname, column["not_null"])
             )
-        if before["default"] != column["default"]:
+        if old_default != column["default"]:
             plan.alter_columns.append(AlterColumnDefault(schema, name, cname, column["default"]))
     for cname in old["columns"]:
         if cname not in new["columns"]:
@@ -381,5 +390,44 @@ def diff(
             _diff_table(before, table, plan, compare_expressions)
     for k, table in old_tables.items():
         if k not in new["tables"]:
+            # Its foreign keys would block changes to the tables they reference.
+            plan.drop_fks += [
+                DropConstraint(table["schema"], table["name"], n, "foreign_key")
+                for n in table["foreign_keys"]
+            ]
             plan.drop_tables.append(DropTable(table["schema"], table["name"]))
+    _recreate_dependent_fks(old_tables, new, plan)
     return plan.steps()
+
+
+def _recreate_dependent_fks(old_tables: dict[str, TableSnap], new: Snapshot, plan: _Plan) -> None:
+    """A foreign key depends on the key it references: dropping that primary key or unique
+    fails while the key is in use, so drop the foreign key first and add it back after.
+    Keys match by column set, in any order, as PostgreSQL matches them."""
+    dropped: set[tuple[str, str, frozenset[str]]] = set()
+    for step in plan.drop_constraints:
+        if not isinstance(step, DropConstraint) or step.kind not in ("primary_key", "unique"):
+            continue
+        table = old_tables[key(step.schema, step.table)]
+        pk = table["primary_key"]
+        cols = pk["columns"] if step.kind == "primary_key" and pk else []
+        if step.kind == "unique":
+            cols = table["uniques"][step.name]["columns"]
+        dropped.add((step.schema, step.table, frozenset(cols)))
+    added = {
+        (s.schema, s.table, s.foreign_key["name"])
+        for s in plan.add_fks
+        if isinstance(s, AddForeignKey)
+    }
+    for k, table in new["tables"].items():
+        before = old_tables.get(k)
+        for name, fk in table["foreign_keys"].items():
+            ref = (fk["ref_schema"], fk["ref_table"], frozenset(fk["ref_columns"]))
+            if before is None or name not in before["foreign_keys"] or ref not in dropped:
+                continue
+            if (table["schema"], table["name"], name) in added:
+                continue
+            plan.drop_fks.append(
+                DropConstraint(table["schema"], table["name"], name, "foreign_key")
+            )
+            plan.add_fks.append(AddForeignKey(table["schema"], table["name"], fk))

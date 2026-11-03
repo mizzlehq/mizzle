@@ -200,3 +200,38 @@ def test_default_literals_are_normalized() -> None:
     assert cols["num"]["type"] == "numeric(10,2)"
     assert cols["moods"]["type"] == "mood[]"
     _ = (datetime, uuid)
+
+
+async def test_temporal_literal_defaults_do_not_drift(driver: PostgresDriver) -> None:
+    from mizzle.pg import time
+
+    chatham = datetime.timezone(datetime.timedelta(hours=12, minutes=45))
+
+    class Stamps(Table, name="stamps"):
+        id = serial().primary_key()
+        aware = timestamp(tz=True).default(datetime.datetime(2024, 1, 2, 3, 4, 5, 123456, chatham))
+        utc = timestamp(tz=True).default(
+            datetime.datetime(2024, 1, 2, 3, 4, 5, tzinfo=datetime.UTC)
+        )
+        naive = timestamp().default(datetime.datetime(2024, 1, 2, 3, 4, 5, 500000))
+        day = date().default(datetime.date(2024, 1, 2))
+        clock = time().default(datetime.time(3, 4, 5, 500000))
+        clock_tz = time(tz=True).default(datetime.time(3, 4, 5, tzinfo=chatham))
+
+    async with driver.acquire() as conn:
+        await conn.execute("DROP TABLE IF EXISTS stamps", [])
+    desired = build_snapshot([Stamps], dialect)
+    await apply(driver, diff(empty_snapshot("postgresql"), desired))
+    try:
+        # PostgreSQL prints timestamptz defaults in the session time zone.
+        for zone in ("UTC", "Asia/Kathmandu", "America/St_Johns"):
+            async with driver.acquire() as conn, conn.transaction():
+                await conn.execute(f"SET LOCAL TimeZone TO '{zone}'", [])
+                live = await dialect.introspect(conn, ["public"])
+            live["tables"] = {"public.stamps": live["tables"]["public.stamps"]}
+            live["enums"] = {}
+            remaining = diff(live, desired, compare_expressions=False)
+            assert remaining == [], (zone, [s.describe() for s in remaining])
+    finally:
+        async with driver.acquire() as conn:
+            await conn.execute("DROP TABLE stamps", [])
