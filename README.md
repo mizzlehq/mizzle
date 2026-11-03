@@ -71,6 +71,26 @@ mizzle migrate     # apply it
 mizzle studio      # browse the data
 ```
 
+## In production
+
+```python
+db = await Database.connect(
+    "postgresql://...",
+    schema=[Users],
+    replicas=["postgresql://replica-1/...", "postgresql://replica-2/..."],
+    pool_size=20,
+    query_timeout=5,  # seconds; slow queries raise QueryTimeout
+)
+
+await db.select().from_(Users)  # reads go to the replicas, in turn
+await db.primary.select().from_(Users)  # read your own write right away
+await db.retry(transfer)  # re-run a transaction on a serialization conflict
+```
+
+Writes, transactions and `FOR UPDATE` always use the primary. Behind PgBouncer in
+transaction mode, pass `statement_cache_size=0`. CI tests a real streaming replica and
+PgBouncer on every change.
+
 ## Learn more
 
 The [example app](https://github.com/mizzlehq/mizzle/tree/main/examples/social) is a
