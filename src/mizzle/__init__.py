@@ -121,7 +121,7 @@ from mizzle.core.sql.raw import sql
 from mizzle.db import Database, QueryEvent, Session
 from mizzle.dialects.base import Notification, Reconnected
 
-__version__ = "0.2.1"
+__version__ = "0.2.2"
 
 __all__ = [
     "CheckViolation",

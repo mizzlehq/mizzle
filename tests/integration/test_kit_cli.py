@@ -1,6 +1,9 @@
 """End-to-end tests of the `mizzle` CLI against a fresh database per test."""
 
 import asyncio
+import importlib
+import subprocess
+import sys
 import uuid
 from collections.abc import AsyncGenerator, Iterator
 from pathlib import Path
@@ -258,6 +261,99 @@ async def test_pull_into_new_project_writes_the_schema_module(
     # Pulling again keeps the schema module and writes next to it.
     assert await cli("pull") == 0
     assert (fresh / module / "db" / "pulled_schema.py").exists()
+
+
+async def test_pull_update_follows_a_schema_another_app_owns(
+    project: Path, kit_url: str, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # The owner app (this project) generates and applies migrations.
+    assert await cli("generate") == 0
+    assert await cli("migrate") == 0
+    owner = project
+    # A second service on the same database follows the schema; it never migrates.
+    follower = project / "follower"
+    follower.mkdir()
+    module = f"follower_{uuid.uuid4().hex[:8]}"
+    (follower / "mizzle.toml").write_text(f'schema = "{module}"\nout = "migrations"\n')
+    monkeypatch.chdir(follower)
+    assert await cli("pull", "--update") == 0  # first time: the schema module and a baseline
+    assert len(list(follower.glob("migrations/0*"))) == 1
+    assert await cli("pull", "--update") == 0
+    assert "Up to date with the database." in capsys.readouterr().out
+
+    # The owner adds a column and a table, and applies it.
+    monkeypatch.chdir(owner)
+    rewrite_schema(
+        owner,
+        V1.replace("    name = text()", "    name = text()\n    nickname = text()")
+        + '\nclass Tags(Table, name="tags"):\n    id = serial().primary_key()\n',
+        monkeypatch,
+    )
+    assert await cli("generate", "--name", "tags") == 0
+    assert await cli("migrate") == 0
+
+    # The follower pulls the change: the module is rewritten, the migration is a record.
+    monkeypatch.chdir(follower)
+    assert await cli("pull", "--update", "--name", "tags") == 0
+    recorded = follower / "migrations" / "0002_tags" / "migration.sql"
+    sql = recorded.read_text()
+    assert '-- ALTER TABLE "users" ADD COLUMN "nickname" text' in sql
+    assert '-- CREATE TABLE "tags"' in sql
+    assert all(line.startswith("--") for line in sql.splitlines() if line.strip())
+    text = (follower / f"{module}.py").read_text()
+    assert "class Tags(Table" in text and "nickname = text()" in text
+    for name in [m for m in sys.modules if m.startswith(module)]:
+        monkeypatch.delitem(sys.modules, name)  # the CLI is a new process in real use
+    capsys.readouterr()
+    assert await cli("generate") == 0
+    assert "No schema changes." in capsys.readouterr().out
+    assert await cli("check") == 0
+    assert await cli("pull", "--update") == 0
+    assert "Up to date with the database." in capsys.readouterr().out
+    # A recorded migration runs nothing.
+    directory = MigrationsDir(follower / "migrations", "postgresql")
+    assert directory.migrations()[-1].statements() == []
+
+
+async def test_pull_columns_named_like_types_and_helpers(
+    tmp_path: Path,
+    kit_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # Columns named like a constructor the class body calls (text(), sql(...)) must not
+    # shadow it: "text = text()" then "note = text()" would call a Column.
+    conn = await asyncpg.connect(kit_url)
+    await conn.execute(
+        """
+        CREATE TYPE "Mood" AS ENUM ('ok', 'bad');
+        CREATE TABLE clock (
+            id serial PRIMARY KEY, text text NOT NULL, note text, date date, time time,
+            integer integer, sql text, one text, "Mood" "Mood", mood "Mood"
+        );
+        """
+    )
+    await conn.close()
+    module = f"pulled_{uuid.uuid4().hex[:8]}"
+    (tmp_path / "mizzle.toml").write_text(f'schema = "{module}"\nout = "migrations"\n')
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.syspath_prepend(str(tmp_path))
+    monkeypatch.setenv("DATABASE_URL", kit_url)
+    assert await cli("pull") == 0
+    source = (tmp_path / f"{module}.py").read_text()
+    assert "    text_ = text(name='text').not_null()" in source
+    assert "    note = text()" in source
+    mod = importlib.import_module(module)  # the class body runs
+    assert mod.Clock.text_.name == "text" and mod.Clock.Mood_.name == "Mood"
+    capsys.readouterr()
+    assert await cli("generate") == 0
+    assert "No schema changes." in capsys.readouterr().out
+    checked = subprocess.run(
+        [sys.executable, "-m", "basedpyright", str(tmp_path / f"{module}.py")],
+        capture_output=True,
+        text=True,
+    )
+    assert checked.returncode == 0, checked.stdout
 
 
 OBJECTS = (

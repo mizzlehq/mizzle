@@ -56,9 +56,12 @@ For development databases. In production, use `generate` and `migrate`.
 ```bash
 mizzle pull                       # writes your schema module, or pulled_schema.py
 mizzle pull --out db/legacy.py --force
+mizzle pull --update              # another app owns the schema: follow it
 ```
 
 Reads tables, enums, views, relations, row-level security and triggers from the database.
+`--update` rewrites your schema module and records the database's changes as a migration
+that runs nothing ([Following a schema another app owns](guide/migrations.md#following-a-schema-another-app-owns)).
 
 ## check
 

@@ -481,3 +481,23 @@ prints them. Review the file before you commit it.
 
 `schema_filter = ["public", "auth"]` in `mizzle.toml` sets which schemas `pull` and `push`
 read.
+
+### Following a schema another app owns
+
+In microservices, one app often owns the schema and applies its migrations. Other apps on
+the same database only follow it. In a follower, run:
+
+```bash
+mizzle pull --update                 # after the owner applied a migration
+mizzle pull --update --name add_tags # name the record
+```
+
+`--update`:
+
+- rewrites your schema module from the database (it is generated: do not edit it by hand),
+- writes a new migration folder as a record of what changed. Every statement in it is
+  commented out, because the database already has the changes, so `migrate` runs nothing,
+- prints `Up to date with the database.` and writes nothing when nothing changed.
+
+The first `pull --update` in a new project writes the schema module and a baseline. A
+follower does not run `generate` or `migrate`: the owner's migrations are the ones applied.

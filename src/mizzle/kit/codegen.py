@@ -10,6 +10,7 @@ import re
 import uuid
 from collections.abc import Sequence
 
+from mizzle import pg
 from mizzle.core.schema.column import ColumnBase
 from mizzle.core.schema.table import Table
 from mizzle.core.schema.view import View
@@ -27,7 +28,9 @@ from mizzle.core.snapshot import (
     sequence_defaults,
 )
 
-_RESERVED_ATTRS = {"config", "from_db"}
+# Names a class body calls (text(), sql(...), one(...)): an attribute of the same name would
+# shadow them for the rest of the class, so such columns get a trailing "_" (and name=).
+_RESERVED_ATTRS = {"config", "from_db", "sql", "one", "many", "Column", "Any", *pg.__all__}
 
 _SIMPLE_TYPES = {
     "integer": "integer",
@@ -136,6 +139,11 @@ class _SchemaWriter:
         self.uses_any: bool = False
         self.uses_relations: set[str] = set()
         self.relations: dict[str, list[str]] = {}  # "schema.table" -> relation lines
+
+    def attr(self, column: str) -> str:
+        """A column's attribute name; an enum class used in the class body is not shadowed."""
+        name = _identifier(column)
+        return f"{name}_" if name in self.enum_classes.values() else name
 
     def factory(self, sql_type: str, kwargs: str) -> str:
         if sql_type.endswith("[]"):
@@ -380,7 +388,7 @@ class _SchemaWriter:
             kw += f", schema={view['schema']!r}"
         if view["materialized"]:
             kw += ", materialized=True"
-        attrs = {c: _identifier(c) for c in view["columns"]}
+        attrs = {c: self.attr(c) for c in view["columns"]}
         lines = ["@final", f"class {cls}(View, {kw}):"]
         for cname, column in view["columns"].items():
             kwargs = f"name={cname!r}" if attrs[cname] != cname else ""
@@ -425,7 +433,7 @@ class _SchemaWriter:
             if name in self.table_classes.values() or name in self.enum_classes.values():
                 name = _class_name(f"{table['schema']}_{table['name']}")
             self.table_classes[k] = name
-            self.attrs[k] = {c: _identifier(c) for c in table["columns"]}
+            self.attrs[k] = {c: self.attr(c) for c in table["columns"]}
         self.add_relations()
 
         objects_code: list[str] = []
@@ -527,7 +535,7 @@ class _SchemaWriter:
                 cls = _class_name(f"{view['schema']}_{view['name']}_view")
             taken.add(cls)
             tables_code.append(self.view(k, cls))
-            owners.append((cls, view, {c: _identifier(c) for c in view["columns"]}))
+            owners.append((cls, view, {c: self.attr(c) for c in view["columns"]}))
             for i in view.get("indexes", {}).values():
                 uses_config.add("unique_index" if i["unique"] else "index")
                 has_config = True
@@ -562,9 +570,11 @@ class _SchemaWriter:
             typing_names.add("override")
         header.append(f"from typing import {', '.join(sorted(typing_names))}")
         header.append("")
+        blocks = [*enums_code, *objects_code, *tables_code, *triggers_code]
+        body = "\n\n\n".join(blocks)
         mizzle_names: set[str] = {
             "Table",
-            "sql",
+            *(["sql"] if re.search(r"\bsql\(", body) else []),  # unused imports fail strict checks
             *uses_config,
             *self.uses_relations,
             *uses_objects,
@@ -578,8 +588,7 @@ class _SchemaWriter:
         header.append(f"from mizzle import {', '.join(sorted(mizzle_names))}")
         if self.pg_imports:
             header.append(f"from mizzle.pg import {', '.join(sorted(self.pg_imports))}")
-        blocks = [*enums_code, *objects_code, *tables_code, *triggers_code]
-        return "\n".join(header) + "\n\n\n" + "\n\n\n".join(blocks) + "\n"
+        return "\n".join(header) + "\n\n\n" + body + "\n"
 
 
 def _trigger_args(t: TriggerSnap, cls: str, attrs: dict[str, str], execute: str) -> list[str]:

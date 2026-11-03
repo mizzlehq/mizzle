@@ -7,6 +7,7 @@ import asyncio
 import hashlib
 import importlib
 import sys
+import uuid
 from collections.abc import Awaitable, Callable, Sequence
 from pathlib import Path
 from typing import Protocol, cast
@@ -37,6 +38,7 @@ class Args(Protocol):
     allow_data_loss: bool
     lock_timeout: float
     force: bool
+    update: bool
     dry_run: bool
     out: str | None
     port: int
@@ -214,15 +216,16 @@ def cmd_push(config: Config, args: Args) -> int:
 
 def cmd_pull(config: Config, args: Args) -> int:
     # A new project gets the pulled tables as its schema module. An existing schema module
-    # is never overwritten: the result goes next to it, to compare and copy from.
+    # is never overwritten (the result goes next to it, to compare and copy from), unless
+    # --update: another app owns the schema and this one follows it.
     schema_file = config.schema_file()
     if args.out:
         out = Path(args.out)
-    elif schema_file.exists():
+    elif schema_file.exists() and not args.update:
         out = schema_file.with_name("pulled_schema.py")
     else:
         out = schema_file
-    if out.exists() and not args.force:
+    if out.exists() and not (args.force or args.update):
         raise MigrationError(f"{out} exists; pass --force to overwrite it")
 
     async def run(driver: Driver, dialect: Dialect) -> Snapshot:
@@ -230,15 +233,34 @@ def cmd_pull(config: Config, args: Args) -> int:
             return await dialect.introspect(conn, config.schema_filter)
 
     snapshot = asyncio.run(_with_driver(config, run))
+    directory = MigrationsDir(config.out, config.dialect_name)
+    if args.update and directory.migrations():
+        previous = directory.latest_snapshot()
+        steps = diff(previous, snapshot, no_renames, compare_expressions=False)
+        if not steps:
+            print("Up to date with the database.")
+            return 0
+        snapshot["id"], snapshot["prev_id"] = str(uuid.uuid4()), previous["id"]
+        sql = format_sql(config.dialect().render(steps))
+        header = PULLED_HEADER + "".join(
+            f"-- {line}\n" if line else "--\n" for line in sql.splitlines()
+        )
+        migration = directory.write(args.name or "pull", [], snapshot, header)
+        print(f"Recorded {migration.path} ({len(steps)} changes, already in the database)")
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(render_schema_module(snapshot), encoding="utf-8")
     print(f"Wrote {out} ({len(snapshot['tables'])} tables)")
-    directory = MigrationsDir(config.out, config.dialect_name)
     if not directory.migrations():
         header = "-- Baseline pulled from an existing database. Nothing to run.\n"
         migration = directory.write("pull", [], snapshot, header)
         print(f"Created baseline {migration.path}")
     return 0
+
+
+PULLED_HEADER = (
+    "-- Pulled from the database: another app already applied these changes.\n"
+    "-- Kept as a record only; every statement is commented out, so migrate runs nothing.\n"
+)
 
 
 CUSTOM_HEADER = "-- Custom migration. Separate statements with: -- mizzle:breakpoint\n"
@@ -397,6 +419,13 @@ def _parser() -> argparse.ArgumentParser:
         "otherwise pulled_schema.py next to it)",
     )
     p.add_argument("--force", action="store_true", help="overwrite the output file")
+    p.add_argument(
+        "--update",
+        action="store_true",
+        help="the schema is owned by another app: rewrite your schema module and record "
+        "the database's changes as a migration that runs nothing",
+    )
+    p.add_argument("--name", help="name of the recorded migration (with --update)")
     p.set_defaults(func=cmd_pull)
 
     p = sub.add_parser("check", help="validate the migrations folder")

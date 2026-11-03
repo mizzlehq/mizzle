@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.2.2
+
+- `mizzle pull --update`: follow a schema another app owns (microservices on one
+  database). It rewrites your schema module from the database and records what changed
+  as a migration that runs nothing.
+- `mizzle pull`: a column named like a type or helper the class body calls (`text`, `date`,
+  `time`, `integer`, `sql`, `one`...) or like an enum class is written as `text_ =
+  text(name='text')`. Before, `text = text()` shadowed `text()` for the rest of the class,
+  and the module failed to import.
+- `mizzle pull` imports `sql` only when the module uses it.
+
 ## 0.2.1
 
 - `cross_join(Table)`: `CROSS JOIN`, every row with every row of the other table.

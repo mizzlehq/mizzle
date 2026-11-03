@@ -11,7 +11,7 @@ Install: `pip install mizzle`. Import everything from `mizzle`; column types fro
 - [Queries](https://mizzle.readthedocs.io/en/latest/guide/queries/): select, joins, operators, aggregates, subqueries, CTEs, window functions, set operations, insert/upsert, update, delete, locking, full-text search
 - [Relational queries](https://mizzle.readthedocs.io/en/latest/guide/relational/): `db.query(Table).find_many(with_=...)`, nested rows in one statement
 - [Transactions and errors](https://mizzle.readthedocs.io/en/latest/guide/transactions/): transactions, retries, timeouts, error classes, SQLSTATE
-- [Migrations and database objects](https://mizzle.readthedocs.io/en/latest/guide/migrations/): migration workflow, views, row-level security, roles, grants, functions, triggers, extensions
+- [Migrations and database objects](https://mizzle.readthedocs.io/en/latest/guide/migrations/): migration workflow, `pull --update` for a schema another app owns, views, row-level security, roles, grants, functions, triggers, extensions
 - [Bulk, streaming and LISTEN](https://mizzle.readthedocs.io/en/latest/guide/bulk/): COPY, insert_many, stream, LISTEN/NOTIFY
 - [pgvector](https://mizzle.readthedocs.io/en/latest/guide/extensions/): vector types, distance operators, indexes
 - [Pydantic, Supabase, Studio](https://mizzle.readthedocs.io/en/latest/guide/integrations/): Pydantic models, Supabase roles and policies, mizzle studio, typegen
