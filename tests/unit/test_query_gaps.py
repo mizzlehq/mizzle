@@ -32,6 +32,7 @@ from mizzle import (
     ts_rank_cd,
 )
 from mizzle.core.errors import QueryError
+from mizzle.core.query.base import row_decoder
 from mizzle.core.query.builder import QueryBuilder
 from mizzle.core.schema.table import Table
 from mizzle.core.sql.nodes import ExprBase, Node
@@ -265,3 +266,13 @@ def test_user_named_functions_are_not_session_safe(qb: QueryBuilder) -> None:
     assert flags(qb.select(lower(Users.email)).from_(Users)) == (True, False)
     assert flags(qb.select(func[bool]("pg_is_in_recovery")).from_(Users)) == (False, False)
     assert flags(qb.select(sql("1")).from_(Users)) == (False, True)
+
+
+def test_generated_row_decoder() -> None:
+    # Columns from an offset, a converter (the enum) and NULLs; built once and reused.
+    columns = [(n, Users.__table__.columns[n]) for n in ("id", "bio", "role")]
+    decode = row_decoder(Users, columns, 2)
+    assert row_decoder(Users, columns, 2) is decode
+    user = decode(("x", "y", 7, None, "admin"))
+    assert (user.id, user.bio, user.role) == (7, None, Role.ADMIN)
+    assert not hasattr(user, "email")  # not selected: absent, not None

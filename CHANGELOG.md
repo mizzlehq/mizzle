@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- Faster row building: each table's row decoder is generated once (fixed column positions
+  in a dict display) and cached. Selecting 1000 rows is about 1.75x faster, nested
+  relational queries about 1.25x.
+
 ## 0.2.3
 
 - `reset_connections="auto"` is the default: a connection's session state is reset when it

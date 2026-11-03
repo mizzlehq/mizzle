@@ -122,26 +122,39 @@ def row_decoder[T: Table](
 
     ``converter(column)`` gives the function applied to the column's non-NULL values, or
     None to keep them as they are."""
-    names = tuple(name for name, _ in columns)
-    converters = [
-        (name, convert) for name, col in columns if (convert := converter(col)) is not None
-    ]
-    stop = start + len(names)
-    whole = start == 0
-    new = object.__new__
+    key = (table, tuple(columns), start, converter)
+    if (cached := _ROW_DECODERS.get(key)) is not None:
+        return cast(Callable[[Row], T], cached)
+    # Generated once per table and column list: a dict display with fixed positions is ~2x
+    # faster per row than dict(zip(...)) plus a converter loop. Only repr()'d names,
+    # integers and our own converters go into the code.
+    env: dict[str, object] = {"new": object.__new__, "table": table}
+    lines: list[str] = []
+    items: list[str] = []
+    for i, (name, col) in enumerate(columns, start):
+        if (convert := converter(col)) is None:
+            items.append(f"{name!r}: v[{i}]")
+        else:
+            env[f"c{i}"] = convert
+            lines.append(f"    x{i} = v[{i}]")
+            items.append(f"{name!r}: None if x{i} is None else c{i}(x{i})")
+    source = (
+        "def decode(v):\n"
+        + "".join(f"{line}\n" for line in lines)
+        + "    obj = new(table)\n"
+        + f"    obj.__dict__ = {{{', '.join(items)}}}\n"
+        + "    return obj\n"
+    )
+    exec(source, env)
+    decode = _ROW_DECODERS[key] = cast(Callable[[Row], Table], env["decode"])
+    return cast(Callable[[Row], T], decode)
 
-    def decode(values: Row) -> T:
-        # zip() stops at the shorter side, so a full row needs no slice copy.
-        data = dict(zip(names, values if whole else values[start:stop], strict=False))
-        for name, convert in converters:
-            value = data[name]
-            if value is not None:
-                data[name] = convert(value)
-        obj = new(table)
-        obj.__dict__ = data
-        return obj
 
-    return decode
+# ponytail: never evicted; one entry per table and selected column list (a few per query
+# shape), fine unless queries are built from unbounded column lists.
+_ROW_DECODERS: dict[
+    tuple[type[Table], tuple[tuple[str, ColumnBase], ...], int, object], Callable[[Row], Table]
+] = {}
 
 
 def table_columns(table: type[Table]) -> tuple[tuple[str, ColumnBase], ...]:
