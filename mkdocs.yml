@@ -1,0 +1,59 @@
+site_name: mizzle
+site_description: Fully typed async ORM for Python and PostgreSQL
+site_url: https://mizzle.readthedocs.io/
+repo_url: https://github.com/mizzlehq/mizzle
+repo_name: mizzlehq/mizzle
+edit_uri: edit/main/docs/
+strict: true
+exclude_docs: |
+  superpowers/
+
+theme:
+  name: material
+  features:
+    - content.code.copy
+    - navigation.sections
+    - search.suggest
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      toggle: { icon: material/brightness-7, name: Dark mode }
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      toggle: { icon: material/brightness-4, name: Light mode }
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - md_in_html
+  - pymdownx.highlight
+  - pymdownx.superfences
+  - pymdownx.snippets:
+      check_paths: true
+  - toc:
+      permalink: true
+
+plugins:
+  - search
+  - mkdocstrings:
+      handlers:
+        python:
+          paths: [src]
+          options:
+            docstring_style: google
+            show_source: false
+            show_root_heading: true
+            members_order: source
+            filters: ["!^_"]
+
+nav:
+  - Home: index.md
+  - Getting started: getting-started.md
+  - CLI: cli.md
+  - Production: production.md
+  - API reference:
+      - mizzle: reference/mizzle.md
+      - mizzle.pg: reference/pg.md
+      - mizzle.pydantic: reference/pydantic.md
+      - mizzle.supabase: reference/supabase.md
+  - Changelog: changelog.md

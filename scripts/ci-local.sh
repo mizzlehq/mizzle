@@ -7,6 +7,8 @@ set -uo pipefail
 cd "$(dirname "$0")/.."
 ROOT=$PWD
 LOGS=$ROOT/.ci-local
+# Venvs live outside the repo, so editors and tools do not see them.
+VENVS=${XDG_CACHE_HOME:-$HOME/.cache}/mizzle-ci
 mkdir -p "$LOGS"
 ONLY=${1:-all}
 
@@ -14,11 +16,12 @@ ONLY=${1:-all}
 MATRIX=("3.14/14" "3.14/15" "3.14/16" "3.14/17" "3.14/18" "3.12/18" "3.13/18")
 
 lint() {
-  export UV_PROJECT_ENVIRONMENT=$ROOT/.venv-ci-3.12
+  export UV_PROJECT_ENVIRONMENT=$VENVS/3.12
   uv sync -q --python 3.12 &&
     uv run ruff check && uv run ruff format --check &&
     uv run basedpyright && uv run mypy &&
-    uv run basedpyright --pythonversion 3.14 && uv run mypy --python-version 3.14
+    uv run basedpyright --pythonversion 3.14 && uv run mypy --python-version 3.14 &&
+    NO_MKDOCS_2_WARNING=1 uv run --group docs mkdocs build --strict -d "$VENVS/site"
 }
 
 ui() {
@@ -32,11 +35,11 @@ test_one() {  # $1 = python, $2 = postgres, $3 = port
     -e POSTGRES_PASSWORD=mizzle -e POSTGRES_DB=mizzle "postgres:$2" >/dev/null || return 1
   until docker exec "$name" pg_isready -U mizzle -h 127.0.0.1 >/dev/null 2>&1; do sleep 1; done
   # Own venvs: the matrix runs in parallel.
-  export UV_PROJECT_ENVIRONMENT=$ROOT/.venv-ci-$1-pg$2 MIZZLE_TEST_URL=$url
+  export UV_PROJECT_ENVIRONMENT=$VENVS/$1-pg$2 MIZZLE_TEST_URL=$url
   local ok=0
   uv sync -q --python "$1" && uv run pytest -q -p no:cacheprovider || ok=1
   if [ $ok = 0 ]; then
-    (cd examples/social && export UV_PROJECT_ENVIRONMENT=$ROOT/.venv-ci-social-$1-pg$2 &&
+    (cd examples/social && export UV_PROJECT_ENVIRONMENT=$VENVS/social-$1-pg$2 &&
       uv sync -q && uv run basedpyright && uv run pytest -q -p no:cacheprovider) || ok=1
   fi
   docker rm -f "$name" >/dev/null
@@ -44,7 +47,7 @@ test_one() {  # $1 = python, $2 = postgres, $3 = port
 }
 
 infra() {
-  export UV_PROJECT_ENVIRONMENT=$ROOT/.venv-ci-3.14
+  export UV_PROJECT_ENVIRONMENT=$VENVS/3.14
   local P=postgresql://mizzle:mizzle@localhost
   export MIZZLE_TEST_URL=$P:54331/mizzle MIZZLE_PRIMARY_URL=$P:54331/mizzle \
     MIZZLE_REPLICA_URL=$P:54332/mizzle MIZZLE_PGBOUNCER_URL=$P:54333/mizzle \
@@ -78,7 +81,7 @@ run() {  # $1 = job name, rest = command; runs in the background, log in .ci-loc
 if [ "$ONLY" = all ]; then
   run lint lint
   run ui ui
-  run studio-assets bash -c "export UV_PROJECT_ENVIRONMENT=$ROOT/.venv-ci-assets && uv sync -q --python 3.12 && uv run pytest -q tests/unit/test_studio_assets.py"
+  run studio-assets bash -c "export UV_PROJECT_ENVIRONMENT=$VENVS/assets && uv sync -q --python 3.12 && uv run pytest -q tests/unit/test_studio_assets.py"
 fi
 port=55410
 for entry in "${MATRIX[@]}"; do

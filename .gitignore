@@ -20,4 +20,4 @@ docs/superpowers/
 
 # scripts/ci-local.sh
 .ci-local/
-.venv-ci-*/
+site/
