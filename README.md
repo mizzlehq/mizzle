@@ -101,29 +101,30 @@ latency each way (2.2 ms round trip, like a database on another server):
 
 | | mizzle | Tortoise | SQLAlchemy ORM | SQLAlchemy Core | Piccolo | Django |
 |---|---:|---:|---:|---:|---:|---:|
-| insert 1 row | **3,040** | 1,587 | 935 | 921 | 1,577 | 427 |
-| bulk insert 1000 rows | 448 | 180 | 223 | **462** | 76 | 111 |
-| get by primary key | **3,078** | 1,566 | 942 | 952 | 1,565 | 413 |
-| select 1000 rows | **728** | 362 | 268 | 680\* | 331 | 239 |
-| update by primary key | **3,035** | 1,566 | 935 | 923 | 1,573 | 426 |
-| 100 users with their posts | **1,358** | 392 | 245 | 549 | 369 | 110 |
+| insert 1 row | **3,060** | 1,565 | 922 | 907 | 1,552 | 423 |
+| bulk insert 1000 rows | 328 | 180 | 224 | **456** | 75 | 115 |
+| get by primary key | **3,074** | 1,558 | 937 | 955 | 1,563 | 412 |
+| select 1000 rows | **1,726** | 297 | 263 | 677\* | 415 | 233 |
+| update by primary key | **3,041** | 1,563 | 916 | 911 | 1,570 | 424 |
+| 100 users with their posts | **1,327** | 384 | 238 | 540 | 373 | 106 |
 
-**One client, database on the same machine** (0.04 ms round trip, 4 connections):
+**One client, database on the same machine** (0.05 ms round trip, 4 connections):
 
 | | mizzle | Tortoise | SQLAlchemy ORM | SQLAlchemy Core | Piccolo | Django |
 |---|---:|---:|---:|---:|---:|---:|
-| insert 1 row | **9,831** | 6,207 | 2,226 | 2,827 | 5,651 | 4,588 |
-| bulk insert 1000 rows | **215** | 120 | 156 | 194 | 66 | 132 |
-| get by primary key | **10,112** | 4,516 | 2,623 | 3,182 | 4,706 | 3,467 |
-| select 1000 rows | **898** | 356 | 300 | 846\* | 390 | 336 |
-| update by primary key | **10,516** | 4,234 | 2,085 | 2,779 | 5,345 | 4,061 |
-| 100 users with their posts | **655** | 336 | 234 | 472 | 320 | 218 |
+| insert 1 row | **12,859** | 6,586 | 2,356 | 2,849 | 4,924 | 4,680 |
+| bulk insert 1000 rows | **214** | 125 | 165 | 207 | 62 | 140 |
+| get by primary key | **10,178** | 4,900 | 2,733 | 3,177 | 4,733 | 3,555 |
+| select 1000 rows | **1,072** | 319 | 311 | 837\* | 382 | 377 |
+| update by primary key | **9,278** | 4,301 | 2,127 | 2,771 | 5,168 | 3,972 |
+| 100 users with their posts | **650** | 320 | 219 | 453 | 302 | 212 |
 
 \* SQLAlchemy Core returns plain tuples; the ORMs build full row objects.
 
 mizzle loads nested rows in one statement, so it pays one round trip where the others pay
-two. Raw asyncpg, the driver under mizzle, is the upper limit: on single-row work mizzle
-reaches 97% of it over the network and 67–84% on the same machine. Python 3.14, mizzle 0.2.3, Tortoise 1.1.9,
+two (over the network that beats even hand-written asyncpg doing two queries). Against raw
+asyncpg, the driver under mizzle, it reaches 97–99% over the network (bulk insert: 54%) and
+71–93% on single rows on the same machine. Python 3.14, mizzle 0.2.4, Tortoise 1.1.9,
 SQLAlchemy 2.1.6, Piccolo 1.39.0, Django 6.1.3 (its async ORM runs queries in one thread, on
 psycopg). The script's docstring explains each library's setup and the latency proxy. Run
 it yourself:
