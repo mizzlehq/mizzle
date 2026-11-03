@@ -1,0 +1,75 @@
+# A primary with a streaming read replica, and PgBouncer in transaction mode in front of the
+# primary. Used by tests/integration/test_infra.py (CI job "infra"):
+#   docker compose -f tests/infra/compose.yml up -d --wait
+#   MIZZLE_PRIMARY_URL=postgresql://mizzle:mizzle@localhost:54331/mizzle \
+#   MIZZLE_REPLICA_URL=postgresql://mizzle:mizzle@localhost:54332/mizzle \
+#   MIZZLE_PGBOUNCER_URL=postgresql://mizzle:mizzle@localhost:54333/mizzle \
+#   uv run pytest tests/integration/test_infra.py
+# "odd" is a TLS-only server with unusual defaults, for tests/integration/test_production_env.py:
+#   MIZZLE_ODD_URL=postgresql://mizzle:mizzle@localhost:54334/mizzle?sslmode=require \
+#   MIZZLE_RESTART_CMD="docker compose -f tests/infra/compose.yml restart odd" \
+#   MIZZLE_PRIMARY_RESTART_CMD="docker compose -f tests/infra/compose.yml restart primary" \
+#   uv run pytest tests/integration/test_production_env.py
+name: mizzle-infra
+
+services:
+  primary:
+    image: postgres:18
+    environment:
+      POSTGRES_USER: mizzle
+      POSTGRES_PASSWORD: mizzle
+      POSTGRES_DB: mizzle
+    command: postgres -c wal_level=replica -c max_wal_senders=4
+    volumes:
+      - ./primary-init.sh:/docker-entrypoint-initdb.d/primary-init.sh:ro
+    ports: ["54331:5432"]
+    healthcheck:
+      test: pg_isready -U mizzle -d mizzle
+      interval: 2s
+      retries: 30
+
+  replica:
+    image: postgres:18
+    user: postgres
+    environment:
+      PGPASSWORD: mizzle
+      PGDATA: /var/lib/postgresql/replica
+    # Clone the primary, then run as a hot standby (-R writes the standby settings).
+    entrypoint: >-
+      bash -c 'until pg_basebackup -h primary -U mizzle -D "$$PGDATA" -R -X stream;
+      do rm -rf "$$PGDATA"; sleep 1; done; exec postgres'
+    depends_on:
+      primary: { condition: service_healthy }
+    ports: ["54332:5432"]
+    healthcheck:
+      test: pg_isready -U mizzle -d mizzle
+      interval: 2s
+      retries: 30
+
+  pgbouncer:
+    image: edoburu/pgbouncer:latest@sha256:8638aa563607256d3c7440437534195f1066a92b68015d89ae9d6b935b444a6d  # 1.26.1
+    environment:
+      DATABASE_URL: postgres://mizzle:mizzle@primary:5432/mizzle
+      POOL_MODE: transaction
+      AUTH_TYPE: scram-sha-256
+      MAX_PREPARED_STATEMENTS: "100"
+    depends_on:
+      primary: { condition: service_healthy }
+    ports: ["54333:5432"]
+
+  odd:
+    image: postgres:18
+    environment:
+      POSTGRES_USER: mizzle
+      POSTGRES_PASSWORD: mizzle
+      POSTGRES_DB: mizzle
+    command: >-
+      postgres -c timezone=Pacific/Chatham -c datestyle='SQL, DMY'
+      -c intervalstyle=iso_8601 -c extra_float_digits=0 -c lc_monetary=C
+    volumes:
+      - ./odd-init.sh:/docker-entrypoint-initdb.d/odd-init.sh:ro
+    ports: ["54334:5432"]
+    healthcheck:
+      test: pg_isready -U mizzle -d mizzle
+      interval: 2s
+      retries: 30

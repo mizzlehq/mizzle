@@ -83,3 +83,23 @@ jobs:
       - name: Example app (examples/social) against Postgres
         working-directory: examples/social
         run: uv sync && uv run basedpyright && uv run pytest
+
+  infra:
+    # A real streaming read replica and PgBouncer in transaction mode (tests/infra).
+    runs-on: ubuntu-latest
+    env:
+      MIZZLE_PRIMARY_URL: postgresql://mizzle:mizzle@localhost:54331/mizzle
+      MIZZLE_REPLICA_URL: postgresql://mizzle:mizzle@localhost:54332/mizzle
+      MIZZLE_PGBOUNCER_URL: postgresql://mizzle:mizzle@localhost:54333/mizzle
+      # TLS-only server with unusual settings, and real restarts (test_production_env.py)
+      MIZZLE_ODD_URL: postgresql://mizzle:mizzle@localhost:54334/mizzle?sslmode=require
+      MIZZLE_RESTART_CMD: docker compose -f tests/infra/compose.yml restart odd
+      MIZZLE_PRIMARY_RESTART_CMD: docker compose -f tests/infra/compose.yml restart primary
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - run: uv sync --python 3.14
+      - run: docker compose -f tests/infra/compose.yml up -d --wait
+      - run: uv run pytest tests/integration/test_infra.py tests/integration/test_production_env.py -v
+      - if: failure()
+        run: docker compose -f tests/infra/compose.yml logs
