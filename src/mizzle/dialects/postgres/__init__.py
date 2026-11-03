@@ -10,7 +10,7 @@ from mizzle.core.schema.column import ColumnBase
 from mizzle.core.snapshot import Snapshot
 from mizzle.core.sql.nodes import Node
 from mizzle.core.steps import Statement, Step
-from mizzle.dialects.base import Connection
+from mizzle.dialects.base import Connection, ResetMode
 from mizzle.dialects.postgres import ddl
 from mizzle.dialects.postgres.compiler import PostgresCompiler
 from mizzle.dialects.postgres.driver import PostgresDriver
@@ -36,6 +36,7 @@ class PostgresDialect:
         pool_min_size: int = 1,
         max_idle: float = 300.0,
         query_timeout: float | None = None,
+        reset_connections: ResetMode = "always",
     ) -> PostgresDriver:
         return await PostgresDriver.connect(
             url,
@@ -44,6 +45,7 @@ class PostgresDialect:
             pool_min_size=pool_min_size,
             max_idle=max_idle,
             query_timeout=query_timeout,
+            reset_connections=reset_connections,
         )
 
     def column_type(self, column: ColumnBase) -> str:

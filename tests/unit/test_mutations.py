@@ -29,6 +29,18 @@ def test_insert_one(qb: QueryBuilder) -> None:
     )
 
 
+def test_insert_sql_cache_matches_full_path(qb: QueryBuilder) -> None:
+    def insert(email: str) -> tuple[str, tuple[object, ...]]:
+        return qb.insert(Users).values(email=email, role=Role.ADMIN, bio=None).to_sql()
+
+    first, second = insert("a@x"), insert("b@x")  # the second one uses the cached SQL
+    assert first[0] == second[0]
+    assert first[1] == ("a@x", None, "admin")  # column order; enum encoded
+    assert second[1] == ("b@x", None, "admin")
+    # A different column set is a different statement.
+    assert qb.insert(Users).values(email="c@x").to_sql()[0] != first[0]
+
+
 def test_insert_bulk_fills_gaps_with_default(qb: QueryBuilder) -> None:
     q = qb.insert(Users).values([{"email": "a"}, {"email": "b", "bio": "hi"}])
     assert q.to_sql() == (

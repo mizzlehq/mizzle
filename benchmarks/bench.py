@@ -7,6 +7,10 @@ Uses its own UNLOGGED tables (bench_users, bench_posts): without the write-ahead
 measure the library rather than disk flushes. Each scenario runs once per library to warm
 up, then ROUNDS times with the libraries taking turns; the table shows the median round,
 in operations per second.
+
+Columns: asyncpg with its default pool (resets each connection on release, like mizzle's
+default) and without that reset (like mizzle's reset_connections="auto"). Compare mizzle
+with the asyncpg column that uses the same setting.
 """
 
 from __future__ import annotations
@@ -233,36 +237,56 @@ async def measure(
     }
 
 
+async def _no_reset(_conn: asyncpg.Connection) -> None:
+    pass
+
+
 async def main() -> None:
     pool = await asyncpg.create_pool(URL, min_size=1, max_size=4)
+    # Without the per-release session reset: the fastest raw asyncpg setup, to compare
+    # with mizzle's reset_connections="auto".
+    fast_pool = await asyncpg.create_pool(URL, min_size=1, max_size=4, reset=_no_reset)
     await reset(pool)
     db = await Database.connect(URL, schema=[Users, Posts], pool_size=4)
+    db_auto = await Database.connect(
+        URL, schema=[Users, Posts], pool_size=4, reset_connections="auto"
+    )
     await Tortoise.init(
         db_url=URL.replace("postgresql://", "asyncpg://", 1), modules={"models": ["__main__"]}
     )
     results = await measure(
         pool,
         {
-            "asyncpg (raw)": asyncpg_scenarios(pool),
+            "asyncpg": asyncpg_scenarios(pool),
+            "asyncpg no-reset": asyncpg_scenarios(fast_pool),
             "mizzle": mizzle_scenarios(db),
+            "mizzle auto": mizzle_scenarios(db_auto),
             "tortoise": tortoise_scenarios(),
         },
     )
     await Tortoise.close_connections()
     await db.close()
+    await db_auto.close()
+    await fast_pool.close()
     await pool.execute("DROP TABLE bench_posts, bench_users")
     await pool.close()
 
     libs = list(results)
     names = list(results["mizzle"])
-    print(f"{'ops/sec (higher is better)':32}" + "".join(f"{lib:>16}" for lib in libs))
+    print(f"{'ops/sec (higher is better)':30}" + "".join(f"{lib:>18}" for lib in libs))
     for name in names:
-        row = "".join(f"{results[lib][name]:>16,.0f}" for lib in libs)
-        print(f"{name:32}{row}")
+        row = "".join(f"{results[lib][name]:>18,.0f}" for lib in libs)
+        print(f"{name:30}{row}")
     print()
-    print("mizzle vs tortoise:")
+    print("Same-setting comparisons (mizzle / other):")
+    print(f"  {'':30}{'vs asyncpg':>14}{'auto vs no-reset':>18}{'vs tortoise':>14}")
     for name in names:
-        print(f"  {name:30} {results['mizzle'][name] / results['tortoise'][name]:.2f}x")
+        r = {lib: results[lib][name] for lib in libs}
+        print(
+            f"  {name:30}{r['mizzle'] / r['asyncpg']:>13.2f}x"
+            f"{r['mizzle auto'] / r['asyncpg no-reset']:>17.2f}x"
+            f"{r['mizzle'] / r['tortoise']:>13.2f}x"
+        )
 
 
 if __name__ == "__main__":

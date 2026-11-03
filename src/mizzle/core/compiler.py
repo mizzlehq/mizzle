@@ -50,6 +50,12 @@ class CompiledQuery:
     sql: str
     params: tuple[object, ...]
     placeholders: tuple[Placeholder | None, ...]  # per param slot; set where a placeholder sits
+    # True when the statement contains raw ``sql(...)``, which might change session state
+    # (SET, LISTEN, advisory locks...); the pool then resets the connection after use.
+    raw: bool = False
+    # True when any SELECT in it (also in a CTE or subquery) takes row locks (FOR UPDATE):
+    # it must run on the primary.
+    locking: bool = False
 
     @property
     def has_placeholders(self) -> bool:
@@ -68,7 +74,16 @@ class CompiledQuery:
             else (p.column.encode(values[p.name]) if p.column else values[p.name])
             for value, p in zip(self.params, self.placeholders, strict=True)
         )
-        return CompiledQuery(self.sql, params, (None,) * len(params))
+        return CompiledQuery(self.sql, params, (None,) * len(params), self.raw, self.locking)
+
+
+type _Visitor = Callable[[Compiler, Node], str]
+# (compiler class, node class) -> unbound visit_* method; found once, then reused.
+_VISITORS: dict[tuple[type[Compiler], type[Node]], _Visitor] = {}
+
+
+# ponytail: never evicted; one entry per (table, set of columns) actually inserted.
+_INSERT_SQL: dict[tuple[type[Compiler], Casing | None, type[Table], tuple[str, ...], int], str] = {}
 
 
 class Compiler:
@@ -79,6 +94,8 @@ class Compiler:
     qualify_columns: bool
     _params: list[object]
     _placeholders: list[Placeholder | None]
+    _raw: bool
+    _locking: bool
     _scopes: list[dict[type[Table], str]]  # table -> alias, for aliased (relational) queries
     _alias_count: int
 
@@ -96,21 +113,33 @@ class Compiler:
         self.qualify_columns = qualify_columns
         self._params = []
         self._placeholders = []
+        self._raw = False
+        self._locking = False
         self._scopes = []
         self._alias_count = 0
 
     def compile(self, node: Node) -> CompiledQuery:
-        self._params, self._placeholders = [], []
+        self._params, self._placeholders, self._raw, self._locking = [], [], False, False
         text = self.visit(node)
-        return CompiledQuery(text, tuple(self._params), tuple(self._placeholders))
+        return CompiledQuery(
+            text, tuple(self._params), tuple(self._placeholders), self._raw, self._locking
+        )
 
     def visit(self, node: Node) -> str:
+        kind = type(node)
+        try:
+            visitor = _VISITORS[type(self), kind]
+        except KeyError:
+            visitor = _VISITORS[type(self), kind] = self._find_visitor(kind)
+        return visitor(self, node)
+
+    def _find_visitor(self, kind: type[Node]) -> _Visitor:
         # Walk the MRO so subclasses (e.g. jsonb -> Column) reuse their parent's visitor.
-        for cls in type(node).__mro__:
-            method = getattr(self, f"visit_{cls.__name__}", None)
+        for cls in kind.__mro__:
+            method: object = getattr(type(self), f"visit_{cls.__name__}", None)
             if method is not None:
-                return cast(Callable[[Node], str], method)(node)
-        raise QueryError(f"{type(self).__name__} cannot compile {type(node).__name__}")
+                return cast(_Visitor, method)
+        raise QueryError(f"{type(self).__name__} cannot compile {kind.__name__}")
 
     # -- hooks ------------------------------------------------------------------------
 
@@ -231,6 +260,7 @@ class Compiler:
         return f"{text} NULLS {node.nulls.upper()}" if node.nulls else text
 
     def visit_Raw(self, node: Raw) -> str:
+        self._raw = True
         return "".join(p if isinstance(p, str) else self.visit(p) for p in node.parts)
 
     def visit_Nullable(self, node: Nullable) -> str:
@@ -261,6 +291,19 @@ class Compiler:
         return f"{self.quote(node.cte.name)}.{self.quote(node.name)}"
 
     def visit_SelectBase(self, node: SelectBase) -> str:
+        if not self._scopes:
+            return self._select_text(node)
+        # A subquery inside a relational query: its own tables shadow the outer aliases.
+        sources = (node.source, *(j.source for j in node.joins))
+        self._scopes.append({s: s.__table__.name for s in sources if isinstance(s, type)})
+        try:
+            return self._select_text(node)
+        finally:
+            self._scopes.pop()
+
+    def _select_text(self, node: SelectBase) -> str:
+        if node.lock is not None:
+            self._locking = True
         # Clauses are emitted strictly left to right so $n numbering follows the text.
         parts: list[str] = []
         if node.ctes:
@@ -316,6 +359,28 @@ class Compiler:
     def visit_Insert(self, node: Insert[Table]) -> str:
         if not node.rows:
             raise QueryError(f"insert into {node.table.__name__} has no values()")
+        # Fast path for the most common write: one row of plain values, no ON CONFLICT.
+        # Its SQL depends only on which columns are set, so the text is cached and only
+        # the values are bound (in column order, as the full path below binds them).
+        if node.conflict is None and len(node.rows) == 1 and not self.inline_literals:
+            row = node.rows[0]
+            if row and not any(isinstance(v, Node) for v in row.values()):
+                key = (type(self), self.casing, node.table, tuple(row), len(self._params))
+                text = _INSERT_SQL.get(key)
+                if text is None:
+                    text = _INSERT_SQL[key] = self._insert_text(node)
+                    return text
+                columns = node.table.__table__.columns
+                for attr, value in row.items():
+                    encoder = columns[attr].encoder
+                    self._params.append(
+                        value if value is None or encoder is None else encoder(value)
+                    )
+                    self._placeholders.append(None)
+                return text
+        return self._insert_text(node)
+
+    def _insert_text(self, node: Insert[Table]) -> str:
         columns = node.table.__table__.columns
         used = [attr for attr in columns if any(attr in row for row in node.rows)]
         head = f"INSERT INTO {self.table_name(node.table)}"
@@ -324,9 +389,10 @@ class Compiler:
         else:
             used = used or [next(iter(columns))]  # several all-default rows: VALUES (DEFAULT)
             names = ", ".join(self.column_name(columns[a]) for a in used)
+            targets = [(a, columns[a]) for a in used]
             rows = ", ".join(
                 "("
-                + ", ".join(self._insert_value(columns[a], row.get(a, MISSING)) for a in used)
+                + ", ".join([self._insert_value(c, row.get(a, MISSING)) for a, c in targets])
                 + ")"
                 for row in node.rows
             )
@@ -336,7 +402,16 @@ class Compiler:
         return text
 
     def _insert_value(self, column: ColumnBase, value: object) -> str:
-        return "DEFAULT" if value is MISSING else self.value(column, value)
+        # Inlined value()/bind(): bulk inserts run this for every value.
+        if value is MISSING:
+            return "DEFAULT"
+        if isinstance(value, Node) or self.inline_literals:
+            return self.value(column, value)
+        if value is not None and column.encoder is not None:
+            value = column.encoder(value)
+        self._params.append(value)
+        self._placeholders.append(None)
+        return self.param_marker(len(self._params))
 
     def _require_filter(self, node: Update[Table] | Delete[Table], verb: str) -> None:
         if node.where_ is None and not node.all_rows_:

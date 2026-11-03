@@ -4,7 +4,7 @@ from typing import cast
 
 import pytest
 
-from mizzle import ConnectionError, Database, QueryError, SerializationFailure
+from mizzle import ConnectionError, Database, QueryError, SerializationFailure, exists
 from mizzle.dialects.base import Connection, Driver
 from tests.models import Posts, Users
 
@@ -13,7 +13,9 @@ class FakeConnection:
     def __init__(self, name: str) -> None:
         self.name = name
 
-    async def fetch(self, sql: str, params: object, timeout: float | None = None) -> list[object]:
+    async def fetch(
+        self, sql: str, params: object, timeout: float | None = None, *, session_safe: bool = False
+    ) -> list[object]:
         return []
 
 
@@ -32,6 +34,9 @@ class FakeDriver:
     async def close(self) -> None:
         pass
 
+    async def expire_connections(self) -> None:
+        pass
+
 
 def database(log: list[str], *replicas: FakeDriver) -> Database:
     db = Database(schema=[Users, Posts], driver=cast(Driver, FakeDriver("primary", log)))
@@ -46,6 +51,24 @@ async def test_replicas_take_turns_and_fall_back_to_primary() -> None:
         await db.select().from_(Users)
     await db.primary.select().from_(Users)
     assert log == ["r1", "r2", "primary", "primary"]
+
+
+async def test_row_locks_anywhere_use_the_primary() -> None:
+    log: list[str] = []
+    db = database(log, FakeDriver("r1", log))
+    await db.select().from_(Users).for_update()
+    locked = db.select().from_(Posts).for_update()
+    await db.select().from_(Users).where(exists(locked))  # lock inside a subquery
+    await db.with_(locked.cte("p")).select().from_(Users)  # lock inside a CTE
+    await db.select().from_(Users)
+    assert log == ["primary", "primary", "primary", "r1"]
+
+
+def test_evolve_rejects_unknown_fields() -> None:
+    from mizzle.core.query.base import evolve
+
+    with pytest.raises(TypeError, match="no field"):
+        evolve(Database().select().from_(Users), nope=1)
 
 
 async def test_retry() -> None:

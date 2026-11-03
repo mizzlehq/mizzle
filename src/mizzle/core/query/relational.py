@@ -8,15 +8,16 @@ from __future__ import annotations
 
 import datetime
 import ipaddress
+import struct
 import uuid
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import TypedDict, cast, override
 
 from mizzle.core.compiler import CompiledQuery
 from mizzle.core.errors import QueryError
-from mizzle.core.query.base import Executable, Row, Runner
+from mizzle.core.query.base import Converter, Executable, Row, Runner, column_decoder, row_decoder
 from mizzle.core.schema.column import ColumnBase
 from mizzle.core.schema.relations import Link
 from mizzle.core.schema.table import Table
@@ -140,10 +141,14 @@ def _from_json(column: ColumnBase, value: Json) -> object:
     if isinstance(value, list | dict):
         raise QueryError(f"{column.qualified_name}: unexpected JSON value {value!r}")
     if kind is float:
-        return float(value)  # also handles "NaN" / "Infinity" strings
+        return struct.unpack(">d", bytes.fromhex(str(value)))[0]  # float8send, as hex
     if kind is Decimal:
         return Decimal(str(value))  # numerics are sent as text: no float rounding
     text = str(value)
+    if kind in (datetime.datetime, datetime.date) and text in ("infinity", "-infinity"):
+        # asyncpg reads (and writes) min / max as -infinity / infinity; so must JSON.
+        end = datetime.datetime if kind is datetime.datetime else datetime.date
+        return end.max if text == "infinity" else end.min
     if kind is datetime.datetime:
         return datetime.datetime.fromisoformat(text)
     if kind is datetime.date:
@@ -151,7 +156,12 @@ def _from_json(column: ColumnBase, value: Json) -> object:
     if kind is datetime.time:
         return datetime.time.fromisoformat(text)
     if kind is datetime.timedelta:
-        return datetime.timedelta(seconds=float(text))
+        # Same day count as asyncpg's interval codec: a year is 365 days, a month 30.
+        years, months, days, micros = text.split()
+        return datetime.timedelta(
+            days=int(days) + int(years) * 365 + int(months) * 30,
+            microseconds=int(Decimal(micros)),
+        )
     if kind is uuid.UUID:
         return uuid.UUID(text)
     if kind is bytes:
@@ -167,37 +177,48 @@ def _json_list(value: Json, what: str) -> list[Json]:
     return value
 
 
-def _decode_json_row(plan: LoadPlan, value: Json) -> Table:
-    values = _json_list(value, plan.table.__name__)
-    data = {
-        attr: col.decode(_from_json(col, v))
-        for (attr, col), v in zip(plan.columns, values, strict=False)
-    }
-    row = plan.table.from_db(data)
-    nested_values = values[len(plan.columns) :]
-    for (name, link, child), nested in zip(plan.children, nested_values, strict=True):
-        row.__dict__[name] = _decode_child(link, child, nested)
-    return row
+def _json_converter(column: ColumnBase) -> Converter | None:
+    """What turns a non-NULL JSON value into the column's Python value (None: keep it)."""
+    kind = column.accepts[0] if column.accepts else None
+    plain = kind is None or kind in (int, str, bool) or column.enum is not None
+    if column.item is None and plain:
+        return column.decoder  # JSON already has the right type; enums still convert
+    return lambda value: column.decode(_from_json(column, cast(Json, value)))
 
 
-def _decode_child(link: Link, plan: LoadPlan, value: Json) -> list[Table] | Table | None:
-    if link.many:
-        items = [] if value is None else _json_list(value, plan.table.__name__)
-        return [_decode_json_row(plan, v) for v in items]
-    return None if value is None else _decode_json_row(plan, value)
+type RowDecoder = Callable[[Row], Table]
 
 
-def decode_root(plan: LoadPlan, row: Row) -> Table:
-    # Columns that were not loaded are absent; reading them raises a clear AttributeError.
-    obj = plan.table.from_db(
-        {attr: col.decode(row[i]) for i, (attr, col) in enumerate(plan.columns)}
+def plan_decoder(plan: LoadPlan, *, nested: bool = False) -> RowDecoder:
+    """Decode a root row (``nested=False``) or one nested JSON row of ``plan``.
+
+    Built once per query; columns that were not loaded are absent from the result, so
+    reading them raises a clear AttributeError.
+    """
+    decode = row_decoder(
+        plan.table, plan.columns, converter=_json_converter if nested else column_decoder
     )
-    index = len(plan.columns)
-    for name, link, child in plan.children:
-        nested = cast(Json, row[index])  # built with json_agg / json_build_array
-        obj.__dict__[name] = _decode_child(link, child, nested)
-        index += 1
-    return obj
+    children = [
+        (name, link.many, plan_decoder(child, nested=True), child.table.__name__)
+        for name, link, child in plan.children
+    ]
+    if not children:
+        return decode
+    width = len(plan.columns)
+
+    def decode_with_children(row: Row) -> Table:
+        obj = decode(row)
+        values = obj.__dict__
+        for index, (name, many, child, what) in enumerate(children, width):
+            value = cast(Json, row[index])  # built with json_agg / json_build_array
+            if many:
+                items = [] if value is None else _json_list(value, what)
+                values[name] = [child(_json_list(item, what)) for item in items]
+            else:
+                values[name] = None if value is None else child(_json_list(value, what))
+        return obj
+
+    return decode_with_children
 
 
 # -- statements -----------------------------------------------------------------------
@@ -216,7 +237,8 @@ class RelationalSelect[T: Table](RelationalStatement, Executable[list[T]]):
     @override
     async def run_compiled(self, compiled: CompiledQuery) -> list[T]:
         rows = await self.runner.fetch(compiled, read_only=True)
-        return [cast(T, decode_root(self.plan, row)) for row in rows]
+        decode = plan_decoder(self.plan)
+        return cast(list[T], [decode(row) for row in rows])
 
 
 @dataclass(frozen=True, eq=False)
@@ -224,7 +246,7 @@ class RelationalFirst[T: Table](RelationalStatement, Executable[T | None]):
     @override
     async def run_compiled(self, compiled: CompiledQuery) -> T | None:
         rows = await self.runner.fetch(compiled, read_only=True)
-        return cast(T, decode_root(self.plan, rows[0])) if rows else None
+        return cast(T, plan_decoder(self.plan)(rows[0])) if rows else None
 
 
 class RelationalQuery[T: Table]:

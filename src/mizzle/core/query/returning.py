@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from typing import override
 
 from mizzle.core.compiler import CompiledQuery
-from mizzle.core.query.base import Executable, decode_table
+from mizzle.core.query.base import Executable, table_decoder
 from mizzle.core.schema.table import Table
 
 
@@ -18,5 +18,5 @@ class Returning[T: Table](Executable[list[T]]):
     @override
     async def run_compiled(self, compiled: CompiledQuery) -> list[T]:
         rows = await self.runner.fetch(compiled)
-        decoded = [decode_table(self.table, row, 0) for row in rows]
-        return [row for row in decoded if row is not None]
+        decode = table_decoder(self.table)
+        return [decode(row) for row in rows]

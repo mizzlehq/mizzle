@@ -8,9 +8,9 @@ import logging
 import random
 import time
 from collections.abc import AsyncGenerator, Awaitable, Callable, Sequence
-from contextlib import AsyncExitStack, asynccontextmanager
+from contextlib import AbstractAsyncContextManager, AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass
-from typing import Self
+from typing import Literal, Self, overload
 
 from mizzle.core.compiler import CompiledQuery
 from mizzle.core.errors import ConnectionError as DbConnectionError
@@ -20,7 +20,7 @@ from mizzle.core.query.base import Row
 from mizzle.core.query.builder import QueryBuilder
 from mizzle.core.schema.table import Table, validate_tables
 from mizzle.core.sql.nodes import Node, Raw
-from mizzle.dialects.base import Connection, Dialect, Driver, IsolationLevel
+from mizzle.dialects.base import Connection, Dialect, Driver, IsolationLevel, ResetMode
 from mizzle.dialects.postgres import PostgresDialect
 
 log = logging.getLogger("mizzle")
@@ -38,6 +38,7 @@ class QueryEvent:
 
 
 type QueryLogger = Callable[[QueryEvent], None]
+type _CallKind = Literal["fetch", "execute", "dicts"]
 
 
 class Session(QueryBuilder):
@@ -90,15 +91,12 @@ class Session(QueryBuilder):
     def compile(self, node: Node) -> CompiledQuery:
         return self._dialect.compiler(self._casing).compile(node)
 
-    async def fetch(self, query: CompiledQuery, *, read_only: bool = False) -> list[Row]:
-        return await self._call(
-            query, lambda conn: conn.fetch(query.sql, query.params, self._timeout), read_only
-        )
+    def fetch(self, query: CompiledQuery, *, read_only: bool = False) -> Awaitable[list[Row]]:
+        # FOR UPDATE anywhere in the query (CTE, subquery) needs the primary.
+        return self._call(query, "fetch", read_only and not query.locking)
 
-    async def run(self, query: CompiledQuery) -> int:
-        return await self._call(
-            query, lambda conn: conn.execute(query.sql, query.params, self._timeout)
-        )
+    def run(self, query: CompiledQuery) -> Awaitable[int]:
+        return self._call(query, "execute")
 
     # -- public API -------------------------------------------------------------------
 
@@ -107,9 +105,7 @@ class Session(QueryBuilder):
         compiled = self.compile(statement)
         if compiled.has_placeholders:
             raise QueryError("execute() does not take placeholders")
-        return await self._call(
-            compiled, lambda conn: conn.fetch_dicts(compiled.sql, compiled.params, self._timeout)
-        )
+        return await self._call(compiled, "dicts")
 
     @property
     def primary(self) -> Session:
@@ -214,18 +210,24 @@ class Session(QueryBuilder):
             raise MizzleError("database is not connected; use await Database.connect(url)")
         return self._driver
 
-    @asynccontextmanager
-    async def _connection(self, read_only: bool = False) -> AsyncGenerator[Connection]:
+    def _connection(self, read_only: bool = False) -> AbstractAsyncContextManager[Connection]:
         if self._conn is not None:
-            async with self._lock:
-                yield self._conn
-            return
+            return self._locked(self._conn)
         primary = self._require_driver()
         if not read_only or self._use_primary or not self._replicas:
-            async with primary.acquire() as conn:
-                yield conn
-            return
+            return primary.acquire()  # the common case: no extra wrapper
         replica = self._replicas[next(self._next_replica) % len(self._replicas)]
+        return self._replica_connection(replica, primary)
+
+    @asynccontextmanager
+    async def _locked(self, conn: Connection) -> AsyncGenerator[Connection]:
+        async with self._lock:
+            yield conn
+
+    @asynccontextmanager
+    async def _replica_connection(
+        self, replica: Driver, primary: Driver
+    ) -> AsyncGenerator[Connection]:
         async with AsyncExitStack() as stack:
             try:
                 conn = await stack.enter_async_context(replica.acquire())
@@ -235,32 +237,83 @@ class Session(QueryBuilder):
                 conn = await stack.enter_async_context(primary.acquire())
             yield conn
 
-    async def _call[R](
-        self,
-        query: CompiledQuery,
-        op: Callable[[Connection], Awaitable[R]],
-        read_only: bool = False,
-    ) -> R:
+    @overload
+    async def _call(
+        self, query: CompiledQuery, kind: Literal["fetch"], read_only: bool = ...
+    ) -> list[Row]: ...
+    @overload
+    async def _call(self, query: CompiledQuery, kind: Literal["execute"]) -> int: ...
+    @overload
+    async def _call(
+        self, query: CompiledQuery, kind: Literal["dicts"]
+    ) -> list[dict[str, object]]: ...
+    async def _call(
+        self, query: CompiledQuery, kind: _CallKind, read_only: bool = False
+    ) -> list[Row] | int | list[dict[str, object]]:
+        if self._logger is None:
+            try:
+                async with self._connection(read_only) as conn:
+                    return await self._send(conn, query, kind)
+            except DbConnectionError:
+                if not await self._after_lost_connection(query, read_only):
+                    raise
+            return await self._retry_read(query, kind, read_only)
         start = time.perf_counter()
         error: BaseException | None = None
         try:
-            async with self._connection(read_only) as conn:
-                return await op(conn)
+            try:
+                async with self._connection(read_only) as conn:
+                    return await self._send(conn, query, kind)
+            except DbConnectionError:
+                if not await self._after_lost_connection(query, read_only):
+                    raise
+            return await self._retry_read(query, kind, read_only)
         except BaseException as exc:
             error = exc
             raise
         finally:
-            if self._logger is not None:
-                event = QueryEvent(
-                    query.sql,
-                    query.params if self._log_params else None,
-                    (time.perf_counter() - start) * 1000,
-                    error,
-                )
-                try:
-                    self._logger(event)
-                except Exception:
-                    log.exception("mizzle query logger raised")
+            event = QueryEvent(
+                query.sql,
+                query.params if self._log_params else None,
+                (time.perf_counter() - start) * 1000,
+                error,
+            )
+            try:
+                self._logger(event)
+            except Exception:
+                log.exception("mizzle query logger raised")
+
+    async def _after_lost_connection(self, query: CompiledQuery, read_only: bool) -> bool:
+        """Handle a lost connection; return whether the statement may run again.
+
+        The usual cause is a server restart, failover or idle timeout, which kills every
+        pooled connection, so all of them are replaced. A plain read outside a transaction
+        can safely run again; writes and raw SQL never do, as they may have taken effect.
+        """
+        if self._conn is not None:
+            return False  # inside a transaction: the caller must retry the transaction
+        for driver in (self._driver, *self._replicas):
+            if driver is not None:
+                await driver.expire_connections()
+        return read_only and not query.raw
+
+    async def _retry_read(
+        self, query: CompiledQuery, kind: _CallKind, read_only: bool
+    ) -> list[Row] | int | list[dict[str, object]]:
+        log.warning("mizzle: connection lost during a read; retrying once on a new connection")
+        async with self._connection(read_only) as conn:
+            return await self._send(conn, query, kind)
+
+    def _send(
+        self, conn: Connection, query: CompiledQuery, kind: _CallKind
+    ) -> Awaitable[list[Row] | int | list[dict[str, object]]]:
+        # A plain function returning the driver's coroutine: no extra await layer.
+        safe = not query.raw
+        if kind == "fetch":
+            return conn.fetch(query.sql, query.params, self._timeout, session_safe=safe)
+        if kind == "execute":
+            return conn.execute(query.sql, query.params, self._timeout, session_safe=safe)
+        return conn.fetch_dicts(query.sql, query.params, self._timeout)
 
 
 def dialect_for_url(url: str) -> Dialect:
@@ -311,6 +364,7 @@ class Database(Session):
         max_idle: float = 300.0,
         query_timeout: float | None = None,
         statement_cache_size: int = 100,
+        reset_connections: ResetMode = "always",
         casing: Casing | None = None,
         logger: QueryLogger | None = None,
         log_params: bool = False,
@@ -318,7 +372,14 @@ class Database(Session):
         """Open a pool to ``url`` and one to each read replica URL (same pool settings).
 
         ``max_idle`` closes connections unused for that many seconds. ``query_timeout``
-        cancels statements that run longer (seconds; None: no limit)."""
+        cancels statements that run longer (seconds; None: no limit).
+        ``statement_cache_size=0`` is needed behind PgBouncer in transaction mode.
+
+        ``reset_connections="auto"`` makes small queries up to ~40% faster: the session reset
+        that normally follows every query is skipped when mizzle built the statement itself
+        (raw SQL still resets). Leave it at ``"always"`` if triggers or functions your
+        queries call change session settings (``set_config(..., false)``, ``SET``), because
+        mizzle cannot see those."""
         dialect = dialect_for_url(url)
         for replica in replicas:
             if dialect_for_url(replica).name != dialect.name:
@@ -337,6 +398,7 @@ class Database(Session):
                         max_idle=max_idle,
                         query_timeout=query_timeout,
                         statement_cache_size=statement_cache_size,
+                        reset_connections=reset_connections,
                     )
                 )
         except BaseException:

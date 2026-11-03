@@ -64,6 +64,14 @@ async def test_find_many_with_nested_relations(db: Database) -> None:
     assert [p.title for p in users[1].posts] == ["b1"]
 
 
+async def test_nested_order_without_limit(db: Database) -> None:
+    await seed(db)
+    [ann] = await db.query(Users).find_many(
+        where=eq(Users.email, "ann"), with_={"posts": {"order_by": desc(Posts.title)}}
+    )
+    assert [p.title for p in ann.posts] == ["a3", "a2", "a1"]
+
+
 async def test_filters_at_each_level(db: Database) -> None:
     await seed(db)
     users = await db.query(Users).find_many(

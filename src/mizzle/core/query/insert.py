@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from typing import Literal, Protocol, Self, override
 
 from mizzle.core.compiler import CompiledQuery
 from mizzle.core.errors import QueryError
-from mizzle.core.query.base import Executable
+from mizzle.core.query.base import Executable, evolve
 from mizzle.core.query.returning import Returning
 from mizzle.core.schema.column import ColumnBase
 from mizzle.core.schema.table import Table
@@ -42,11 +42,15 @@ def check_values(table: type[Table], values: Mapping[str, object]) -> None:
 
 def prepare_row(table: type[Table], row: Mapping[str, object]) -> dict[str, object]:
     """Validate one insert row and apply Python-side defaults."""
-    check_values(table, row)
+    columns = table.__table__.columns
+    if not row.keys() <= columns.keys():
+        check_values(table, row)  # raises with the unknown names
     out: dict[str, object] = {}
-    for attr, column in table.__table__.columns.items():
+    for attr, column in columns.items():
         if attr in row:
-            out[attr] = row[attr]
+            value = row[attr]
+            column.validate(value)
+            out[attr] = value
         elif column.default_factory is not None:
             value = column.default_factory()
             column.validate(value)
@@ -100,12 +104,12 @@ class Insert[T: Table](Executable[int]):
                 raise QueryError("values() got an empty list")
         else:
             batch = [as_mapping(rows)]
-        return replace(self, rows=tuple(prepare_row(self.table, row) for row in batch))
+        return evolve(self, rows=tuple(prepare_row(self.table, row) for row in batch))
 
     def on_conflict_do_nothing(
         self, target: ColumnBase | Sequence[ColumnBase] | None = None
     ) -> Self:
-        return replace(self, conflict=OnConflict(_targets(self.table, target), "nothing"))
+        return evolve(self, conflict=OnConflict(_targets(self.table, target), "nothing"))
 
     def on_conflict_do_update(
         self,
@@ -121,7 +125,7 @@ class Insert[T: Table](Executable[int]):
         if not set_:
             raise QueryError("on_conflict_do_update() needs a non-empty set_")
         check_values(self.table, set_)
-        return replace(self, conflict=OnConflict(targets, "update", dict(set_), where))
+        return evolve(self, conflict=OnConflict(targets, "update", dict(set_), where))
 
     def returning(self) -> Returning[T]:
         return Returning(self.runner, self, self.table)

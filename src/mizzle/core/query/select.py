@@ -2,13 +2,21 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
-from dataclasses import dataclass, field, replace
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass, field
 from typing import Literal, Self, cast, overload, override
 
 from mizzle.core.compiler import CompiledQuery
 from mizzle.core.errors import QueryError
-from mizzle.core.query.base import Executable, Row, Runner, decode_table
+from mizzle.core.query.base import (
+    Executable,
+    Row,
+    Runner,
+    evolve,
+    row_decoder,
+    table_columns,
+    table_decoder,
+)
 from mizzle.core.schema.column import ColumnBase
 from mizzle.core.schema.table import Table
 from mizzle.core.sql.nodes import (
@@ -98,43 +106,43 @@ class SelectBase(Node):
     def where(self, condition: Condition) -> Self:
         """Add a filter. Calling ``where`` again ANDs the conditions."""
         combined = condition if self.where_ is None else and_(self.where_, condition)
-        return replace(self, where_=combined)
+        return evolve(self, where_=combined)
 
     def _join(self, kind: JoinKind, source: Source, on: Condition) -> Self:
         if kind in ("RIGHT", "FULL") and self.projection is None:
             raise QueryError(
                 f"{kind.lower()} join needs an explicit select(A, B) so missing rows are typed"
             )
-        return replace(self, joins=(*self.joins, Join(kind, source, on)))
+        return evolve(self, joins=(*self.joins, Join(kind, source, on)))
 
     def join(self, source: Source, on: Condition) -> Self:
         return self._join("INNER", source, on)
 
     def group_by(self, *exprs: ExprBase) -> Self:
-        return replace(self, group_by_=(*self.group_by_, *exprs))
+        return evolve(self, group_by_=(*self.group_by_, *exprs))
 
     def having(self, condition: Condition) -> Self:
         combined = condition if self.having_ is None else and_(self.having_, condition)
-        return replace(self, having_=combined)
+        return evolve(self, having_=combined)
 
     def order_by(self, *items: ExprBase | OrderBy) -> Self:
-        return replace(self, order_by_=(*self.order_by_, *items))
+        return evolve(self, order_by_=(*self.order_by_, *items))
 
     def limit(self, n: int | Expr[int]) -> Self:
-        return replace(self, limit_=_count("limit", n))
+        return evolve(self, limit_=_count("limit", n))
 
     def offset(self, n: int | Expr[int]) -> Self:
-        return replace(self, offset_=_count("offset", n))
+        return evolve(self, offset_=_count("offset", n))
 
     def distinct(self) -> Self:
-        return replace(self, distinct_=True)
+        return evolve(self, distinct_=True)
 
     def for_update(
         self, *, of: Sequence[type[Table]] = (), skip_locked: bool = False, nowait: bool = False
     ) -> Self:
         if skip_locked and nowait:
             raise QueryError("for_update() takes skip_locked or nowait, not both")
-        return replace(self, lock=Lock(tuple(of), skip_locked, nowait))
+        return evolve(self, lock=Lock(tuple(of), skip_locked, nowait))
 
     def cte(self, name: str) -> Cte:
         """Use this query as a named CTE: ``db.with_(cte).select(...).from_(cte)``."""
@@ -150,23 +158,66 @@ class SelectBase(Node):
             return tuple(self.projection.values())
         return self.projection
 
-    def decode(self, row: Row) -> object:
-        values: list[object] = []
+    def decoder(self) -> Callable[[Row], object]:
+        """A function that decodes one result row. Built once per query, used per row."""
+        if self.projection is None and not self.joins and isinstance(self.source, type):
+            return table_decoder(self.source)
+        outer = self._outer_sources()
+        parts: list[Callable[[Row], object]] = []
         index = 0
         for slot in self.slots():
             if isinstance(slot, type):
-                values.append(decode_table(slot, row, index))
-                index += len(slot.__table__.columns)
+                columns = table_columns(slot)
+                decode = row_decoder(slot, columns, index)
+                parts.append(_or_none(decode, index, len(columns)) if slot in outer else decode)
+                index += len(columns)
             else:
-                value = row[index]
                 inner = slot.expr if isinstance(slot, Nullable) else slot
-                values.append(inner.decode(value) if isinstance(inner, ColumnBase) else value)
+                convert = inner.decoder if isinstance(inner, ColumnBase) else None
+                parts.append(_value(index, convert))
                 index += 1
         if self.projection is None:
-            return values[0]
+            return parts[0]
         if isinstance(self.projection, dict):
-            return dict(zip(self.projection, values, strict=True))
-        return tuple(values)
+            keys = tuple(self.projection)
+            return lambda row: dict(zip(keys, [part(row) for part in parts], strict=True))
+        return lambda row: tuple([part(row) for part in parts])
+
+    def _outer_sources(self) -> set[Source]:
+        """Sources an outer join can leave empty (their columns come back all NULL)."""
+        nullable: set[Source] = set()
+        seen: list[Source] = [self.source]
+        for join in self.joins:
+            if join.kind in ("LEFT", "FULL"):
+                nullable.add(join.source)
+            if join.kind in ("RIGHT", "FULL"):
+                nullable.update(seen)
+            seen.append(join.source)
+        return nullable
+
+
+def _or_none(
+    decode: Callable[[Row], Table], start: int, width: int
+) -> Callable[[Row], Table | None]:
+    # ponytail: a real row whose columns are all NULL (only possible in a table with no
+    # NOT NULL column) is indistinguishable from "no match" and decodes to None.
+    stop = start + width
+
+    def decode_or_none(row: Row) -> Table | None:
+        return None if all(v is None for v in row[start:stop]) else decode(row)
+
+    return decode_or_none
+
+
+def _value(index: int, convert: Callable[[object], object] | None) -> Callable[[Row], object]:
+    if convert is None:
+        return lambda row: row[index]
+
+    def decode(row: Row) -> object:
+        value = row[index]
+        return None if value is None else convert(value)
+
+    return decode
 
 
 @dataclass(frozen=True, eq=False)
@@ -211,6 +262,6 @@ class Select[R](SelectBase, Executable[list[R]]):
     @override
     async def run_compiled(self, compiled: CompiledQuery) -> list[R]:
         # decode() builds exactly the shape R describes (rows, tuples or dicts).
-        # FOR UPDATE takes row locks, so only a lock-free SELECT may go to a replica.
-        rows = await self.runner.fetch(compiled, read_only=self.lock is None)
-        return [cast(R, self.decode(row)) for row in rows]
+        rows = await self.runner.fetch(compiled, read_only=True)
+        decode = self.decoder()
+        return cast(list[R], [decode(row) for row in rows])

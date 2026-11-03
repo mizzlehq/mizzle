@@ -18,20 +18,36 @@ from mizzle.core.sql.nodes import Node
 from mizzle.core.steps import Statement, Step
 
 type IsolationLevel = Literal["read committed", "repeatable read", "serializable"]
+# "always": reset session state (SET, LISTEN, advisory locks...) whenever a connection goes
+# back to the pool. "auto": skip it after statements mizzle built itself (faster; see
+# Database.connect for the one case it cannot see).
+type ResetMode = Literal["always", "auto"]
 
 
 class Connection(Protocol):
     """One database connection. Errors are raised as mizzle errors, with SQL attached.
-    ``timeout`` (seconds) overrides the pool's ``query_timeout`` for one statement."""
+    ``timeout`` (seconds) overrides the pool's ``query_timeout`` for one statement.
+    ``session_safe=True`` promises the statement cannot change session state (SET, LISTEN,
+    advisory locks, cursors), so a pool may skip resetting the connection afterwards."""
 
     async def fetch(
-        self, sql: str, params: Sequence[object], timeout: float | None = None
+        self,
+        sql: str,
+        params: Sequence[object],
+        timeout: float | None = None,
+        *,
+        session_safe: bool = False,
     ) -> list[Row]: ...
     async def fetch_dicts(
         self, sql: str, params: Sequence[object], timeout: float | None = None
     ) -> list[dict[str, object]]: ...
     async def execute(
-        self, sql: str, params: Sequence[object], timeout: float | None = None
+        self,
+        sql: str,
+        params: Sequence[object],
+        timeout: float | None = None,
+        *,
+        session_safe: bool = False,
     ) -> int: ...
     def transaction(
         self, isolation: IsolationLevel | None = None, readonly: bool = False
@@ -43,6 +59,9 @@ class Driver(Protocol):
 
     def acquire(self) -> AbstractAsyncContextManager[Connection]: ...
     async def close(self) -> None: ...
+    async def expire_connections(self) -> None:
+        """Replace every pooled connection (idle ones now, busy ones when released)."""
+        ...
 
 
 class Dialect(Protocol):
@@ -60,6 +79,7 @@ class Dialect(Protocol):
         pool_min_size: int = 1,
         max_idle: float = 300.0,
         query_timeout: float | None = None,
+        reset_connections: ResetMode = "always",
     ) -> Driver: ...
 
     # -- schema snapshots (normalized so a schema and its database compare equal) -----

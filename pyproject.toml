@@ -57,12 +57,13 @@ dev = [
     "pytest>=8.3",
     "pytest-asyncio>=0.25",
     "pytest-cov>=6.0",
-        "mypy>=1.15",
+    "mypy>=1.15",
     "ruff>=0.11",
     "asyncpg-stubs>=0.30",
     "httpx>=0.28.1",
     "pydantic>=2.7",
     "basedpyright>=1.40.2",
+    "hypothesis>=6.170.14",
 ]
 
 [tool.pytest.ini_options]
