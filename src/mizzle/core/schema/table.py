@@ -8,13 +8,15 @@ from typing import ClassVar, Self, override
 
 from mizzle.core.errors import SchemaError
 from mizzle.core.naming import Casing, snake_case
-from mizzle.core.schema.column import ColumnBase
+from mizzle.core.schema.column import MISSING, ColumnBase
 from mizzle.core.schema.constraints import (
     Check,
     Constraint,
     ForeignKey,
     Index,
+    Policy,
     PrimaryKey,
+    RowLevelSecurity,
     UniqueConstraint,
 )
 from mizzle.core.schema.relations import Relation
@@ -32,11 +34,18 @@ class Table:
     __table__: ClassVar[TableInfo]
 
     def __init_subclass__(
-        cls, *, name: str | None = None, schema: str | None = None, **kwargs: object
+        cls,
+        *,
+        name: str | None = None,
+        schema: str | None = None,
+        abstract: bool = False,
+        **kwargs: object,
     ) -> None:
         super().__init_subclass__(**kwargs)
+        if abstract:  # a base such as View: not a table itself
+            return
         if parents := [
-            b.__name__ for b in cls.__bases__ if b is not Table and issubclass(b, Table)
+            b.__name__ for b in cls.__bases__ if issubclass(b, Table) and "__table__" in vars(b)
         ]:
             raise SchemaError(
                 f"table class {cls.__name__} inherits from table {parents[0]}; tables cannot "
@@ -78,8 +87,22 @@ def _constraint_columns(constraint: Constraint) -> tuple[ColumnBase, ...]:
             return tuple(k for k in constraint.columns if isinstance(k, ColumnBase))
         case UniqueConstraint() | PrimaryKey() | ForeignKey():
             return constraint.columns
-        case Check():
+        case Check() | Policy() | RowLevelSecurity():
             return ()
+
+
+def _check_generated(column: ColumnBase) -> None:
+    if column.identity is None and column.computed is None:
+        return
+    what = "an identity column" if column.identity is not None else "a generated column"
+    if column.identity is not None and column.computed is not None:
+        raise SchemaError(f"{column.qualified_name} cannot be both identity and generated")
+    if column.identity is not None and column.sql_type not in ("integer", "bigint", "smallint"):
+        raise SchemaError(f"{column.qualified_name}: identity needs integer, bigint or smallint")
+    if column.default_value is not MISSING or column.default_factory is not None:
+        raise SchemaError(f"{column.qualified_name} is {what}; it cannot have a default")
+    if column.read_only and column.on_update_value is not None:
+        raise SchemaError(f"{column.qualified_name} is {what}; it cannot have on_update")
 
 
 def validate_tables(tables: Sequence[type[Table]], casing: Casing | None = None) -> None:
@@ -117,6 +140,7 @@ def validate_tables(tables: Sequence[type[Table]], casing: Casing | None = None)
             raise SchemaError(f"{table.__name__}: primary key declared twice")
 
         for column in info.columns.values():
+            _check_generated(column)
             if column.reference is None:
                 continue
             target = column.reference.target()

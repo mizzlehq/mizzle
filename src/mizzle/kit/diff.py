@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import copy
-from collections.abc import Callable, Mapping
+import re
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from typing import Literal, Protocol
 
 from mizzle.core.errors import MigrationError
-from mizzle.core.snapshot import CheckSnap, IndexSnap, Snapshot, TableSnap, key
+from mizzle.core.snapshot import CheckSnap, IndexSnap, Snapshot, TableSnap, ViewSnap, key
 from mizzle.core.steps import (
     AddCheck,
     AddColumn,
@@ -17,22 +18,37 @@ from mizzle.core.steps import (
     AddPrimaryKey,
     AddUnique,
     AlterColumnDefault,
+    AlterColumnGenerated,
+    AlterColumnIdentity,
     AlterColumnNullability,
     AlterColumnType,
+    AlterExtension,
+    AlterPolicy,
     ConstraintKind,
     CreateEnum,
+    CreateExtension,
+    CreateFunction,
     CreateIndex,
+    CreatePolicy,
     CreateSchema,
     CreateTable,
+    CreateTrigger,
+    CreateView,
     DropColumn,
     DropConstraint,
     DropEnum,
+    DropExtension,
+    DropFunction,
     DropIndex,
+    DropPolicy,
     DropTable,
+    DropTrigger,
+    DropView,
     RenameColumn,
     RenameConstraint,
     RenameIndex,
     RenameTable,
+    SetRowLevelSecurity,
     Step,
 )
 
@@ -108,8 +124,13 @@ def no_renames(
 @dataclass
 class _Plan:
     schemas: list[Step] = field(default_factory=list[Step])
+    extensions: list[Step] = field(default_factory=list[Step])
     enums: list[Step] = field(default_factory=list[Step])
     renames: list[Step] = field(default_factory=list[Step])
+    drop_triggers: list[Step] = field(default_factory=list[Step])
+    drop_policies: list[Step] = field(default_factory=list[Step])
+    drop_views: list[Step] = field(default_factory=list[Step])
+    drop_functions: list[Step] = field(default_factory=list[Step])
     drop_fks: list[Step] = field(default_factory=list[Step])
     drop_constraints: list[Step] = field(default_factory=list[Step])
     drop_indexes: list[Step] = field(default_factory=list[Step])
@@ -120,16 +141,29 @@ class _Plan:
     add_constraints: list[Step] = field(default_factory=list[Step])
     create_indexes: list[Step] = field(default_factory=list[Step])
     add_fks: list[Step] = field(default_factory=list[Step])
+    create_functions: list[Step] = field(default_factory=list[Step])
+    create_views: list[Step] = field(default_factory=list[Step])
+    rls: list[Step] = field(default_factory=list[Step])
+    create_policies: list[Step] = field(default_factory=list[Step])
+    create_triggers: list[Step] = field(default_factory=list[Step])
     drop_tables: list[Step] = field(default_factory=list[Step])
     drop_enums: list[Step] = field(default_factory=list[Step])
+    drop_extensions: list[Step] = field(default_factory=list[Step])
 
     def steps(self) -> list[Step]:
         # Order matters: renames first (later steps use new names), drops of dependent
         # objects before what they depend on, foreign keys after every table exists.
+        # Extensions -> types -> tables -> functions -> views -> policies and triggers;
+        # the reverse when dropping.
         return [
             *self.schemas,
+            *self.extensions,
             *self.enums,
             *self.renames,
+            *self.drop_triggers,
+            *self.drop_policies,
+            *self.drop_views,
+            *self.drop_functions,
             *self.drop_fks,
             *self.drop_constraints,
             *self.drop_indexes,
@@ -140,8 +174,14 @@ class _Plan:
             *self.add_constraints,
             *self.create_indexes,
             *self.add_fks,
+            *self.create_functions,
+            *self.create_views,
+            *self.rls,
+            *self.create_policies,
+            *self.create_triggers,
             *self.drop_tables,
             *self.drop_enums,
+            *self.drop_extensions,
         ]
 
 
@@ -276,12 +316,32 @@ def _diff_table(old: TableSnap, new: TableSnap, plan: _Plan, compare_expressions
             plan.add_columns.append(AddColumn(schema, name, column))
             continue
         old_default = before["default"]
+        old_identity, new_identity = before.get("identity"), column.get("identity")
+        if old_identity is not None and new_identity is None:  # before DROP NOT NULL
+            plan.alter_columns.append(AlterColumnIdentity(schema, name, cname, old_identity, None))
         if before["type"] != column["type"]:
             if old_default is not None:  # it may not cast to the new type; set it again after
                 plan.alter_columns.append(AlterColumnDefault(schema, name, cname, None))
                 old_default = None
             plan.alter_columns.append(
-                AlterColumnType(schema, name, cname, before["type"], column["type"])
+                AlterColumnType(
+                    schema,
+                    name,
+                    cname,
+                    before["type"],
+                    column["type"],
+                    generated="generated" in before,
+                )
+            )
+        old_generated, new_generated = before.get("generated"), column.get("generated")
+        if old_generated != new_generated and (
+            compare_expressions  # else only whether it is generated, and how, counts
+            or old_generated is None
+            or new_generated is None
+            or old_generated["stored"] != new_generated["stored"]
+        ):
+            plan.alter_columns.append(
+                AlterColumnGenerated(schema, name, cname, old_generated, new_generated)
             )
         if before["not_null"] != column["not_null"]:
             plan.alter_columns.append(
@@ -289,6 +349,10 @@ def _diff_table(old: TableSnap, new: TableSnap, plan: _Plan, compare_expressions
             )
         if old_default != column["default"]:
             plan.alter_columns.append(AlterColumnDefault(schema, name, cname, column["default"]))
+        if new_identity is not None and old_identity != new_identity:  # after SET NOT NULL
+            plan.alter_columns.append(
+                AlterColumnIdentity(schema, name, cname, old_identity, new_identity)
+            )
     for cname in old["columns"]:
         if cname not in new["columns"]:
             plan.drop_columns.append(DropColumn(schema, name, cname))
@@ -344,6 +408,9 @@ def _diff_table(old: TableSnap, new: TableSnap, plan: _Plan, compare_expressions
     def same_index(a: IndexSnap, b: IndexSnap) -> bool:
         if a["columns"] != b["columns"] or a["unique"] != b["unique"]:
             return False
+        for extra in ("method", "opclasses", "options"):
+            if a.get(extra) != b.get(extra):
+                return False
         if not compare_expressions:  # the database reformats expressions; compare shapes
             return ("expression" in a) == ("expression" in b)
         return a["where"] == b["where"] and a.get("expression") == b.get("expression")
@@ -396,8 +463,217 @@ def diff(
                 for n in table["foreign_keys"]
             ]
             plan.drop_tables.append(DropTable(table["schema"], table["name"]))
+            # They go with the table, but too late for the functions they use.
+            plan.drop_triggers += [
+                DropTrigger(table["schema"], table["name"], n) for n in table.get("triggers", {})
+            ]
+            plan.drop_policies += [
+                DropPolicy(table["schema"], table["name"], n) for n in table.get("policies", {})
+            ]
     _recreate_dependent_fks(old_tables, new, plan)
+    _diff_extensions(old, new, plan, drop_unlisted=compare_expressions)
+    touched = _diff_functions(old, new, plan)
+    touched |= _changed_tables(plan)
+    touched |= _diff_views(old, new, plan, touched)
+    for k, table in new["tables"].items():
+        if (before := old_tables.get(k)) is not None:
+            _diff_security(before, table, plan, touched)
+        else:
+            _diff_security(_empty_like(table), table, plan, touched)
     return plan.steps()
+
+
+# -- extensions, functions, views, policies, triggers -------------------------------
+
+
+def _mentions(text: str | None, names: Iterable[str]) -> bool:
+    """Whether SQL ``text`` may use any of ``names``. A plain word search: it can only
+    over-report, which recreates an object that did not need it."""
+    if not text:
+        return False
+    return any(re.search(rf"(?<![\w$]){re.escape(n)}(?![\w$])", text) for n in names)
+
+
+def _empty_like(table: TableSnap) -> TableSnap:
+    return TableSnap(
+        schema=table["schema"],
+        name=table["name"],
+        columns={},
+        primary_key=None,
+        uniques={},
+        checks={},
+        foreign_keys={},
+        indexes={},
+    )
+
+
+def _diff_extensions(old: Snapshot, new: Snapshot, plan: _Plan, drop_unlisted: bool) -> None:
+    before, after = old.get("extensions", {}), new.get("extensions", {})
+    for name, ext in after.items():
+        prev = before.get(name)
+        if prev is None:
+            plan.extensions.append(CreateExtension(ext))
+            continue
+        # Only what the schema declares is compared: a database may have moved or updated
+        # an extension the schema does not pin.
+        if "schema" in ext and ext["schema"] != prev.get("schema"):
+            plan.extensions.append(AlterExtension(name, schema=ext["schema"]))
+        if "version" in ext and ext["version"] != prev.get("version"):
+            plan.extensions.append(AlterExtension(name, version=ext["version"]))
+    if drop_unlisted:  # else ``old`` is a live database: platforms install their own
+        plan.drop_extensions += [DropExtension(n) for n in before if n not in after]
+
+
+def _diff_functions(old: Snapshot, new: Snapshot, plan: _Plan) -> set[str]:
+    """Returns the names of functions that are dropped (also to be created again)."""
+    before, after = old.get("functions", {}), new.get("functions", {})
+    dropped: set[str] = set()
+    for k, fn in after.items():
+        prev = before.get(k)
+        if prev is not None and (prev["args"], prev["returns"]) != (fn["args"], fn["returns"]):
+            # CREATE OR REPLACE cannot change these: it would make a second function.
+            plan.drop_functions.append(DropFunction(prev["schema"], prev["name"], prev["args"]))
+            dropped.add(prev["name"])
+        if prev != fn:
+            plan.create_functions.append(CreateFunction(fn))
+    for k, prev in before.items():
+        if k not in after:
+            plan.drop_functions.append(DropFunction(prev["schema"], prev["name"], prev["args"]))
+            dropped.add(prev["name"])
+    return dropped
+
+
+def _changed_tables(plan: _Plan) -> set[str]:
+    """Names of tables and columns whose drop or type change a view (or a policy, or a
+    trigger condition) that uses them would block."""
+    names: set[str] = set()
+    for step in [*plan.drop_tables, *plan.drop_columns, *plan.alter_columns]:
+        match step:
+            case DropTable(name=name):
+                names.add(name)
+            case DropColumn(table=table, name=name):
+                names |= {table, name}
+            case AlterColumnType(table=table, column=column):
+                names |= {table, column}
+            case _:
+                pass
+    return names
+
+
+def _ordered(views: Mapping[str, ViewSnap], keys: Iterable[str]) -> list[str]:
+    """``keys`` with views another one uses first."""
+    pending, done = list(keys), list[str]()
+    while pending:
+        ready = [
+            k
+            for k in pending
+            if not any(
+                o != k and _mentions(views[k]["definition"], [views[o]["name"]]) for o in pending
+            )
+        ]
+        ready = ready or pending[:1]  # a cycle (or a false match): keep the given order
+        done += ready
+        pending = [k for k in pending if k not in ready]
+    return done
+
+
+def _diff_views(old: Snapshot, new: Snapshot, plan: _Plan, touched: set[str]) -> set[str]:
+    """Views are dropped and created again, never altered: CREATE OR REPLACE VIEW cannot
+    remove or retype columns. Returns the names of views that are dropped."""
+    before, after = old.get("views", {}), new.get("views", {})
+    redo = {
+        k
+        for k, v in before.items()
+        if k not in after
+        or (after[k]["definition"], after[k]["materialized"])
+        != (v["definition"], v["materialized"])
+    }
+    names = set(touched)
+    while True:  # views using what changes, and views using those
+        names |= {before[k]["name"] for k in redo}
+        more = {k for k, v in before.items() if k not in redo and _mentions(v["definition"], names)}
+        if not more:
+            break
+        redo |= more
+    for k in reversed(_ordered(before, [k for k in before if k in redo])):
+        v = before[k]
+        plan.drop_views.append(DropView(v["schema"], v["name"], v["materialized"]))
+    for k in _ordered(after, [k for k in after if k in redo or k not in before]):
+        v = after[k]
+        plan.create_views.append(CreateView(v))
+        plan.create_views += [
+            CreateIndex(v["schema"], v["name"], i) for i in v.get("indexes", {}).values()
+        ]
+    for k, v in after.items():
+        if k in before and k not in redo:
+            _diff_view_indexes(before[k], v, plan)
+    return {before[k]["name"] for k in redo}
+
+
+def _diff_view_indexes(old: ViewSnap, new: ViewSnap, plan: _Plan) -> None:
+    schema, name = new["schema"], new["name"]
+
+    def same(a: IndexSnap, b: IndexSnap) -> bool:
+        return _without_name(a) == _without_name(b)
+
+    _diff_named(
+        old.get("indexes", {}),
+        new.get("indexes", {}),
+        same,
+        lambda n: plan.drop_indexes.append(DropIndex(schema, n)),
+        lambda i: plan.create_indexes.append(CreateIndex(schema, name, i)),
+        lambda a, b: plan.renames.append(RenameIndex(schema, a, b)),
+    )
+
+
+def _diff_security(old: TableSnap, new: TableSnap, plan: _Plan, touched: set[str]) -> None:
+    """Row-level security, policies and triggers of a table that exists in both."""
+    schema, name = new["schema"], new["name"]
+    off = {"enabled": False, "force": False}
+    old_rls, new_rls = old.get("rls", off), new.get("rls", off)
+    if old_rls != new_rls:
+        plan.rls.append(SetRowLevelSecurity(schema, name, new_rls["enabled"], new_rls["force"]))
+
+    old_policies, new_policies = old.get("policies", {}), new.get("policies", {})
+    for pname, policy in new_policies.items():
+        prev = old_policies.get(pname)
+        if prev is None:
+            plan.create_policies.append(CreatePolicy(schema, name, policy))
+            continue
+        blocked = _mentions(f"{prev['using']} {prev['with_check']}", touched)
+        if prev == policy and not blocked:
+            continue
+        if (
+            not blocked
+            and (prev["command"], prev["permissive"]) == (policy["command"], policy["permissive"])
+            # ALTER POLICY can change an expression, but not remove it
+            and (prev["using"] is None or policy["using"] is not None)
+            and (prev["with_check"] is None or policy["with_check"] is not None)
+        ):
+            plan.create_policies.append(AlterPolicy(schema, name, policy))
+        else:
+            plan.drop_policies.append(DropPolicy(schema, name, pname))
+            plan.create_policies.append(CreatePolicy(schema, name, policy))
+    plan.drop_policies += [
+        DropPolicy(schema, name, n) for n in old_policies if n not in new_policies
+    ]
+
+    old_triggers, new_triggers = old.get("triggers", {}), new.get("triggers", {})
+    for tname, trigger in new_triggers.items():
+        was = old_triggers.get(tname)
+        blocked = was is not None and (
+            _mentions(was["when"], touched)
+            or was["function"].partition(".")[2] in touched  # its function is dropped
+        )
+        if was is None or blocked:
+            if was is not None:
+                plan.drop_triggers.append(DropTrigger(schema, name, tname))
+            plan.create_triggers.append(CreateTrigger(schema, name, trigger))
+        elif was != trigger:
+            plan.create_triggers.append(CreateTrigger(schema, name, trigger, replace=True))
+    plan.drop_triggers += [
+        DropTrigger(schema, name, n) for n in old_triggers if n not in new_triggers
+    ]
 
 
 def _recreate_dependent_fks(old_tables: dict[str, TableSnap], new: Snapshot, plan: _Plan) -> None:

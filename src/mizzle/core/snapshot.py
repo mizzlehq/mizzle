@@ -13,11 +13,25 @@ from typing import NotRequired, TypedDict
 SNAPSHOT_VERSION = 1
 
 
+class IdentitySnap(TypedDict):
+    always: bool  # GENERATED ALWAYS (else BY DEFAULT)
+    start: int
+    increment: int
+
+
+class GeneratedSnap(TypedDict):
+    expression: str
+    stored: bool  # STORED (else VIRTUAL)
+
+
 class ColumnSnap(TypedDict):
     name: str
     type: str  # normalized SQL type, or "serial" / "bigserial" / "smallserial"
     not_null: bool
     default: str | None  # normalized SQL expression
+    # Absent unless set, so snapshots written before these fields existed compare equal.
+    identity: NotRequired[IdentitySnap]
+    generated: NotRequired[GeneratedSnap]
 
 
 class PrimaryKeySnap(TypedDict):
@@ -53,6 +67,34 @@ class IndexSnap(TypedDict):
     # Key list as SQL, for indexes on expressions (e.g. "lower(email)"). Absent otherwise,
     # so snapshots written before this field existed compare equal.
     expression: NotRequired[str]
+    method: NotRequired[str]  # access method; absent means btree
+    # Non-default operator class per column (None: the default); plain-column indexes only.
+    # Expression indexes carry theirs inside ``expression``.
+    opclasses: NotRequired[list[str | None]]
+    options: NotRequired[dict[str, str]]  # storage parameters: WITH (m = 16, ...)
+
+
+class RlsSnap(TypedDict):
+    enabled: bool
+    force: bool
+
+
+class PolicySnap(TypedDict):
+    name: str
+    command: str  # "all", "select", "insert", "update" or "delete"
+    permissive: bool  # else restrictive
+    roles: list[str]  # sorted; "public" is everyone
+    using: str | None  # normalized SQL expressions
+    with_check: str | None
+
+
+class TriggerSnap(TypedDict):
+    name: str
+    timing: str  # "before", "after" or "instead of"
+    events: list[str]  # of "insert", "delete", "update", "truncate", in that order
+    for_each: str  # "row" or "statement"
+    function: str  # "schema.name" of a function returning trigger
+    when: str | None
 
 
 class TableSnap(TypedDict):
@@ -64,6 +106,10 @@ class TableSnap(TypedDict):
     checks: dict[str, CheckSnap]
     foreign_keys: dict[str, ForeignKeySnap]
     indexes: dict[str, IndexSnap]
+    # Absent unless used, so snapshots written before these fields existed compare equal.
+    rls: NotRequired[RlsSnap]
+    policies: NotRequired[dict[str, PolicySnap]]
+    triggers: NotRequired[dict[str, TriggerSnap]]
 
 
 class EnumSnap(TypedDict):
@@ -72,14 +118,46 @@ class EnumSnap(TypedDict):
     values: list[str]
 
 
+class ExtensionSnap(TypedDict):
+    name: str
+    # Absent: not declared, so whatever the database has is accepted.
+    schema: NotRequired[str]
+    version: NotRequired[str]
+
+
+class FunctionSnap(TypedDict):
+    schema: str
+    name: str
+    args: str  # as pg_get_function_arguments() prints them
+    returns: str
+    language: str
+    body: str  # verbatim
+    volatility: str  # "volatile", "stable" or "immutable"
+    security_definer: bool
+
+
+class ViewSnap(TypedDict):
+    schema: str
+    name: str
+    definition: str  # the query; normalized by the database when compared with one
+    materialized: bool
+    # The declared columns: only for `pull`; the diff ignores them.
+    columns: dict[str, ColumnSnap]
+    indexes: NotRequired[dict[str, IndexSnap]]  # materialized views only
+
+
 class Snapshot(TypedDict):
     version: int
     dialect: str
     id: str
     prev_id: str | None
-    schemas: list[str]  # schemas other than the dialect default that tables live in
+    schemas: list[str]  # schemas other than the dialect default that objects live in
     enums: dict[str, EnumSnap]  # "schema.name" -> enum
     tables: dict[str, TableSnap]  # "schema.name" -> table
+    # Absent unless used, so snapshots written before these fields existed compare equal.
+    extensions: NotRequired[dict[str, ExtensionSnap]]  # name -> extension
+    functions: NotRequired[dict[str, FunctionSnap]]  # "schema.name" -> function
+    views: NotRequired[dict[str, ViewSnap]]  # "schema.name" -> view
 
 
 def key(schema: str, name: str) -> str:

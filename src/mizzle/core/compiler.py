@@ -17,19 +17,26 @@ from typing import TYPE_CHECKING, cast
 from mizzle.core.errors import QueryError
 from mizzle.core.naming import Casing
 from mizzle.core.schema.column import MISSING, ColumnBase
+from mizzle.core.sql.alias import TableAlias
+from mizzle.core.sql.functions import CaseBase
 from mizzle.core.sql.nodes import (
     Between,
     BinaryOp,
     BoolOp,
+    Cast,
     Excluded,
     Exists,
+    Fragment,
+    Frame,
     Func,
     Identifier,
     InList,
     Node,
     Not,
     Nullable,
+    Operation,
     OrderBy,
+    Over,
     Param,
     Placeholder,
     Postfix,
@@ -40,7 +47,7 @@ from mizzle.core.sql.nodes import (
 if TYPE_CHECKING:
     from mizzle.core.query.insert import Insert, OnConflict
     from mizzle.core.query.returning import Returning
-    from mizzle.core.query.select import CteColumn, SelectBase, Slot, Source
+    from mizzle.core.query.select import CompoundBase, CteColumn, SelectBase, Slot, Source
     from mizzle.core.query.update import Delete, Update
     from mizzle.core.schema.table import Table
 
@@ -56,6 +63,9 @@ class CompiledQuery:
     # True when any SELECT in it (also in a CTE or subquery) takes row locks (FOR UPDATE):
     # it must run on the primary.
     locking: bool = False
+    # True when a Python .on_update() hook supplied a value: a prepared query must compile
+    # again on each execution so the hook runs every time, not once at prepare().
+    dynamic: bool = False
 
     @property
     def has_placeholders(self) -> bool:
@@ -74,7 +84,9 @@ class CompiledQuery:
             else (p.column.encode(values[p.name]) if p.column else values[p.name])
             for value, p in zip(self.params, self.placeholders, strict=True)
         )
-        return CompiledQuery(self.sql, params, (None,) * len(params), self.raw, self.locking)
+        return CompiledQuery(
+            self.sql, params, (None,) * len(params), self.raw, self.locking, self.dynamic
+        )
 
 
 type _Visitor = Callable[[Compiler, Node], str]
@@ -96,6 +108,8 @@ class Compiler:
     _placeholders: list[Placeholder | None]
     _raw: bool
     _locking: bool
+    _dynamic: bool
+    _bound: dict[int, str]  # id(Param) -> its marker: a reused node reuses its parameter
     _scopes: list[dict[type[Table], str]]  # table -> alias, for aliased (relational) queries
     _alias_count: int
 
@@ -115,14 +129,23 @@ class Compiler:
         self._placeholders = []
         self._raw = False
         self._locking = False
+        self._dynamic = False
+        self._bound = {}
         self._scopes = []
         self._alias_count = 0
 
     def compile(self, node: Node) -> CompiledQuery:
         self._params, self._placeholders, self._raw, self._locking = [], [], False, False
+        self._dynamic = False
+        self._bound = {}
         text = self.visit(node)
         return CompiledQuery(
-            text, tuple(self._params), tuple(self._placeholders), self._raw, self._locking
+            text,
+            tuple(self._params),
+            tuple(self._placeholders),
+            self._raw,
+            self._locking,
+            self._dynamic,
         )
 
     def visit(self, node: Node) -> str:
@@ -213,8 +236,13 @@ class Compiler:
         return f"{self.quote(node.table.__table__.name)}.{self.column_name(node)}"
 
     def visit_Param(self, node: Param) -> str:
-        value = node.column.encode(node.value) if node.column is not None else node.value
-        return self.bind(value)
+        # The same node twice (an expression both selected and grouped by) binds once, so
+        # PostgreSQL sees identical expressions.
+        marker = self._bound.get(id(node))
+        if marker is None:
+            value = node.column.encode(node.value) if node.column is not None else node.value
+            marker = self._bound[id(node)] = self.bind(value)
+        return marker
 
     def visit_Placeholder(self, node: Placeholder) -> str:
         return self.bind(None, node)
@@ -272,11 +300,54 @@ class Compiler:
     def visit_Excluded(self, node: Excluded) -> str:
         return f"excluded.{self.column_name(node.column)}"
 
+    def visit_Operation(self, node: Operation) -> str:
+        return f"({self.operand(node.left)} {node.op} {self.operand(node.right)})"
+
+    def visit_Cast(self, node: Cast) -> str:
+        return f"CAST({self.visit(node.expr)} AS {node.type})"
+
+    def visit_Fragment(self, node: Fragment) -> str:
+        return "".join(p if isinstance(p, str) else self.visit(p) for p in node.parts)
+
+    def visit_CaseBase(self, node: CaseBase) -> str:
+        parts = ["CASE"]
+        for condition, value in node.whens:
+            parts.append(f"WHEN {self.visit(condition)} THEN {self.visit(value)}")
+        if node.default is not None:
+            parts.append(f"ELSE {self.visit(node.default)}")
+        parts.append("END")
+        return " ".join(parts)
+
+    def visit_Over(self, node: Over) -> str:
+        window: list[str] = []
+        if node.partition_by:
+            window.append("PARTITION BY " + ", ".join(self.visit(e) for e in node.partition_by))
+        if node.order_by:
+            window.append("ORDER BY " + ", ".join(self.visit(e) for e in node.order_by))
+        if node.frame is not None:
+            window.append(self.frame(node.frame))
+        return f"{self.visit(node.func)} OVER ({' '.join(window)})"
+
+    def frame(self, frame: Frame) -> str:
+        def bound(offset: int | None, unbounded: str) -> str:
+            if offset is None:
+                return f"UNBOUNDED {unbounded}"
+            if offset == 0:
+                return "CURRENT ROW"
+            return f"{abs(offset)} {'PRECEDING' if offset < 0 else 'FOLLOWING'}"
+
+        start, end = bound(frame.start, "PRECEDING"), bound(frame.end, "FOLLOWING")
+        return f"{frame.kind} BETWEEN {start} AND {end}"
+
     # -- SELECT -----------------------------------------------------------------------
 
     def source(self, source: Source) -> str:
         if isinstance(source, type):
+            if issubclass(source, TableAlias):
+                return f"{self.table_name(source.__alias_of__)} AS {self.table_name(source)}"
             return self.table_name(source)
+        if source.alias is not None:
+            return f"{self.quote(source.name)} AS {self.quote(source.alias)}"
         return self.quote(source.name)
 
     def select_slot(self, slot: Slot) -> str:
@@ -288,7 +359,22 @@ class Compiler:
         return self.visit(value) if isinstance(value, Placeholder) else self.bind(value)
 
     def visit_CteColumn(self, node: CteColumn) -> str:
-        return f"{self.quote(node.cte.name)}.{self.quote(node.name)}"
+        return f"{self.quote(node.cte.alias or node.cte.name)}.{self.quote(node.name)}"
+
+    def visit_CompoundBase(self, node: CompoundBase) -> str:
+        parts = [f"({self.visit(node.left)}) {node.op} ({self.visit(node.right)})"]
+        if node.order_by_:
+            # The combined result has only its output columns: refer to them by name.
+            qualify, self.qualify_columns = self.qualify_columns, False
+            try:
+                parts.append("ORDER BY " + ", ".join(self.visit(e) for e in node.order_by_))
+            finally:
+                self.qualify_columns = qualify
+        if node.limit_ is not None:
+            parts.append(f"LIMIT {self.count_value(node.limit_)}")
+        if node.offset_ is not None:
+            parts.append(f"OFFSET {self.count_value(node.offset_)}")
+        return " ".join(parts)
 
     def visit_SelectBase(self, node: SelectBase) -> str:
         if not self._scopes:
@@ -351,10 +437,22 @@ class Compiler:
 
     def set_list(self, table: type[Table], values: Mapping[str, object]) -> str:
         columns = table.__table__.columns
-        return ", ".join(
+        items = [
             f"{self.column_name(columns[k])} = {self.value(columns[k], v)}"
             for k, v in values.items()
-        )
+        ]
+        for attr, column in columns.items():  # .on_update() / .on_update_now() hooks
+            hook = column.on_update_value
+            if hook is None or attr in values:
+                continue
+            if isinstance(hook, Node):
+                value: object = hook
+            else:
+                value = hook()
+                self._dynamic = True
+            column.validate(value)
+            items.append(f"{self.column_name(column)} = {self.value(column, value)}")
+        return ", ".join(items)
 
     def visit_Insert(self, node: Insert[Table]) -> str:
         if not node.rows:

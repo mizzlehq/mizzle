@@ -1,5 +1,9 @@
 """Random schemas through the migration engine.
 
+Schemas also get random extensions, views (plain and materialized) over their tables,
+row-level security, policies, a trigger function with triggers, and a SQL function some
+views call; mutations change all of them.
+
 A: empty -> schema, applied, introspected: no drift.
 B: schema S1 (with a few rows) -> random mutation S2, applied: no drift, untouched data kept.
 C: rendering is deterministic and re-diffing the migrated database finds nothing to do.
@@ -26,11 +30,31 @@ import pytest
 from hypothesis import HealthCheck, event, given, note, settings
 from hypothesis import strategies as st
 
-from mizzle import Table, check, foreign_key, index, primary_key, sql, unique, unique_index
+from mizzle import (
+    QueryBuilder,
+    Table,
+    View,
+    check,
+    extension,
+    foreign_key,
+    function,
+    index,
+    is_not_null,
+    policy,
+    primary_key,
+    rls,
+    sql,
+    trigger,
+    unique,
+    unique_index,
+)
 from mizzle.core.errors import DatabaseError
-from mizzle.core.schema.column import ColumnBase, Reference, ReferentialAction
-from mizzle.core.schema.constraints import Constraint
+from mizzle.core.query.select import Select
+from mizzle.core.schema.column import ColumnBase, Computed, Identity, Reference, ReferentialAction
+from mizzle.core.schema.constraints import Constraint, PolicyCommand
+from mizzle.core.schema.objects import SchemaObject, TriggerEvent
 from mizzle.core.snapshot import Snapshot, empty_snapshot
+from mizzle.core.sql.nodes import ExprBase
 from mizzle.core.steps import Statement
 from mizzle.dialects.postgres import PostgresDialect
 from mizzle.dialects.postgres.ddl import qualified, quote
@@ -62,6 +86,7 @@ from mizzle.pg import (
     text,
     time,
     timestamp,
+    tsvector,
     varchar,
 )
 from mizzle.pg import uuid as uuid_col
@@ -83,6 +108,7 @@ class Kind:
     text: bool = False  # lower(col) works
     serial: bool = False
     base: str = ""  # kind of a column referencing this one (serial -> integer)
+    generated: str | None = None  # an expression for a generated column of this kind
 
 
 def _k(
@@ -94,8 +120,11 @@ def _k(
     text: bool = False,
     serial: bool = False,
     base: str = "",
+    generated: str | None = None,
 ) -> Kind:
-    return Kind(lambda _enum: make(), defaults, samples, check, btree, text, serial, base)
+    return Kind(
+        lambda _enum: make(), defaults, samples, check, btree, text, serial, base, generated
+    )
 
 
 INTS = ("1", "2", "3")
@@ -104,19 +133,28 @@ NUMCHECK = "{c} >= 0"
 TEXTCHECK = "length({c}) < 100"
 
 KINDS: dict[str, Kind] = {
-    "smallint": _k(smallint, 0, -3, sql("(1 + 2)"), samples=INTS, check=NUMCHECK),
-    "integer": _k(integer, 0, 7, -1, samples=INTS, check=NUMCHECK),
-    "bigint": _k(bigint, 0, 9_000_000_000, samples=INTS, check=NUMCHECK),
+    "smallint": _k(smallint, 0, -3, sql("(1 + 2)"), samples=INTS, check=NUMCHECK, generated="2"),
+    "integer": _k(integer, 0, 7, -1, samples=INTS, check=NUMCHECK, generated="length('abc')"),
+    "bigint": _k(bigint, 0, 9_000_000_000, samples=INTS, check=NUMCHECK, generated="(4 * 5)"),
     "numeric": _k(numeric, Decimal("1.50"), 0, Decimal("-2.5"), samples=INTS, check=NUMCHECK),
     "numeric(10,2)": _k(
         lambda: numeric(10, 2), Decimal("1.50"), Decimal("-3"), samples=INTS, check=NUMCHECK
     ),
     "real": _k(real, 1.5, -0.25, samples=("1.5", "2.5", "3.5"), check=NUMCHECK),
     "double": _k(double_precision, 2.5, 0.0, samples=("1.5", "2.5", "3.5"), check=NUMCHECK),
-    "text": _k(text, "", "it's", "x", samples=STRS, check=TEXTCHECK, text=True),
+    "text": _k(
+        text, "", "it's", "x", samples=STRS, check=TEXTCHECK, text=True, generated="repeat('g', 2)"
+    ),
     "varchar(20)": _k(lambda: varchar(20), "", "abc", samples=STRS, check=TEXTCHECK, text=True),
     "varchar": _k(varchar, "z", samples=STRS, check=TEXTCHECK, text=True),
-    "boolean": _k(boolean, True, False, samples=("true", "false", "true")),
+    "boolean": _k(boolean, True, False, samples=("true", "false", "true"), generated="true"),
+    "tsvector": _k(
+        tsvector,
+        "'a' 'b'",  # as PostgreSQL prints it back
+        sql("to_tsvector('simple'::regconfig, 'x y'::text)"),  # defaults compare as printed
+        samples=("'a b'", "'c:1A'", "''"),
+        generated="to_tsvector('english', 'cats sat')",
+    ),
     "date": _k(
         date,
         dt.date(2020, 1, 2),
@@ -200,6 +238,7 @@ KIND_NAMES = list(KINDS)
 PLAIN_KINDS = [k for k in KIND_NAMES if not KINDS[k].serial]
 
 NUM = {"smallint", "integer", "bigint", "numeric", "numeric(10,2)", "real", "double"}
+INT_KINDS = {"smallint", "integer", "bigint"}
 STR = {"text", "varchar(20)", "varchar"}
 # Kinds Postgres converts between with ``USING col::new_type``. Anything converts to and
 # from a string type (I/O conversion). Pairs not listed here (uuid -> integer, ...) have no
@@ -239,6 +278,11 @@ ACTIONS: list[ReferentialAction | None] = [
     "set default",
 ]
 TABLE_NAMES = ["alpha", "beta", "gamma", "delta", "Odd Name", "t_" + "long" * 11]
+VIEW_NAMES = ["v_one", "v_two", "Odd View"]
+EXTENSIONS = ["pg_trgm", "citext", "hstore"]
+FZ_ROLE = "mizzle_fz_role"
+TRIGGER_EVENTS: list[TriggerEvent] = ["insert", "delete", "update", "truncate"]
+COMMANDS: list[PolicyCommand] = ["all", "select", "insert", "update", "delete"]
 ENUM_EXTRAS = ["glad", "it's", "Mixed Case", "z"]
 
 
@@ -250,6 +294,8 @@ class Col:
     default: int | None = None  # index into KINDS[kind].defaults
     unique: bool = False
     pk: bool = False  # column-level .primary_key()
+    identity: bool | None = None  # GENERATED ALWAYS (True) / BY DEFAULT (False) AS IDENTITY
+    generated: bool = False  # GENERATED ALWAYS AS (KINDS[kind].generated) STORED
 
 
 @dataclass
@@ -272,6 +318,25 @@ class Fk:
 
 
 @dataclass
+class Pol:
+    name: str
+    command: PolicyCommand
+    using: str | None = None  # column: "col IS NOT NULL"
+    check: str | None = None
+    permissive: bool = True
+    role: bool = False  # TO the fuzz role, else PUBLIC
+
+
+@dataclass
+class Trg:
+    name: str
+    events: list[TriggerEvent]
+    after: bool = False
+    statement: bool = False  # FOR EACH STATEMENT
+    when: str | None = None  # column: WHEN (NEW.col IS NOT NULL)
+
+
+@dataclass
 class Tbl:
     name: str
     schema: str | None
@@ -281,6 +346,9 @@ class Tbl:
     checks: list[str] = field(default_factory=list[str])  # one check per listed column
     indexes: list[Idx] = field(default_factory=list[Idx])
     fks: list[Fk] = field(default_factory=list[Fk])
+    rls: int = 0  # 0 off, 1 enabled, 2 enabled and forced, 3 only forced
+    policies: list[Pol] = field(default_factory=list[Pol])
+    triggers: list[Trg] = field(default_factory=list[Trg])
 
     def col(self, name: str) -> Col | None:
         return next((c for c in self.cols if c.name == name), None)
@@ -293,9 +361,25 @@ class Tbl:
 
 
 @dataclass
+class Vw:
+    name: str
+    schema: str | None
+    table: str
+    cols: list[str]
+    where: str | None = None  # column: WHERE col IS NOT NULL
+    materialized: bool = False
+    indexed: bool = False  # materialized: an index on its first column
+    calc: bool = False  # a column calling fz_calc()
+
+
+@dataclass
 class Spec:
     enum_values: list[str]
     tables: list[Tbl]
+    extensions: list[str] = field(default_factory=list[str])
+    views: list[Vw] = field(default_factory=list[Vw])
+    fn_variant: int = 0  # body of the trigger function
+    calc: int | None = None  # fz_calc(): None absent, else its number of arguments
 
     def table(self, name: str) -> Tbl | None:
         return next((t for t in self.tables if t.name == name), None)
@@ -317,6 +401,14 @@ def sanitize(spec: Spec) -> Spec:
             kind = KINDS[c.kind]
             if kind.serial:
                 c.nullable, c.default = False, None
+            if c.kind not in INT_KINDS or c.generated:
+                c.identity = None
+            if kind.generated is None:
+                c.generated = False
+            if c.identity is not None:
+                c.nullable, c.default = False, None
+            if c.generated:
+                c.default = None
             if c.default is not None and c.default >= len(kind.defaults):
                 c.default = None
             if not kind.btree:
@@ -357,6 +449,8 @@ def sanitize(spec: Spec) -> Spec:
             remote = [target.col(n) for n in fk.ref_cols]
             if len(set(fk.cols)) != len(fk.cols) or len(local) != len(remote):
                 continue
+            if any(a is not None and a.generated for a in local):
+                continue  # a generated column cannot take ON UPDATE / ON DELETE actions
             if any(
                 a is None or b is None or base_kind(a.kind) != base_kind(b.kind)
                 for a, b in zip(local, remote, strict=True)
@@ -367,13 +461,64 @@ def sanitize(spec: Spec) -> Spec:
             fk.inline = fk.inline and len(fk.cols) == 1
             fks.append(fk)
         t.fks = fks
+    sanitize_objects(spec)
     return spec
+
+
+def sanitize_objects(spec: Spec) -> None:
+    spec.extensions = _dedupe(spec.extensions)
+    for t in spec.tables:
+        policies: list[Pol] = []
+        for pol in t.policies:
+            if pol.using is not None and (t.col(pol.using) is None or pol.command == "insert"):
+                pol.using = None
+            if pol.check is not None and (
+                t.col(pol.check) is None or pol.command in ("select", "delete")
+            ):
+                pol.check = None
+            if pol.name not in [q.name for q in policies]:
+                policies.append(pol)
+        t.policies = policies
+        triggers: list[Trg] = []
+        for trg in t.triggers:
+            trg.events = [e for e in TRIGGER_EVENTS if e in trg.events] or ["insert"]
+            trg.statement = trg.statement or "truncate" in trg.events
+            col = t.col(trg.when) if trg.when is not None else None
+            if (
+                col is None
+                or trg.statement
+                or not set(trg.events) <= {"insert", "update"}  # NEW is there
+                or (col.generated and not trg.after)  # not yet computed in BEFORE
+            ):
+                trg.when = None
+            if trg.name not in [u.name for u in triggers]:
+                triggers.append(trg)
+        t.triggers = triggers
+    views: list[Vw] = []
+    for v in spec.views:
+        t = spec.table(v.table)
+        if t is None or v.name in [w.name for w in views]:
+            continue
+        v.cols = _dedupe([c for c in v.cols if t.col(c) is not None])
+        if not v.cols:
+            continue
+        if v.where is not None and t.col(v.where) is None:
+            v.where = None
+        v.indexed = v.indexed and v.materialized and KINDS[_kind(t, v.cols[0])].btree
+        v.calc = v.calc and spec.calc is not None
+        views.append(v)
+    spec.views = views
 
 
 # -- spec -> Table classes -------------------------------------------------------------
 
 
 def build_tables(spec: Spec) -> list[type[Table]]:
+    return build_schema(spec)[0]
+
+
+def build_schema(spec: Spec) -> tuple[list[type[Table]], list[SchemaObject]]:
+    """Tables and views, and the extensions, functions and triggers of ``spec``."""
     members = [(f"V{i}", v) for i, v in enumerate(spec.enum_values)]
     mood = cast(type[enum.Enum], enum.Enum("FzMood", members))
     classes: dict[str, type[Table]] = {}
@@ -384,6 +529,12 @@ def build_tables(spec: Spec) -> list[type[Table]]:
         col.nullable = c.nullable and not c.pk and not kind.serial
         col.is_primary_key = c.pk
         col.is_unique = c.unique
+        if c.identity is not None:
+            col.identity = Identity(c.identity, *(None, None) if c.pk else (10, 3))
+            col.generated = True
+        if c.generated:
+            col.computed = Computed(sql(cast(str, kind.generated)))
+            col.generated = True
         if c.default is not None:
             value = kind.defaults[c.default]
             if c.kind == "enum":
@@ -418,6 +569,18 @@ def build_tables(spec: Spec) -> list[type[Table]]:
                 check(f"{t.name[:40]}_ck_{n}", sql(KINDS[_kind(t, n)].check.format(c=quote(n))))
                 for n in t.checks
             ]
+            out += [rls(enabled=t.rls in (1, 2), force=t.rls >= 2)] if t.rls else []
+            out += [
+                policy(
+                    p.name,
+                    for_=p.command,
+                    to=[FZ_ROLE] if p.role else ["public"],
+                    using=sql(f"{quote(p.using)} IS NOT NULL") if p.using else None,
+                    with_check=sql(f"{quote(p.check)} IS NOT NULL") if p.check else None,
+                    as_="permissive" if p.permissive else "restrictive",
+                )
+                for p in t.policies
+            ]
             for i in t.indexes:
                 ix = unique_index(i.name) if i.unique else index(i.name)
                 if i.expr is not None:
@@ -447,7 +610,72 @@ def build_tables(spec: Spec) -> list[type[Table]]:
             lambda ns, attrs=attrs: ns.update(attrs),
         )
         classes[t.name] = cast(type[Table], cls)
-    return list(classes.values())
+
+    objects: list[SchemaObject] = [extension(e) for e in spec.extensions]
+    trigger_fn = function(
+        "fz_trg", returns="trigger", body=f"BEGIN PERFORM {spec.fn_variant}; RETURN NEW; END"
+    )
+    calc_args = ["a integer", "b integer"][: spec.calc or 0]
+    calc_fn = function(
+        "fz_calc",
+        returns="integer",
+        language="sql",
+        args=", ".join(calc_args),
+        body="SELECT " + " + ".join(a.split()[0] for a in calc_args),
+        volatility="immutable",
+    )
+    if spec.calc is not None:
+        objects.append(calc_fn)
+    for t in spec.tables:
+        for trg in t.triggers:
+            when = sql(f"NEW.{quote(trg.when)} IS NOT NULL") if trg.when else None
+            objects.append(
+                trigger(
+                    trg.name,
+                    on=classes[t.name],
+                    execute=trigger_fn,
+                    timing="after" if trg.after else "before",
+                    events=trg.events,
+                    for_each="statement" if trg.statement else "row",
+                    when=when,
+                )
+            )
+
+    views: list[type[Table]] = []
+    for v in spec.views:
+        source = classes[v.table]
+
+        def query(
+            cls: type[View],
+            db: QueryBuilder,
+            v: Vw = v,
+            source: type[Table] = source,
+            calc_args: int = spec.calc or 0,
+        ) -> ExprBase | Select[dict[str, object]]:
+            cols = source.__table__.columns
+            fields: dict[str, ExprBase] = {c: cols[c] for c in v.cols}
+            if v.calc:
+                fields["calc"] = sql(f"fz_calc({', '.join(['1'] * calc_args)})")
+            select = db.select(fields).from_(source)
+            return select.where(is_not_null(cols[v.where])) if v.where else select
+
+        def view_config(cls: type[Table], v: Vw = v) -> list[Constraint]:
+            first = cls.__table__.columns[v.cols[0]]
+            return [index(f"{v.name}_ix").on(first)] if v.indexed else []
+
+        names = [*v.cols, *(["calc"] if v.calc else [])]
+        view_attrs: dict[str, object] = {c: text() for c in names}
+        view_attrs["query"] = classmethod(query)
+        view_attrs["config"] = classmethod(view_config)
+        views.append(
+            types.new_class(
+                "V_" + uuid.uuid4().hex[:8],
+                (View,),
+                {"name": v.name, "schema": v.schema, "materialized": v.materialized},
+                lambda ns, view_attrs=view_attrs: ns.update(view_attrs),
+            )
+        )
+    return [*classes.values(), *views], objects
 
 
 def _kind(t: Tbl, name: str) -> str:
@@ -457,21 +685,31 @@ def _kind(t: Tbl, name: str) -> str:
 
 
 def snapshot_of(spec: Spec) -> Snapshot:
-    return build_snapshot(build_tables(spec), dialect)
+    tables, objects = build_schema(spec)
+    return build_snapshot(tables, dialect, objects=objects)
 
 
 # -- strategies ------------------------------------------------------------------------
 
 
 def col_strategy(name: str, kinds: list[str] = KIND_NAMES) -> st.SearchStrategy[Col]:
-    def build(kind: str, nullable: bool, default: int | None, uq: bool) -> Col:
-        return Col(name, kind, nullable, default, uq)
+    def build(
+        kind: str,
+        nullable: bool,
+        default: int | None,
+        uq: bool,
+        identity: bool | None,
+        generated: bool,
+    ) -> Col:
+        return Col(name, kind, nullable, default, uq, identity=identity, generated=generated)
 
     return st.builds(
         build,
         st.sampled_from(kinds),
         st.booleans(),
         st.none() | st.integers(0, 2),
+        st.integers(0, 4).map(lambda n: n == 0),
+        st.sampled_from([None, None, True, False]),
         st.integers(0, 4).map(lambda n: n == 0),
     )
 
@@ -555,11 +793,63 @@ def schemas(draw: st.DrawFn) -> Spec:
             fk = draw(fk_strategy(t, spec))
             if fk is not None:
                 t.fks.append(fk)
+    if draw(st.booleans()):  # tables only, half of the time
+        draw_objects(draw, spec)
     return sanitize(spec)
 
 
+def draw_objects(draw: st.DrawFn, spec: Spec) -> None:
+    spec.extensions = draw(st.lists(st.sampled_from(EXTENSIONS), unique=True, max_size=2))
+    spec.fn_variant = draw(st.integers(0, 2))
+    spec.calc = draw(st.sampled_from([None, 1, 2]))
+    for t in spec.tables:
+        t.rls = draw(st.sampled_from([0, 0, 1, 2, 3]))
+        t.policies = [draw(policy_strategy(t, f"p{i}")) for i in range(draw(st.integers(0, 2)))]
+        t.triggers = [draw(trigger_strategy(t, f"tg{i}")) for i in range(draw(st.integers(0, 2)))]
+    for name in draw(st.lists(st.sampled_from(VIEW_NAMES), unique=True, max_size=2)):
+        spec.views.append(draw(view_strategy(spec, name)))
+
+
+def _col_or_none(draw: st.DrawFn, t: Tbl) -> str | None:
+    return draw(st.none() | st.sampled_from([c.name for c in t.cols]))
+
+
+@st.composite
+def policy_strategy(draw: st.DrawFn, t: Tbl, name: str) -> Pol:
+    return Pol(
+        name,
+        draw(st.sampled_from(COMMANDS)),
+        _col_or_none(draw, t),
+        _col_or_none(draw, t),
+        draw(st.booleans()),
+        draw(st.booleans()),
+    )
+
+
+@st.composite
+def trigger_strategy(draw: st.DrawFn, t: Tbl, name: str) -> Trg:
+    events = draw(st.lists(st.sampled_from(TRIGGER_EVENTS), min_size=1, max_size=3, unique=True))
+    return Trg(name, events, draw(st.booleans()), draw(st.booleans()), _col_or_none(draw, t))
+
+
+@st.composite
+def view_strategy(draw: st.DrawFn, spec: Spec, name: str) -> Vw:
+    t = draw(st.sampled_from(spec.tables))
+    names = [c.name for c in t.cols]
+    return Vw(
+        name,
+        draw(st.sampled_from([None, None, "fz_s"])),
+        t.name,
+        draw(st.lists(st.sampled_from(names), min_size=1, max_size=3, unique=True)),
+        _col_or_none(draw, t),
+        draw(st.booleans()),
+        draw(st.booleans()),
+        draw(st.booleans()),
+    )
+
+
 # Mutation ops (see the match below); column changes are listed more than once.
-OPS = [*range(16), 2, 2, 2, 3, 4, 4, 14]
+OPS = [*range(18), 2, 2, 2, 3, 4, 4, 14, *range(18, 30)]
 
 
 def original_kind(s1: Spec, t: Tbl, c: Col) -> str:
@@ -588,7 +878,7 @@ def mutated(draw: st.DrawFn, s1: Spec) -> Spec:
                 t.cols.append(draw(col_strategy(f"n{uuid.uuid4().hex[:4]}")))
             case 1 if len(t.cols) > 1:
                 t.cols.remove(c)
-            case 2 if targets := cast_targets(original_kind(s1, t, c)):
+            case 2 if not c.generated and (targets := cast_targets(original_kind(s1, t, c))):
                 c.kind = draw(st.sampled_from(targets))  # one cast from s1, not a chain
                 c.default = draw(st.none() | st.integers(0, 2))
             case 3:
@@ -629,6 +919,50 @@ def mutated(draw: st.DrawFn, s1: Spec) -> Spec:
                 spec.tables.remove(t)
             case 14:
                 spec.enum_values = enum_values(draw, spec.enum_values)
+            case 16:
+                c.identity = draw(st.sampled_from([None, True, False]))
+            case 17:
+                c.generated = False  # DROP EXPRESSION; the reverse needs a custom migration
+            case 18:
+                ext = draw(st.sampled_from(EXTENSIONS))
+                spec.extensions = [e for e in spec.extensions if e != ext] + (
+                    [] if ext in spec.extensions else [ext]
+                )
+            case 19:
+                free = [n for n in VIEW_NAMES if n not in [v.name for v in spec.views]]
+                if free:
+                    spec.views.append(draw(view_strategy(spec, draw(st.sampled_from(free)))))
+            case 20 if spec.views:
+                spec.views.remove(draw(st.sampled_from(spec.views)))
+            case 21 if spec.views:  # a new query (or kind) under the same name
+                old_view = draw(st.sampled_from(spec.views))
+                spec.views[spec.views.index(old_view)] = draw(view_strategy(spec, old_view.name))
+            case 22:
+                t.rls = draw(st.sampled_from([0, 1, 2, 3]))
+            case 23:
+                t.policies.append(draw(policy_strategy(t, f"p{uuid.uuid4().hex[:4]}")))
+            case 24 if t.policies:
+                pol = draw(st.sampled_from(t.policies))
+                if draw(st.booleans()):
+                    t.policies.remove(pol)
+                else:  # change it in place: roles, expressions, maybe its command
+                    changed = draw(policy_strategy(t, pol.name))
+                    t.policies[t.policies.index(pol)] = changed
+            case 25:
+                t.triggers.append(draw(trigger_strategy(t, f"tg{uuid.uuid4().hex[:4]}")))
+            case 26 if t.triggers:
+                trg = draw(st.sampled_from(t.triggers))
+                if draw(st.booleans()):
+                    t.triggers.remove(trg)
+                else:
+                    t.triggers[t.triggers.index(trg)] = draw(trigger_strategy(t, trg.name))
+            case 27:
+                spec.fn_variant = (spec.fn_variant + 1) % 3
+            case 28:  # add, drop, or change the arguments of fz_calc
+                spec.calc = draw(st.sampled_from([None, 1, 2]))
+            case 29 if spec.views:
+                v = draw(st.sampled_from(spec.views))
+                v.where = None if v.where else c.name if v.table == t.name else None
             case _:
                 pass
         sanitize(spec)
@@ -653,8 +987,15 @@ DO $$ DECLARE r record; BEGIN
            WHERE n.nspname = 'public' AND t.typtype = 'e' LOOP
     EXECUTE format('DROP TYPE IF EXISTS public.%I CASCADE', r.typname);
   END LOOP;
+  FOR r IN SELECT p.oid::regprocedure AS fn FROM pg_proc p
+           JOIN pg_namespace n ON n.oid = p.pronamespace
+           WHERE n.nspname = 'public' AND p.prokind = 'f' AND NOT EXISTS (
+             SELECT 1 FROM pg_depend d WHERE d.objid = p.oid AND d.deptype = 'e') LOOP
+    EXECUTE format('DROP FUNCTION IF EXISTS %s CASCADE', r.fn);
+  END LOOP;
 END $$;
 DROP TYPE IF EXISTS {ENUM} CASCADE;
+DROP EXTENSION IF EXISTS {", ".join(EXTENSIONS)} CASCADE;
 """
 
 
@@ -677,10 +1018,21 @@ def migration(old: Snapshot, new: Snapshot) -> list[Statement]:
     return dialect.render(diff(old, new))
 
 
+async def normalized(driver: PostgresDriver, snapshot: Snapshot) -> Snapshot:
+    """View queries and expressions as the database prints them (what push compares)."""
+    async with driver.acquire() as conn:
+        return await dialect.normalize_snapshot(conn, snapshot)
+
+
 def assert_no_drift(live: Snapshot, expected: Snapshot) -> None:
     note(f"expected: {expected['tables']}\nlive: {live['tables']}")
+    for part in ("views", "functions", "extensions"):
+        note(f"expected {part}: {expected.get(part)}\nlive {part}: {live.get(part)}")
     remaining = diff(live, expected, compare_expressions=False)
     assert remaining == [], [s.describe() for s in remaining]
+    # compare_expressions=False leaves undeclared extensions alone; they must be gone too.
+    installed = {e for e in live.get("extensions", {}) if e in EXTENSIONS}
+    assert installed == set(expected.get("extensions", {})) - {"vector"}
     for k, table in expected["tables"].items():
         live_indexes = live["tables"][k]["indexes"]
         for name, ix in table["indexes"].items():  # predicates are not compared above
@@ -701,7 +1053,11 @@ async def insert_rows(driver: PostgresDriver, spec: Spec) -> None:
     async with driver.acquire() as conn:
         for _ in range(2):  # a second pass fills tables whose references were empty
             for t in spec.tables:
-                cols = [c for c in t.cols if not KINDS[c.kind].serial]
+                cols = [
+                    c
+                    for c in t.cols
+                    if not KINDS[c.kind].serial and c.identity is None and not c.generated
+                ]
                 for i in range(3):
                     names = ", ".join(quote(c.name) for c in cols)
                     values = ", ".join(KINDS[c.kind].samples[i] for c in cols)
@@ -753,9 +1109,17 @@ def runner() -> Generator[tuple[asyncio.Runner, PostgresDriver, str]]:
         pytest.skip("set MIZZLE_TEST_URL to run integration tests")
     with asyncio.Runner() as loop:
         driver = loop.run(PostgresDriver.connect(url, pool_size=2))
+        loop.run(reset(driver))
+        loop.run(role(driver, f"DROP ROLE IF EXISTS {FZ_ROLE}; CREATE ROLE {FZ_ROLE}"))
         yield loop, driver, url
         loop.run(reset(driver))
+        loop.run(role(driver, f"DROP ROLE {FZ_ROLE}"))
         loop.run(driver.close())
+
+
+async def role(driver: PostgresDriver, statement: str) -> None:
+    async with driver.acquire() as conn:
+        await conn.execute(statement, [])
 
 
 EXAMPLES = int(os.environ.get("MIZZLE_FUZZ_EXAMPLES", "200"))
@@ -787,7 +1151,7 @@ def test_create_has_no_drift(
     async def scenario() -> None:
         await reset(driver)
         await apply(driver, statements)
-        assert_no_drift(await introspect(driver), snap)
+        assert_no_drift(await introspect(driver), await normalized(driver, snap))
 
     loop.run(scenario())
 
@@ -831,20 +1195,23 @@ def test_evolve_has_no_drift(
             await apply(driver, create)
             await apply(driver, statements)
         live = await introspect(driver)
-        assert_no_drift(live, snap2)
+        expected = await normalized(driver, snap2)
+        assert_no_drift(live, expected)
         if before is not None:
             event(f"kept rows checked: {sum(map(len, before.values())) > 0}")
             assert await kept_data(driver, s1, s2) == before
         # Running the migration again would find nothing to do.
-        assert dialect.render(diff(live, snap2, compare_expressions=False)) == []
+        assert dialect.render(diff(live, expected, compare_expressions=False)) == []
 
     loop.run(scenario())
 
 
 def _schema_module(spec_id: str) -> str:
     return (
-        f"from {__name__} import CLI_SPECS, build_tables\n"
-        f"globals().update({{t.__name__: t for t in build_tables(CLI_SPECS[{spec_id!r}])}})\n"
+        f"from {__name__} import CLI_SPECS, build_schema\n"
+        f"tables, objects = build_schema(CLI_SPECS[{spec_id!r}])\n"
+        "globals().update({t.__name__: t for t in tables})\n"
+        "globals().update({f'object_{i}': o for i, o in enumerate(objects)})\n"
     )
 
 
@@ -893,7 +1260,9 @@ def test_cli_generate_and_migrate(
         migrations = MigrationsDir(root / "migrations", "postgresql").migrations()
         expected = 1 + (diff(snapshot_of(s1), snapshot_of(s2)) != [])
         assert len(migrations) == expected
-        assert_no_drift(loop.run(introspect(driver)), snapshot_of(s2))
+        live = loop.run(introspect(driver))
+        assert_no_drift(live, loop.run(normalized(driver, snapshot_of(s2))))
+        assert main(["push", "--dry-run", "--no-renames"]) == 0  # nothing to push
         CLI_SPECS.clear()
 
 

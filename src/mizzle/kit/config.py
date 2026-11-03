@@ -19,6 +19,7 @@ from typing import cast
 
 from mizzle.core.errors import MigrationError
 from mizzle.core.naming import Casing
+from mizzle.core.schema.objects import Extension, Function, SchemaObject, Trigger
 from mizzle.core.schema.table import Table
 from mizzle.dialects.base import Dialect
 from mizzle.dialects.postgres import PostgresDialect
@@ -70,27 +71,41 @@ class Config:
             return Path(spec.origin)
         return self.root.joinpath(*module.split(".")).with_suffix(".py")
 
-    def load_tables(self) -> list[type[Table]]:
-        """Import the schema modules and collect every Table subclass they expose."""
+    def _members(self) -> list[object]:
         if str(self.root) not in sys.path:
             sys.path.insert(0, str(self.root))
-        tables: list[type[Table]] = []
+        members: list[object] = []
         for module_name in self.schema:
             try:
                 module = importlib.import_module(module_name)
             except ImportError as exc:
                 raise MigrationError(f"cannot import schema module {module_name!r}: {exc}") from exc
-            for value in cast(dict[str, object], vars(module)).values():
-                if (
-                    isinstance(value, type)
-                    and issubclass(value, Table)
-                    and value is not Table
-                    and value not in tables
-                ):
-                    tables.append(value)
+            members += cast(dict[str, object], vars(module)).values()
+        return members
+
+    def load_tables(self) -> list[type[Table]]:
+        """Import the schema modules and collect every Table (and View) subclass they
+        expose."""
+        tables: list[type[Table]] = []
+        for value in self._members():
+            if (
+                isinstance(value, type)
+                and issubclass(value, Table)
+                and "__table__" in vars(value)  # not Table or View themselves
+                and value not in tables
+            ):
+                tables.append(value)
         if not tables:
             raise MigrationError(f"no Table classes found in {self.schema}")
         return tables
+
+    def load_objects(self) -> list[SchemaObject]:
+        """The extensions, functions and triggers the schema modules expose."""
+        objects: list[SchemaObject] = []
+        for value in self._members():
+            if isinstance(value, Extension | Function | Trigger) and value not in objects:
+                objects.append(value)
+        return objects
 
 
 def _str(data: dict[str, object], name: str, default: str, source: Path) -> str:

@@ -135,7 +135,9 @@ def cmd_generate(config: Config, args: Args) -> int:
     directory = MigrationsDir(config.out, dialect.name)
     previous = directory.latest_snapshot()
     prev_id = previous["id"] if directory.migrations() else None
-    current = build_snapshot(tables, dialect, config.casing, prev_id=prev_id)
+    current = build_snapshot(
+        tables, dialect, config.casing, prev_id=prev_id, objects=config.load_objects()
+    )
     if args.custom:
         header = "-- Custom migration. Separate statements with: -- mizzle:breakpoint\n"
         migration = directory.write(args.name or "custom", [], current, header)
@@ -176,12 +178,14 @@ def cmd_migrate(config: Config, args: Args) -> int:
 
 
 def cmd_push(config: Config, args: Args) -> int:
-    tables = config.load_tables()
+    tables, objects = config.load_tables(), config.load_objects()
 
     async def run(driver: Driver, dialect: Dialect) -> int:
-        desired = build_snapshot(tables, dialect, config.casing)
+        desired = build_snapshot(tables, dialect, config.casing, objects=objects)
         async with driver.acquire() as conn:
             live = await dialect.introspect(conn, _schemas(config, desired))
+            # View queries and expressions as the database prints them, to compare.
+            desired = await dialect.normalize_snapshot(conn, desired)
             steps = diff(live, desired, _resolver(args, dialect), compare_expressions=False)
             if not steps:
                 print("Database is up to date.")

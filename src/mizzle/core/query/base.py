@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from collections.abc import Awaitable, Callable, Generator, Iterator, Sequence
+from collections.abc import AsyncGenerator, Awaitable, Callable, Generator, Iterator, Sequence
 from dataclasses import dataclass, field
 from typing import Protocol, cast, overload
 
@@ -52,6 +52,11 @@ class Runner(Protocol):
         ...
 
     def run(self, query: CompiledQuery) -> Awaitable[int]: ...
+    def stream(
+        self, query: CompiledQuery, batch_size: int, *, read_only: bool = False
+    ) -> AsyncGenerator[list[Row]]:
+        """Rows in batches of ``batch_size`` from a server-side cursor."""
+        ...
 
 
 @dataclass(frozen=True, eq=False)
@@ -93,7 +98,10 @@ class Prepared[R]:
     compiled: CompiledQuery
 
     async def execute(self, **values: object) -> R:
-        return await self.query.run_compiled(self.compiled.bind(values))
+        compiled = self.compiled
+        if compiled.dynamic:  # an .on_update(fn) hook must run on every execution
+            compiled = self.query.runner.compile(self.query)
+        return await self.query.run_compiled(compiled.bind(values))
 
 
 type Converter = Callable[[object], object]

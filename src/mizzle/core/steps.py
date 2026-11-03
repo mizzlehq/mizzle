@@ -9,11 +9,18 @@ from mizzle.core.snapshot import (
     CheckSnap,
     ColumnSnap,
     EnumSnap,
+    ExtensionSnap,
     ForeignKeySnap,
+    FunctionSnap,
+    GeneratedSnap,
+    IdentitySnap,
     IndexSnap,
+    PolicySnap,
     PrimaryKeySnap,
     TableSnap,
+    TriggerSnap,
     UniqueSnap,
+    ViewSnap,
 )
 
 type ConstraintKind = Literal["primary_key", "unique", "check", "foreign_key"]
@@ -144,6 +151,7 @@ class AlterColumnType(Step):
     column: str
     old_type: str
     new_type: str
+    generated: bool = False  # a generated column: recomputed, so no USING cast
 
     @override
     def describe(self) -> str:
@@ -172,6 +180,38 @@ class AlterColumnDefault(Step):
     @override
     def describe(self) -> str:
         return f"change default of {self.table}.{self.column}"
+
+
+@dataclass(frozen=True)
+class AlterColumnIdentity(Step):
+    """Add, drop or change ``GENERATED ... AS IDENTITY`` (``None``: not an identity)."""
+
+    schema: str
+    table: str
+    column: str
+    old: IdentitySnap | None
+    new: IdentitySnap | None
+
+    @override
+    def describe(self) -> str:
+        what = "add" if self.old is None else "drop" if self.new is None else "change"
+        return f"{what} identity on {self.table}.{self.column}"
+
+
+@dataclass(frozen=True)
+class AlterColumnGenerated(Step):
+    """Change or drop the expression of a generated column (``None``: a plain column)."""
+
+    schema: str
+    table: str
+    column: str
+    old: GeneratedSnap | None
+    new: GeneratedSnap | None
+
+    @override
+    def describe(self) -> str:
+        what = "add" if self.old is None else "drop" if self.new is None else "change"
+        return f"{what} generated expression on {self.table}.{self.column}"
 
 
 @dataclass(frozen=True)
@@ -272,6 +312,151 @@ class RenameIndex(Step):
     @override
     def describe(self) -> str:
         return f"rename index {self.old} to {self.new}"
+
+
+@dataclass(frozen=True)
+class CreateExtension(Step):
+    extension: ExtensionSnap
+
+    @override
+    def describe(self) -> str:
+        return f"create extension {self.extension['name']}"
+
+
+@dataclass(frozen=True)
+class AlterExtension(Step):
+    name: str
+    schema: str | None = None  # move to this schema
+    version: str | None = None  # update to this version
+
+    @override
+    def describe(self) -> str:
+        what = f"schema {self.schema}" if self.schema is not None else f"version {self.version}"
+        return f"change extension {self.name} {what}"
+
+
+@dataclass(frozen=True)
+class DropExtension(Step):
+    data_loss: ClassVar[bool] = True  # its types and functions may be in use
+    name: str
+
+    @override
+    def describe(self) -> str:
+        return f"drop extension {self.name}"
+
+
+@dataclass(frozen=True)
+class CreateFunction(Step):
+    """``CREATE OR REPLACE FUNCTION``."""
+
+    function: FunctionSnap
+
+    @override
+    def describe(self) -> str:
+        return f"create function {self.function['name']}"
+
+
+@dataclass(frozen=True)
+class DropFunction(Step):
+    schema: str
+    name: str
+    args: str
+
+    @override
+    def describe(self) -> str:
+        return f"drop function {self.name}"
+
+
+@dataclass(frozen=True)
+class CreateView(Step):
+    view: ViewSnap
+
+    @override
+    def describe(self) -> str:
+        kind = "materialized view" if self.view["materialized"] else "view"
+        return f"create {kind} {self.view['name']}"
+
+
+@dataclass(frozen=True)
+class DropView(Step):
+    schema: str
+    name: str
+    materialized: bool
+
+    @override
+    def describe(self) -> str:
+        return f"drop {'materialized view' if self.materialized else 'view'} {self.name}"
+
+
+@dataclass(frozen=True)
+class SetRowLevelSecurity(Step):
+    schema: str
+    table: str
+    enabled: bool
+    force: bool
+
+    @override
+    def describe(self) -> str:
+        return f"{'enable' if self.enabled else 'disable'} row level security on {self.table}"
+
+
+@dataclass(frozen=True)
+class CreatePolicy(Step):
+    schema: str
+    table: str
+    policy: PolicySnap
+
+    @override
+    def describe(self) -> str:
+        return f"create policy {self.policy['name']} on {self.table}"
+
+
+@dataclass(frozen=True)
+class AlterPolicy(Step):
+    """Change the roles and expressions of a policy (its command and kind stay)."""
+
+    schema: str
+    table: str
+    policy: PolicySnap
+
+    @override
+    def describe(self) -> str:
+        return f"change policy {self.policy['name']} on {self.table}"
+
+
+@dataclass(frozen=True)
+class DropPolicy(Step):
+    schema: str
+    table: str
+    name: str
+
+    @override
+    def describe(self) -> str:
+        return f"drop policy {self.name} on {self.table}"
+
+
+@dataclass(frozen=True)
+class CreateTrigger(Step):
+    schema: str
+    table: str
+    trigger: TriggerSnap
+    replace: bool = False  # CREATE OR REPLACE (PostgreSQL 14+)
+
+    @override
+    def describe(self) -> str:
+        what = "replace" if self.replace else "create"
+        return f"{what} trigger {self.trigger['name']} on {self.table}"
+
+
+@dataclass(frozen=True)
+class DropTrigger(Step):
+    schema: str
+    table: str
+    name: str
+
+    @override
+    def describe(self) -> str:
+        return f"drop trigger {self.name} on {self.table}"
 
 
 @dataclass(frozen=True)

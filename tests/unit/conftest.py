@@ -1,3 +1,4 @@
+from collections.abc import AsyncGenerator
 from typing import Any
 
 import pytest
@@ -29,6 +30,14 @@ class FakeRunner:
     async def run(self, query: CompiledQuery) -> int:
         self.executed.append(query)
         return self.rowcount
+
+    async def stream(
+        self, query: CompiledQuery, batch_size: int, *, read_only: bool = False
+    ) -> AsyncGenerator[list[Row]]:
+        self.executed.append(query)
+        self.read_only.append(read_only)
+        for start in range(0, len(self.rows), batch_size):
+            yield list(self.rows[start : start + batch_size])
 
 
 @pytest.fixture

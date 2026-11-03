@@ -12,8 +12,9 @@
 Security: a model accepts every field it contains, so a request can set any of them.
 For models built from client input, list the allowed fields with ``include=`` (an
 allowlist). Otherwise a client could, for example, send ``"role": "admin"``. Insert and
-update models never contain database-generated columns (serial ids), and update models
-never contain primary keys, unless you ``include`` them explicitly.
+update models never contain database-generated columns (serial and identity ids,
+generated columns), and update models never contain primary keys, unless you ``include``
+them explicitly.
 
 Models only carry the fields a client sent: ``values(model)`` / ``set(model)`` use
 ``model_dump(exclude_unset=True)``, so omitted fields keep their database defaults.
@@ -40,6 +41,7 @@ type Mode = Literal["select", "insert", "update"]
 
 _VARCHAR = re.compile(r"(?:varchar|character varying)\((\d+)\)")
 _NUMERIC = re.compile(r"numeric\((\d+)(?:,\s*(\d+))?\)")
+_VECTOR = re.compile(r"(?:vector|halfvec)\((\d+)\)")
 
 
 def column_type(column: ColumnBase) -> object:
@@ -50,6 +52,9 @@ def column_type(column: ColumnBase) -> object:
         return column.enum
     if column.accepts is None:  # json / jsonb
         return Any
+    if m := _VECTOR.fullmatch(column.sql_type):
+        size = int(m.group(1))
+        return Annotated[list[float], pydantic.Field(min_length=size, max_length=size)]
     base = column.accepts[0]
     if base is str and (m := _VARCHAR.fullmatch(column.sql_type)):
         return Annotated[str, pydantic.Field(max_length=int(m.group(1)))]

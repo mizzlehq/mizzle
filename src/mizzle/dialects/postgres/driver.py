@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
-from collections.abc import AsyncGenerator, Sequence
+from collections.abc import AsyncGenerator, AsyncIterator, Iterable, Sequence
 from contextlib import asynccontextmanager
-from typing import Literal, cast, final
+from typing import TYPE_CHECKING, Literal, Self, cast, final
 
 import asyncpg
 from asyncpg import exceptions as pg
@@ -24,7 +25,17 @@ from mizzle.core.errors import (
 )
 from mizzle.core.errors import ConnectionError as DbConnectionError
 from mizzle.core.query.base import Row
-from mizzle.dialects.base import IsolationLevel, ResetMode
+from mizzle.dialects.base import (
+    CopyFormat,
+    CopyOutput,
+    IsolationLevel,
+    Notification,
+    ResetMode,
+)
+
+if TYPE_CHECKING:
+    # Stub-only. It leaves out str paths, which asyncpg accepts (os.fspath).
+    from asyncpg.connection import _OutputType  # pyright: ignore[reportPrivateUsage]
 
 type _AsyncpgIsolation = Literal["read_committed", "repeatable_read", "serializable"]
 log = logging.getLogger("mizzle")
@@ -60,14 +71,16 @@ def map_error(exc: BaseException, sql: str) -> MizzleError | None:
             return QueryTimeout(exc.message, sql=sql, original=exc)
         case TimeoutError():  # client-side timeout; asyncpg cancels the statement
             return QueryTimeout("query timed out", sql=sql, original=exc)
-        case (
-            pg.PostgresConnectionError()
-            | pg.ConnectionDoesNotExistError()
-            | OSError()
-            | asyncpg.InterfaceError()  # e.g. "connection is closed"
-            | pg.InternalClientError()  # a connection the server just closed, mid-handshake
-        ):
+        case pg.PostgresConnectionError() | pg.ConnectionDoesNotExistError() | OSError():
             return DbConnectionError(f"{type(exc).__name__}: {exc}", sql=sql, original=exc)
+        case asyncpg.InterfaceError() | pg.InternalClientError() if _connection_broken(exc):
+            # "connection is closed", or a connection the server closed mid-operation
+            # ("cannot switch to state ...; another operation is in progress").
+            return DbConnectionError(f"{type(exc).__name__}: {exc}", sql=sql, original=exc)
+        case asyncpg.InterfaceError() | pg.InternalClientError():
+            # Misuse such as a wrong number of arguments: not a lost connection, so the pool
+            # is kept and reads are not retried. These messages hold no values.
+            return DatabaseError(f"{type(exc).__name__}: {exc}", sql=sql, original=exc)
         case asyncpg.PostgresError() if not exc.message:
             # Raised client-side by asyncpg while encoding params; its text includes the value.
             message = (
@@ -86,6 +99,14 @@ def map_error(exc: BaseException, sql: str) -> MizzleError | None:
             return DatabaseError(exc.message, sql=sql, original=exc)
         case _:
             return None
+
+
+_BROKEN_CONNECTION = ("closed", "another operation", "switch to state", "released back")
+
+
+def _connection_broken(exc: BaseException) -> bool:
+    text = str(exc)
+    return any(marker in text for marker in _BROKEN_CONNECTION)
 
 
 def _translate(exc: Exception, sql: str) -> Exception:
@@ -158,8 +179,143 @@ class PostgresConnection:
         try:
             async with self._conn.transaction(isolation=level, readonly=readonly):
                 yield
-        except asyncpg.PostgresError as exc:  # BEGIN / COMMIT failures (body errors are mapped)
+        # BEGIN / COMMIT failures (body errors are mapped), and a connection lost before
+        # ROLLBACK (asyncpg's InterfaceError: "the underlying connection is closed").
+        except (asyncpg.PostgresError, asyncpg.InterfaceError) as exc:
             raise _translate(exc, "COMMIT") from None
+
+    async def cursor(
+        self,
+        sql: str,
+        params: Sequence[object],
+        batch_size: int,
+        timeout: float | None = None,
+        *,
+        session_safe: bool = False,
+    ) -> AsyncGenerator[list[Row]]:
+        # A protocol-level portal: it ends with the transaction, so it needs no reset.
+        self.dirty |= not session_safe
+        try:
+            cursor = await self._conn.cursor(sql, *params, timeout=timeout)
+            while batch := await cursor.fetch(batch_size, timeout=timeout):
+                yield list(batch)
+        except Exception as exc:
+            raise _translate(exc, sql) from None
+
+    async def copy_records(
+        self,
+        table: str,
+        schema: str | None,
+        columns: Sequence[str],
+        records: Iterable[Sequence[object]],
+        timeout: float | None = None,
+    ) -> int:
+        sql = f"COPY {table} FROM STDIN"
+        try:
+            status = await self._conn.copy_records_to_table(
+                table, records=records, columns=columns, schema_name=schema, timeout=timeout
+            )
+        except MizzleError:
+            raise  # a row the caller's checks rejected
+        except (ValueError, TypeError, OverflowError) as exc:
+            # asyncpg encodes COPY values in Python; its messages can quote the value.
+            raise DatabaseError(
+                f"{type(exc).__name__}: a COPY value has the wrong type or cannot be encoded "
+                "(value hidden)",
+                sql=sql,
+                original=exc,
+            ) from None
+        except Exception as exc:
+            raise _translate(exc, sql) from None
+        return _rowcount(status)
+
+    async def copy_out(
+        self,
+        sql: str,
+        params: Sequence[object],
+        output: CopyOutput,
+        format: CopyFormat,
+        header: bool,
+        timeout: float | None = None,
+        *,
+        session_safe: bool = False,
+    ) -> int:
+        self.dirty |= not session_safe
+        try:
+            # With params, asyncpg inlines them: the server quotes each one (quote_literal).
+            status = await self._conn.copy_from_query(
+                sql,
+                *params,
+                output=cast("_OutputType", output),
+                format=format,
+                header=header or None,
+                timeout=timeout,
+            )
+        except Exception as exc:
+            raise _translate(exc, sql) from None
+        return _rowcount(status)
+
+    @asynccontextmanager
+    async def listen(self, channels: Sequence[str]) -> AsyncGenerator[AsyncIterator[Notification]]:
+        self.dirty = True  # the pool's reset runs UNLISTEN * even if removing a listener fails
+        conn = self._conn
+        # ponytail: unbounded; a consumer that never keeps up grows it without limit.
+        queue = asyncio.Queue[Notification | None]()
+
+        def on_notify(_conn: object, pid: int, channel: str, payload: object, /) -> None:
+            queue.put_nowait(Notification(channel, str(payload), pid))
+
+        def on_lost(_conn: object, /) -> None:
+            queue.put_nowait(None)
+
+        conn.add_termination_listener(on_lost)
+        added: list[str] = []
+        try:
+            for channel in dict.fromkeys(channels):
+                try:
+                    await conn.add_listener(channel, on_notify)
+                except Exception as exc:
+                    raise _translate(exc, "LISTEN") from None
+                added.append(channel)
+            yield _Notifications(queue)
+        finally:
+            try:
+                conn.remove_termination_listener(on_lost)
+                lost = conn.is_closed()
+            except asyncpg.InterfaceError:  # lost: the pool already took the proxy back
+                lost = True
+            for channel in () if lost else added:
+                try:
+                    await conn.remove_listener(channel, on_notify)
+                except Exception:
+                    log.warning(
+                        "mizzle: could not UNLISTEN; the connection is reset", exc_info=True
+                    )
+                    break
+
+
+@final
+class _Notifications:
+    """The iterator ``listen()`` yields. A class, not an async generator: a timeout or
+    cancellation while waiting must not end the iteration."""
+
+    __slots__ = ("_queue",)
+    _queue: asyncio.Queue[Notification | None]
+
+    def __init__(self, queue: asyncio.Queue[Notification | None]) -> None:
+        self._queue = queue
+
+    def __aiter__(self) -> Self:
+        return self
+
+    async def __anext__(self) -> Notification:
+        event = await self._queue.get()
+        if event is None:
+            self._queue.put_nowait(None)  # stays failed
+            raise DbConnectionError(
+                "the listen() connection was lost; notifications sent meanwhile were missed"
+            )
+        return event
 
 
 @final
@@ -188,9 +344,26 @@ async def _reset_connection(conn: asyncpg.Connection) -> None:
         await conn.execute(conn.get_reset_query())
 
 
+def _jsonb_encode(value: object) -> bytes:
+    return b"\x01" + json.dumps(value).encode()  # binary jsonb: a version byte, then text
+
+
+def _jsonb_decode(data: bytes) -> object:
+    return json.loads(data[1:])  # pyright: ignore[reportAny]
+
+
+def _json_encode(value: object) -> bytes:
+    return json.dumps(value).encode()
+
+
 async def _init_connection(conn: asyncpg.Connection) -> None:
-    for name in ("json", "jsonb"):
-        await conn.set_type_codec(name, encoder=json.dumps, decoder=json.loads, schema="pg_catalog")
+    # Binary format, so binary COPY (copy_into) can send JSON too.
+    await conn.set_type_codec(
+        "json", encoder=_json_encode, decoder=json.loads, schema="pg_catalog", format="binary"
+    )
+    await conn.set_type_codec(
+        "jsonb", encoder=_jsonb_encode, decoder=_jsonb_decode, schema="pg_catalog", format="binary"
+    )
 
 
 @final

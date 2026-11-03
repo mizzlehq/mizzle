@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
-from dataclasses import dataclass, field
+from collections.abc import AsyncGenerator, Callable, Sequence
+from contextlib import aclosing
+from dataclasses import dataclass, field, replace
 from typing import Literal, Self, cast, overload, override
 
 from mizzle.core.compiler import CompiledQuery
@@ -17,14 +18,14 @@ from mizzle.core.query.base import (
     table_columns,
     table_decoder,
 )
-from mizzle.core.schema.column import ColumnBase
 from mizzle.core.schema.table import Table
+from mizzle.core.sql.alias import alias_table, real_table
+from mizzle.core.sql.functions import column_of
 from mizzle.core.sql.nodes import (
     Condition,
     Expr,
     ExprBase,
     Node,
-    Nullable,
     OrderBy,
     Placeholder,
 )
@@ -56,7 +57,8 @@ class Cte(Node):
     """A named subquery for ``WITH``. Reference its columns with ``cte.c("name")``."""
 
     name: str
-    query: SelectBase
+    query: SelectBase | CompoundBase
+    alias: str | None = None  # see alias(cte, name)
 
     def c[T](self, column: str, type_: type[T]) -> TypedCteColumn[T]:
         """A column of this CTE, e.g. ``cte.c("id", int)``. The type is not checked."""
@@ -161,20 +163,19 @@ class SelectBase(Node):
     def decoder(self) -> Callable[[Row], object]:
         """A function that decodes one result row. Built once per query, used per row."""
         if self.projection is None and not self.joins and isinstance(self.source, type):
-            return table_decoder(self.source)
+            return table_decoder(real_table(self.source))
         outer = self._outer_sources()
         parts: list[Callable[[Row], object]] = []
         index = 0
         for slot in self.slots():
             if isinstance(slot, type):
                 columns = table_columns(slot)
-                decode = row_decoder(slot, columns, index)
+                decode = row_decoder(real_table(slot), columns, index)
                 parts.append(_or_none(decode, index, len(columns)) if slot in outer else decode)
                 index += len(columns)
             else:
-                inner = slot.expr if isinstance(slot, Nullable) else slot
-                convert = inner.decoder if isinstance(inner, ColumnBase) else None
-                parts.append(_value(index, convert))
+                column = column_of(slot)
+                parts.append(_value(index, column.decoder if column is not None else None))
                 index += 1
         if self.projection is None:
             return parts[0]
@@ -220,8 +221,89 @@ def _value(index: int, convert: Callable[[object], object] | None) -> Callable[[
     return decode
 
 
+class SetOps[R]:
+    """``union``, ``intersect`` and ``except_`` between queries with the same row type."""
+
+    def union(self, other: Select[R] | Compound[R]) -> Compound[R]:
+        """Rows of both queries, without duplicates."""
+        return self._set_op("UNION", other)
+
+    def union_all(self, other: Select[R] | Compound[R]) -> Compound[R]:
+        """Rows of both queries, duplicates kept."""
+        return self._set_op("UNION ALL", other)
+
+    def intersect(self, other: Select[R] | Compound[R]) -> Compound[R]:
+        """Rows in both queries, without duplicates."""
+        return self._set_op("INTERSECT", other)
+
+    def intersect_all(self, other: Select[R] | Compound[R]) -> Compound[R]:
+        return self._set_op("INTERSECT ALL", other)
+
+    def except_(self, other: Select[R] | Compound[R]) -> Compound[R]:
+        """Rows of this query that are not in ``other``, without duplicates."""
+        return self._set_op("EXCEPT", other)
+
+    def except_all(self, other: Select[R] | Compound[R]) -> Compound[R]:
+        return self._set_op("EXCEPT ALL", other)
+
+    def _set_op(self, op: str, other: Select[R] | Compound[R]) -> Compound[R]:
+        assert isinstance(self, SelectBase | CompoundBase)
+        return Compound[R](self.runner, self, op, other)
+
+
 @dataclass(frozen=True, eq=False)
-class Select[R](SelectBase, Executable[list[R]]):
+class CompoundBase(Node):
+    """Queries combined with UNION / INTERSECT / EXCEPT (see ``Compound[R]``)."""
+
+    runner: Runner = field(repr=False)
+    left: SelectBase | CompoundBase
+    op: str
+    right: SelectBase | CompoundBase
+    order_by_: tuple[ExprBase | OrderBy, ...] = ()
+    limit_: int | Placeholder | None = None
+    offset_: int | Placeholder | None = None
+
+    def order_by(self, *items: ExprBase | OrderBy) -> Self:
+        """Order the combined rows. Columns are matched by name to the result columns."""
+        return evolve(self, order_by_=(*self.order_by_, *items))
+
+    def limit(self, n: int | Expr[int]) -> Self:
+        return evolve(self, limit_=_count("limit", n))
+
+    def offset(self, n: int | Expr[int]) -> Self:
+        return evolve(self, offset_=_count("offset", n))
+
+    def cte(self, name: str) -> Cte:
+        return Cte(name, self)
+
+    def decoder(self) -> Callable[[Row], object]:
+        return self.left.decoder()  # rows have the shape of the first query
+
+
+@dataclass(frozen=True, eq=False)
+class Compound[R](CompoundBase, Executable[list[R]], SetOps[R]):
+    @override
+    async def run_compiled(self, compiled: CompiledQuery) -> list[R]:
+        rows = await self.runner.fetch(compiled, read_only=True)
+        decode = self.decoder()
+        return cast(list[R], [decode(row) for row in rows])
+
+
+@overload
+def alias[T: Table](source: type[T], name: str, /) -> type[T]: ...
+@overload
+def alias(source: Cte, name: str, /) -> Cte: ...
+def alias(source: type[Table] | Cte, name: str, /) -> type[Table] | Cte:
+    """The same table (or CTE) under another name, to use it twice in one query:
+    ``manager = alias(Employees, "manager")``, then ``manager.id`` and ``.join(manager, ...)``.
+    Rows of an aliased table decode into the table's own class."""
+    if isinstance(source, Cte):
+        return replace(source, alias=name)
+    return alias_table(source, name)
+
+
+@dataclass(frozen=True, eq=False)
+class Select[R](SelectBase, Executable[list[R]], SetOps[R]):
     """A SELECT whose rows are ``R`` (a table row, a tuple, or a dict)."""
 
     @overload
@@ -265,3 +347,15 @@ class Select[R](SelectBase, Executable[list[R]]):
         rows = await self.runner.fetch(compiled, read_only=True)
         decode = self.decoder()
         return cast(list[R], [decode(row) for row in rows])
+
+    async def stream(self, batch_size: int = 1000) -> AsyncGenerator[R]:
+        """Rows one by one, read ``batch_size`` at a time from a server-side cursor, so
+        large results never sit in memory at once. Holds a connection (and a transaction)
+        until the loop ends; wrap in ``contextlib.aclosing()`` to release it right away
+        when breaking out early."""
+        decode = self.decoder()
+        compiled = self._compile_for_run()
+        async with aclosing(self.runner.stream(compiled, batch_size, read_only=True)) as batches:
+            async for batch in batches:
+                for row in batch:
+                    yield cast(R, decode(row))

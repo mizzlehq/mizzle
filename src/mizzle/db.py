@@ -7,8 +7,23 @@ import itertools
 import logging
 import random
 import time
-from collections.abc import AsyncGenerator, Awaitable, Callable, Sequence
-from contextlib import AbstractAsyncContextManager, AsyncExitStack, asynccontextmanager
+from collections.abc import (
+    AsyncGenerator,
+    AsyncIterator,
+    Awaitable,
+    Callable,
+    Generator,
+    Iterable,
+    Iterator,
+    Sequence,
+)
+from contextlib import (
+    AbstractAsyncContextManager,
+    AsyncExitStack,
+    aclosing,
+    asynccontextmanager,
+    contextmanager,
+)
 from dataclasses import dataclass
 from typing import Literal, Self, overload
 
@@ -18,9 +33,23 @@ from mizzle.core.errors import MizzleError, QueryError, SerializationFailure
 from mizzle.core.naming import Casing
 from mizzle.core.query.base import Row
 from mizzle.core.query.builder import QueryBuilder
+from mizzle.core.query.insert import Insert, RowLike, as_mapping, prepare_row
+from mizzle.core.query.relational import RelationalStatement
+from mizzle.core.query.select import SelectBase
+from mizzle.core.schema.column import ColumnBase
 from mizzle.core.schema.table import Table, validate_tables
-from mizzle.core.sql.nodes import Node, Raw
-from mizzle.dialects.base import Connection, Dialect, Driver, IsolationLevel, ResetMode
+from mizzle.core.schema.view import View
+from mizzle.core.sql.nodes import Identifier, Node, Raw
+from mizzle.dialects.base import (
+    Connection,
+    CopyFormat,
+    CopyOutput,
+    Dialect,
+    Driver,
+    IsolationLevel,
+    Notification,
+    ResetMode,
+)
 from mizzle.dialects.postgres import PostgresDialect
 
 log = logging.getLogger("mizzle")
@@ -39,6 +68,8 @@ class QueryEvent:
 
 type QueryLogger = Callable[[QueryEvent], None]
 type _CallKind = Literal["fetch", "execute", "dicts"]
+# The most bind parameters one statement can have (asyncpg / the wire protocol).
+MAX_PARAMS = 32767
 
 
 class Session(QueryBuilder):
@@ -98,6 +129,43 @@ class Session(QueryBuilder):
     def run(self, query: CompiledQuery) -> Awaitable[int]:
         return self._call(query, "execute")
 
+    async def stream(
+        self, query: CompiledQuery, batch_size: int, *, read_only: bool = False
+    ) -> AsyncGenerator[list[Row]]:
+        if batch_size < 1:
+            raise QueryError("stream() needs batch_size >= 1")
+        safe = not query.raw
+        with self._logged(query):
+            if self._conn is not None:
+                # Locked per batch, not for the whole loop: its body may run other
+                # statements in the same transaction.
+                cursor = self._conn.cursor(
+                    query.sql, query.params, batch_size, self._timeout, session_safe=safe
+                )
+                async with aclosing(cursor) as batches:
+                    while True:
+                        async with self._lock:
+                            batch = await anext(batches, None)
+                        if batch is None:
+                            return
+                        yield batch
+            try:
+                # Cursors only live inside a transaction; it ends (and closes the cursor)
+                # when the loop ends, breaks or is cancelled.
+                async with (
+                    self._connection(read_only and not query.locking) as conn,
+                    conn.transaction(),
+                ):
+                    cursor = conn.cursor(
+                        query.sql, query.params, batch_size, self._timeout, session_safe=safe
+                    )
+                    async with aclosing(cursor) as batches:
+                        async for batch in batches:
+                            yield batch
+            except DbConnectionError:
+                await self._after_lost_connection(query, False)  # never resumed mid-stream
+                raise
+
     # -- public API -------------------------------------------------------------------
 
     async def execute(self, statement: Raw) -> list[dict[str, object]]:
@@ -106,6 +174,155 @@ class Session(QueryBuilder):
         if compiled.has_placeholders:
             raise QueryError("execute() does not take placeholders")
         return await self._call(compiled, "dicts")
+
+    async def refresh(self, view: type[View], *, concurrently: bool = False) -> None:
+        """``REFRESH MATERIALIZED VIEW``. ``concurrently=True`` keeps the view readable
+        meanwhile; it needs a unique index on the view."""
+        if not view.__materialized__:
+            raise QueryError(f"{view.__name__} is not a materialized view")
+        info = view.__table__
+        name: list[str | Node] = [Identifier(info.name)]
+        if info.schema is not None:
+            name[:0] = [Identifier(info.schema), "."]
+        how = "CONCURRENTLY " if concurrently else ""
+        await self.execute(Raw((f"REFRESH MATERIALIZED VIEW {how}", *name)))
+
+    async def copy_into(
+        self,
+        table: type[Table],
+        rows: Iterable[RowLike],
+        *,
+        columns: Sequence[ColumnBase] | None = None,
+    ) -> int:
+        """Bulk load ``rows`` with COPY, much faster than INSERT for many rows; returns
+        the row count. Rows are checked like ``insert().values()``. Every row must set
+        the same columns: ``columns`` (default: those the first row sets). Columns left
+        out get their database default. All rows or none are stored. Tables with
+        vector or tsvector columns are loaded with ``insert_many()`` instead."""
+        it = iter(rows)
+        first = next(it, None)
+        if first is None:
+            return 0
+        if columns is not None:
+            attrs = _copy_attrs(table, columns)
+        else:
+            attrs = tuple(prepare_row(table, as_mapping(first)))
+        if not attrs:
+            raise QueryError("copy_into() needs at least one column")
+        info = table.__table__
+        if any(_text_only(info.columns[a]) for a in attrs):
+            # asyncpg's COPY sends binary values; these types only have a text encoding.
+            return await self.insert_many(table, itertools.chain((first,), it))
+        names = [info.columns[a].db_name(self._casing) for a in attrs]
+        compiled = CompiledQuery(f"COPY {info.name} ({', '.join(names)}) FROM STDIN", (), ())
+        records = _copy_records(table, itertools.chain((first,), it), attrs)
+        with self._logged(compiled):
+            try:
+                async with self._connection() as conn:
+                    return await conn.copy_records(
+                        info.name, info.schema, names, records, self._timeout
+                    )
+            except DbConnectionError:
+                await self._after_lost_connection(compiled, False)
+                raise
+
+    async def copy_from(
+        self,
+        query: Node,  # a select or relational query, or raw sql(...)
+        output: CopyOutput,
+        *,
+        format: CopyFormat = "csv",
+        header: bool = False,
+    ) -> int:
+        """Export the rows of ``query`` with ``COPY (query) TO STDOUT`` into ``output``: a
+        file path, a binary file, or ``async def write(chunk: bytes)``. Returns the row
+        count. Lock-free selects read from a replica, like plain reads."""
+        compiled = self.compile(query)
+        if compiled.has_placeholders:
+            raise QueryError("copy_from() does not take placeholders")
+        read_only = isinstance(query, SelectBase | RelationalStatement) and not compiled.locking
+        with self._logged(compiled):
+            try:
+                async with self._connection(read_only) as conn:
+                    return await conn.copy_out(
+                        compiled.sql,
+                        compiled.params,
+                        output,
+                        format,
+                        header,
+                        self._timeout,
+                        session_safe=not compiled.raw,
+                    )
+            except DbConnectionError:
+                await self._after_lost_connection(compiled, False)
+                raise
+
+    @overload
+    async def insert_many[T: Table](
+        self,
+        table: type[T],
+        rows: Iterable[RowLike],
+        *,
+        batch_size: int | None = None,
+        returning: Literal[False] = False,
+    ) -> int: ...
+    @overload
+    async def insert_many[T: Table](
+        self,
+        table: type[T],
+        rows: Iterable[RowLike],
+        *,
+        batch_size: int | None = None,
+        returning: Literal[True],
+    ) -> list[T]: ...
+    async def insert_many[T: Table](
+        self,
+        table: type[T],
+        rows: Iterable[RowLike],
+        *,
+        batch_size: int | None = None,
+        returning: bool = False,
+    ) -> int | list[T]:
+        """INSERT any number of rows, in as few statements as the bind parameter limit
+        (32767) allows, inside one transaction: all rows or none. ``batch_size`` caps the
+        rows per statement. Returns the row count, or the rows with ``returning=True``."""
+        if batch_size is not None and batch_size < 1:
+            raise QueryError("insert_many() needs batch_size >= 1")
+        count = 0
+        inserted: list[T] = []
+        async with self.transaction() as tx:
+            for batch in _insert_batches(table, rows, batch_size):
+                insert = Insert(tx, table, batch)
+                if returning:
+                    inserted += await insert.returning()
+                else:
+                    count += await insert
+        return inserted if returning else count
+
+    @asynccontextmanager
+    async def listen(self, *channels: str) -> AsyncGenerator[AsyncIterator[Notification]]:
+        """Receive ``NOTIFY`` messages sent to ``channels``, on a pooled connection held
+        until the block exits::
+
+            async with db.listen("orders") as events:
+                async for event in events:
+                    print(event.channel, event.payload)
+
+        If the connection is lost, iterating raises ``ConnectionError`` (notifications
+        sent meanwhile are missed). Does not work through PgBouncer in transaction mode."""
+        if self._conn is not None:
+            raise QueryError("listen() needs its own connection; call it outside a transaction")
+        if not channels:
+            raise QueryError("listen() needs at least one channel")
+        async with self._require_driver().acquire() as conn, conn.listen(channels) as events:
+            yield events
+
+    async def notify(self, channel: str, payload: str = "") -> None:
+        """Send a notification to ``channel`` (``pg_notify``; the payload is a bind
+        parameter). Inside a transaction it is sent on commit."""
+        await self._call(
+            CompiledQuery("SELECT pg_notify($1, $2)", (channel, payload), (None, None)), "execute"
+        )
 
     @property
     def primary(self) -> Session:
@@ -258,9 +475,7 @@ class Session(QueryBuilder):
                 if not await self._after_lost_connection(query, read_only):
                     raise
             return await self._retry_read(query, kind, read_only)
-        start = time.perf_counter()
-        error: BaseException | None = None
-        try:
+        with self._logged(query):
             try:
                 async with self._connection(read_only) as conn:
                     return await self._send(conn, query, kind)
@@ -268,6 +483,19 @@ class Session(QueryBuilder):
                 if not await self._after_lost_connection(query, read_only):
                     raise
             return await self._retry_read(query, kind, read_only)
+
+    @contextmanager
+    def _logged(self, query: CompiledQuery) -> Generator[None]:
+        """Pass a QueryEvent to the logger hook when the block ends."""
+        if self._logger is None:
+            yield
+            return
+        start = time.perf_counter()
+        error: BaseException | None = None
+        try:
+            yield
+        except GeneratorExit:  # a stream the caller stopped early: not an error
+            raise
         except BaseException as exc:
             error = exc
             raise
@@ -314,6 +542,72 @@ class Session(QueryBuilder):
         if kind == "execute":
             return conn.execute(query.sql, query.params, self._timeout, session_safe=safe)
         return conn.fetch_dicts(query.sql, query.params, self._timeout)
+
+
+def _insert_batches(
+    table: type[Table], rows: Iterable[RowLike], batch_size: int | None
+) -> Iterator[tuple[dict[str, object], ...]]:
+    """Checked rows in batches that fit one INSERT's bind parameters."""
+    batch: list[dict[str, object]] = []
+    params = 0
+    for row in rows:
+        values = prepare_row(table, as_mapping(row))
+        size = sum(not isinstance(v, Node) for v in values.values())  # SQL is not bound
+        if batch and (params + size > MAX_PARAMS or len(batch) == batch_size):
+            yield tuple(batch)
+            batch, params = [], 0
+        batch.append(values)
+        params += size
+    if batch:
+        yield tuple(batch)
+
+
+# Extension and text-search types: asyncpg has no binary codec for them, so COPY cannot
+# send them; copy_into() falls back to insert_many() for tables that use them.
+_TEXT_ONLY_TYPES = ("vector", "halfvec", "sparsevec", "tsvector", "tsquery")
+
+
+def _text_only(column: ColumnBase) -> bool:
+    base = column.sql_type.removesuffix("[]").split("(", 1)[0].strip()
+    return base in _TEXT_ONLY_TYPES
+
+
+def _copy_attrs(table: type[Table], columns: Sequence[ColumnBase]) -> tuple[str, ...]:
+    for column in columns:
+        if column.table is not table:
+            raise QueryError(f"{column.qualified_name} is not a column of {table.__name__}")
+    wanted = {column.attr for column in columns}
+    for attr, column in table.__table__.columns.items():
+        if column.required_on_insert and attr not in wanted:
+            raise QueryError(f"{column.qualified_name} is required")
+    return tuple(attr for attr in table.__table__.columns if attr in wanted)
+
+
+def _copy_records(
+    table: type[Table], rows: Iterable[RowLike], attrs: tuple[str, ...]
+) -> Iterator[tuple[object, ...]]:
+    """Check and encode each row while COPY sends them (rows are never all in memory)."""
+    columns = table.__table__.columns
+    for number, row in enumerate(rows):
+        given = as_mapping(row)
+        values = prepare_row(table, given)  # unknown columns, types, NOT NULL, defaults
+        if missing := [a for a in attrs if a not in values]:
+            raise QueryError(
+                f"copy_into() row {number} has no value for {', '.join(missing)}; "
+                "every row must set the same columns"
+            )
+        if extra := [a for a in given if a not in attrs]:
+            raise QueryError(
+                f"copy_into() row {number} sets {', '.join(extra)}, which the first row "
+                "(or columns=) does not"
+            )
+        record: list[object] = []
+        for attr in attrs:
+            value = values[attr]
+            if isinstance(value, Node):
+                raise QueryError("copy_into() cannot send SQL expressions; use insert()")
+            record.append(columns[attr].encode(value))
+        yield tuple(record)
 
 
 def dialect_for_url(url: str) -> Dialect:

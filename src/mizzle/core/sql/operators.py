@@ -13,6 +13,7 @@ from typing import Literal, overload
 from mizzle.core.errors import QueryError
 from mizzle.core.schema.column import ColumnBase
 from mizzle.core.sql.nodes import (
+    Aggregate,
     Between,
     BinaryOp,
     BoolOp,
@@ -30,7 +31,6 @@ from mizzle.core.sql.nodes import (
     Postfix,
     Raw,
     Star,
-    TypedFunc,
     TypedNullable,
     TypedPlaceholder,
 )
@@ -128,6 +128,24 @@ def ilike(left: Text, pattern: str | Text) -> Expr[bool]:
     return BinaryOp(left, "ILIKE", _wrap(pattern, left))
 
 
+def not_like(left: Text, pattern: str | Text) -> Expr[bool]:
+    return BinaryOp(left, "NOT LIKE", _wrap(pattern, left))
+
+
+def not_ilike(left: Text, pattern: str | Text) -> Expr[bool]:
+    return BinaryOp(left, "NOT ILIKE", _wrap(pattern, left))
+
+
+def regex(left: Text, pattern: str | Text, *, ignore_case: bool = False) -> Expr[bool]:
+    """POSIX regular expression match (``~``, or ``~*`` with ``ignore_case``); the pattern
+    may match anywhere unless anchored with ``^``/``$``."""
+    return BinaryOp(left, "~*" if ignore_case else "~", _wrap(pattern, left))
+
+
+def not_regex(left: Text, pattern: str | Text, *, ignore_case: bool = False) -> Expr[bool]:
+    return BinaryOp(left, "!~*" if ignore_case else "!~", _wrap(pattern, left))
+
+
 def is_null(expr: ExprBase) -> Expr[bool]:
     return Postfix(expr, "IS NULL")
 
@@ -156,8 +174,8 @@ def desc(expr: ExprBase, *, nulls: Literal["first", "last"] | None = None) -> Or
     return OrderBy(expr, descending=True, nulls=nulls)
 
 
-def count(expr: ExprBase | None = None, *, distinct: bool = False) -> Expr[int]:
-    return TypedFunc[int]("count", (expr if expr is not None else Star(),), distinct)
+def count(expr: ExprBase | None = None, *, distinct: bool = False) -> Aggregate[int]:
+    return Aggregate[int]("count", (expr if expr is not None else Star(),), distinct)
 
 
 type _Int = Expr[int] | Expr[int | None]
@@ -167,32 +185,32 @@ type _Float = Expr[float] | Expr[float | None]
 
 # The overloads "overlap" only for impossible bottom types; both checkers flag that.
 @overload
-def sum_(expr: _Int) -> Expr[int | Decimal | None]: ...  # type: ignore[overload-overlap]  # pyright: ignore[reportOverlappingOverload]
+def sum_(expr: _Int) -> Aggregate[int | Decimal | None]: ...  # type: ignore[overload-overlap]  # pyright: ignore[reportOverlappingOverload]
 @overload
-def sum_(expr: _Decimal) -> Expr[Decimal | None]: ...  # type: ignore[overload-overlap]
+def sum_(expr: _Decimal) -> Aggregate[Decimal | None]: ...  # type: ignore[overload-overlap]
 @overload
-def sum_(expr: _Float) -> Expr[float | None]: ...
+def sum_(expr: _Float) -> Aggregate[float | None]: ...
 def sum_(expr: _Int | _Decimal | _Float) -> ExprBase:
     """``sum()``. Integers give ``int | Decimal``: PostgreSQL sums integer to bigint, but
     bigint to numeric, and both are ``int`` in Python. NULL when there are no rows."""
-    return TypedFunc[object]("sum", (expr,))
+    return Aggregate[object]("sum", (expr,))
 
 
 @overload
-def avg(expr: _Int | _Decimal) -> Expr[Decimal | None]: ...  # type: ignore[overload-overlap]  # pyright: ignore[reportOverlappingOverload]
+def avg(expr: _Int | _Decimal) -> Aggregate[Decimal | None]: ...  # type: ignore[overload-overlap]  # pyright: ignore[reportOverlappingOverload]
 @overload
-def avg(expr: _Float) -> Expr[float | None]: ...
+def avg(expr: _Float) -> Aggregate[float | None]: ...
 def avg(expr: _Int | _Decimal | _Float) -> ExprBase:
     """``avg()``: numeric (``Decimal``) for integers and decimals, float for floats."""
-    return TypedFunc[object]("avg", (expr,))
+    return Aggregate[object]("avg", (expr,))
 
 
-def min_[T](expr: Expr[T]) -> Expr[T | None]:
-    return TypedFunc[T | None]("min", (expr,))
+def min_[T](expr: Expr[T]) -> Aggregate[T | None]:
+    return Aggregate[T | None]("min", (expr,), keeps_type=True)
 
 
-def max_[T](expr: Expr[T]) -> Expr[T | None]:
-    return TypedFunc[T | None]("max", (expr,))
+def max_[T](expr: Expr[T]) -> Aggregate[T | None]:
+    return Aggregate[T | None]("max", (expr,), keeps_type=True)
 
 
 def placeholder[T](name: str) -> TypedPlaceholder[T]:

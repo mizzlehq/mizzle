@@ -242,3 +242,74 @@ async def test_pull_into_new_project_writes_the_schema_module(
     # Pulling again keeps the schema module and writes next to it.
     assert await cli("pull") == 0
     assert (fresh / module / "db" / "pulled_schema.py").exists()
+
+
+OBJECTS = (
+    V1.replace(
+        "from mizzle import Table, sql, index",
+        "from typing import override\n"
+        "from mizzle import Table, sql, index, eq, View, QueryBuilder, extension, function, "
+        "trigger, policy, rls",
+    ).replace(
+        'index("posts_author_idx").on(cls.author_id),',
+        'index("posts_author_idx").on(cls.author_id), rls(), '
+        'policy("visible", for_="select", using=sql("author_id > 0")),',
+    )
+    + """
+trgm = extension("pg_trgm")
+lower_name = function(
+    "lower_name", returns="trigger", body="BEGIN NEW.name = lower(NEW.name); RETURN NEW; END"
+)
+users_lower = trigger("users_lower", on=Users, execute=lower_name, events=["insert", "update"])
+
+class Admins(View, name="admins"):
+    id = integer()
+    email = varchar(255)
+
+    @classmethod
+    @override
+    def query(cls, db: QueryBuilder):
+        return db.select(Users.id, Users.email).from_(Users).where(eq(Users.role, Role.ADMIN))
+"""
+)
+
+
+async def test_objects_generate_migrate_push_pull(
+    project: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    rewrite_schema(project, OBJECTS, monkeypatch)
+    assert await cli("generate") == 0
+    sql = next(project.glob("migrations/0001_*/migration.sql")).read_text()
+    assert sql.index("CREATE EXTENSION") < sql.index("CREATE TABLE") < sql.index("CREATE VIEW")
+    assert await cli("migrate") == 0
+    assert await cli("check") == 0
+    assert await cli("generate") == 0
+    assert await cli("push", "--dry-run") == 0  # the database's view text compares equal
+    out = capsys.readouterr().out
+    assert "No schema changes." in out and "Database is up to date." in out
+
+    # Change the view query and the function body; drop the unapplied migration once.
+    evolved = OBJECTS.replace("Role.ADMIN", "Role.USER").replace("lower(", "upper(")
+    rewrite_schema(project, evolved, monkeypatch)
+    assert await cli("generate") == 0
+    sql = next(project.glob("migrations/0002_*/migration.sql")).read_text()
+    assert 'DROP VIEW "admins"' in sql and "CREATE OR REPLACE FUNCTION" in sql
+    assert await cli("drop") == 0
+    assert await cli("generate") == 0
+    assert await cli("migrate") == 0
+    assert await cli("push", "--dry-run") == 0
+    assert "Database is up to date." in capsys.readouterr().out
+
+    # Pull into a fresh project: its schema builds the snapshot of the database.
+    fresh = project / "fresh"
+    fresh.mkdir()
+    module = f"fresh_{uuid.uuid4().hex[:8]}"
+    (fresh / "mizzle.toml").write_text(f'schema = "{module}"\nout = "migrations"\n')
+    monkeypatch.chdir(fresh)
+    assert await cli("pull") == 0
+    pulled = (fresh / f"{module}.py").read_text()
+    assert "class Admins(View" in pulled and "trigger(" in pulled and "policy(" in pulled
+    assert await cli("generate") == 0
+    assert await cli("push", "--dry-run") == 0
+    out = capsys.readouterr().out
+    assert "No schema changes." in out and "Database is up to date." in out

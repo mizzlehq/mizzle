@@ -10,7 +10,16 @@ from typing import cast
 from mizzle.core.errors import MigrationError
 from mizzle.core.naming import Casing
 from mizzle.core.schema.column import MISSING, ColumnBase
-from mizzle.core.snapshot import ColumnSnap, ForeignKeySnap, IndexSnap, TableSnap
+from mizzle.core.snapshot import (
+    ColumnSnap,
+    ForeignKeySnap,
+    FunctionSnap,
+    IdentitySnap,
+    IndexSnap,
+    PolicySnap,
+    TableSnap,
+    TriggerSnap,
+)
 from mizzle.core.sql.nodes import Node
 from mizzle.core.steps import (
     AddCheck,
@@ -20,21 +29,36 @@ from mizzle.core.steps import (
     AddPrimaryKey,
     AddUnique,
     AlterColumnDefault,
+    AlterColumnGenerated,
+    AlterColumnIdentity,
     AlterColumnNullability,
     AlterColumnType,
+    AlterExtension,
+    AlterPolicy,
     CreateEnum,
+    CreateExtension,
+    CreateFunction,
     CreateIndex,
+    CreatePolicy,
     CreateSchema,
     CreateTable,
+    CreateTrigger,
+    CreateView,
     DropColumn,
     DropConstraint,
     DropEnum,
+    DropExtension,
+    DropFunction,
     DropIndex,
+    DropPolicy,
     DropTable,
+    DropTrigger,
+    DropView,
     RenameColumn,
     RenameConstraint,
     RenameIndex,
     RenameTable,
+    SetRowLevelSecurity,
     Statement,
     Step,
 )
@@ -133,6 +157,14 @@ def expression(node: Node, casing: Casing | None = None) -> str:
     return compiler(casing).compile(node).sql
 
 
+def view_definition(query: Node, casing: Casing | None = None) -> str:
+    """A view's query as SQL; columns stay qualified, since it may join tables."""
+    compiled = PostgresCompiler(casing, inline_literals=True).compile(query)
+    if compiled.params:
+        raise MigrationError("a view query cannot have placeholders or parameters")
+    return compiled.sql
+
+
 def column_default(column: ColumnBase, casing: Casing | None = None) -> str | None:
     if column.default_value is MISSING:
         return None
@@ -222,8 +254,31 @@ def _columns(names: Sequence[str]) -> str:
     return ", ".join(quote(n) for n in names)
 
 
+def _identity(identity: IdentitySnap) -> str:
+    text = f"GENERATED {'ALWAYS' if identity['always'] else 'BY DEFAULT'} AS IDENTITY"
+    options = _sequence_options(identity, None)
+    return f"{text} ({' '.join(options)})" if options else text
+
+
+def _sequence_options(new: IdentitySnap, old: IdentitySnap | None) -> list[str]:
+    """Options that differ from ``old`` (or from the database defaults)."""
+    default_start = 1 if new["increment"] > 0 else -1
+    start, increment = old["start"] if old else default_start, old["increment"] if old else 1
+    parts: list[str] = []
+    if new["increment"] != increment:
+        parts.append(f"INCREMENT BY {new['increment']}")
+    if new["start"] != start:
+        parts.append(f"START WITH {new['start']}")
+    return parts
+
+
 def column_definition(column: ColumnSnap) -> str:
     parts = [quote(column["name"]), column["type"]]
+    if generated := column.get("generated"):
+        kind = "STORED" if generated["stored"] else "VIRTUAL"
+        parts.append(f"GENERATED ALWAYS AS ({generated['expression']}) {kind}")
+    if identity := column.get("identity"):
+        parts.append(_identity(identity))
     if column["not_null"]:
         parts.append("NOT NULL")
     if column["default"] is not None:
@@ -260,9 +315,55 @@ def _create_table(table: TableSnap) -> str:
 
 def _create_index(schema: str, table: str, index: IndexSnap) -> str:
     unique = "UNIQUE " if index["unique"] else ""
-    keys = index.get("expression") or _columns(index["columns"])
-    text = f"CREATE {unique}INDEX {quote(index['name'])} ON {qualified(schema, table)} ({keys})"
+    keys = index.get("expression")
+    if keys is None:
+        opclasses = index.get("opclasses") or [None] * len(index["columns"])
+        keys = ", ".join(
+            quote(c) + (f" {op}" if op else "")
+            for c, op in zip(index["columns"], opclasses, strict=True)
+        )
+    using = f" USING {index['method']}" if "method" in index else ""
+    text = f"CREATE {unique}INDEX {quote(index['name'])} ON {qualified(schema, table)}{using}"
+    text += f" ({keys})"
+    if options := index.get("options"):
+        text += " WITH (" + ", ".join(f"{k} = {_literal(v)}" for k, v in options.items()) + ")"
     return text + (f" WHERE {index['where']}" if index["where"] else "")
+
+
+def _literal(text: str) -> str:
+    return "'" + text.replace("'", "''") + "'"
+
+
+def _alter_identity(step: AlterColumnIdentity) -> str:
+    col = f"ALTER TABLE {qualified(step.schema, step.table)} ALTER COLUMN {quote(step.column)}"
+    old, new = step.old, step.new
+    if new is None:
+        return f"{col} DROP IDENTITY"
+    if old is None:
+        return f"{col} ADD {_identity(new)}"
+    actions: list[str] = []
+    if old["always"] != new["always"]:
+        actions.append(f"SET GENERATED {'ALWAYS' if new['always'] else 'BY DEFAULT'}")
+    actions += [f"SET {option}" for option in _sequence_options(new, old)]
+    return f"{col} {' '.join(actions)}"
+
+
+def _alter_generated(step: AlterColumnGenerated) -> str:
+    col = f"ALTER TABLE {qualified(step.schema, step.table)} ALTER COLUMN {quote(step.column)}"
+    old, new = step.old, step.new
+    where = f"{step.table}.{step.column}"
+    if old is None or (new is not None and old["stored"] != new["stored"]):
+        raise MigrationError(
+            f"making {where} a generated column, or switching STORED/VIRTUAL, needs a custom "
+            "migration (drop the column and add it again)"
+        )
+    if new is None:
+        if not old["stored"]:
+            raise MigrationError(
+                f"{where} is VIRTUAL: making it a plain column needs a custom migration"
+            )
+        return f"{col} DROP EXPRESSION"
+    return f"{col} SET EXPRESSION AS ({new['expression']})"  # PostgreSQL 17+
 
 
 def _alter_type(step: AlterColumnType) -> str:
@@ -271,10 +372,11 @@ def _alter_type(step: AlterColumnType) -> str:
             f"changing {step.table}.{step.column} to or from a serial type needs a custom migration"
         )
     col = quote(step.column)
-    return (
+    text = (
         f"ALTER TABLE {qualified(step.schema, step.table)} ALTER COLUMN {col} "
-        f"SET DATA TYPE {step.new_type} USING {col}::{step.new_type}"
+        f"SET DATA TYPE {step.new_type}"
     )
+    return text if step.generated else f"{text} USING {col}::{step.new_type}"
 
 
 def render_step(step: Step) -> Statement:
@@ -316,6 +418,10 @@ def render_step(step: Step) -> Statement:
         case AlterColumnNullability(schema=schema, table=table, column=column, not_null=not_null):
             action = "SET NOT NULL" if not_null else "DROP NOT NULL"
             return alter(schema, table, f"ALTER COLUMN {quote(column)} {action}")
+        case AlterColumnIdentity():
+            return Statement(_alter_identity(step))
+        case AlterColumnGenerated():
+            return Statement(_alter_generated(step))
         case AlterColumnDefault(schema=schema, table=table, column=column, default=default):
             action = "DROP DEFAULT" if default is None else f"SET DEFAULT {default}"
             return alter(schema, table, f"ALTER COLUMN {quote(column)} {action}")
@@ -347,9 +453,126 @@ def render_step(step: Step) -> Statement:
             return Statement(f"DROP INDEX {qualified(schema, name)}")
         case RenameIndex(schema=schema, old=old, new=new):
             return Statement(f"ALTER INDEX {qualified(schema, old)} RENAME TO {quote(new)}")
+        case CreateExtension(extension=ext):
+            text = f"CREATE EXTENSION IF NOT EXISTS {type_ident(ext['name'])}"
+            if "schema" in ext:
+                text += f" SCHEMA {quote(ext['schema'])}"
+            if "version" in ext:
+                text += f" VERSION {_literal(ext['version'])}"
+            return Statement(text)
+        case AlterExtension(name=name, schema=schema, version=version):
+            action = (
+                f"SET SCHEMA {quote(schema)}" if schema else f"UPDATE TO {_literal(version or '')}"
+            )
+            return Statement(f"ALTER EXTENSION {type_ident(name)} {action}")
+        case DropExtension(name=name):
+            return Statement(f"DROP EXTENSION IF EXISTS {type_ident(name)}")
+        case CreateFunction(function=fn):
+            return Statement(_create_function(fn))
+        case DropFunction(schema=schema, name=name, args=args):
+            return Statement(f"DROP FUNCTION {qualified(schema, name)}({args})")
+        case CreateView(view=view):
+            kind = "MATERIALIZED VIEW" if view["materialized"] else "VIEW"
+            name = qualified(view["schema"], view["name"])
+            return Statement(f"CREATE {kind} {name} AS\n{view['definition']}")
+        case DropView(schema=schema, name=name, materialized=materialized):
+            kind = "MATERIALIZED VIEW" if materialized else "VIEW"
+            return Statement(f"DROP {kind} {qualified(schema, name)}")
+        case SetRowLevelSecurity(schema=schema, table=table, enabled=enabled, force=force):
+            return alter(
+                schema,
+                table,
+                f"{'ENABLE' if enabled else 'DISABLE'} ROW LEVEL SECURITY, "
+                f"{'FORCE' if force else 'NO FORCE'} ROW LEVEL SECURITY",
+            )
+        case CreatePolicy(schema=schema, table=table, policy=policy):
+            kind = "PERMISSIVE" if policy["permissive"] else "RESTRICTIVE"
+            text = (
+                f"CREATE POLICY {quote(policy['name'])} ON {qualified(schema, table)} "
+                f"AS {kind} FOR {policy['command'].upper()}"
+            )
+            return Statement(text + _policy_body(policy))
+        case AlterPolicy(schema=schema, table=table, policy=policy):
+            return Statement(
+                f"ALTER POLICY {quote(policy['name'])} ON {qualified(schema, table)}"
+                + _policy_body(policy)
+            )
+        case DropPolicy(schema=schema, table=table, name=name):
+            return Statement(f"DROP POLICY {quote(name)} ON {qualified(schema, table)}")
+        case CreateTrigger(schema=schema, table=table, trigger=trigger, replace=replace):
+            return Statement(_create_trigger(schema, table, trigger, replace))
+        case DropTrigger(schema=schema, table=table, name=name):
+            return Statement(f"DROP TRIGGER {quote(name)} ON {qualified(schema, table)}")
         case _:
             raise MigrationError(f"PostgreSQL cannot render {type(step).__name__}")
 
 
+def _dollar_quote(body: str) -> str:
+    tag = "$mizzle$"
+    n = 0
+    while tag in body:
+        n += 1
+        tag = f"$mizzle{n}$"
+    return f"{tag}{body}{tag}"
+
+
+def _create_function(fn: FunctionSnap) -> str:
+    text = (
+        f"CREATE OR REPLACE FUNCTION {qualified(fn['schema'], fn['name'])}({fn['args']}) "
+        f"RETURNS {fn['returns']} LANGUAGE {type_ident(fn['language'])}"
+    )
+    if fn["volatility"] != "volatile":
+        text += f" {fn['volatility'].upper()}"
+    if fn["security_definer"]:
+        text += " SECURITY DEFINER"
+    return f"{text} AS {_dollar_quote(fn['body'])}"
+
+
+def _role(name: str) -> str:
+    return "PUBLIC" if name == "public" else quote(name)
+
+
+def _policy_body(policy: PolicySnap) -> str:
+    text = f" TO {', '.join(_role(r) for r in policy['roles'])}"
+    if policy["using"] is not None:
+        text += f" USING ({policy['using']})"
+    if policy["with_check"] is not None:
+        text += f" WITH CHECK ({policy['with_check']})"
+    return text
+
+
+def _create_trigger(schema: str, table: str, trigger: TriggerSnap, replace: bool) -> str:
+    fn_schema, _, fn_name = trigger["function"].partition(".")
+    events = " OR ".join(e.upper() for e in trigger["events"])
+    text = (
+        f"CREATE {'OR REPLACE ' if replace else ''}TRIGGER {quote(trigger['name'])} "
+        f"{trigger['timing'].upper()} {events} ON {qualified(schema, table)} "
+        f"FOR EACH {trigger['for_each'].upper()}"
+    )
+    if trigger["when"] is not None:
+        text += f" WHEN ({trigger['when']})"
+    return f"{text} EXECUTE FUNCTION {qualified(fn_schema, fn_name)}()"
+
+
+# Column types that need an extension, and the extension.
+_EXTENSION_TYPES = re.compile(r"(?:vector|halfvec|sparsevec)(?:\(\d+\))?(?:\[\])*")
+
+
+def type_extension(sql_type: str) -> str | None:
+    return "vector" if _EXTENSION_TYPES.fullmatch(sql_type) else None
+
+
 def render(steps: Sequence[Step]) -> list[Statement]:
-    return [render_step(s) for s in steps]
+    statements: list[Statement] = []
+    for step in steps:
+        # The schema an extension goes into may hold nothing else, so nothing created it.
+        match step:
+            case (
+                CreateExtension(extension={"schema": str(schema)})
+                | AlterExtension(schema=str(schema))
+            ):
+                statements.append(render_step(CreateSchema(schema)))
+            case _:
+                pass
+        statements.append(render_step(step))
+    return statements

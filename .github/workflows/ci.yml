@@ -95,11 +95,13 @@ jobs:
       MIZZLE_ODD_URL: postgresql://mizzle:mizzle@localhost:54334/mizzle?sslmode=require
       MIZZLE_RESTART_CMD: docker compose -f tests/infra/compose.yml restart odd
       MIZZLE_PRIMARY_RESTART_CMD: docker compose -f tests/infra/compose.yml restart primary
+      # pgvector (test_vector.py)
+      MIZZLE_VECTOR_URL: postgresql://mizzle:mizzle@localhost:54335/mizzle
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
       - run: uv sync --python 3.14
       - run: docker compose -f tests/infra/compose.yml up -d --wait
-      - run: uv run pytest tests/integration/test_infra.py tests/integration/test_production_env.py -v
+      - run: uv run pytest tests/integration/test_infra.py tests/integration/test_production_env.py tests/integration/test_vector.py -v
       - if: failure()
         run: docker compose -f tests/infra/compose.yml logs

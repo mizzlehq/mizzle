@@ -7,8 +7,10 @@ Typing pattern: a node that internal code handles generically is a plain class (
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Literal
+from decimal import Decimal
+from typing import TYPE_CHECKING, Literal, overload
 
 if TYPE_CHECKING:
     from mizzle.core.schema.column import ColumnBase
@@ -28,6 +30,115 @@ class Expr[T](ExprBase):
     # Never set per instance. A public, mutable attribute mentioning T makes T invariant,
     # so eq(Users.id, "x") is a type error (underscore names are ignored for variance).
     py_type: type[T] | None = None
+
+    # Arithmetic: ``Users.age + 1``. Both sides have the same numeric type (an int literal
+    # also fits float and Decimal); NULL on either side makes the result NULL. As in SQL,
+    # ``/`` on integers is integer division.
+    @overload
+    def __add__[N: (int, float, Decimal)](
+        self: Expr[N], other: N | int | Expr[N], /
+    ) -> Expr[N]: ...
+    @overload
+    def __add__[N: (int, float, Decimal)](
+        self: Expr[N], other: Expr[N | None], /
+    ) -> Expr[N | None]: ...
+    @overload
+    def __add__[N: (int, float, Decimal)](
+        self: Expr[N | None], other: _Num[N], /
+    ) -> Expr[N | None]: ...
+    def __add__(self: ExprBase, other: object, /) -> ExprBase:
+        return _arith(self, "+", other)
+
+    @overload
+    def __sub__[N: (int, float, Decimal)](
+        self: Expr[N], other: N | int | Expr[N], /
+    ) -> Expr[N]: ...
+    @overload
+    def __sub__[N: (int, float, Decimal)](
+        self: Expr[N], other: Expr[N | None], /
+    ) -> Expr[N | None]: ...
+    @overload
+    def __sub__[N: (int, float, Decimal)](
+        self: Expr[N | None], other: _Num[N], /
+    ) -> Expr[N | None]: ...
+    def __sub__(self: ExprBase, other: object, /) -> ExprBase:
+        return _arith(self, "-", other)
+
+    @overload
+    def __mul__[N: (int, float, Decimal)](
+        self: Expr[N], other: N | int | Expr[N], /
+    ) -> Expr[N]: ...
+    @overload
+    def __mul__[N: (int, float, Decimal)](
+        self: Expr[N], other: Expr[N | None], /
+    ) -> Expr[N | None]: ...
+    @overload
+    def __mul__[N: (int, float, Decimal)](
+        self: Expr[N | None], other: _Num[N], /
+    ) -> Expr[N | None]: ...
+    def __mul__(self: ExprBase, other: object, /) -> ExprBase:
+        return _arith(self, "*", other)
+
+    @overload
+    def __truediv__[N: (int, float, Decimal)](
+        self: Expr[N], other: N | int | Expr[N], /
+    ) -> Expr[N]: ...
+    @overload
+    def __truediv__[N: (int, float, Decimal)](
+        self: Expr[N], other: Expr[N | None], /
+    ) -> Expr[N | None]: ...
+    @overload
+    def __truediv__[N: (int, float, Decimal)](
+        self: Expr[N | None], other: _Num[N], /
+    ) -> Expr[N | None]: ...
+    def __truediv__(self: ExprBase, other: object, /) -> ExprBase:
+        return _arith(self, "/", other)
+
+    @overload
+    def __radd__[N: (int, float, Decimal)](self: Expr[N], other: N | int, /) -> Expr[N]: ...
+    @overload
+    def __radd__[N: (int, float, Decimal)](
+        self: Expr[N | None], other: N | int, /
+    ) -> Expr[N | None]: ...
+    def __radd__(self: ExprBase, other: object, /) -> ExprBase:
+        return _arith(other, "+", self)
+
+    @overload
+    def __rsub__[N: (int, float, Decimal)](self: Expr[N], other: N | int, /) -> Expr[N]: ...
+    @overload
+    def __rsub__[N: (int, float, Decimal)](
+        self: Expr[N | None], other: N | int, /
+    ) -> Expr[N | None]: ...
+    def __rsub__(self: ExprBase, other: object, /) -> ExprBase:
+        return _arith(other, "-", self)
+
+    @overload
+    def __rmul__[N: (int, float, Decimal)](self: Expr[N], other: N | int, /) -> Expr[N]: ...
+    @overload
+    def __rmul__[N: (int, float, Decimal)](
+        self: Expr[N | None], other: N | int, /
+    ) -> Expr[N | None]: ...
+    def __rmul__(self: ExprBase, other: object, /) -> ExprBase:
+        return _arith(other, "*", self)
+
+    @overload
+    def __rtruediv__[N: (int, float, Decimal)](self: Expr[N], other: N | int, /) -> Expr[N]: ...
+    @overload
+    def __rtruediv__[N: (int, float, Decimal)](
+        self: Expr[N | None], other: N | int, /
+    ) -> Expr[N | None]: ...
+    def __rtruediv__(self: ExprBase, other: object, /) -> ExprBase:
+        return _arith(other, "/", self)
+
+
+# The right side of arithmetic on a nullable left side.
+type _Num[N] = N | int | Expr[N] | Expr[N | None]
+
+
+def _arith(left: object, op: str, right: object) -> ExprBase:
+    from mizzle.core.sql.functions import bind  # functions imports this module
+
+    return TypedOperation[object](bind(left, (right,)), op, bind(right, (left,)))
 
 
 @dataclass(frozen=True)
@@ -119,10 +230,105 @@ class Func(ExprBase):
     name: str
     args: tuple[Node, ...]
     distinct: bool = False
+    # The result has the type of its arguments (min, coalesce, lag...): a column among them
+    # decodes it (e.g. back into an enum).
+    keeps_type: bool = False
 
 
 @dataclass(frozen=True)
 class TypedFunc[T](Func, Expr[T]):
+    pass
+
+
+@dataclass(frozen=True)
+class Aggregate[T](TypedFunc[T]):
+    """An aggregate (``count``, ``sum_``...); ``.over(...)`` makes it a window function."""
+
+    def over(
+        self,
+        *,
+        partition_by: ExprBase | Sequence[ExprBase] = (),
+        order_by: ExprBase | OrderBy | Sequence[ExprBase | OrderBy] = (),
+        frame: Frame | None = None,
+    ) -> Expr[T]:
+        return over(self, partition_by, order_by, frame)
+
+
+@dataclass(frozen=True)
+class Operation(ExprBase):
+    """Arithmetic: ``left op right``."""
+
+    left: Node
+    op: str
+    right: Node
+
+
+@dataclass(frozen=True)
+class TypedOperation[T](Operation, Expr[T]):
+    pass
+
+
+@dataclass(frozen=True)
+class Frame:
+    """A window frame; see ``rows_between()``. Offsets: negative = PRECEDING, 0 = CURRENT ROW,
+    positive = FOLLOWING, None = UNBOUNDED."""
+
+    kind: Literal["ROWS", "RANGE", "GROUPS"]
+    start: int | None
+    end: int | None
+
+
+@dataclass(frozen=True)
+class Over(ExprBase):
+    """``func OVER (PARTITION BY ... ORDER BY ... frame)``."""
+
+    func: Func
+    partition_by: tuple[Node, ...]
+    order_by: tuple[Node, ...]
+    frame: Frame | None
+
+
+@dataclass(frozen=True)
+class TypedOver[T](Over, Expr[T]):
+    pass
+
+
+def over[T](
+    func: Func,
+    partition_by: ExprBase | Sequence[ExprBase],
+    order_by: ExprBase | OrderBy | Sequence[ExprBase | OrderBy],
+    frame: Frame | None,
+) -> Expr[T]:
+    partition = (partition_by,) if isinstance(partition_by, ExprBase) else tuple(partition_by)
+    order = (order_by,) if isinstance(order_by, ExprBase | OrderBy) else tuple(order_by)
+    return TypedOver[T](func, partition, order, frame)
+
+
+@dataclass(frozen=True)
+class Fragment(ExprBase):
+    """SQL built by mizzle itself (``CURRENT_DATE``, ``extract(year FROM ...)``). String parts
+    are fixed or validated text, never user input; node parts are compiled. Unlike ``Raw``
+    it cannot change session state."""
+
+    parts: tuple[str | Node, ...]
+
+
+@dataclass(frozen=True)
+class TypedFragment[T](Fragment, Expr[T]):
+    pass
+
+
+@dataclass(frozen=True)
+class Cast(ExprBase):
+    """``CAST(expr AS type)``. ``column`` (if any) decodes the result."""
+
+    expr: Node
+    type: str
+    column: ColumnBase | None = None
+
+
+@dataclass(frozen=True)
+class TypedCast[T](Cast, Expr[T]):
     pass
 
 

@@ -37,7 +37,10 @@ def check_values(table: type[Table], values: Mapping[str, object]) -> None:
     if unknown := [k for k in values if k not in columns]:
         raise QueryError(f"{table.__name__} has no column(s): {', '.join(unknown)}")
     for key, value in values.items():
-        columns[key].validate(value)
+        column = columns[key]
+        if column.read_only:
+            column.check_writable()
+        column.validate(value)
 
 
 def prepare_row(table: type[Table], row: Mapping[str, object]) -> dict[str, object]:
@@ -49,6 +52,8 @@ def prepare_row(table: type[Table], row: Mapping[str, object]) -> dict[str, obje
     for attr, column in columns.items():
         if attr in row:
             value = row[attr]
+            if column.read_only:
+                column.check_writable()
             column.validate(value)
             out[attr] = value
         elif column.default_factory is not None:

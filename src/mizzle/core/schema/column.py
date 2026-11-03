@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING, Final, Literal, Self, overload, override
 
 from mizzle.core.errors import QueryError
 from mizzle.core.naming import Casing, snake_case
-from mizzle.core.sql.nodes import Condition, Expr, ExprBase, Node
+from mizzle.core.sql.nodes import Condition, Expr, ExprBase, Node, Raw
 
 if TYPE_CHECKING:
     from mizzle.core.schema.table import Table
@@ -35,6 +35,27 @@ class Reference:
     on_update: ReferentialAction | None = None
 
 
+@dataclass(frozen=True)
+class Identity:
+    """``GENERATED {ALWAYS | BY DEFAULT} AS IDENTITY``; ``None`` options use the database's."""
+
+    always: bool
+    start: int | None = None
+    increment: int | None = None
+
+
+@dataclass(frozen=True)
+class Computed:
+    """``GENERATED ALWAYS AS (expression) STORED`` (or ``VIRTUAL``, PostgreSQL 18+)."""
+
+    expression: ExprBase
+    stored: bool = True
+
+
+# The database's now(), for ``on_update_now()``.
+NOW: Final = Raw(("now()",))
+
+
 class ColumnBase(ExprBase):
     """Everything about a column except its value type. Internal code uses this non-generic
     base for columns of mixed types; user code sees ``Column[T]``."""
@@ -57,6 +78,10 @@ class ColumnBase(ExprBase):
     default_factory: Callable[[], object] | None
     reference: Reference | None
     checks: list[Condition]
+    identity: Identity | None
+    computed: Computed | None
+    # Written by update() (and upsert DO UPDATE) when the column is not set explicitly.
+    on_update_value: Callable[[], object] | ExprBase | None
 
     def __init__(
         self,
@@ -87,6 +112,9 @@ class ColumnBase(ExprBase):
         self.default_factory = None
         self.reference = None
         self.checks = []
+        self.identity = None
+        self.computed = None
+        self.on_update_value = None
 
     @property
     def qualified_name(self) -> str:
@@ -107,6 +135,24 @@ class ColumnBase(ExprBase):
         if self.name is not None:
             return self.name
         return snake_case(self.attr) if casing == "snake_case" else self.attr
+
+    @property
+    def read_only(self) -> bool:
+        """Generated and ``GENERATED ALWAYS`` identity columns: the database writes them."""
+        return self.computed is not None or (self.identity is not None and self.identity.always)
+
+    def check_writable(self) -> None:
+        """Raise QueryError if insert/update may not set this column."""
+        if self.computed is not None:
+            raise QueryError(
+                f"{self.qualified_name} is a generated column; the database computes it, "
+                "so it cannot be written"
+            )
+        if self.identity is not None and self.identity.always:
+            raise QueryError(
+                f"{self.qualified_name} is GENERATED ALWAYS AS IDENTITY; the database assigns "
+                "it. Use generated_by_default_as_identity() to allow explicit values"
+            )
 
     def validate(self, value: object) -> None:
         """Raise QueryError if ``value`` cannot be stored in this column."""
@@ -151,7 +197,19 @@ class ColumnBase(ExprBase):
         default: object = MISSING,
         default_factory: Callable[[], object] | None = None,
         reference: Reference | None = None,
+        identity: Identity | None = None,
+        computed: Computed | None = None,
+        on_update: Callable[[], object] | ExprBase | None = None,
     ) -> None:
+        if identity is not None:
+            self.identity = identity
+            self.nullable = False
+            self.generated = True
+        if computed is not None:
+            self.computed = computed
+            self.generated = True
+        if on_update is not None:
+            self.on_update_value = on_update
         if nullable is not None:
             self.nullable = nullable
         if primary_key is not None:
@@ -228,4 +286,51 @@ class Column[T](ColumnBase, Expr[T]):
 
     def check(self, condition: Condition) -> Self:
         self.checks.append(condition)
+        return self
+
+    @overload
+    def generated_always_as_identity[U](
+        self: Column[U | None], *, start: int | None = None, increment: int | None = None
+    ) -> Column[U]: ...
+    @overload
+    def generated_always_as_identity(
+        self, *, start: int | None = None, increment: int | None = None
+    ) -> Self: ...
+    def generated_always_as_identity(
+        self, *, start: int | None = None, increment: int | None = None
+    ) -> ColumnBase:
+        """An identity column the database always assigns; inserts cannot set it."""
+        self._set(identity=Identity(True, start, increment))
+        return self
+
+    @overload
+    def generated_by_default_as_identity[U](
+        self: Column[U | None], *, start: int | None = None, increment: int | None = None
+    ) -> Column[U]: ...
+    @overload
+    def generated_by_default_as_identity(
+        self, *, start: int | None = None, increment: int | None = None
+    ) -> Self: ...
+    def generated_by_default_as_identity(
+        self, *, start: int | None = None, increment: int | None = None
+    ) -> ColumnBase:
+        """An identity column the database assigns unless an insert gives a value."""
+        self._set(identity=Identity(False, start, increment))
+        return self
+
+    def generated_always_as(self, expression: ExprBase, *, stored: bool = True) -> Self:
+        """A column computed from others: ``sql('price * qty')``. Never written by inserts or
+        updates. ``stored=False`` makes it ``VIRTUAL`` (PostgreSQL 18+)."""
+        self._set(computed=Computed(expression, stored))
+        return self
+
+    def on_update(self, fn: Callable[[], T]) -> Self:
+        """Call ``fn`` for the value on every ``update()`` (and upsert ``DO UPDATE``) that
+        does not set this column itself."""
+        self._set(on_update=fn)
+        return self
+
+    def on_update_now(self) -> Self:
+        """Set the column to the database's ``now()`` on every update that does not set it."""
+        self._set(on_update=NOW)
         return self

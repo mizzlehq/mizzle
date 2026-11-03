@@ -238,3 +238,12 @@ async def test_connection_errors() -> None:
         await Database.connect("mysql://x")
     with pytest.raises(MizzleError, match="not connected"):
         await Database().select().from_(Users)
+
+
+async def test_misuse_is_not_a_lost_connection(db: Database) -> None:
+    # A wrong argument count is a DatabaseError, not ConnectionError: no pool reset or retry.
+    with pytest.raises(DatabaseError) as info:
+        async with db.driver.acquire() as conn:
+            await conn.fetch("select $1::int", [])
+    assert not isinstance(info.value, ConnectionError)
+    assert "expects 1 argument" in str(info.value)

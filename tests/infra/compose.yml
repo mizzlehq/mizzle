@@ -10,6 +10,9 @@
 #   MIZZLE_RESTART_CMD="docker compose -f tests/infra/compose.yml restart odd" \
 #   MIZZLE_PRIMARY_RESTART_CMD="docker compose -f tests/infra/compose.yml restart primary" \
 #   uv run pytest tests/integration/test_production_env.py
+# "vector" has the pgvector extension, for tests/integration/test_vector.py:
+#   MIZZLE_VECTOR_URL=postgresql://mizzle:mizzle@localhost:54335/mizzle \
+#   uv run pytest tests/integration/test_vector.py
 name: mizzle-infra
 
 services:
@@ -69,6 +72,18 @@ services:
     volumes:
       - ./odd-init.sh:/docker-entrypoint-initdb.d/odd-init.sh:ro
     ports: ["54334:5432"]
+    healthcheck:
+      test: pg_isready -U mizzle -d mizzle
+      interval: 2s
+      retries: 30
+
+  vector:
+    image: pgvector/pgvector:pg18@sha256:c29f30688a9ad961691bdf0ec1650717cc132a5814619d80f80463d6e4c42e47  # 0.8.x
+    environment:
+      POSTGRES_USER: mizzle
+      POSTGRES_PASSWORD: mizzle
+      POSTGRES_DB: mizzle
+    ports: ["54335:5432"]
     healthcheck:
       test: pg_isready -U mizzle -d mizzle
       interval: 2s

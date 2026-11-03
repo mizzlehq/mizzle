@@ -5,9 +5,11 @@ Adding a database means a new ``dialects/<name>/`` package that implements them.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+import os
+from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Iterable, Sequence
 from contextlib import AbstractAsyncContextManager
-from typing import Literal, Protocol
+from dataclasses import dataclass
+from typing import BinaryIO, Literal, Protocol
 
 from mizzle.core.compiler import Compiler
 from mizzle.core.naming import Casing
@@ -22,6 +24,18 @@ type IsolationLevel = Literal["read committed", "repeatable read", "serializable
 # back to the pool. "auto": skip it after statements mizzle built itself (faster; see
 # Database.connect for the one case it cannot see).
 type ResetMode = Literal["always", "auto"]
+type CopyFormat = Literal["csv", "text", "binary"]
+# Where copy_from() writes: a file path, a binary file, or an async function given each chunk.
+type CopyOutput = str | os.PathLike[str] | BinaryIO | Callable[[bytes], Awaitable[None]]
+
+
+@dataclass(frozen=True)
+class Notification:
+    """A ``NOTIFY`` received by ``db.listen()``."""
+
+    channel: str
+    payload: str
+    pid: int  # server process ID of the session that sent it
 
 
 class Connection(Protocol):
@@ -52,6 +66,49 @@ class Connection(Protocol):
     def transaction(
         self, isolation: IsolationLevel | None = None, readonly: bool = False
     ) -> AbstractAsyncContextManager[None]: ...
+    def cursor(
+        self,
+        sql: str,
+        params: Sequence[object],
+        batch_size: int,
+        timeout: float | None = None,
+        *,
+        session_safe: bool = False,
+    ) -> AsyncGenerator[list[Row]]:
+        """Rows in batches from a server-side cursor; only inside a transaction."""
+        ...
+
+    async def copy_records(
+        self,
+        table: str,
+        schema: str | None,
+        columns: Sequence[str],
+        records: Iterable[Sequence[object]],
+        timeout: float | None = None,
+    ) -> int:
+        """Bulk load with COPY; returns the number of rows."""
+        ...
+
+    async def copy_out(
+        self,
+        sql: str,
+        params: Sequence[object],
+        output: CopyOutput,
+        format: CopyFormat,
+        header: bool,
+        timeout: float | None = None,
+        *,
+        session_safe: bool = False,
+    ) -> int:
+        """``COPY (sql) TO`` ``output``; returns the number of rows."""
+        ...
+
+    def listen(
+        self, channels: Sequence[str]
+    ) -> AbstractAsyncContextManager[AsyncIterator[Notification]]:
+        """LISTEN until the context exits. The iterator raises ConnectionError if the
+        connection is lost."""
+        ...
 
 
 class Driver(Protocol):
@@ -87,7 +144,16 @@ class Dialect(Protocol):
     def column_default(self, column: ColumnBase, casing: Casing | None) -> str | None: ...
     def expression(self, node: Node, casing: Casing | None) -> str: ...
     def truncate_name(self, name: str) -> str: ...
+    def view_definition(self, query: Node, casing: Casing | None) -> str: ...
+    def type_extension(self, sql_type: str) -> str | None:
+        """The extension a column type needs (``vector`` -> ``"vector"``), if any."""
+        ...
+
     async def introspect(self, conn: Connection, schemas: Sequence[str]) -> Snapshot: ...
+    async def normalize_snapshot(self, conn: Connection, snapshot: Snapshot) -> Snapshot:
+        """``snapshot`` with view queries and other expressions as the database prints
+        them back, so it compares equal to an introspected one. Nothing is changed."""
+        ...
 
     # -- migrations -------------------------------------------------------------------
     def render(self, steps: Sequence[Step]) -> list[Statement]: ...

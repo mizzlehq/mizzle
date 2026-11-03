@@ -10,7 +10,8 @@ import datetime
 import ipaddress
 import struct
 import uuid
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import AsyncGenerator, Callable, Mapping, Sequence
+from contextlib import aclosing
 from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import TypedDict, cast, override
@@ -239,6 +240,15 @@ class RelationalSelect[T: Table](RelationalStatement, Executable[list[T]]):
         rows = await self.runner.fetch(compiled, read_only=True)
         decode = plan_decoder(self.plan)
         return cast(list[T], [decode(row) for row in rows])
+
+    async def stream(self, batch_size: int = 1000) -> AsyncGenerator[T]:
+        """Like ``Select.stream()``: rows from a server-side cursor, ``batch_size`` at a time."""
+        decode = plan_decoder(self.plan)
+        compiled = self._compile_for_run()
+        async with aclosing(self.runner.stream(compiled, batch_size, read_only=True)) as batches:
+            async for batch in batches:
+                for row in batch:
+                    yield cast(T, decode(row))
 
 
 @dataclass(frozen=True, eq=False)

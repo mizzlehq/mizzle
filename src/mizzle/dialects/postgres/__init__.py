@@ -14,7 +14,7 @@ from mizzle.dialects.base import Connection, ResetMode
 from mizzle.dialects.postgres import ddl
 from mizzle.dialects.postgres.compiler import PostgresCompiler
 from mizzle.dialects.postgres.driver import PostgresDriver
-from mizzle.dialects.postgres.introspect import MIGRATIONS_TABLE, introspect
+from mizzle.dialects.postgres.introspect import MIGRATIONS_TABLE, introspect, normalize_snapshot
 
 # Fixed key for pg_advisory_lock so concurrent `migrate` runs serialize.
 MIGRATION_LOCK_KEY = 0x6D697A7A6C65  # "mizzle"
@@ -60,8 +60,17 @@ class PostgresDialect:
     def truncate_name(self, name: str) -> str:
         return ddl.truncate_name(name)
 
+    def view_definition(self, query: Node, casing: Casing | None) -> str:
+        return ddl.view_definition(query, casing)
+
+    def type_extension(self, sql_type: str) -> str | None:
+        return ddl.type_extension(sql_type)
+
     async def introspect(self, conn: Connection, schemas: Sequence[str]) -> Snapshot:
         return await introspect(conn, schemas)
+
+    async def normalize_snapshot(self, conn: Connection, snapshot: Snapshot) -> Snapshot:
+        return await normalize_snapshot(conn, snapshot)
 
     def render(self, steps: Sequence[Step]) -> list[Statement]:
         return ddl.render(steps)

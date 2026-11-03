@@ -12,7 +12,8 @@ from collections.abc import Sequence
 
 from mizzle.core.schema.column import ColumnBase
 from mizzle.core.schema.table import Table
-from mizzle.core.snapshot import ColumnSnap, Snapshot, TableSnap
+from mizzle.core.schema.view import View
+from mizzle.core.snapshot import ColumnSnap, IndexSnap, PolicySnap, Snapshot, TableSnap
 
 _RESERVED_ATTRS = {"config", "from_db"}
 
@@ -34,6 +35,10 @@ _SIMPLE_TYPES = {
     "smallserial": "smallserial",
     "numeric": "numeric",
     "character varying": "varchar",
+    "tsvector": "tsvector",
+    "tsquery": "tsquery",
+    "vector": "vector",
+    "halfvec": "halfvec",
 }
 
 
@@ -136,7 +141,9 @@ class _SchemaWriter:
             if match.group(2) is not None:
                 args.append(f"precision={match.group(2)}")
             return f"{fn}({', '.join([*args, kwargs] if kwargs else args)})"
-        if match := re.fullmatch(r"(character varying|numeric)\(([\d,]+)\)", sql_type):
+        if match := re.fullmatch(
+            r"(character varying|numeric|vector|halfvec)\(([\d,]+)\)", sql_type
+        ):
             fn = _SIMPLE_TYPES[match.group(1)]
             self.pg_imports.add(fn)
             numbers = match.group(2).replace(",", ", ")
@@ -156,10 +163,26 @@ class _SchemaWriter:
         tname, cname = table["name"], column["name"]
         pk = table["primary_key"]
         is_pk = pk is not None and pk["columns"] == [cname] and pk["name"] == f"{tname}_pkey"
+        identity = column.get("identity")
         if is_pk:
             code += ".primary_key()"
-        elif column["not_null"] and column["type"] not in ("serial", "bigserial", "smallserial"):
+        elif (
+            column["not_null"]
+            and identity is None
+            and column["type"] not in ("serial", "bigserial", "smallserial")
+        ):
             code += ".not_null()"
+        if identity is not None:
+            fn = "always" if identity["always"] else "by_default"
+            seq: list[str] = []
+            if identity["increment"] != 1:
+                seq.append(f"increment={identity['increment']}")
+            if identity["start"] != (1 if identity["increment"] > 0 else -1):
+                seq.append(f"start={identity['start']}")
+            code += f".generated_{fn}_as_identity({', '.join(seq)})"
+        if generated := column.get("generated"):
+            stored = "" if generated["stored"] else ", stored=False"
+            code += f".generated_always_as({_sql(generated['expression'])}{stored})"
         unique = table["uniques"].get(f"{tname}_{cname}_key")
         if unique is not None and unique["columns"] == [cname]:
             code += ".unique()"
@@ -310,14 +333,42 @@ class _SchemaWriter:
             )
         for c in table["checks"].values():
             items.append(f"check({c['name']!r}, {_sql(c['expression'])})")
-        for i in table["indexes"].values():
-            fn = "unique_index" if i["unique"] else "index"
-            keys = _sql(i["expression"]) if "expression" in i else cols(i["columns"])
-            code = f"{fn}({i['name']!r}).on({keys})"
-            if i["where"]:
-                code += f".where({_sql(i['where'])})"
-            items.append(code)
+        items += [_index_item(i, attrs) for i in table["indexes"].values()]
+        if rls := table.get("rls"):
+            args = [] if rls["enabled"] else ["enabled=False"]
+            items.append(f"rls({', '.join([*args, 'force=True'] if rls['force'] else args)})")
+        items += [_policy_item(p) for p in table.get("policies", {}).values()]
         return items
+
+    def view(self, k: str, cls: str) -> str:
+        view = self.snapshot.get("views", {})[k]
+        kw = f"name={view['name']!r}"
+        if view["schema"] != "public":
+            kw += f", schema={view['schema']!r}"
+        if view["materialized"]:
+            kw += ", materialized=True"
+        attrs = {c: _identifier(c) for c in view["columns"]}
+        lines = ["@final", f"class {cls}(View, {kw}):"]
+        for cname, column in view["columns"].items():
+            kwargs = f"name={cname!r}" if attrs[cname] != cname else ""
+            lines.append(f"    {attrs[cname]} = {self.factory(column['type'], kwargs)}")
+        lines += [
+            "",
+            "    @classmethod",
+            "    @override",
+            "    def query(cls, db: QueryBuilder):",
+            f"        return {_sql(view['definition'])}",
+        ]
+        if indexes := view.get("indexes"):
+            body = "".join(f"            {_index_item(i, attrs)},\n" for i in indexes.values())
+            lines += [
+                "",
+                "    @classmethod",
+                "    @override",
+                "    def config(cls) -> list[Constraint]:",
+                "        return [\n" + body + "        ]",
+            ]
+        return "\n".join(lines)
 
     def render(self) -> str:
         enums_code: list[str] = []
@@ -338,6 +389,36 @@ class _SchemaWriter:
             self.attrs[k] = {c: _identifier(c) for c in table["columns"]}
         self.add_relations()
 
+        objects_code: list[str] = []
+        function_vars: dict[str, str] = {}  # "schema.name" -> variable
+        for ext in self.snapshot.get("extensions", {}).values():
+            schema = ext.get("schema", "public")
+            extra = f", schema={schema!r}" if schema != "public" else ""
+            var = f"ext_{_identifier(ext['name'])}"
+            objects_code.append(f"{var} = extension({ext['name']!r}{extra})")
+        for k, fn in self.snapshot.get("functions", {}).items():
+            var = function_vars[k] = f"fn_{_identifier(fn['name'])}"
+            args = [repr(fn["name"]), f"returns={fn['returns']!r}", f"body={fn['body']!r}"]
+            if fn["language"] != "plpgsql":
+                args.append(f"language={fn['language']!r}")
+            if fn["args"]:
+                args.append(f"args={fn['args']!r}")
+            if fn["schema"] != "public":
+                args.append(f"schema={fn['schema']!r}")
+            if fn["volatility"] != "volatile":
+                args.append(f"volatility={fn['volatility']!r}")
+            if fn["security_definer"]:
+                args.append("security_definer=True")
+            objects_code.append(f"{var} = function(\n    " + ",\n    ".join(args) + ",\n)")
+        uses_objects = {
+            name
+            for name, used in (
+                ("extension", self.snapshot.get("extensions")),
+                ("function", self.snapshot.get("functions")),
+            )
+            if used
+        }
+
         tables_code: list[str] = []
         uses_config: set[str] = set()
         has_config = False
@@ -355,16 +436,18 @@ class _SchemaWriter:
                 lines += ["", *(f"    {r}" for r in relations)]
             items = self.config_items(table, attrs)
             if items:
-                for fn in (
+                for maker in (
                     "primary_key",
                     "unique",
                     "foreign_key",
                     "check",
                     "unique_index",
                     "index",
+                    "rls",
+                    "policy",
                 ):
-                    if any(i.startswith(f"{fn}(") for i in items):
-                        uses_config.add(fn)
+                    if any(i.startswith(f"{maker}(") for i in items):
+                        uses_config.add(maker)
                 body = "".join(
                     f"            {i}\n" if i.startswith("#") else f"            {i},\n"
                     for i in items
@@ -379,17 +462,60 @@ class _SchemaWriter:
                 ]
             tables_code.append("\n".join(lines))
 
+        taken = {*self.table_classes.values(), *self.enum_classes.values()}
+        for k, view in self.snapshot.get("views", {}).items():
+            cls = _class_name(view["name"])
+            if cls in taken:
+                cls = _class_name(f"{view['schema']}_{view['name']}_view")
+            taken.add(cls)
+            tables_code.append(self.view(k, cls))
+            for i in view.get("indexes", {}).values():
+                uses_config.add("unique_index" if i["unique"] else "index")
+                has_config = True
+
+        triggers_code: list[str] = []
+        for k, table in self.snapshot["tables"].items():
+            for t in table.get("triggers", {}).values():
+                var = f"trg_{_identifier(table['name'])}_{_identifier(t['name'])}"
+                if t["function"] not in function_vars:
+                    triggers_code.append(
+                        f"# trigger {t['name']!r} runs {t['function']!r}, which was not pulled"
+                    )
+                    continue
+                args = [
+                    repr(t["name"]),
+                    f"on={self.table_classes[k]}",
+                    f"execute={function_vars[t['function']]}",
+                    f"timing={t['timing']!r}",
+                    f"events={t['events']!r}",
+                ]
+                if t["for_each"] != "row":
+                    args.append(f"for_each={t['for_each']!r}")
+                if t["when"] is not None:
+                    args.append(f"when={_sql(t['when'])}")
+                uses_objects.add("trigger")
+                triggers_code.append(f"{var} = trigger(\n    " + ",\n    ".join(args) + ",\n)")
+
         header = ['"""Generated by `mizzle pull`. Review before committing."""', ""]
         if enums_code:
             header.append("import enum")
         typing_names: set[str] = {"final"}
+        views = bool(self.snapshot.get("views"))
         if self.uses_any:
             typing_names.add("Any")
-        if has_config:  # config() methods are marked @override
+        if has_config or views:  # config() and query() methods are marked @override
             typing_names.add("override")
         header.append(f"from typing import {', '.join(sorted(typing_names))}")
         header.append("")
-        mizzle_names: set[str] = {"Table", "sql", *uses_config, *self.uses_relations}
+        mizzle_names: set[str] = {
+            "Table",
+            "sql",
+            *uses_config,
+            *self.uses_relations,
+            *uses_objects,
+        }
+        if views:
+            mizzle_names |= {"View", "QueryBuilder"}
         if self.uses_column:
             mizzle_names.add("Column")
         if has_config:
@@ -397,7 +523,45 @@ class _SchemaWriter:
         header.append(f"from mizzle import {', '.join(sorted(mizzle_names))}")
         if self.pg_imports:
             header.append(f"from mizzle.pg import {', '.join(sorted(self.pg_imports))}")
-        return "\n".join(header) + "\n\n\n" + "\n\n\n".join([*enums_code, *tables_code]) + "\n"
+        blocks = [*enums_code, *objects_code, *tables_code, *triggers_code]
+        return "\n".join(header) + "\n\n\n" + "\n\n\n".join(blocks) + "\n"
+
+
+def _index_item(i: IndexSnap, attrs: dict[str, str]) -> str:
+    if "opclasses" in i and len(set(i["opclasses"])) > 1:
+        return f"# index {i['name']!r} mixes operator classes, not pulled"
+    fn = "unique_index" if i["unique"] else "index"
+    keys = (
+        _sql(i["expression"])
+        if "expression" in i
+        else ", ".join(f"cls.{attrs[n]}" for n in i["columns"])
+    )
+    code = f"{fn}({i['name']!r})"
+    opclass = i["opclasses"][0] if "opclasses" in i else None
+    if "method" in i or opclass:
+        method = i.get("method", "btree")
+        code += f".using({method!r}{f', {opclass!r}' if opclass else ''})"
+    code += f".on({keys})"
+    if storage := i.get("options"):
+        code += f".with_({', '.join(f'{k}={v!r}' for k, v in storage.items())})"
+    if i["where"]:
+        code += f".where({_sql(i['where'])})"
+    return code
+
+
+def _policy_item(p: PolicySnap) -> str:
+    args = [repr(p["name"])]
+    if p["command"] != "all":
+        args.append(f"for_={p['command']!r}")
+    if p["roles"] != ["public"]:
+        args.append(f"to={p['roles']!r}")
+    if p["using"] is not None:
+        args.append(f"using={_sql(p['using'])}")
+    if p["with_check"] is not None:
+        args.append(f"with_check={_sql(p['with_check'])}")
+    if not p["permissive"]:
+        args.append('as_="restrictive"')
+    return f"policy({', '.join(args)})"
 
 
 def render_schema_module(snapshot: Snapshot) -> str:
@@ -427,12 +591,17 @@ _PY_TYPES: dict[type[object], str] = {
 }
 
 
+_VECTOR = re.compile(r"(?:vector|halfvec)\(\d+\)")
+
+
 def _py_type(column: ColumnBase, imports: set[str]) -> str:
     if column.enum is not None:
         imports.add(f"from {column.enum.__module__} import {column.enum.__qualname__}")
         base = column.enum.__qualname__
         if column.sql_type.endswith("[]"):
             base = f"list[{base}]"
+    elif _VECTOR.fullmatch(column.sql_type):
+        base = "list[float]"
     elif column.accepts is None or list in column.accepts:
         base = "list[Any]" if column.accepts else "Any"
     else:
@@ -449,10 +618,14 @@ def render_types_module(tables: Sequence[type[Table]]) -> str:
     imports: set[str] = set()
     blocks: list[str] = []
     for table in tables:
+        if issubclass(table, View):  # read through queries, never written
+            continue
         columns = table.__table__.columns
         insert = [f"class {table.__name__}Insert(TypedDict):"]
         update = [f"class {table.__name__}Update(TypedDict, total=False):"]
         for attr, column in columns.items():
+            if column.read_only:  # generated columns: the database writes them
+                continue
             py = _py_type(column, imports)
             insert.append(
                 f"    {attr}: {py if column.required_on_insert else f'NotRequired[{py}]'}"

@@ -202,3 +202,23 @@ async def test_delete_returning(qb: QueryBuilder, runner: FakeRunner) -> None:
     assert q.to_sql()[0].endswith(f"RETURNING {USER_COLS}")
     runner.rows = [(1, "a", None, "admin", None)]
     assert [u.email for u in await q] == ["a"]
+
+
+async def test_prepared_update_runs_on_update_hook_each_time(runner: FakeRunner) -> None:
+    from itertools import count
+
+    from mizzle.core.sql.operators import placeholder
+
+    ticks = count(1)
+
+    class Edited(Table, name="edited"):
+        id = serial().primary_key()
+        body = text()
+        version = integer().on_update(lambda: next(ticks))
+
+    qb = QueryBuilder(runner)
+    query = qb.update(Edited).set(body="x").where(eq(Edited.id, placeholder("id"))).prepare()
+    await query.execute(id=1)
+    await query.execute(id=2)
+    # prepare() compiled once (tick 1); each execution ran the hook again (2, 3).
+    assert [q.params for q in runner.executed] == [("x", 2, 1), ("x", 3, 2)]

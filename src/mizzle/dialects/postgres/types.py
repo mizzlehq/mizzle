@@ -5,12 +5,15 @@ from __future__ import annotations
 import datetime as _dt
 import enum
 import ipaddress
+import struct
 import uuid as _uuid
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable, Sequence
 from typing import cast
 
+from mizzle.core.errors import QueryError
 from mizzle.core.naming import snake_case
 from mizzle.core.schema.column import Column
+from mizzle.core.sql.nodes import Expr, Node, Param, TypedOperation
 
 type IPAddress = (
     ipaddress.IPv4Address
@@ -79,6 +82,84 @@ class json[T](Column[T | None]):
 
     def __init__(self, name: str | None = None) -> None:
         super().__init__("json", None, name)
+
+
+def tsvector(name: str | None = None) -> Column[str | None]:
+    """Full-text search document, read and written as text (``'cat':1 'sat':2``).
+    Usually generated: ``tsvector().generated_always_as(sql("to_tsvector('english', body)"))``."""
+    return Column("tsvector", (str,), name)
+
+
+def tsquery(name: str | None = None) -> Column[str | None]:
+    """Full-text search query, read and written as text (``'cat' & 'sat'``)."""
+    return Column("tsquery", (str,), name)
+
+
+def _vector_text(values: object) -> object:
+    """``[1.0, 2.5]`` -> ``'[1,2.5]'``: pgvector's text form (asyncpg sends unknown types as
+    text, so no codec or extension is needed on the connection)."""
+    try:
+        items = [float(v) for v in cast(Iterable[float], values)]
+    except (TypeError, ValueError) as exc:
+        raise QueryError(f"vector values must be numbers; got {values!r}") from exc
+    return "[" + ",".join(repr(v).removesuffix(".0") for v in items) + "]"
+
+
+def _vector_list(width: str) -> Callable[[object], object]:
+    """Text -> floats. pgvector prints the shortest text that reads back as the same float4
+    (``width`` "f") or float2 ("e"); as a Python float, round it to that width again."""
+
+    def decode(text: object) -> object:
+        body = str(text)[1:-1]
+        values = [float(v) for v in body.split(",")] if body else []
+        packing = f"{len(values)}{width}"
+        return list(struct.unpack(packing, struct.pack(packing, *values)))
+
+    return decode
+
+
+_FLOAT4, _FLOAT2 = _vector_list("f"), _vector_list("e")
+
+
+def vector(dimensions: int, name: str | None = None) -> Column[list[float] | None]:
+    """A pgvector ``vector(n)`` (float4 values; needs the ``vector`` extension, which
+    migrations create). Write a list or tuple of floats (``array.tolist()`` for numpy)."""
+    return Column(
+        f"vector({dimensions})", (list, tuple), name, encoder=_vector_text, decoder=_FLOAT4
+    )
+
+
+def halfvec(dimensions: int, name: str | None = None) -> Column[list[float] | None]:
+    """A pgvector ``halfvec(n)``: like ``vector`` with half-precision (float2) values."""
+    return Column(
+        f"halfvec({dimensions})", (list, tuple), name, encoder=_vector_text, decoder=_FLOAT2
+    )
+
+
+type VectorOperand = Expr[list[float]] | Expr[list[float] | None] | Sequence[float]
+
+
+def _distance(left: VectorOperand, op: str, right: VectorOperand) -> Expr[float]:
+    def node(value: VectorOperand) -> Node:
+        return value if isinstance(value, Node) else Param(_vector_text(value))
+
+    return TypedOperation[float](node(left), op, node(right))
+
+
+def l2_distance(left: VectorOperand, right: VectorOperand) -> Expr[float]:
+    """Euclidean distance, pgvector's ``<->``. Order by it (ascending) for nearest first."""
+    return _distance(left, "<->", right)
+
+
+def cosine_distance(left: VectorOperand, right: VectorOperand) -> Expr[float]:
+    """1 - cosine similarity, pgvector's ``<=>``."""
+    return _distance(left, "<=>", right)
+
+
+def inner_product(left: VectorOperand, right: VectorOperand) -> Expr[float]:
+    """The NEGATIVE inner product, pgvector's ``<#>`` (so ascending order is most similar
+    first, and indexes apply). Negate it for the inner product itself."""
+    return _distance(left, "<#>", right)
 
 
 def array[T](item: Column[T], name: str | None = None) -> Column[list[T] | None]:
