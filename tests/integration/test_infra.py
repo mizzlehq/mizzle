@@ -11,7 +11,7 @@ from typing import final
 
 import pytest
 
-from mizzle import Database, QueryTimeout, Table, eq, many, one, placeholder, sql
+from mizzle import Database, DatabaseError, QueryTimeout, Table, eq, many, one, placeholder, sql
 from mizzle.pg import integer, serial, text
 
 
@@ -58,8 +58,12 @@ async def primary_url() -> AsyncGenerator[str]:
 
 async def wait_replicated(db: Database, body: str) -> None:
     for _ in range(100):
-        if await db.select().from_(Notes).where(eq(Notes.body, body)):
-            return
+        try:
+            if await db.select().from_(Notes).where(eq(Notes.body, body)):
+                return
+        except DatabaseError as exc:  # the fixture's CREATE TABLE has not replicated yet
+            if exc.sqlstate != "42P01":
+                raise
         await asyncio.sleep(0.05)
     raise AssertionError("row never reached the replica")
 
