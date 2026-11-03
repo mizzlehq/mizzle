@@ -48,7 +48,7 @@ build-backend = "hatchling.build"
 artifacts = ["src/mizzle/studio/ui.json"]
 
 [tool.hatch.build.targets.sdist]
-exclude = ["studio-ui", ".github", "docs", "docker-compose.yml"]
+exclude = ["studio-ui", ".github", "docs", "benchmarks", "docker-compose.yml"]
 
 [dependency-groups]
 dev = [
