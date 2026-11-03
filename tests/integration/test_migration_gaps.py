@@ -35,6 +35,7 @@ from mizzle.kit.diff import StrictRenames, diff
 from mizzle.kit.migrate import apply_statements
 from mizzle.kit.snapshot import build_snapshot
 from mizzle.pg import bigint, date, integer, pg_enum, smallint, text, timestamp
+from tests.integration.test_generated_columns import server_version
 
 dialect = PostgresDialect()
 SCHEMAS = ["mg", "mg2"]
@@ -434,8 +435,11 @@ async def test_generated_column_rebuilds(driver: PostgresDriver) -> None:
     assert any(s.data_loss for s in steps)  # the CLI asks for --allow-data-loss
     [row] = await execute(driver, "SELECT b FROM mg.calc")
     assert row["b"] == 6
-    await migrate(driver, stored, virtual)
-    await migrate(driver, virtual, plain)
+    if await server_version(driver) >= 180000:  # VIRTUAL is PostgreSQL 18+
+        await migrate(driver, stored, virtual)
+        await migrate(driver, virtual, plain)
+    else:
+        await migrate(driver, stored, plain)
 
 
 def keyed(kind: str) -> list[type[Table]]:

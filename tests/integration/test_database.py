@@ -213,7 +213,8 @@ async def test_other_violations(db: Database) -> None:
 
 
 async def test_restrict_foreign_key_is_a_foreign_key_violation(db: Database) -> None:
-    # RESTRICT reports SQLSTATE 23001, not 23503: both are ForeignKeyViolation.
+    # PostgreSQL 18 reports RESTRICT as SQLSTATE 23001, older ones as 23503: both are
+    # ForeignKeyViolation.
     with pytest.raises(ForeignKeyViolation) as info:
         async with db.transaction() as tx:  # rolled back by the error
             await tx.execute(sql("create table fk_parent (id int primary key)"))
@@ -223,7 +224,7 @@ async def test_restrict_foreign_key_is_a_foreign_key_violation(db: Database) -> 
             await tx.execute(sql("insert into fk_parent values (1)"))
             await tx.execute(sql("insert into fk_child values (1)"))
             await tx.execute(sql("delete from fk_parent"))
-    assert info.value.sqlstate == "23001"
+    assert info.value.sqlstate in ("23001", "23503")
 
 
 async def test_logger_hides_params_by_default(pg_url: str, driver: object) -> None:

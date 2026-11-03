@@ -2,6 +2,7 @@
 introspected without drift, evolved, pulled and dropped."""
 
 import importlib.util
+import re
 import sys
 import uuid
 from collections.abc import AsyncGenerator
@@ -233,7 +234,8 @@ async def test_create_query_evolve_and_drop(driver: PostgresDriver, pg_url: str)
     live, expected = await live_and_expected(driver, v1())
     assert_no_drift(live, expected)
     # The database's own text of the view query, policies and trigger condition.
-    assert live.get("views", {})["so_app.so_active"]["definition"].startswith("SELECT id,")
+    view = live.get("views", {})["so_app.so_active"]["definition"]
+    assert re.match(r"SELECT (so_accounts\.)?id,", view), view  # 14-15 qualify columns
     policies = live["tables"]["public.so_accounts"].get("policies", {})
     assert policies["own"]["using"] == "(owner = CURRENT_USER)"
     trig = live["tables"]["public.so_accounts"].get("triggers", {})["so_touch"]
@@ -348,5 +350,6 @@ async def test_normalize_twice_on_one_connection(driver: PostgresDriver) -> None
             got = out.get("functions", {})[f"public.so_calc({args})"]
             assert (got["args"], got["returns"]) == (args, returns)
             definition = out.get("views", {})["so_app.so_active"]["definition"]
-            assert definition.startswith("SELECT id,"), definition  # the server's text
+            # The server's text (14-15 qualify columns).
+            assert re.match(r"SELECT (so_accounts\.)?id,", definition), definition
             assert ("owner" in definition) == (tables[1] is Active2), definition

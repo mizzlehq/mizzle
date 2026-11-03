@@ -17,3 +17,7 @@ src/mizzle/studio/ui.json
 
 # Local AI-assistant working notes (design specs, plans)
 docs/superpowers/
+
+# scripts/ci-local.sh
+.ci-local/
+.venv-ci-*/
