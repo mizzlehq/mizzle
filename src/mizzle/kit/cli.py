@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import importlib
 import sys
 from collections.abc import Awaitable, Callable, Sequence
@@ -18,7 +19,7 @@ from mizzle.kit.codegen import render_schema_module, render_types_module
 from mizzle.kit.config import Config, load_config
 from mizzle.kit.diff import RenameKind, RenameResolver, StrictRenames, diff, no_renames
 from mizzle.kit.init import init_project
-from mizzle.kit.journal import MigrationsDir
+from mizzle.kit.journal import MigrationsDir, format_sql
 from mizzle.kit.migrate import apply_statements, run_migrations
 from mizzle.kit.snapshot import build_snapshot
 
@@ -64,8 +65,10 @@ def _ask_renames(
         if not left:
             break
         options = ", ".join(left)
+        what = "a move" if scope == "*" else "a rename"  # "*": names are "schema.table"
         answer = input(
-            f"{kind} {scope}.{new} is new. Is it a rename of one of: {options}? "
+            f"{kind} {new if scope == '*' else f'{scope}.{new}'} is new. Is it {what} of one "
+            f"of: {options}? "
             "Type the old name, or press enter to create it: "
         ).strip()
         if answer:
@@ -139,8 +142,7 @@ def cmd_generate(config: Config, args: Args) -> int:
         tables, dialect, config.casing, prev_id=prev_id, objects=config.load_objects()
     )
     if args.custom:
-        header = "-- Custom migration. Separate statements with: -- mizzle:breakpoint\n"
-        migration = directory.write(args.name or "custom", [], current, header)
+        migration = directory.write(args.name or "custom", [], current, CUSTOM_HEADER)
         print(f"Created {migration.sql_path}")
         return 0
     steps = diff(previous, current, _resolver(args, dialect))
@@ -239,6 +241,10 @@ def cmd_pull(config: Config, args: Args) -> int:
     return 0
 
 
+CUSTOM_HEADER = "-- Custom migration. Separate statements with: -- mizzle:breakpoint\n"
+_CUSTOM_HASH = hashlib.sha256(format_sql([], CUSTOM_HEADER).encode()).hexdigest()
+
+
 def cmd_check(config: Config, _args: Args) -> int:
     directory = MigrationsDir(config.out, config.dialect_name)
     problems: list[str] = []
@@ -250,7 +256,8 @@ def cmd_check(config: Config, _args: Args) -> int:
         if not migration.sql_path.exists() or not migration.snapshot_path.exists():
             problems.append(f"{migration.name}: migration.sql or snapshot.json is missing")
             continue
-        if migration.hash() != entry["hash"]:
+        if migration.hash() != entry["hash"] and entry["hash"] != _CUSTOM_HASH:
+            # A --custom migration is meant to be written after generate.
             warnings.append(f"{migration.name}: migration.sql was edited after generate")
         snapshot = migration.snapshot()
         if snapshot["prev_id"] != prev_id:

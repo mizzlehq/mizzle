@@ -17,7 +17,7 @@ import pytest
 from hypothesis import HealthCheck, given, settings
 from hypothesis import strategies as st
 
-from mizzle import Constraint, Database, Table, eq, index, many, one
+from mizzle import Constraint, Database, QueryError, Table, eq, index, many, ne, one
 from mizzle.core.snapshot import Snapshot, empty_snapshot
 from mizzle.dialects.postgres import PostgresDialect
 from mizzle.kit.codegen import render_schema_module
@@ -29,6 +29,7 @@ from mizzle.pg import (
     inner_product,
     integer,
     l2_distance,
+    sparsevec,
     text,
     vector,
 )
@@ -50,6 +51,7 @@ class Items(Table, name="items", schema=SCHEMA):
     label = text()
     embedding = vector(3)
     half = halfvec(2)
+    sparse = sparsevec(5)
     shelf = one(lambda: Shelves, fields=lambda: [Items.shelf_id], references=lambda: [Shelves.id])
 
     @classmethod
@@ -62,6 +64,7 @@ class Items(Table, name="items", schema=SCHEMA):
             .with_(m=16, ef_construction=64),
             index("items_embedding_ivf").using("ivfflat").on(cls.embedding).with_(lists=1),
             index("items_half_hnsw").using("hnsw", "halfvec_l2_ops").on(cls.half),
+            index("items_sparse_hnsw").using("hnsw", "sparsevec_l2_ops").on(cls.sparse),
         ]
 
 
@@ -115,6 +118,7 @@ def test_no_drift_and_pull_round_trip(
 
     source = render_schema_module(live)
     assert "embedding = vector(3)" in source and "half = halfvec(2)" in source
+    assert "sparse = sparsevec(5)" in source
     path = tmp_path / "pulled_vec.py"
     path.write_text(source)
     spec = importlib.util.spec_from_file_location("pulled_vec", path)
@@ -175,27 +179,93 @@ finite2 = st.floats(width=16, allow_nan=False, allow_infinity=False)
 @given(
     embedding=st.none() | st.lists(finite4, min_size=3, max_size=3),
     halves=st.none() | st.lists(finite2, min_size=2, max_size=2),
+    sparse=st.none() | st.dictionaries(st.integers(0, 4), finite4.filter(bool), max_size=5),
 )
 def test_vectors_round_trip(
     runner: tuple[asyncio.Runner, Database],
     embedding: list[float] | None,
     halves: list[float] | None,
+    sparse: dict[int, float] | None,
 ) -> None:
     loop, db = runner
 
     async def scenario() -> None:
         [shelf] = await db.insert(Shelves).values({}).returning()
         [row] = await (
-            db.insert(Items).values(shelf_id=shelf.id, embedding=embedding, half=halves).returning()
+            db.insert(Items)
+            .values(shelf_id=shelf.id, embedding=embedding, half=halves, sparse=sparse)
+            .returning()
         )
         assert row.embedding == embedding  # float4 values come back exactly
         assert row.half == halves
+        assert row.sparse == sparse
         [selected] = await db.select().from_(Items).where(eq(Items.id, row.id))
         [loaded] = await db.query(Shelves).find_many(
             where=eq(Shelves.id, shelf.id), with_={"items": True}
         )
         assert loaded.items == [selected] == [row]  # also through nested JSON
         await db.delete(Items).where(eq(Items.id, row.id))
+        await db.delete(Shelves).where(eq(Shelves.id, shelf.id))
+
+    loop.run(scenario())
+
+
+@final
+class FakeArray:
+    """Like a numpy array: only ``tolist()`` matters."""
+
+    def __init__(self, values: list[float]) -> None:
+        self.values = values
+
+    def tolist(self) -> list[float]:
+        return self.values
+
+
+def test_sparse_vectors_and_array_values(runner: tuple[asyncio.Runner, Database]) -> None:
+    loop, db = runner
+
+    async def scenario() -> None:
+        [shelf] = await db.insert(Shelves).values({}).returning()
+        points = {
+            "x": ([1.0, 0.0, 0.0], {0: 1.0}),
+            "y": ([0.0, 1.0, 0.0], {1: 1.0}),
+            "xy": ([1.0, 1.0, 0.0], {0: 1.0, 1: 1.0, 4: 0.0}),  # zeros are not stored
+        }
+        await db.insert_many(
+            Items,
+            [
+                {"shelf_id": shelf.id, "label": k, "embedding": FakeArray(v), "sparse": s}
+                for k, (v, s) in points.items()
+            ],
+        )
+        await db.insert(Items).values(shelf_id=shelf.id, label="h", half=FakeArray([0.5, 1.5]))
+        [h] = await db.select().from_(Items).where(eq(Items.label, "h"))
+        assert h.half == [0.5, 1.5]
+        near = (
+            await db.select()
+            .from_(Items)
+            .order_by(l2_distance(Items.embedding, FakeArray([0.9, 0.1, 0])))
+        )
+        assert [i.label for i in near][:3] == ["x", "xy", "y"]
+        for distance in (l2_distance, cosine_distance, inner_product):
+            [best] = await (
+                db.select()
+                .from_(Items)
+                .where(ne(Items.label, "h"))
+                .order_by(distance(Items.sparse, {0: 0.9, 1: 0.1}))
+                .limit(1)
+            )
+            assert best.label == ("xy" if distance is inner_product else "x")
+        [loaded] = await db.query(Shelves).find_many(
+            where=eq(Shelves.id, shelf.id), with_={"items": True}
+        )
+        sparse = {i.label: i.sparse for i in loaded.items}
+        assert sparse == {"x": {0: 1.0}, "y": {1: 1.0}, "xy": {0: 1.0, 1: 1.0}, "h": None}
+        with pytest.raises(QueryError, match="indices"):
+            await db.insert(Items).values(shelf_id=shelf.id, sparse={5: 1.0})
+        with pytest.raises(QueryError, match="sparsevec column"):
+            l2_distance({0: 1.0}, {1: 1.0})
+        await db.delete(Items).where(eq(Items.shelf_id, shelf.id))
         await db.delete(Shelves).where(eq(Shelves.id, shelf.id))
 
     loop.run(scenario())

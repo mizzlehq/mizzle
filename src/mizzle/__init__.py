@@ -6,6 +6,7 @@ from mizzle.core.errors import (
     DatabaseError,
     DataLossBlocked,
     ForeignKeyViolation,
+    ListenerOverflow,
     MigrationError,
     MigrationLockTimeout,
     MigrationTampered,
@@ -25,6 +26,7 @@ from mizzle.core.schema.constraints import (
     Constraint,
     check,
     foreign_key,
+    grant,
     index,
     policy,
     primary_key,
@@ -74,9 +76,11 @@ from mizzle.core.sql.functions import (
     to_tsvector,
     trim,
     ts_rank,
+    ts_rank_cd,
     upper,
     websearch_to_tsquery,
 )
+from mizzle.core.sql.nodes import Condition, Expr
 from mizzle.core.sql.operators import (
     and_,
     asc,
@@ -105,27 +109,32 @@ from mizzle.core.sql.operators import (
     not_in,
     not_like,
     not_regex,
+    not_similar_to,
     nullable,
     or_,
     placeholder,
     regex,
+    similar_to,
     sum_,
 )
 from mizzle.core.sql.raw import sql
 from mizzle.db import Database, QueryEvent, Session
-from mizzle.dialects.base import Notification
+from mizzle.dialects.base import Notification, Reconnected
 
 __version__ = "0.2.0"
 
 __all__ = [
     "CheckViolation",
     "Column",
+    "Condition",
     "ConnectionError",
     "Constraint",
     "DataLossBlocked",
     "Database",
     "DatabaseError",
+    "Expr",
     "ForeignKeyViolation",
+    "ListenerOverflow",
     "MigrationError",
     "MigrationLockTimeout",
     "MigrationTampered",
@@ -136,6 +145,7 @@ __all__ = [
     "QueryError",
     "QueryEvent",
     "QueryTimeout",
+    "Reconnected",
     "RelationNotLoaded",
     "SchemaError",
     "SerializationFailure",
@@ -169,6 +179,7 @@ __all__ = [
     "foreign_key",
     "func",
     "function",
+    "grant",
     "greatest",
     "gt",
     "gte",
@@ -197,6 +208,7 @@ __all__ = [
     "not_in",
     "not_like",
     "not_regex",
+    "not_similar_to",
     "now",
     "nth_value",
     "ntile",
@@ -218,6 +230,7 @@ __all__ = [
     "round_",
     "row_number",
     "rows_between",
+    "similar_to",
     "sql",
     "sum_",
     "to_tsquery",
@@ -225,6 +238,7 @@ __all__ = [
     "trigger",
     "trim",
     "ts_rank",
+    "ts_rank_cd",
     "unique",
     "unique_index",
     "upper",

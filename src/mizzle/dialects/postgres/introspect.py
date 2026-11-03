@@ -23,16 +23,22 @@ from mizzle.core.snapshot import (
     TableSnap,
     TriggerSnap,
     ViewSnap,
+    default_cost,
     empty_snapshot,
+    function_key,
     key,
+    sequence_defaults,
 )
 from mizzle.dialects.base import Connection
 from mizzle.dialects.postgres.ddl import (
     DEFAULT_SCHEMA,
     SERIAL_TYPES,
+    create_index,
+    function_options,
     normalize_default,
     qualified,
     quote,
+    sql_standard_body,
     type_ident,
 )
 
@@ -55,7 +61,9 @@ SELECT a.attrelid AS table_oid, a.attname AS name,
        format_type(a.atttypid, a.atttypmod) AS type, a.attnotnull AS not_null,
        pg_get_expr(d.adbin, d.adrelid) AS default,
        a.attidentity::text AS identity, a.attgenerated::text AS generated,
-       s.seqstart AS identity_start, s.seqincrement AS identity_increment
+       s.seqstart AS identity_start, s.seqincrement AS identity_increment,
+       s.seqmin AS identity_min, s.seqmax AS identity_max, s.seqcache AS identity_cache,
+       s.seqcycle AS identity_cycle
 FROM pg_attribute a
 LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum
 -- An identity column's sequence depends on it internally (deptype 'i').
@@ -134,10 +142,16 @@ WHERE c.relkind IN ('v', 'm') AND n.nspname = ANY($1::text[])
 ORDER BY n.nspname, c.relname
 """
 
+_FUNCTION_COLUMNS = """
+pg_get_function_arguments(p.oid) AS args, pg_get_function_result(p.oid) AS returns,
+l.lanname AS language, p.prosrc AS body, p.provolatile::text AS volatility,
+p.prosecdef AS security_definer, p.proisstrict AS strict, p.proleakproof AS leakproof,
+p.proparallel::text AS parallel, p.procost AS cost, coalesce(p.proconfig, '{}') AS config,
+CASE WHEN p.prosqlbody IS NOT NULL THEN pg_get_functiondef(p.oid) END AS definition
+"""
+
 _FUNCTIONS = f"""
-SELECT n.nspname AS schema, p.proname AS name, pg_get_function_arguments(p.oid) AS args,
-       pg_get_function_result(p.oid) AS returns, l.lanname AS language, p.prosrc AS body,
-       p.provolatile::text AS volatility, p.prosecdef AS security_definer
+SELECT n.nspname AS schema, p.proname AS name, {_FUNCTION_COLUMNS}
 FROM pg_proc p
 JOIN pg_namespace n ON n.oid = p.pronamespace
 JOIN pg_language l ON l.oid = p.prolang
@@ -149,7 +163,11 @@ ORDER BY n.nspname, p.proname, p.oid
 _TRIGGERS = """
 SELECT t.tgrelid AS table_oid, t.tgname AS name, t.tgtype AS type,
        fn.nspname AS function_schema, f.proname AS function_name,
-       pg_get_triggerdef(t.oid) AS definition
+       pg_get_triggerdef(t.oid) AS definition,
+       ARRAY(SELECT a.attname FROM unnest(t.tgattr::int2[]) AS k(n)
+             JOIN pg_attribute a ON a.attrelid = t.tgrelid AND a.attnum = k.n
+             ORDER BY 1) AS columns,
+       t.tgoldtable AS old_table, t.tgnewtable AS new_table
 FROM pg_trigger t
 JOIN pg_proc f ON f.oid = t.tgfoid
 JOIN pg_namespace fn ON fn.oid = f.pronamespace
@@ -169,6 +187,16 @@ WHERE p.polrelid = ANY($1::oid[])
 ORDER BY p.polrelid, p.polname
 """
 
+# Privileges granted on tables and views, except the owner's own.
+_GRANTS = """
+SELECT c.oid, CASE WHEN a.grantee = 0 THEN 'public' ELSE pg_get_userbyid(a.grantee) END AS role,
+       array_agg(DISTINCT lower(a.privilege_type)) AS privileges
+FROM pg_class c, aclexplode(c.relacl) AS a
+WHERE c.oid = ANY($1::oid[]) AND a.grantee <> c.relowner
+GROUP BY c.oid, a.grantee
+ORDER BY c.oid, 2
+"""
+
 _ROLES = """
 SELECT rolname AS name, rolcanlogin AS login, rolcreatedb AS create_db,
        rolcreaterole AS create_role, rolinherit AS inherit
@@ -183,6 +211,9 @@ ORDER BY e.extname
 
 _COMMANDS = {"*": "all", "r": "select", "a": "insert", "w": "update", "d": "delete"}
 _VOLATILITY = {"v": "volatile", "s": "stable", "i": "immutable"}
+_PARALLEL = {"s": "safe", "r": "restricted", "u": "unsafe"}
+# Settings whose value is a list of names (printed as SQL as is); others are quoted.
+_LIST_SETTINGS = {"search_path", "temp_tablespaces", "session_preload_libraries"}
 # pg_trigger.tgtype bits
 _ROW, _BEFORE, _INSTEAD = 1, 2, 64
 _EVENTS = (("insert", 4), ("delete", 8), ("update", 16), ("truncate", 32))
@@ -225,11 +256,19 @@ def _column(row: _Row) -> ColumnSnap:
         default=normalize_default(default),
     )
     if row["identity"] in ("a", "d"):
-        column["identity"] = IdentitySnap(
-            always=row["identity"] == "a",
-            start=_int(row["identity_start"]),
-            increment=_int(row["identity_increment"]),
+        increment = _int(row["identity_increment"])
+        identity = column["identity"] = IdentitySnap(
+            always=row["identity"] == "a", start=_int(row["identity_start"]), increment=increment
         )
+        low, high = sequence_defaults(sql_type, increment)
+        if (low_value := _int(row["identity_min"])) != low:
+            identity["min_value"] = low_value
+        if (high_value := _int(row["identity_max"])) != high:
+            identity["max_value"] = high_value
+        if (cache := _int(row["identity_cache"])) != 1:
+            identity["cache"] = cache
+        if row["identity_cycle"]:
+            identity["cycle"] = True
     return column
 
 
@@ -250,7 +289,7 @@ def _trigger_when(definition: str) -> str | None:
 def _trigger(row: _Row) -> TriggerSnap:
     tgtype = _int(row["type"])
     timing = "instead of" if tgtype & _INSTEAD else "before" if tgtype & _BEFORE else "after"
-    return TriggerSnap(
+    trigger = TriggerSnap(
         name=str(row["name"]),
         timing=timing,
         events=[name for name, bit in _EVENTS if tgtype & bit],
@@ -258,6 +297,56 @@ def _trigger(row: _Row) -> TriggerSnap:
         function=key(str(row["function_schema"]), str(row["function_name"])),
         when=_trigger_when(str(row["definition"])),
     )
+    if columns := _strs(row["columns"]):
+        trigger["columns"] = columns
+    if row["old_table"] is not None:
+        trigger["old_table"] = str(row["old_table"])
+    if row["new_table"] is not None:
+        trigger["new_table"] = str(row["new_table"])
+    return trigger
+
+
+def _function(schema: str, name: str, row: _Row) -> FunctionSnap:
+    language = str(row["language"])
+    definition = _opt_str(row["definition"])
+    fn = FunctionSnap(
+        schema=schema,
+        name=name,
+        args=str(row["args"]),
+        returns=str(row["returns"]),
+        language=language,
+        body=str(row["body"]) if definition is None else _sql_body(definition),
+        volatility=_VOLATILITY[str(row["volatility"])],
+        security_definer=bool(row["security_definer"]),
+    )
+    if row["strict"]:
+        fn["strict"] = True
+    if row["leakproof"]:
+        fn["leakproof"] = True
+    if (parallel := _PARALLEL[str(row["parallel"])]) != "unsafe":
+        fn["parallel"] = parallel
+    cost = row["cost"]
+    if isinstance(cost, int | float) and float(cost) != default_cost(language):
+        fn["cost"] = float(cost)
+    if config := _strs(row["config"]):
+        fn["settings"] = dict(_setting(c) for c in config)
+    return fn
+
+
+def _setting(config: str) -> tuple[str, str]:
+    """An entry of pg_proc.proconfig ("work_mem=64MB") as name and SQL value."""
+    name, _, value = config.partition("=")
+    if name in _LIST_SETTINGS:
+        return name, "''" if value == '""' else value
+    return name, "'" + value.replace("'", "''") + "'"
+
+
+def _sql_body(definition: str) -> str:
+    """A SQL-standard body (RETURN ... / BEGIN ATOMIC ... END) from pg_get_functiondef: the
+    lines after the header, whose option lines start with a space."""
+    lines = definition.rstrip().split("\n")
+    start = next((i for i, line in enumerate(lines) if i and not line.startswith(" ")), len(lines))
+    return "\n".join(lines[start:])
 
 
 def _index(row: _Row) -> IndexSnap:
@@ -364,12 +453,18 @@ async def introspect(
         trigger = _trigger(row)
         by_oid[_int(row["table_oid"])].setdefault("triggers", {})[trigger["name"]] = trigger
 
+    for row in await conn.fetch_dicts(_GRANTS, [oids]):
+        by_oid[_int(row["oid"])].setdefault("grants", {})[str(row["role"])] = sorted(
+            _strs(row["privileges"])
+        )
+
     await _introspect_objects(conn, schema_list, snapshot, roles)
 
     for row in await conn.fetch_dicts(_ENUMS, [schema_list]):
         schema, name = str(row["schema"]), str(row["name"])
         enum = EnumSnap(schema=schema, name=name, values=_strs(row["values"]))
         snapshot["enums"][key(schema, name)] = enum
+        _add_schema(snapshot, schema)
     return snapshot
 
 
@@ -402,23 +497,18 @@ async def _introspect_objects(
         for row in await conn.fetch_dicts(_INDEXES, [list(views)]):
             index = _index(row)
             views[_int(row["table_oid"])].setdefault("indexes", {})[index["name"]] = index
+        for row in await conn.fetch_dicts(_TRIGGERS, [list(views)]):
+            trigger = _trigger(row)
+            views[_int(row["table_oid"])].setdefault("triggers", {})[trigger["name"]] = trigger
+        for row in await conn.fetch_dicts(_GRANTS, [list(views)]):
+            views[_int(row["oid"])].setdefault("grants", {})[str(row["role"])] = sorted(
+                _strs(row["privileges"])
+            )
 
     for row in await conn.fetch_dicts(_FUNCTIONS, [schemas]):
         schema, name = str(row["schema"]), str(row["name"])
-        # ponytail: one function per name; overloads after the first are not managed
-        snapshot.setdefault("functions", {}).setdefault(
-            key(schema, name),
-            FunctionSnap(
-                schema=schema,
-                name=name,
-                args=str(row["args"]),
-                returns=str(row["returns"]),
-                language=str(row["language"]),
-                body=str(row["body"]),
-                volatility=_VOLATILITY[str(row["volatility"])],
-                security_definer=bool(row["security_definer"]),
-            ),
-        )
+        fn = _function(schema, name, row)
+        snapshot.setdefault("functions", {})[function_key(fn)] = fn
         _add_schema(snapshot, schema)
 
     # Only the named roles: the others belong to the server (and other databases), and a
@@ -437,6 +527,58 @@ async def _introspect_objects(
         ext = ExtensionSnap(name=str(row["name"]), schema=str(row["schema"]))
         ext["version"] = str(row["version"])
         snapshot.setdefault("extensions", {})[ext["name"]] = ext
+
+
+async def _normalize_indexes(snapshot: Snapshot, read_back: _ReadBack) -> None:
+    """Operator classes (naming the default one is the same as naming none) and expression
+    keys as the database prints them, from the index made on a temporary table."""
+    rel = f"to_regclass('pg_temp.{quote(_NORM)}')"
+    query = _INDEXES.replace("ANY($1::oid[])", f"ANY(ARRAY[{rel}::oid])")
+    for table in snapshot["tables"].values():
+        columns = ", ".join(
+            f"{quote(c['name'])} {SERIAL_TYPES.get(c['type'], c['type'])}"
+            for c in table["columns"].values()
+        )
+        for index in table["indexes"].values():
+            if "opclasses" not in index and "expression" not in index:
+                continue
+            temp_index = copy.copy(index)
+            temp_index["name"] = f"{_NORM}_index"  # not the table's name
+            row = await read_back(
+                [
+                    f"CREATE TEMP TABLE {quote(_NORM)} ({columns})",
+                    create_index("pg_temp", _NORM, temp_index),
+                ],
+                query,
+            )
+            if row is None:
+                continue
+            printed = _index(row)
+            index.pop("opclasses", None)
+            if "opclasses" in printed:
+                index["opclasses"] = printed["opclasses"]
+            if "expression" in printed:
+                index["expression"] = printed["expression"]
+
+
+async def _normalize_grants(snapshot: Snapshot, read_back: _ReadBack) -> None:
+    """``all`` as the privileges it stands for on this server."""
+    relations = [*snapshot["tables"].values(), *snapshot.get("views", {}).values()]
+    if not any("all" in p for r in relations for p in r.get("grants", {}).values()):
+        return
+    temp = f"pg_temp.{quote(_NORM)}"
+    row = await read_back(
+        [f"CREATE TEMP TABLE {quote(_NORM)} ()", f"GRANT ALL ON {temp} TO PUBLIC"],
+        "SELECT array_agg(DISTINCT lower(privilege_type)) AS p FROM aclexplode("
+        f"(SELECT relacl FROM pg_class WHERE oid = to_regclass('{temp}'))) WHERE grantee = 0",
+    )
+    if row is None:
+        return
+    every = sorted(_strs(row["p"]))
+    for relation in relations:
+        for role, privileges in relation.get("grants", {}).items():
+            if "all" in privileges:
+                relation.setdefault("grants", {})[role] = every
 
 
 class _ReadBack(Protocol):
@@ -502,18 +644,36 @@ async def _normalize(snapshot: Snapshot, read_back: _ReadBack) -> None:
                 f"return (it returns {_strs(row['columns'])})"
             )
 
-    for fn in snapshot.get("functions", {}).values():
+    functions = snapshot.get("functions", {})
+    for fn in functions.values():
+        # Settings are printed back; a SQL-standard body is parsed, so it needs the real one.
+        plain = copy.copy(fn)
+        plain.pop("leakproof", None)  # LEAKPROOF needs a superuser
+        options = function_options(plain)
+        body = f"\n{fn['body']}" if sql_standard_body(fn) else " AS $$ $$"
         create = (
             f"CREATE FUNCTION {norm}({fn['args']}) RETURNS {fn['returns']} "
-            f"LANGUAGE {type_ident(fn['language'])} AS $$ $$"
+            f"LANGUAGE {type_ident(fn['language'])}{options}{body}"
         )
         row = await read_back(
             [create],
-            f"SELECT pg_get_function_arguments({proc}) AS args, "
-            f"pg_get_function_result({proc}) AS returns",
+            f"SELECT n.nspname AS schema, p.proname AS name, {_FUNCTION_COLUMNS} "
+            "FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace "
+            f"JOIN pg_language l ON l.oid = p.prolang WHERE p.oid = {proc}",
         )
-        if row is not None and row["returns"] is not None:
-            fn["args"], fn["returns"] = str(row["args"]), str(row["returns"])
+        if row is None:
+            continue
+        printed = _function(fn["schema"], fn["name"], row)
+        fn["args"], fn["returns"] = printed["args"], printed["returns"]
+        if "settings" in printed:
+            fn["settings"] = printed["settings"]
+        if row["definition"] is not None:
+            fn["body"] = printed["body"]
+    if functions:  # keyed by the arguments as printed
+        snapshot["functions"] = {function_key(f): f for f in functions.values()}
+
+    await _normalize_indexes(snapshot, read_back)
+    await _normalize_grants(snapshot, read_back)
 
     for table in snapshot["tables"].values():
         like = (

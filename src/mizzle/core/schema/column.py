@@ -42,6 +42,10 @@ class Identity:
     always: bool
     start: int | None = None
     increment: int | None = None
+    min_value: int | None = None
+    max_value: int | None = None
+    cache: int | None = None
+    cycle: bool = False
 
 
 @dataclass(frozen=True)
@@ -70,6 +74,7 @@ class ColumnBase(ExprBase):
     attr: str
     table: type[Table] | None
     enum: type[enum.Enum] | None
+    enum_schema: str | None  # the enum type's schema; None: the default one
     item: ColumnBase | None
     is_primary_key: bool
     is_unique: bool
@@ -104,6 +109,7 @@ class ColumnBase(ExprBase):
         self.attr = ""
         self.table = None
         self.enum = None
+        self.enum_schema = None
         self.item = None  # element column of an array
         self.is_primary_key = False
         self.is_unique = False
@@ -290,32 +296,75 @@ class Column[T](ColumnBase, Expr[T]):
 
     @overload
     def generated_always_as_identity[U](
-        self: Column[U | None], *, start: int | None = None, increment: int | None = None
+        self: Column[U | None],
+        *,
+        start: int | None = None,
+        increment: int | None = None,
+        min_value: int | None = None,
+        max_value: int | None = None,
+        cache: int | None = None,
+        cycle: bool = False,
     ) -> Column[U]: ...
     @overload
     def generated_always_as_identity(
-        self, *, start: int | None = None, increment: int | None = None
+        self,
+        *,
+        start: int | None = None,
+        increment: int | None = None,
+        min_value: int | None = None,
+        max_value: int | None = None,
+        cache: int | None = None,
+        cycle: bool = False,
     ) -> Self: ...
     def generated_always_as_identity(
-        self, *, start: int | None = None, increment: int | None = None
+        self,
+        *,
+        start: int | None = None,
+        increment: int | None = None,
+        min_value: int | None = None,
+        max_value: int | None = None,
+        cache: int | None = None,
+        cycle: bool = False,
     ) -> ColumnBase:
-        """An identity column the database always assigns; inserts cannot set it."""
-        self._set(identity=Identity(True, start, increment))
+        """An identity column the database always assigns; inserts cannot set it. The
+        options are the sequence's (None: the database's default)."""
+        self._set(identity=Identity(True, start, increment, min_value, max_value, cache, cycle))
         return self
 
     @overload
     def generated_by_default_as_identity[U](
-        self: Column[U | None], *, start: int | None = None, increment: int | None = None
+        self: Column[U | None],
+        *,
+        start: int | None = None,
+        increment: int | None = None,
+        min_value: int | None = None,
+        max_value: int | None = None,
+        cache: int | None = None,
+        cycle: bool = False,
     ) -> Column[U]: ...
     @overload
     def generated_by_default_as_identity(
-        self, *, start: int | None = None, increment: int | None = None
+        self,
+        *,
+        start: int | None = None,
+        increment: int | None = None,
+        min_value: int | None = None,
+        max_value: int | None = None,
+        cache: int | None = None,
+        cycle: bool = False,
     ) -> Self: ...
     def generated_by_default_as_identity(
-        self, *, start: int | None = None, increment: int | None = None
+        self,
+        *,
+        start: int | None = None,
+        increment: int | None = None,
+        min_value: int | None = None,
+        max_value: int | None = None,
+        cache: int | None = None,
+        cycle: bool = False,
     ) -> ColumnBase:
         """An identity column the database assigns unless an insert gives a value."""
-        self._set(identity=Identity(False, start, increment))
+        self._set(identity=Identity(False, start, increment, min_value, max_value, cache, cycle))
         return self
 
     def generated_always_as(self, expression: ExprBase, *, stored: bool = True) -> Self:

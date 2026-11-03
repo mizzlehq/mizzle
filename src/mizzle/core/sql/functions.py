@@ -22,6 +22,7 @@ from mizzle.core.sql.nodes import (
     BinaryOp,
     Cast,
     Condition,
+    CteColumn,
     Expr,
     ExprBase,
     Fragment,
@@ -29,6 +30,7 @@ from mizzle.core.sql.nodes import (
     Func,
     Node,
     Nullable,
+    Operation,
     OrderBy,
     Over,
     Param,
@@ -75,10 +77,42 @@ def column_of(node: object) -> ColumnBase | None:
             return _first_column(node.args)
         case Over():
             return column_of(node.func)
+        case CteColumn():
+            return node.cte.source_column(node.name)
         case CaseBase():
             return _first_column((*(v for _, v in node.whens), node.default))
         case _:
             return None
+
+
+_TEXT_TYPES = frozenset({"text", "varchar", "character varying", "char", "character", "citext"})
+_TEXT_FUNCS = frozenset({"lower", "upper", "btrim", "concat"})
+
+
+def is_text(node: object) -> bool:
+    """Whether ``node`` is known to be text, so ``+`` on it means ``||``."""
+    match node:
+        case str():
+            return True
+        case Operation():
+            return node.op == "||"
+        case Cast():
+            return node.type.split("(", 1)[0] in _TEXT_TYPES
+        case Func(keeps_type=False):
+            return node.name in _TEXT_FUNCS
+        case Func():
+            return any(is_text(a) for a in node.args)
+        case CaseBase():
+            return any(is_text(v) for v in (*(v for _, v in node.whens), node.default))
+        case Nullable():
+            return is_text(node.expr)
+        case Over():
+            return is_text(node.func)
+        case CteColumn() if node.type_ is str:
+            return True
+        case _:
+            column = column_of(node)
+            return column is not None and column.sql_type.split("(", 1)[0] in _TEXT_TYPES
 
 
 def _first_column(nodes: Iterable[object]) -> ColumnBase | None:
@@ -250,6 +284,8 @@ def cast[T](expr: ExprBase, to: Column[T], /) -> Expr[T]:
     if to.enum is not None:  # a user-defined type name: quote it
         base = sql_type.removesuffix("[]")
         sql_type = '"' + base.replace('"', '""') + '"' + sql_type[len(base) :]
+        if to.enum_schema is not None:
+            sql_type = '"' + to.enum_schema.replace('"', '""') + '".' + sql_type
     return TypedCast[T](expr, sql_type, to)
 
 
@@ -437,13 +473,16 @@ class WindowFunctionBase:
 class WindowFunction[T](WindowFunctionBase):
     def over(
         self,
+        window: str | None = None,
+        /,
         *,
         partition_by: ExprBase | Sequence[ExprBase] = (),
         order_by: ExprBase | OrderBy | Sequence[ExprBase | OrderBy] = (),
         frame: Frame | None = None,
     ) -> Expr[T]:
-        """``row_number().over(partition_by=Posts.author_id, order_by=desc(Posts.id))``."""
-        return over(self._func, partition_by, order_by, frame)
+        """``row_number().over(partition_by=Posts.author_id, order_by=desc(Posts.id))``, or
+        ``.over("w")`` for a window named with ``query.window("w", ...)``."""
+        return over(self._func, window, partition_by, order_by, frame)
 
 
 def _window[T](name: str, *args: object, keeps_type: bool = False) -> WindowFunction[T]:
@@ -588,15 +627,77 @@ def matches(vector: _Text, query: Expr[str], /) -> Expr[bool]:
 
 
 @overload
-def ts_rank(vector: Expr[str], query: Expr[str], /, *, normalization: int = 0) -> Expr[float]: ...
+def ts_rank(
+    vector: Expr[str],
+    query: Expr[str],
+    /,
+    *,
+    weights: Sequence[float] | None = None,
+    normalization: int = 0,
+) -> Expr[float]: ...
 @overload
 def ts_rank(
-    vector: Expr[str | None], query: Expr[str], /, *, normalization: int = 0
+    vector: Expr[str | None],
+    query: Expr[str],
+    /,
+    *,
+    weights: Sequence[float] | None = None,
+    normalization: int = 0,
 ) -> Expr[float | None]: ...
-def ts_rank(vector: _Text, query: Expr[str], /, *, normalization: int = 0) -> ExprBase:
-    """How well ``vector`` matches ``query`` (higher is better). ``normalization`` is
-    PostgreSQL's bit mask for document length (0: ignore length)."""
+def ts_rank(
+    vector: _Text,
+    query: Expr[str],
+    /,
+    *,
+    weights: Sequence[float] | None = None,
+    normalization: int = 0,
+) -> ExprBase:
+    """How well ``vector`` matches ``query`` (higher is better). ``weights`` are the
+    weights of the D, C, B and A labels (default ``[0.1, 0.2, 0.4, 1.0]``).
+    ``normalization`` is PostgreSQL's bit mask for document length (0: ignore length)."""
+    return _rank("ts_rank", vector, query, weights, normalization)
+
+
+@overload
+def ts_rank_cd(
+    vector: Expr[str],
+    query: Expr[str],
+    /,
+    *,
+    weights: Sequence[float] | None = None,
+    normalization: int = 0,
+) -> Expr[float]: ...
+@overload
+def ts_rank_cd(
+    vector: Expr[str | None],
+    query: Expr[str],
+    /,
+    *,
+    weights: Sequence[float] | None = None,
+    normalization: int = 0,
+) -> Expr[float | None]: ...
+def ts_rank_cd(
+    vector: _Text,
+    query: Expr[str],
+    /,
+    *,
+    weights: Sequence[float] | None = None,
+    normalization: int = 0,
+) -> ExprBase:
+    """Like ``ts_rank``, but rewards matching words that are close together ("cover
+    density"). The vector needs positions (a ``to_tsvector`` result has them)."""
+    return _rank("ts_rank_cd", vector, query, weights, normalization)
+
+
+def _rank(
+    name: str, vector: _Text, query: Expr[str], weights: Sequence[float] | None, norm: int
+) -> ExprBase:
     args: tuple[Node, ...] = (vector, query)
-    if normalization:
-        args += (Fragment((str(_whole("normalization", normalization)),)),)
-    return TypedFunc[float]("ts_rank", args)
+    if weights is not None:
+        values = [float(w) for w in weights]
+        if len(values) != 4:
+            raise QueryError(f"{name} weights must be 4 numbers (D, C, B, A); got {weights!r}")
+        args = (Cast(Param(values), "real[]"), *args)
+    if norm:
+        args += (Fragment((str(_whole("normalization", norm)),)),)
+    return TypedFunc[float](name, args)

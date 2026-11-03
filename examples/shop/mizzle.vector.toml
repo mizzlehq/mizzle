@@ -1,0 +1,6 @@
+# The same app plus product embeddings, for servers with pgvector:
+#   uv run mizzle --config mizzle.vector.toml migrate
+schema = ["shop.schema", "shop.vectors"]
+out = "migrations_vector"
+url_env = "DATABASE_URL"
+schema_filter = ["public", "shop_audit", "auth"]

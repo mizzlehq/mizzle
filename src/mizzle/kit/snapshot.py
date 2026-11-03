@@ -2,16 +2,18 @@
 
 from __future__ import annotations
 
+import hashlib
 import uuid
 from collections.abc import Sequence
 from typing import cast
 
 from mizzle.core.errors import SchemaError
 from mizzle.core.naming import Casing
-from mizzle.core.schema.column import ColumnBase, ReferentialAction
+from mizzle.core.schema.column import ColumnBase, Identity, ReferentialAction
 from mizzle.core.schema.constraints import (
     Check,
     ForeignKey,
+    Grant,
     Index,
     Policy,
     PrimaryKey,
@@ -30,6 +32,7 @@ from mizzle.core.snapshot import (
     ForeignKeySnap,
     FunctionSnap,
     GeneratedSnap,
+    GrantsSnap,
     IdentitySnap,
     IndexSnap,
     PolicySnap,
@@ -41,8 +44,11 @@ from mizzle.core.snapshot import (
     TriggerSnap,
     UniqueSnap,
     ViewSnap,
+    default_cost,
     empty_snapshot,
+    function_key,
     key,
+    sequence_defaults,
 )
 from mizzle.db import Session
 from mizzle.dialects.base import Dialect
@@ -82,13 +88,7 @@ def build_snapshot(
         schema, tname = schema_of(table), info.name
 
         def trunc(name: str) -> str:
-            # Shorten the middle, keeping the "_key" / "_fkey" / ... suffix: cutting it off
-            # can give a unique and a foreign key on the same columns the same name.
-            over = len(name) - len(dialect.truncate_name(name))
-            if over == 0:
-                return name
-            base, _, suffix = name.rpartition("_")
-            return dialect.truncate_name(f"{base[:-over]}_{suffix}")
+            return _truncate(name, dialect)
 
         snap = TableSnap(
             schema=schema,
@@ -103,7 +103,8 @@ def build_snapshot(
         for column in info.columns.values():
             cname = column.db_name(casing)
             if column.enum is not None:
-                _add_enum(snapshot, default_schema, column)
+                _add_enum(snapshot, column.enum_schema or default_schema, column)
+                add_schema(column.enum_schema or default_schema)
             col = snap["columns"][cname] = ColumnSnap(
                 name=cname,
                 type=dialect.column_type(column),
@@ -111,14 +112,7 @@ def build_snapshot(
                 default=dialect.column_default(column, casing),
             )
             if (identity := column.identity) is not None:
-                increment = identity.increment or 1
-                start = identity.start
-                col["identity"] = IdentitySnap(
-                    always=identity.always,
-                    # The database's defaults: ascending from 1, descending from -1.
-                    start=start if start is not None else (1 if increment > 0 else -1),
-                    increment=increment,
-                )
+                col["identity"] = _identity(identity, col["type"])
             if (computed := column.computed) is not None:
                 col["generated"] = GeneratedSnap(
                     expression=dialect.expression(computed.expression, casing),
@@ -194,6 +188,10 @@ def build_snapshot(
                 case RowLevelSecurity():
                     if constraint.enabled or constraint.force:
                         snap["rls"] = RlsSnap(enabled=constraint.enabled, force=constraint.force)
+                case Grant():
+                    _add_grant(snap.setdefault("grants", {}), constraint)
+                    for declared in constraint.declared_roles:
+                        _add_role(snapshot, declared)
 
         if pk := snap["primary_key"]:  # CREATE TABLE drops a UNIQUE that repeats the key
             snap["uniques"] = {
@@ -219,20 +217,22 @@ def build_snapshot(
             case Function():
                 fn = _function(obj, default_schema)
                 functions = snapshot.setdefault("functions", {})
-                existing = functions.get(key(fn["schema"], fn["name"]))
+                existing = functions.get(function_key(fn))
                 if existing is not None and existing != fn:
                     raise SchemaError(f"function {fn['name']!r} is declared twice")
-                functions[key(fn["schema"], fn["name"])] = fn
+                functions[function_key(fn)] = fn
                 add_schema(fn["schema"])
             case Trigger():
-                on = snapshot["tables"].get(key(schema_of(obj.on), obj.on.__table__.name))
+                k = key(schema_of(obj.on), obj.on.__table__.name)
+                on = snapshot["tables"].get(k) or snapshot.get("views", {}).get(k)
                 if on is None:
                     raise SchemaError(
                         f"trigger {obj.name!r} is on {obj.on.__name__}, which is not a table "
-                        "in the schema"
+                        "or view in the schema"
                     )
+                _check_trigger(obj)
                 when = obj.when
-                on.setdefault("triggers", {})[obj.name] = TriggerSnap(
+                trg = TriggerSnap(
                     name=obj.name,
                     timing=obj.timing,
                     events=list(obj.events),
@@ -240,7 +240,28 @@ def build_snapshot(
                     function=key(obj.execute.schema or default_schema, obj.execute.name),
                     when=dialect.expression(when, casing) if when is not None else None,
                 )
+                if obj.update_of:
+                    trg["columns"] = sorted(c.db_name(casing) for c in obj.update_of)
+                if obj.old_table is not None:
+                    trg["old_table"] = obj.old_table
+                if obj.new_table is not None:
+                    trg["new_table"] = obj.new_table
+                on.setdefault("triggers", {})[obj.name] = trg
     return snapshot
+
+
+def _check_trigger(trigger: Trigger) -> None:
+    on = trigger.on
+    on_view = issubclass(on, View)
+    if issubclass(on, View) and on.__materialized__:
+        raise SchemaError(f"trigger {trigger.name!r}: materialized views cannot have triggers")
+    if on_view and trigger.for_each == "row" and trigger.timing != "instead of":
+        raise SchemaError(
+            f"trigger {trigger.name!r} is on view {trigger.on.__name__}: row triggers on a view "
+            "are INSTEAD OF (timing='instead of'); BEFORE/AFTER ones are FOR EACH STATEMENT"
+        )
+    if not on_view and trigger.timing == "instead of":
+        raise SchemaError(f"trigger {trigger.name!r}: INSTEAD OF triggers are for views")
 
 
 def _index(constraint: Index, dialect: Dialect, casing: Casing | None) -> IndexSnap:
@@ -253,13 +274,14 @@ def _index(constraint: Index, dialect: Dialect, casing: Casing | None) -> IndexS
         unique=constraint.unique,
         where=dialect.expression(where, casing) if where is not None else None,
     )
-    opclass = constraint.opclass
+    opclasses = constraint.opclasses(len(keys))
     if len(plain) != len(keys):  # an expression index; opclasses inline
         index["expression"] = ", ".join(
-            dialect.expression(k, casing) + (f" {opclass}" if opclass else "") for k in keys
+            dialect.expression(k, casing) + (f" {op}" if op else "")
+            for k, op in zip(keys, opclasses, strict=True)
         )
-    elif opclass is not None:
-        index["opclasses"] = [opclass] * len(keys)
+    elif any(opclasses):
+        index["opclasses"] = opclasses
     if constraint.method is not None and constraint.method != "btree":
         index["method"] = constraint.method
     if constraint.options:
@@ -280,7 +302,7 @@ def _policy(policy: Policy, dialect: Dialect, casing: Casing | None) -> PolicySn
 
 
 def _function(fn: Function, default_schema: str) -> FunctionSnap:
-    return FunctionSnap(
+    snap = FunctionSnap(
         schema=fn.schema or default_schema,
         name=fn.name,
         args=fn.args,
@@ -290,6 +312,53 @@ def _function(fn: Function, default_schema: str) -> FunctionSnap:
         volatility=fn.volatility,
         security_definer=fn.security_definer,
     )
+    if fn.strict:
+        snap["strict"] = True
+    if fn.leakproof:
+        snap["leakproof"] = True
+    if fn.parallel != "unsafe":
+        snap["parallel"] = fn.parallel
+    if fn.cost is not None and fn.cost != default_cost(fn.language):
+        snap["cost"] = float(fn.cost)
+    if fn.settings:
+        snap["settings"] = dict(fn.settings)
+    return snap
+
+
+def _identity(identity: Identity, sql_type: str) -> IdentitySnap:
+    increment = identity.increment or 1
+    low, high = sequence_defaults(sql_type, increment)
+    snap = IdentitySnap(always=identity.always, start=0, increment=increment)
+    if identity.min_value is not None and identity.min_value != low:
+        snap["min_value"] = low = identity.min_value
+    if identity.max_value is not None and identity.max_value != high:
+        snap["max_value"] = high = identity.max_value
+    if identity.cache not in (None, 1):
+        snap["cache"] = identity.cache
+    if identity.cycle:
+        snap["cycle"] = True
+    # The database's default start: the low end ascending, the high end descending.
+    default_start = low if increment > 0 else high
+    snap["start"] = identity.start if identity.start is not None else default_start
+    return snap
+
+
+def _add_grant(grants: GrantsSnap, grant: Grant) -> None:
+    for role in grant.roles:
+        privileges = {*grants.get(role, []), *grant.privileges}
+        grants[role] = ["all"] if "all" in privileges else sorted(privileges)
+
+
+def _truncate(name: str, dialect: Dialect) -> str:
+    """A generated name the database can keep. A longer one is shortened in the middle,
+    with a hash of the whole name: the "_key" / "_fkey" / ... suffix stays (a unique and a
+    foreign key on the same columns differ) and two long names never end up the same."""
+    if dialect.truncate_name(name) == name:
+        return name
+    base, _, suffix = name.rpartition("_")
+    tail = f"_{hashlib.sha256(name.encode()).hexdigest()[:8]}_{suffix}"
+    room = len(dialect.truncate_name(name)) - len(tail.encode())
+    return dialect.truncate_name(base.encode()[:room].decode(errors="ignore") + tail)
 
 
 def _add_view(
@@ -311,9 +380,14 @@ def _add_view(
             name=name, type=dialect.column_type(column), not_null=False, default=None
         )
     for constraint in view.config():
+        if isinstance(constraint, Grant):
+            _add_grant(snap.setdefault("grants", {}), constraint)
+            for declared in constraint.declared_roles:
+                _add_role(snapshot, declared)
+            continue
         if not isinstance(constraint, Index) or not view.__materialized__:
             raise SchemaError(
-                f"{view.__name__}.config(): views take only indexes, on materialized views"
+                f"{view.__name__}.config(): views take grants, and indexes on materialized views"
             )
         snap.setdefault("indexes", {})[constraint.name] = _index(constraint, dialect, casing)
     snapshot.setdefault("views", {})[key(schema, info.name)] = snap

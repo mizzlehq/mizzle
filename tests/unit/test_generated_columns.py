@@ -10,7 +10,7 @@ from typing import final, override
 import pytest
 
 from mizzle import Constraint, Table, eq, index, sql
-from mizzle.core.errors import MigrationError, QueryError, SchemaError
+from mizzle.core.errors import QueryError, SchemaError
 from mizzle.core.query.builder import QueryBuilder
 from mizzle.core.snapshot import Snapshot, empty_snapshot
 from mizzle.core.sql.operators import excluded
@@ -115,12 +115,17 @@ def test_alter_identity_and_generated() -> None:
     assert _alter("change identity") == [
         'ALTER TABLE "docs" ALTER COLUMN "seq" SET GENERATED ALWAYS SET START WITH 7'
     ]
-    assert _alter("change expression") == [
-        'ALTER TABLE "docs" ALTER COLUMN "shout" SET EXPRESSION AS (lower(body))'
-    ]
+    # SET EXPRESSION on PostgreSQL 17+; older servers drop and add the column again.
+    [change] = _alter("change expression")
+    assert 'ALTER COLUMN "shout" SET EXPRESSION AS (lower(body))' in change
+    assert "server_version_num')::int >= 170000" in change
+    assert """ADD COLUMN "shout" text GENERATED ALWAYS AS (lower(body)) VIRTUAL""" in change
     assert _alter("drop expression") == ['ALTER TABLE "docs" ALTER COLUMN "search" DROP EXPRESSION']
-    with pytest.raises(MigrationError, match="VIRTUAL"):
-        _alter("drop virtual")
+    # A VIRTUAL column has no stored values to keep: dropped and added as a plain column.
+    assert _alter("drop virtual") == [
+        'ALTER TABLE "docs" DROP COLUMN "shout"',
+        'ALTER TABLE "docs" ADD COLUMN "shout" text',
+    ]
 
 
 def test_dropping_identity_comes_before_drop_not_null() -> None:
@@ -172,7 +177,19 @@ def test_insert_skips_identity_and_rejects_generated(qb: QueryBuilder) -> None:
     )
     for column, value in [("id", 1), ("search", "'x'"), ("shout", "X")]:
         with pytest.raises(QueryError, match=f"Docs.{column} is"):
-            qb.insert(Docs).values({"body": "x", column: value})
+            qb.insert(Docs).values({"body": "x", column: value}).to_sql()
+    # GENERATED ALWAYS identity: explicit values need OVERRIDING SYSTEM VALUE
+    q = qb.insert(Docs).values(id=7, body="x").overriding_system_value()
+    assert q.to_sql() == (
+        'INSERT INTO "docs" ("id", "body") OVERRIDING SYSTEM VALUE VALUES ($1, $2)',
+        (7, "x"),
+    )
+    q = qb.insert(Docs).overriding_user_value().values([{"id": 7, "body": "x"}, {"body": "y"}])
+    assert q.to_sql()[0] == (
+        'INSERT INTO "docs" ("id", "body") OVERRIDING USER VALUE VALUES ($1, $2), (DEFAULT, $3)'
+    )
+    with pytest.raises(QueryError, match="generated column"):  # overriding never allows these
+        qb.insert(Docs).values(body="x", shout="X").overriding_system_value()
     # BY DEFAULT identity columns take explicit values
     assert qb.insert(Docs).values(body="x", seq=5).to_sql()[1] == (5, "x")
     with pytest.raises(QueryError, match="generated column"):

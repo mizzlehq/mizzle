@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, override
 
 from mizzle.core.compiler import CompiledQuery, Compiler
 from mizzle.core.errors import QueryError
+from mizzle.core.sql.alias import real_table
 from mizzle.core.sql.nodes import Node
 
 if TYPE_CHECKING:
@@ -132,11 +133,14 @@ class PostgresCompiler(Compiler):
     def visit_RelationalStatement(self, node: RelationalStatement) -> str:
         plan = node.plan
         alias = self.new_alias()
-        self._scopes.append({plan.table: alias})
+        # Columns of the table and of an alias of it (``db.query(alias(Users, "u"))``)
+        # both mean the root row.
+        real = real_table(plan.table)
+        self._scopes.append({plan.table: alias, real: alias})
         try:
             columns = [self.visit(c) for _, c in plan.columns]
             columns += [self._child(link, child, alias) for _, link, child in plan.children]
-            text = f"SELECT {', '.join(columns)} FROM {self.table_name(plan.table)} AS "
+            text = f"SELECT {', '.join(columns)} FROM {self.table_name(real)} AS "
             text += self.quote(alias)
             if plan.where is not None:
                 text += f" WHERE {self.visit(plan.where)}"

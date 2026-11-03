@@ -141,7 +141,7 @@ def test_snapshot() -> None:
     )
     assert list(views["public.user_counts"].get("indexes", {})) == ["user_counts_active"]
     assert s.get("extensions") == {"pg_trgm": {"name": "pg_trgm"}}
-    assert s.get("functions", {})["public.touch"]["returns"] == "trigger"
+    assert s.get("functions", {})["public.touch()"]["returns"] == "trigger"
 
 
 def test_create_order_and_sql() -> None:
@@ -203,10 +203,14 @@ def test_changed_view_recreates_views_that_use_it() -> None:
 
     steps = described(snap(), snap([Users, Emails, ActiveUsers2, Counts]))
     assert steps == [
+        "keep privileges of emails",
         "drop view emails",
+        "keep privileges of active_users",
         "drop view active_users",
         "create view active_users",
+        "restore privileges of active_users",
         "create view emails",
+        "restore privileges of emails",
     ]
 
 
@@ -237,10 +241,12 @@ def test_dropped_column_recreates_views_policies_and_triggers_using_it() -> None
     assert described(old, new) == [
         "drop policy own on users",  # its USING reads owner
         "drop policy add on users",
+        "keep privileges of active_users",
         "drop view active_users",
         "drop column users.active",
         "drop column users.owner",
         "create view active_users",
+        "restore privileges of active_users",
         "create policy own on users",
         # A whole-row WHEN (OLD.*) does not block dropping a column: replaced in place.
         "replace trigger users_touch on users",
@@ -359,7 +365,7 @@ def test_mistakes_are_reported() -> None:
     with pytest.raises(SchemaError, match="must define query"):
         build_snapshot([NoQuery], dialect)
     on_view = trigger("t", on=ActiveUsers, execute=touch)
-    with pytest.raises(SchemaError, match="not a table"):
+    with pytest.raises(SchemaError, match="INSTEAD OF"):
         build_snapshot([Users, ActiveUsers], dialect, objects=[on_view])
     with pytest.raises(SchemaError, match="declared twice"):
         other = function("touch", returns="trigger", body="BEGIN RETURN NULL; END")

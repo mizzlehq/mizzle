@@ -25,6 +25,9 @@ type IsolationLevel = Literal["read committed", "repeatable read", "serializable
 # Database.connect for the one case it cannot see).
 type ResetMode = Literal["always", "auto"]
 type CopyFormat = Literal["csv", "text", "binary"]
+# What a listener does when ``max_queue`` notifications wait unread: "raise" ends the
+# iteration with ListenerOverflow, "drop_oldest" discards the oldest one (with a warning).
+type Overflow = Literal["raise", "drop_oldest", "block"]
 # Where copy_from() writes: a file path, a binary file, or an async function given each chunk.
 type CopyOutput = str | os.PathLike[str] | BinaryIO | Callable[[bytes], Awaitable[None]]
 
@@ -36,6 +39,13 @@ class Notification:
     channel: str
     payload: str
     pid: int  # server process ID of the session that sent it
+
+
+@dataclass(frozen=True)
+class Reconnected:
+    """Yielded by ``db.listen(..., reconnect=True)`` after the connection was lost and
+    LISTEN started again on a new one. Notifications sent in between were missed: reload
+    whatever state they would have told you about."""
 
 
 class Connection(Protocol):
@@ -104,10 +114,17 @@ class Connection(Protocol):
         ...
 
     def listen(
-        self, channels: Sequence[str]
+        self,
+        channels: Sequence[str],
+        max_queue: int | None = None,
+        overflow: Overflow = "raise",
+        probe: Callable[[str], Awaitable[None]] | None = None,
+        pooler_session_mode: bool = False,
     ) -> AbstractAsyncContextManager[AsyncIterator[Notification]]:
         """LISTEN until the context exits. The iterator raises ConnectionError if the
-        connection is lost."""
+        connection is lost. Behind a pooler it raises unless ``pooler_session_mode``; then
+        ``probe(channel)`` sends a notification from another connection to check that
+        notifications reach this one."""
         ...
 
 
@@ -118,6 +135,10 @@ class Driver(Protocol):
     async def close(self) -> None: ...
     async def expire_connections(self) -> None:
         """Replace every pooled connection (idle ones now, busy ones when released)."""
+        ...
+
+    async def notify_unpooled(self, channel: str, payload: str = "") -> None:
+        """``pg_notify`` on a short-lived connection outside the pool."""
         ...
 
 

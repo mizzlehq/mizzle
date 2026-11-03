@@ -18,16 +18,22 @@ from mizzle.core.query.base import (
     table_columns,
     table_decoder,
 )
+from mizzle.core.schema.column import ColumnBase
 from mizzle.core.schema.table import Table
 from mizzle.core.sql.alias import alias_table, real_table
 from mizzle.core.sql.functions import column_of
 from mizzle.core.sql.nodes import (
     Condition,
+    CteColumn,
     Expr,
     ExprBase,
+    Frame,
     Node,
     OrderBy,
     Placeholder,
+    TypedCteColumn,
+    Window,
+    window,
 )
 from mizzle.core.sql.operators import and_
 
@@ -54,27 +60,38 @@ class Lock:
 
 @dataclass(frozen=True, eq=False)
 class Cte(Node):
-    """A named subquery for ``WITH``. Reference its columns with ``cte.c("name")``."""
+    """A named subquery: a ``WITH`` query (``query.cte(name)``), or with ``inline`` a
+    subquery in FROM (``query.subquery(name)``). Reference its columns with ``c()``."""
 
     name: str
     query: SelectBase | CompoundBase
     alias: str | None = None  # see alias(cte, name)
+    inline: bool = False
 
     def c[T](self, column: str, type_: type[T]) -> TypedCteColumn[T]:
-        """A column of this CTE, e.g. ``cte.c("id", int)``. The type is not checked."""
-        _ = type_  # only tells type checkers what the column holds
-        return TypedCteColumn[T](self, column)
+        """A column of this query, e.g. ``cte.c("id", int)``. The type is not checked;
+        values decode like the column of the inner query they come from."""
+        return TypedCteColumn[T](self, column, type_)
 
-
-@dataclass(frozen=True, eq=False)
-class CteColumn(ExprBase):
-    cte: Cte
-    name: str
-
-
-@dataclass(frozen=True, eq=False)
-class TypedCteColumn[T](CteColumn, Expr[T]):
-    pass
+    def source_column(self, name: str) -> ColumnBase | None:
+        """The column whose values the output column ``name`` holds, if known."""
+        query = self.query
+        while isinstance(query, CompoundBase):
+            query = query.left  # output columns are named by the first query
+        if isinstance(query.projection, dict):
+            node = query.projection.get(name)
+            return None if node is None else column_of(node)
+        for slot in query.slots():
+            if isinstance(slot, type):
+                columns: tuple[ExprBase, ...] = tuple(slot.__table__.columns.values())
+            else:
+                columns = (slot,)
+            for item in columns:
+                if isinstance(item, ColumnBase) and name in (item.attr, item.db_name()):
+                    return item
+                if isinstance(item, CteColumn) and item.name == name:
+                    return column_of(item)
+        return None
 
 
 def _count(name: str, value: int | Expr[int]) -> int | Placeholder:
@@ -102,6 +119,7 @@ class SelectBase(Node):
     offset_: int | Placeholder | None = None
     distinct_: bool = False
     lock: Lock | None = None
+    windows_: tuple[tuple[str, Window], ...] = ()
 
     # -- clauses ----------------------------------------------------------------------
 
@@ -127,6 +145,19 @@ class SelectBase(Node):
         combined = condition if self.having_ is None else and_(self.having_, condition)
         return evolve(self, having_=combined)
 
+    def window(
+        self,
+        name: str,
+        /,
+        *,
+        partition_by: ExprBase | Sequence[ExprBase] = (),
+        order_by: ExprBase | OrderBy | Sequence[ExprBase | OrderBy] = (),
+        frame: Frame | None = None,
+    ) -> Self:
+        """A named window (``WINDOW name AS (...)``) for ``.over(name)`` in this query."""
+        spec = window(None, partition_by, order_by, frame)
+        return evolve(self, windows_=(*self.windows_, (name, spec)))
+
     def order_by(self, *items: ExprBase | OrderBy) -> Self:
         return evolve(self, order_by_=(*self.order_by_, *items))
 
@@ -149,6 +180,10 @@ class SelectBase(Node):
     def cte(self, name: str) -> Cte:
         """Use this query as a named CTE: ``db.with_(cte).select(...).from_(cte)``."""
         return Cte(name, self)
+
+    def subquery(self, name: str) -> Cte:
+        """Use this query in FROM or a join: ``db.select(sub.c("n", int)).from_(sub)``."""
+        return Cte(name, self, inline=True)
 
     # -- results ----------------------------------------------------------------------
 
@@ -264,7 +299,8 @@ class CompoundBase(Node):
     offset_: int | Placeholder | None = None
 
     def order_by(self, *items: ExprBase | OrderBy) -> Self:
-        """Order the combined rows. Columns are matched by name to the result columns."""
+        """Order the combined rows. Columns are matched by name to the result columns;
+        expressions may use them too (``abs_(Items.a - 3)``)."""
         return evolve(self, order_by_=(*self.order_by_, *items))
 
     def limit(self, n: int | Expr[int]) -> Self:
@@ -275,6 +311,9 @@ class CompoundBase(Node):
 
     def cte(self, name: str) -> Cte:
         return Cte(name, self)
+
+    def subquery(self, name: str) -> Cte:
+        return Cte(name, self, inline=True)
 
     def decoder(self) -> Callable[[Row], object]:
         return self.left.decoder()  # rows have the shape of the first query

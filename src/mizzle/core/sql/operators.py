@@ -146,6 +146,16 @@ def not_regex(left: Text, pattern: str | Text, *, ignore_case: bool = False) -> 
     return BinaryOp(left, "!~*" if ignore_case else "!~", _wrap(pattern, left))
 
 
+def similar_to(left: Text, pattern: str | Text) -> Expr[bool]:
+    """SQL regular expression (``SIMILAR TO``): matches the whole string; ``%`` and ``_``
+    work as in LIKE, plus ``|``, ``*``, ``+``, ``?``, ``()`` and ``[]`` as in regexes."""
+    return BinaryOp(left, "SIMILAR TO", _wrap(pattern, left))
+
+
+def not_similar_to(left: Text, pattern: str | Text) -> Expr[bool]:
+    return BinaryOp(left, "NOT SIMILAR TO", _wrap(pattern, left))
+
+
 def is_null(expr: ExprBase) -> Expr[bool]:
     return Postfix(expr, "IS NULL")
 

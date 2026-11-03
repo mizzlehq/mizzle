@@ -13,6 +13,7 @@ from mizzle.core.schema.constraints import (
     Check,
     Constraint,
     ForeignKey,
+    Grant,
     Index,
     Policy,
     PrimaryKey,
@@ -87,7 +88,7 @@ def _constraint_columns(constraint: Constraint) -> tuple[ColumnBase, ...]:
             return tuple(k for k in constraint.columns if isinstance(k, ColumnBase))
         case UniqueConstraint() | PrimaryKey() | ForeignKey():
             return constraint.columns
-        case Check() | Policy() | RowLevelSecurity():
+        case Check() | Policy() | RowLevelSecurity() | Grant():
             return ()
 
 

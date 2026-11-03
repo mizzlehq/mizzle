@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
-from typing import ClassVar, Literal, override
+from typing import Literal, override
 
 from mizzle.core.snapshot import (
     CheckSnap,
@@ -26,10 +27,42 @@ from mizzle.core.snapshot import (
 
 type ConstraintKind = Literal["primary_key", "unique", "check", "foreign_key"]
 
+_TEXT = ("text", "character varying")
+_INTS = ("smallint", "integer", "bigint")
+_SIZED = re.compile(r"(character varying|numeric)(?:\((\d+)(?:,(\d+))?\))?")
+
+
+def widens(old: str, new: str) -> bool:
+    """Whether every value of type ``old`` fits ``new`` unchanged (types as normalized in
+    snapshots: ``character varying(40)``, ``numeric(10,2)``)."""
+    if old.endswith("[]") and new.endswith("[]"):
+        return widens(old[:-2], new[:-2])
+    if new == "text":  # every value as its exact text
+        return old in (*_TEXT, *_INTS, "boolean", "uuid") or old.startswith(
+            ("character varying(", "numeric")
+        )
+    if old in _INTS and new in _INTS:
+        return _INTS.index(old) <= _INTS.index(new)
+    if (old in _INTS and new == "numeric") or (old, new) == ("real", "double precision"):
+        return True
+    a, b = _SIZED.fullmatch(old), _SIZED.fullmatch(new)
+    if a is None or b is None or a.group(1) != b.group(1):
+        return False
+    if b.group(2) is None:  # unbounded
+        return True
+    if a.group(2) is None:
+        return False
+    scale_a, scale_b = int(a.group(3) or 0), int(b.group(3) or 0)
+    # numeric(p, s): as many digits before the point, and the same scale (no rounding)
+    return scale_a == scale_b and int(b.group(2)) >= int(a.group(2))
+
 
 @dataclass(frozen=True)
 class Step:
-    data_loss: ClassVar[bool] = False
+    @property
+    def data_loss(self) -> bool:
+        """Whether the step can lose data (the CLI asks for --allow-data-loss)."""
+        return False
 
     def describe(self) -> str:
         return type(self).__name__
@@ -89,9 +122,13 @@ class CreateTable(Step):
 
 @dataclass(frozen=True)
 class DropTable(Step):
-    data_loss: ClassVar[bool] = True
     schema: str
     name: str
+
+    @property
+    @override
+    def data_loss(self) -> bool:
+        return True
 
     @override
     def describe(self) -> str:
@@ -110,6 +147,19 @@ class RenameTable(Step):
 
 
 @dataclass(frozen=True)
+class SetTableSchema(Step):
+    """Move a table to another schema (its indexes, constraints and sequences go along)."""
+
+    schema: str
+    name: str
+    new_schema: str
+
+    @override
+    def describe(self) -> str:
+        return f"move table {self.name} from schema {self.schema} to {self.new_schema}"
+
+
+@dataclass(frozen=True)
 class AddColumn(Step):
     schema: str
     table: str
@@ -122,10 +172,14 @@ class AddColumn(Step):
 
 @dataclass(frozen=True)
 class DropColumn(Step):
-    data_loss: ClassVar[bool] = True
     schema: str
     table: str
     name: str
+
+    @property
+    @override
+    def data_loss(self) -> bool:
+        return True
 
     @override
     def describe(self) -> str:
@@ -146,13 +200,19 @@ class RenameColumn(Step):
 
 @dataclass(frozen=True)
 class AlterColumnType(Step):
-    data_loss: ClassVar[bool] = True  # casts can fail, round or truncate
     schema: str
     table: str
     column: str
     old_type: str
     new_type: str
     generated: bool = False  # a generated column: recomputed, so no USING cast
+
+    @property
+    @override
+    def data_loss(self) -> bool:
+        """Casts can fail, round or truncate; widening (varchar(40) -> text, integer ->
+        bigint...) keeps every value."""
+        return not widens(self.old_type, self.new_type)
 
     @override
     def describe(self) -> str:
@@ -192,6 +252,7 @@ class AlterColumnIdentity(Step):
     column: str
     old: IdentitySnap | None
     new: IdentitySnap | None
+    sql_type: str = "integer"  # the column's (for the sequence's default bounds)
 
     @override
     def describe(self) -> str:
@@ -208,6 +269,8 @@ class AlterColumnGenerated(Step):
     column: str
     old: GeneratedSnap | None
     new: GeneratedSnap | None
+    # The whole new column: servers without SET EXPRESSION (before PostgreSQL 17) add it again.
+    definition: ColumnSnap | None = None
 
     @override
     def describe(self) -> str:
@@ -365,8 +428,12 @@ class AlterExtension(Step):
 
 @dataclass(frozen=True)
 class DropExtension(Step):
-    data_loss: ClassVar[bool] = True  # its types and functions may be in use
     name: str
+
+    @property
+    @override
+    def data_loss(self) -> bool:
+        return True
 
     @override
     def describe(self) -> str:
@@ -414,6 +481,44 @@ class DropView(Step):
     @override
     def describe(self) -> str:
         return f"drop {'materialized view' if self.materialized else 'view'} {self.name}"
+
+
+@dataclass(frozen=True)
+class SaveGrants(Step):
+    """Remember the privileges, owner and comment of a view about to be dropped and
+    created again (they go with the view), for ``RestoreGrants``."""
+
+    schema: str
+    name: str
+
+    @override
+    def describe(self) -> str:
+        return f"keep privileges of {self.name}"
+
+
+@dataclass(frozen=True)
+class RestoreGrants(Step):
+    schema: str
+    name: str
+    materialized: bool
+
+    @override
+    def describe(self) -> str:
+        return f"restore privileges of {self.name}"
+
+
+@dataclass(frozen=True)
+class GrantPrivileges(Step):
+    schema: str
+    table: str  # a table or a view
+    role: str  # "public": everyone
+    privileges: tuple[str, ...]
+    revoke: bool = False
+
+    @override
+    def describe(self) -> str:
+        what, to = ("revoke", "from") if self.revoke else ("grant", "to")
+        return f"{what} {', '.join(self.privileges)} on {self.table} {to} {self.role}"
 
 
 @dataclass(frozen=True)

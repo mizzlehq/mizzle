@@ -1,0 +1,8 @@
+# Module(s) with your Table classes.
+schema = "shop.schema"
+# Migrations folder. Commit it.
+out = "migrations"
+# Environment variable holding the database URL (never put the URL in this file).
+url_env = "DATABASE_URL"
+# Schemas push and pull read: the audit log and the auth helpers live outside public.
+schema_filter = ["public", "shop_audit", "auth"]

@@ -37,13 +37,20 @@ class DatabaseError(MizzleError):
         self.constraint: str | None = constraint
         self.column: str | None = column
 
+    @property
+    def sqlstate(self) -> str | None:
+        """The server's SQLSTATE code (e.g. ``"42501"`` when RLS or a grant denies access)."""
+        code = getattr(self.original, "sqlstate", None)
+        return code if isinstance(code, str) else None
+
 
 class UniqueViolation(DatabaseError):
     pass
 
 
 class ForeignKeyViolation(DatabaseError):
-    pass
+    """A missing referenced row, or a delete/update blocked by a foreign key (NO ACTION
+    or RESTRICT)."""
 
 
 class NotNullViolation(DatabaseError):
@@ -64,6 +71,11 @@ class ConnectionError(DatabaseError):
 
 class QueryTimeout(DatabaseError):
     """The statement ran longer than its timeout and was cancelled."""
+
+
+class ListenerOverflow(MizzleError):
+    """A ``listen()`` consumer fell ``max_queue`` notifications behind (``overflow="raise"``);
+    later notifications were not kept."""
 
 
 class MigrationError(MizzleError):

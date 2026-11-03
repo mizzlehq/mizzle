@@ -175,6 +175,22 @@ async def test_drop(project: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     assert len(MigrationsDir(project / "migrations", "postgresql").migrations()) == 1
 
 
+async def test_check_accepts_written_custom_migrations(
+    project: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert await cli("generate") == 0
+    assert await cli("generate", "--custom", "--name", "seed") == 0
+    custom = next(project.glob("migrations/0002_seed/migration.sql"))
+    custom.write_text(custom.read_text() + "INSERT INTO users (email) VALUES ('a@b.c');\n")
+    capsys.readouterr()
+    assert await cli("check") == 0
+    assert "edited" not in capsys.readouterr().out  # written by hand on purpose
+    generated = next(project.glob("migrations/0001_*/migration.sql"))
+    generated.write_text(generated.read_text() + "-- edited\n")
+    assert await cli("check") == 0
+    assert "0001" in capsys.readouterr().out  # a generated one still warns
+
+
 async def test_check_detects_fork(project: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     assert await cli("generate") == 0
     migrations = project / "migrations"

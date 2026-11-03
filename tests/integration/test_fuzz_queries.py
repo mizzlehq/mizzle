@@ -37,7 +37,9 @@ from mizzle import (
     ne,
     not_,
     not_in,
+    not_similar_to,
     or_,
+    similar_to,
     sum_,
 )
 from mizzle.core.sql.nodes import Expr, OrderBy
@@ -118,6 +120,10 @@ def sql_not(value: Truth) -> Truth:
     return None if value is None else not value
 
 
+def sql_is(value: Truth) -> Truth:
+    return value
+
+
 def sql_in(value: int | None, options: list[int | None], negate: bool) -> Truth:
     if not options:
         return negate
@@ -136,17 +142,31 @@ def sql_like(value: str | None, pattern: str, fold: bool) -> Truth:
     return like_regex(pattern, fold).fullmatch(value) is not None
 
 
+def sql_similar(value: str | None, pattern: str) -> Truth:
+    """SIMILAR TO with patterns of letters, ``%``, ``_`` and ``|``: a whole-string match."""
+    if value is None:
+        return None
+    body = "".join(
+        ".*" if ch == "%" else "." if ch == "_" else ch if ch == "|" else re.escape(ch)
+        for ch in pattern
+    )
+    return re.fullmatch(f"(?:{body})", value, re.DOTALL) is not None
+
+
 # -- random conditions ---------------------------------------------------------------
 
 ints = st.integers(-3, 3)
 strs = st.text("abAB", max_size=3)
 patterns = st.text("ab%_", max_size=4)
+similar_patterns = st.text("ab%_|", max_size=5)
 OPS = {"=": eq, "<>": ne, "<": lt, "<=": lte, ">": gt, ">=": gte}
 
 
 @st.composite
 def leaves(draw: st.DrawFn) -> Cond:
-    kind = draw(st.sampled_from(["cmp_n", "cmp_s", "null", "in", "between", "like", "bool"]))
+    kind = draw(
+        st.sampled_from(["cmp_n", "cmp_s", "null", "in", "between", "like", "similar", "bool"])
+    )
     match kind:
         case "cmp_n":
             op, number = draw(st.sampled_from(sorted(OPS))), draw(ints)
@@ -195,6 +215,13 @@ def leaves(draw: st.DrawFn) -> Cond:
                 (ilike if fold else like)(Items.s, pattern),
                 lambda r: sql_like(r["s"], pattern, fold),
                 f"s {'ILIKE' if fold else 'LIKE'} {pattern!r}",
+            )
+        case "similar":
+            pattern, negate = draw(similar_patterns), draw(st.booleans())
+            return Cond(
+                (not_similar_to if negate else similar_to)(Items.s, pattern),
+                lambda r: (sql_not if negate else sql_is)(sql_similar(r["s"], pattern)),
+                f"s {'NOT ' if negate else ''}SIMILAR TO {pattern!r}",
             )
         case _:
             value = draw(st.booleans())

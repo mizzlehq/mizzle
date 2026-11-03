@@ -52,13 +52,30 @@ services:
   pgbouncer:
     image: edoburu/pgbouncer:latest@sha256:8638aa563607256d3c7440437534195f1066a92b68015d89ae9d6b935b444a6d  # 1.26.1
     environment:
-      DATABASE_URL: postgres://mizzle:mizzle@primary:5432/mizzle
+      # Every database on the primary ("* = host=primary"): examples/shop uses its own.
+      DB_HOST: primary
+      DB_USER: mizzle
+      DB_PASSWORD: mizzle
       POOL_MODE: transaction
       AUTH_TYPE: scram-sha-256
       MAX_PREPARED_STATEMENTS: "100"
     depends_on:
       primary: { condition: service_healthy }
     ports: ["54333:5432"]
+
+  pgbouncer-session:
+    # Session mode: one server connection per client, so LISTEN works.
+    image: edoburu/pgbouncer:latest@sha256:8638aa563607256d3c7440437534195f1066a92b68015d89ae9d6b935b444a6d  # 1.26.1
+    environment:
+      # Every database on the primary ("* = host=primary"): examples/shop uses its own.
+      DB_HOST: primary
+      DB_USER: mizzle
+      DB_PASSWORD: mizzle
+      POOL_MODE: session
+      AUTH_TYPE: scram-sha-256
+    depends_on:
+      primary: { condition: service_healthy }
+    ports: ["54337:5432"]
 
   odd:
     image: postgres:18

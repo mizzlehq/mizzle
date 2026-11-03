@@ -45,6 +45,7 @@ from mizzle import (
     placeholder,
     sum_,
 )
+from mizzle import alias as renamed
 from mizzle.core.query.builder import QueryBuilder
 from mizzle.core.query.relational import WithOptions
 from mizzle.core.query.select import JoinKind, Select, SelectBase, Source
@@ -614,6 +615,7 @@ def test_subqueries(runner: Harness, data: Data, spec: SubSpec, correlate: bool)
     outer=st.none() | conditions("x"),
     on_extra=st.none() | conditions("p", "x"),
     kind=st.sampled_from(KINDS),
+    inline=st.booleans(),
 )
 def test_ctes(
     runner: Harness,
@@ -622,7 +624,9 @@ def test_ctes(
     outer: Cond | None,
     on_extra: Cond | None,
     kind: JoinKind,
+    inline: bool,
 ) -> None:
+    """``x`` as a CTE, or (``inline``) as a subquery in FROM / the join."""
     loop, db, _ = runner
     cid, n, s = X.c("cid", int), X.c("n", int), X.c("s", str)
     on = both(col_eq("x", "pid", "p", "id"), on_extra)
@@ -635,9 +639,11 @@ def test_ctes(
             if holds(inner, {"c": c})
         ]
         query = x_query(db)
-        cte = (query if inner is None else query.where(inner.expr)).cte("x")
+        filtered = query if inner is None else query.where(inner.expr)
+        cte = filtered.subquery("x") if inline else filtered.cte("x")
+        qb = db if inline else db.with_(cte)
 
-        q = db.with_(cte).select(cid, n, s).from_(cte).order_by(cid)
+        q = qb.select(cid, n, s).from_(cte).order_by(cid)
         got = await (q if outer is None else q.where(outer.expr))
         assert got == [(r["cid"], r["n"], r["s"]) for r in xs if holds(outer, {"x": r})]
 
@@ -649,7 +655,7 @@ def test_ctes(
                 null_last(get({"x": r[1]}, "x", "cid")),
             )
         )
-        jq = db.with_(cte).select(Parent, nullable(cid), nullable(n)).from_(Parent)
+        jq = qb.select(Parent, nullable(cid), nullable(n)).from_(Parent)
         jq = joined(jq, kind, cte, on.expr)
         jq = jq if outer is None else jq.where(outer.expr)
         rows = await jq.order_by(Parent.id, cid)
@@ -893,11 +899,16 @@ def roots(draw: st.DrawFn) -> tuple[Load, int | None]:
 
 
 @SETTINGS
-@given(data=data_strategy, root=roots())
-def test_relational(runner: Harness, data: Data, root: tuple[Load, int | None]) -> None:
+@given(data=data_strategy, root=roots(), aliased=st.booleans())
+def test_relational(
+    runner: Harness, data: Data, root: tuple[Load, int | None], aliased: bool
+) -> None:
+    """``aliased``: the root table through ``alias()``; conditions on the real table's
+    columns still mean the root row, and rows decode into the real class."""
     loop, db, _ = runner
     plan, offset = root
-    table = {"p": Parent, "c": Child, "t": Toy}[plan.alias]
+    real = {"p": Parent, "c": Child, "t": Toy}[plan.alias]
+    table = renamed(real, "root") if aliased else real
     options = with_options(plan)
 
     async def scenario() -> None:
@@ -916,6 +927,7 @@ def test_relational(runner: Harness, data: Data, root: tuple[Load, int | None]) 
             limit=plan.limit,
             offset=offset,
         )
+        assert all(type(obj) is real for obj in found)
         got = [got_tree(plan, obj) for obj in found]
         assert (got if plan.order else unordered(got)) == (
             want if plan.order else unordered(want)

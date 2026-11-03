@@ -22,6 +22,7 @@ from mizzle.core.query.base import Converter, Executable, Row, Runner, column_de
 from mizzle.core.schema.column import ColumnBase
 from mizzle.core.schema.relations import Link
 from mizzle.core.schema.table import Table
+from mizzle.core.sql.alias import real_table
 from mizzle.core.sql.nodes import Condition, ExprBase, Node, OrderBy
 
 
@@ -75,10 +76,10 @@ def _columns(
     if not columns:
         raise QueryError(f"columns for {table.__name__} must not be empty")
     for column in columns:
-        if column.table is not table:
+        if column.table not in (table, real_table(table)):  # an alias takes both
             raise QueryError(f"{column.qualified_name} is not a column of {table.__name__}")
-    wanted = {id(c) for c in columns}
-    return tuple((attr, c) for attr, c in available.items() if id(c) in wanted)
+    wanted = {c.attr for c in columns}
+    return tuple((attr, c) for attr, c in available.items() if attr in wanted)
 
 
 def build_plan(
@@ -92,7 +93,7 @@ def build_plan(
     with_: With | None = None,
 ) -> LoadPlan:
     children: list[tuple[str, Link, LoadPlan]] = []
-    relations = table.__table__.relations
+    relations = real_table(table).__table__.relations
     for name, options in (with_ or {}).items():
         if name not in relations:
             available = ", ".join(relations) or "none"
@@ -197,7 +198,9 @@ def plan_decoder(plan: LoadPlan, *, nested: bool = False) -> RowDecoder:
     reading them raises a clear AttributeError.
     """
     decode = row_decoder(
-        plan.table, plan.columns, converter=_json_converter if nested else column_decoder
+        real_table(plan.table),
+        plan.columns,
+        converter=_json_converter if nested else column_decoder,
     )
     children = [
         (name, link.many, plan_decoder(child, nested=True), child.table.__name__)

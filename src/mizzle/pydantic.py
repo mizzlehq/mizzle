@@ -55,6 +55,8 @@ def column_type(column: ColumnBase) -> object:
     if m := _VECTOR.fullmatch(column.sql_type):
         size = int(m.group(1))
         return Annotated[list[float], pydantic.Field(min_length=size, max_length=size)]
+    if column.sql_type.startswith("sparsevec("):
+        return dict[int, float]
     base = column.accepts[0]
     if base is str and (m := _VARCHAR.fullmatch(column.sql_type)):
         return Annotated[str, pydantic.Field(max_length=int(m.group(1)))]

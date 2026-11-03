@@ -1,10 +1,12 @@
 """Differential testing of expressions (arithmetic, CASE, coalesce, nullif, greatest/least,
-string functions), set operations, window functions and self-joins through table aliases:
+string functions and ``+``, SIMILAR TO, date/time arithmetic), set operations (also ordered
+by expressions), window functions (also named windows) and self-joins through table aliases:
 random rows and random expressions run through mizzle on PostgreSQL and through a Python
 model of SQL. Any difference is a bug in query building or decoding.
 """
 
 import asyncio
+import datetime
 import os
 from collections import Counter
 from collections.abc import Callable, Generator
@@ -50,14 +52,15 @@ from mizzle import (
     rank,
     row_number,
     rows_between,
+    similar_to,
     sum_,
     upper,
 )
 from mizzle.core.query.select import Compound, Select
 from mizzle.core.sql.functions import Case
 from mizzle.core.sql.nodes import Expr
-from mizzle.pg import integer, serial, text
-from tests.integration.test_fuzz_queries import cmp, sql_and, sql_not, sql_or
+from mizzle.pg import date, integer, interval, serial, text, timestamp
+from tests.integration.test_fuzz_queries import cmp, sql_and, sql_not, sql_or, sql_similar
 
 
 @final
@@ -67,12 +70,16 @@ class Items(Table, name="fuzz_expr"):
     b = integer()
     s = text()
     g = integer()  # partition / group key
+    t = timestamp()
+    d = date()
+    e = date()
+    iv = interval()
 
 
 DDL = """
 DROP TABLE IF EXISTS fuzz_expr;
 CREATE TABLE fuzz_expr (id serial PRIMARY KEY, a integer, b integer, s text COLLATE "C",
-                        g integer);
+                        g integer, t timestamp, d date, e date, iv interval);
 """
 
 
@@ -82,9 +89,13 @@ class Row(TypedDict):
     b: int | None
     s: str | None
     g: int | None
+    t: datetime.datetime | None
+    d: datetime.date | None
+    e: datetime.date | None
+    iv: datetime.timedelta | None
 
 
-type NewRow = dict[str, int | str | None]
+type NewRow = dict[str, int | str | datetime.date | datetime.timedelta | None]
 type Truth = bool | None  # SQL three-valued logic: None is UNKNOWN
 type Int = Expr[int | None]
 type Str = Expr[str | None]
@@ -334,7 +345,9 @@ def int_conds(
 def str_terms(draw: st.DrawFn, table: type[Items] = Items) -> Term[str]:
     term: Term[str] = Term(table.s, lambda r: r["s"], "s")
     for _ in range(draw(st.integers(0, 3))):
-        kind = draw(st.sampled_from(["lower", "upper", "concat", "coalesce", "nullif"]))
+        kind = draw(
+            st.sampled_from(["lower", "upper", "concat", "coalesce", "nullif", "plus", "radd"])
+        )
         word = draw(words)
         inner = term
         match kind:
@@ -362,6 +375,26 @@ def str_terms(draw: st.DrawFn, table: type[Items] = Items) -> Term[str]:
                     lambda r, t=inner, w=word: first_not_null(t.eval(r), w),
                     f"coalesce({inner}, {word!r})",
                 )
+            case "plus":  # || : NULL if either side is NULL
+                other = draw(st.sampled_from([word, "self"]))
+                if other == "self":
+                    term = Term(
+                        inner.expr + inner.expr,
+                        lambda r, t=inner: None if (v := t.eval(r)) is None else v + v,
+                        f"({inner} || {inner})",
+                    )
+                else:
+                    term = Term(
+                        inner.expr + word,
+                        lambda r, t=inner, w=word: None if (v := t.eval(r)) is None else v + w,
+                        f"({inner} || {word!r})",
+                    )
+            case "radd":
+                term = Term(
+                    word + inner.expr,
+                    lambda r, t=inner, w=word: None if (v := t.eval(r)) is None else w + v,
+                    f"({word!r} || {inner})",
+                )
             case _:
                 term = Term(
                     nullif(inner.expr, word),
@@ -375,6 +408,9 @@ def int_terms(table: type[Items] = Items) -> st.SearchStrategy[Term[int]]:
     return st.recursive(int_leaf(table), int_ops(table), max_leaves=6)
 
 
+# Days and microseconds only: asyncpg sends a timedelta as such (no months).
+intervals = st.timedeltas(datetime.timedelta(days=-9999), datetime.timedelta(days=9999))
+similar_patterns = st.text("abA %_|", max_size=5)
 INT_TERMS = int_terms()
 CONDS = int_conds(Items, INT_TERMS)
 rows_strategy = st.lists(
@@ -384,6 +420,11 @@ rows_strategy = st.lists(
             "b": st.none() | ints,
             "s": st.none() | words,
             "g": st.none() | st.integers(0, 2),
+            "t": st.none()
+            | st.datetimes(datetime.datetime(1990, 1, 1), datetime.datetime(2050, 1, 1)),
+            "d": st.none() | st.dates(datetime.date(1990, 1, 1), datetime.date(2050, 1, 1)),
+            "e": st.none() | st.dates(datetime.date(1990, 1, 1), datetime.date(2050, 1, 1)),
+            "iv": st.none() | intervals,
         }
     ),
     max_size=10,
@@ -422,7 +463,20 @@ async def load(db: Database, rows: list[NewRow]) -> list[Row]:
     if not rows:
         return []
     inserted = await db.insert(Items).values(rows).returning()
-    return [{"id": i.id, "a": i.a, "b": i.b, "s": i.s, "g": i.g} for i in inserted]
+    return [
+        {
+            "id": i.id,
+            "a": i.a,
+            "b": i.b,
+            "s": i.s,
+            "g": i.g,
+            "t": i.t,
+            "d": i.d,
+            "e": i.e,
+            "iv": i.iv,
+        }
+        for i in inserted
+    ]
 
 
 EXAMPLES = int(os.environ.get("MIZZLE_FUZZ_EXAMPLES", "300"))
@@ -448,6 +502,7 @@ def test_expressions_match_python(
 ) -> None:
     loop, db = runner
     cond = data.draw(CONDS, label="cond")
+    pattern = data.draw(similar_patterns, label="pattern")
 
     async def scenario() -> None:
         stored = await load(db, rows)
@@ -469,6 +524,17 @@ def test_expressions_match_python(
         # Grouping by the expression: the same node in SELECT and GROUP BY binds once.
         groups = await db.select(term.expr, count()).from_(Items).group_by(term.expr)
         assert dict(groups) == Counter(term.eval(r) for r in stored)
+
+        # SIMILAR TO on the text expression.
+        similar = await (
+            db.select(Items.id)
+            .from_(Items)
+            .where(similar_to(text_term.expr, pattern))
+            .order_by(Items.id)
+        )
+        assert [i for (i,) in similar] == [
+            r["id"] for r in stored if sql_similar(text_term.eval(r), pattern) is True
+        ], (text_term, pattern)
 
     loop.run(scenario())
 
@@ -507,6 +573,7 @@ def combine_model(
     descending=st.booleans(),
     limit=st.none() | st.integers(0, 4),
     offset=st.none() | st.integers(0, 3),
+    pivot=ints,
 )
 def test_set_operations_match_python(
     runner: tuple[asyncio.Runner, Database],
@@ -518,6 +585,7 @@ def test_set_operations_match_python(
     descending: bool,
     limit: int | None,
     offset: int | None,
+    pivot: int,
 ) -> None:
     loop, db = runner
 
@@ -549,6 +617,19 @@ def test_set_operations_match_python(
         start = offset or 0
         expected = expected[start : None if limit is None else start + limit]
         assert [a for (a,) in await ordered] == expected
+
+        # Ordered by an expression of the result column: distance to pivot, then a DESC.
+        by_distance = combined.order_by(asc(abs_(Items.a - pivot), nulls="first"), desc(Items.a))
+        if limit is not None:
+            by_distance = by_distance.limit(limit)
+        if offset is not None:
+            by_distance = by_distance.offset(offset)
+        closest = sorted(
+            want.elements(), key=lambda v: (0, 0, 0) if v is None else (1, abs(v - pivot), -v)
+        )
+        assert [a for (a,) in await by_distance] == closest[
+            start : None if limit is None else start + limit
+        ]
 
     loop.run(scenario())
 
@@ -609,6 +690,26 @@ def test_window_functions_match_python(
         )
         assert got == window_model(stored)
 
+        # The same through named windows (WINDOW clause), refined in OVER.
+        named = await (
+            db.select(
+                Items.id,
+                row_number().over("p", order_by=by_a),
+                rank().over("p", order_by=Items.a),
+                dense_rank().over("p", order_by=asc(Items.a)),
+                count(Items.a).over("p"),
+                lag(Items.a).over("by_id"),
+                lead(Items.a, 2, 99).over("by_id"),
+                first_value(Items.a).over("by_id"),
+                sum_(Items.a).over("by_id", frame=rows_between(-1, 0)),
+            )
+            .from_(Items)
+            .window("p", partition_by=Items.g)
+            .window("by_id", partition_by=Items.g, order_by=Items.id)
+            .order_by(Items.id)
+        )
+        assert named == got
+
         # Top row per group through a CTE: the window result filtered outside.
         n = row_number().over(
             partition_by=Items.g, order_by=[desc(Items.a, nulls="last"), asc(Items.id)]
@@ -662,5 +763,91 @@ def test_self_join_through_alias(
             want, key=key
         ), f"{mine} {op} other.{theirs}"
         assert all(type(o) is Items for _, o in got if o is not None)
+
+    loop.run(scenario())
+
+
+def plus(
+    x: datetime.datetime | datetime.date | None, y: datetime.timedelta | None
+) -> datetime.datetime | None:
+    """timestamp + interval; a date is midnight of that day."""
+    if x is None or y is None:
+        return None
+    if not isinstance(x, datetime.datetime):
+        x = datetime.datetime.combine(x, datetime.time())
+    return x + y
+
+
+def minus[V: (datetime.datetime, datetime.date)](
+    x: V | None, y: V | None
+) -> datetime.timedelta | None:
+    return None if x is None or y is None else x - y
+
+
+def before(
+    x: datetime.datetime | None, y: datetime.datetime | None, *, or_equal: bool = False
+) -> bool:
+    """``x < y`` (or ``<=``) is true: NULL never is."""
+    return x is not None and y is not None and (x <= y if or_equal else x < y)
+
+
+def neg(value: datetime.timedelta | None) -> datetime.timedelta | None:
+    return None if value is None else -value
+
+
+@SETTINGS
+@given(rows=rows_strategy, shift=intervals)
+def test_date_time_arithmetic_matches_python(
+    runner: tuple[asyncio.Runner, Database], rows: list[NewRow], shift: datetime.timedelta
+) -> None:
+    loop, db = runner
+    origin = datetime.datetime(2000, 1, 1)
+
+    async def scenario() -> None:
+        stored = await load(db, rows)
+        got = await (
+            db.select(
+                Items.t + Items.iv,
+                Items.t - Items.iv,
+                Items.t + shift,
+                Items.t - shift,
+                Items.d + Items.iv,
+                Items.d - shift,
+                Items.t - (Items.d + Items.iv),
+                Items.t - origin,
+                Items.d - Items.e,
+            )
+            .from_(Items)
+            .order_by(Items.id)
+        )
+        want = [
+            (
+                plus(r["t"], r["iv"]),
+                plus(r["t"], neg(r["iv"])),
+                plus(r["t"], shift),
+                plus(r["t"], -shift),
+                plus(r["d"], r["iv"]),
+                plus(r["d"], -shift),
+                minus(r["t"], plus(r["d"], r["iv"])),
+                minus(r["t"], origin),
+                None if (days := minus(r["d"], r["e"])) is None else days.days,
+            )
+            for r in stored
+        ]
+        assert got == want
+
+        # In a filter: rows whose timestamp is within the interval after the date.
+        found = await (
+            db.select(Items.id)
+            .from_(Items)
+            .where(and_(gte(Items.t, Items.d + shift), lt(Items.t - Items.iv, Items.d + shift)))
+            .order_by(Items.id)
+        )
+        assert [i for (i,) in found] == [
+            r["id"]
+            for r in stored
+            if before(plus(r["d"], shift), r["t"], or_equal=True)
+            and before(plus(r["t"], neg(r["iv"])), plus(r["d"], shift))
+        ]
 
     loop.run(scenario())

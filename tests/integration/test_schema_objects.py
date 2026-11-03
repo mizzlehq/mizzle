@@ -238,7 +238,7 @@ async def test_create_query_evolve_and_drop(driver: PostgresDriver, pg_url: str)
     assert policies["own"]["using"] == "(owner = CURRENT_USER)"
     trig = live["tables"]["public.so_accounts"].get("triggers", {})["so_touch"]
     assert trig["when"] == "(old.score IS DISTINCT FROM new.score)"
-    assert live.get("functions", {})["public.so_touch"]["body"] == touch.body
+    assert live.get("functions", {})["public.so_touch()"]["body"] == touch.body
 
     async with await Database.connect(pg_url, schema=V1_TABLES) as db:
         await db.insert(Accounts).values(email="a@x", owner="me", score=1)
@@ -267,14 +267,14 @@ async def test_create_query_evolve_and_drop(driver: PostgresDriver, pg_url: str)
     assert table.get("rls") == {"enabled": True, "force": True}
     assert set(table.get("policies", {})) == {"own", "edit"}
     assert table.get("triggers", {})["so_touch"]["events"] == ["insert", "update"]
-    assert "clock_timestamp" in live.get("functions", {})["public.so_touch"]["body"]
+    assert "clock_timestamp" in live.get("functions", {})["public.so_touch()"]["body"]
     assert list(live.get("views", {})["so_app.so_active"]["columns"]) == ["id", "email", "owner"]
 
     # Dropping everything leaves nothing behind.
     await migrate(driver, v2(), empty_snapshot("postgresql"))
     live, _ = await live_and_expected(driver, empty_snapshot("postgresql"))
     assert live["tables"] == {} and live.get("views", {}) == {}
-    assert "public.so_touch" not in live.get("functions", {})
+    assert "public.so_touch()" not in live.get("functions", {})
     assert live.get("extensions", {}) == {}
 
 
@@ -345,7 +345,7 @@ async def test_normalize_twice_on_one_connection(driver: PostgresDriver) -> None
             out = await dialect.normalize_snapshot(
                 conn, build_snapshot(tables, dialect, objects=[fn])
             )
-            got = out.get("functions", {})["public.so_calc"]
+            got = out.get("functions", {})[f"public.so_calc({args})"]
             assert (got["args"], got["returns"]) == (args, returns)
             definition = out.get("views", {})["so_app.so_active"]["definition"]
             assert definition.startswith("SELECT id,"), definition  # the server's text

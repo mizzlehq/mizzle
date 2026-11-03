@@ -25,13 +25,13 @@ from contextlib import (
     contextmanager,
 )
 from dataclasses import dataclass
-from typing import Literal, Self, overload
+from typing import Literal, Self, final, overload
 
 from mizzle.core.compiler import CompiledQuery
 from mizzle.core.errors import ConnectionError as DbConnectionError
 from mizzle.core.errors import MizzleError, QueryError, SerializationFailure
 from mizzle.core.naming import Casing
-from mizzle.core.query.base import Row
+from mizzle.core.query.base import Row, evolve
 from mizzle.core.query.builder import QueryBuilder
 from mizzle.core.query.insert import Insert, RowLike, as_mapping, prepare_row
 from mizzle.core.query.relational import RelationalStatement
@@ -48,6 +48,8 @@ from mizzle.dialects.base import (
     Driver,
     IsolationLevel,
     Notification,
+    Overflow,
+    Reconnected,
     ResetMode,
 )
 from mizzle.dialects.postgres import PostgresDialect
@@ -265,6 +267,7 @@ class Session(QueryBuilder):
         *,
         batch_size: int | None = None,
         returning: Literal[False] = False,
+        on_conflict: Insert[T] | None = None,
     ) -> int: ...
     @overload
     async def insert_many[T: Table](
@@ -274,6 +277,7 @@ class Session(QueryBuilder):
         *,
         batch_size: int | None = None,
         returning: Literal[True],
+        on_conflict: Insert[T] | None = None,
     ) -> list[T]: ...
     async def insert_many[T: Table](
         self,
@@ -282,25 +286,67 @@ class Session(QueryBuilder):
         *,
         batch_size: int | None = None,
         returning: bool = False,
+        on_conflict: Insert[T] | None = None,
     ) -> int | list[T]:
         """INSERT any number of rows, in as few statements as the bind parameter limit
         (32767) allows, inside one transaction: all rows or none. ``batch_size`` caps the
-        rows per statement. Returns the row count, or the rows with ``returning=True``."""
+        rows per statement. Returns the row count, or the rows with ``returning=True``.
+
+        ``on_conflict`` is an insert without values whose conflict clause every statement
+        gets: ``on_conflict=db.insert(Users).on_conflict_do_nothing(Users.email)`` or
+        ``.on_conflict_do_update(...)``. Rows skipped by DO NOTHING are not counted or
+        returned. Two rows with the same key in one batch fail with DO UPDATE (PostgreSQL
+        cannot update a row twice in one statement)."""
         if batch_size is not None and batch_size < 1:
             raise QueryError("insert_many() needs batch_size >= 1")
+        template = Insert[T](self, table) if on_conflict is None else on_conflict
+        if template.table is not table:
+            raise QueryError(f"on_conflict must be an insert into {table.__name__}")
+        if template.rows:
+            raise QueryError("on_conflict must not have values(); pass the rows to insert_many()")
         count = 0
         inserted: list[T] = []
         async with self.transaction() as tx:
-            for batch in _insert_batches(table, rows, batch_size):
-                insert = Insert(tx, table, batch)
+            template = evolve(template, runner=tx)
+            # Bind parameters the conflict clause takes (DO UPDATE SET values, WHERE).
+            no_values: dict[str, object] = {}
+            reserved = len(tx.compile(evolve(template, rows=(no_values,))).params)
+            allow_identity = template.overriding is not None
+            batches = _insert_batches(table, rows, batch_size, reserved, allow_identity)
+            for batch in batches:
+                insert = evolve(template, rows=batch)
                 if returning:
                     inserted += await insert.returning()
                 else:
                     count += await insert
         return inserted if returning else count
 
-    @asynccontextmanager
-    async def listen(self, *channels: str) -> AsyncGenerator[AsyncIterator[Notification]]:
+    @overload
+    def listen(
+        self,
+        *channels: str,
+        reconnect: Literal[False] = False,
+        max_queue: int | None = None,
+        overflow: Overflow = "raise",
+        pooler_session_mode: bool = False,
+    ) -> AbstractAsyncContextManager[AsyncIterator[Notification]]: ...
+    @overload
+    def listen(
+        self,
+        *channels: str,
+        reconnect: Literal[True],
+        max_queue: int | None = None,
+        overflow: Overflow = "raise",
+        pooler_session_mode: bool = False,
+    ) -> AbstractAsyncContextManager[AsyncIterator[Notification | Reconnected]]: ...
+    def listen(
+        self,
+        *channels: str,
+        reconnect: bool = False,
+        max_queue: int | None = None,
+        overflow: Overflow = "raise",
+        pooler_session_mode: bool = False,
+    ) -> AbstractAsyncContextManager[AsyncIterator[Notification | Reconnected]]:
         """Receive ``NOTIFY`` messages sent to ``channels``, on a pooled connection held
         until the block exits::
 
@@ -309,13 +355,42 @@ class Session(QueryBuilder):
                     print(event.channel, event.payload)
 
         If the connection is lost, iterating raises ``ConnectionError`` (notifications
-        sent meanwhile are missed). Does not work through PgBouncer in transaction mode."""
+        sent meanwhile are missed). With ``reconnect=True`` it LISTENs again on a new
+        connection instead (retrying until the database is back) and yields a
+        ``Reconnected`` event first, so the gap is never silent.
+
+        ``max_queue`` bounds the notifications waiting to be read (default: no bound).
+        When it is reached, ``overflow="raise"`` makes iteration raise ``ListenerOverflow``
+        after the queued ones; ``"drop_oldest"`` discards the oldest and logs a warning;
+        ``"block"`` stops reading the connection until the consumer catches up, so
+        PostgreSQL holds the rest and nothing is lost (the queue can briefly exceed
+        ``max_queue`` by the notifications already in one network read).
+
+        Through a connection pooler, listen() raises ``DatabaseError``: PgBouncer in
+        transaction or statement mode drops notifications. Connect it directly to
+        PostgreSQL, or pass ``pooler_session_mode=True`` when the pooler runs in session
+        mode (listen() then checks that a test notification arrives)."""
         if self._conn is not None:
             raise QueryError("listen() needs its own connection; call it outside a transaction")
         if not channels:
             raise QueryError("listen() needs at least one channel")
-        async with self._require_driver().acquire() as conn, conn.listen(channels) as events:
-            yield events
+        if max_queue is not None and max_queue < 1:
+            raise QueryError("listen() needs max_queue >= 1")
+        driver = self._require_driver()
+
+        async def open_listener(stack: AsyncExitStack) -> AsyncIterator[Notification]:
+            conn = await stack.enter_async_context(driver.acquire())
+            return await stack.enter_async_context(
+                # The pooler check's test notification must not wait for a pooled
+                # connection: with pool_size=1 the listener holds the only one.
+                conn.listen(
+                    channels, max_queue, overflow, driver.notify_unpooled, pooler_session_mode
+                )
+            )
+
+        if reconnect:
+            return _reconnecting(_Relistener(open_listener, driver))
+        return _listening(open_listener)
 
     async def notify(self, channel: str, payload: str = "") -> None:
         """Send a notification to ``channel`` (``pg_notify``; the payload is a bind
@@ -544,16 +619,97 @@ class Session(QueryBuilder):
         return conn.fetch_dicts(query.sql, query.params, self._timeout)
 
 
+type _OpenListener = Callable[[AsyncExitStack], Awaitable[AsyncIterator[Notification]]]
+
+
+@asynccontextmanager
+async def _listening(open_listener: _OpenListener) -> AsyncGenerator[AsyncIterator[Notification]]:
+    async with AsyncExitStack() as stack:
+        yield await open_listener(stack)
+
+
+@asynccontextmanager
+async def _reconnecting(
+    listener: _Relistener,
+) -> AsyncGenerator[AsyncIterator[Notification | Reconnected]]:
+    try:
+        await listener.connect()  # the first connection's errors are raised as they are
+        yield listener
+    finally:
+        await listener.close()
+
+
+@final
+class _Relistener:
+    """The iterator ``listen(reconnect=True)`` yields. A class, not an async generator: a
+    timeout or cancellation while waiting must not end the iteration (a reconnect it
+    interrupts starts again on the next call)."""
+
+    __slots__ = ("_driver", "_events", "_open", "_stack")
+    _open: _OpenListener
+    _driver: Driver
+    _stack: AsyncExitStack | None
+    _events: AsyncIterator[Notification] | None
+
+    def __init__(self, open_listener: _OpenListener, driver: Driver) -> None:
+        self._open = open_listener
+        self._driver = driver
+        self._stack = None
+        self._events = None
+
+    async def connect(self) -> None:
+        stack = AsyncExitStack()
+        try:
+            self._events = await self._open(stack)
+        except BaseException:
+            await stack.aclose()
+            raise
+        self._stack = stack
+
+    async def close(self) -> None:
+        stack, self._stack, self._events = self._stack, None, None
+        if stack is not None:
+            await stack.aclose()
+
+    def __aiter__(self) -> Self:
+        return self
+
+    async def __anext__(self) -> Notification | Reconnected:
+        if self._events is not None:
+            try:
+                return await anext(self._events)
+            except DbConnectionError:
+                log.warning("mizzle: the listen() connection was lost; reconnecting")
+                await self.close()
+                await self._driver.expire_connections()  # like any lost connection
+        delay = 0.1
+        while True:
+            try:
+                await self.connect()
+            except DbConnectionError:
+                log.warning("mizzle: listen() could not reconnect; retrying in %gs", delay)
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, 5.0)
+            else:
+                return Reconnected()
+
+
 def _insert_batches(
-    table: type[Table], rows: Iterable[RowLike], batch_size: int | None
+    table: type[Table],
+    rows: Iterable[RowLike],
+    batch_size: int | None,
+    reserved: int = 0,
+    allow_identity: bool = False,
 ) -> Iterator[tuple[dict[str, object], ...]]:
-    """Checked rows in batches that fit one INSERT's bind parameters."""
+    """Checked rows in batches that fit one INSERT's bind parameters (less ``reserved``
+    ones the rest of the statement uses)."""
     batch: list[dict[str, object]] = []
     params = 0
+    limit = MAX_PARAMS - reserved
     for row in rows:
-        values = prepare_row(table, as_mapping(row))
+        values = prepare_row(table, as_mapping(row), allow_identity=allow_identity)
         size = sum(not isinstance(v, Node) for v in values.values())  # SQL is not bound
-        if batch and (params + size > MAX_PARAMS or len(batch) == batch_size):
+        if batch and (params + size > limit or len(batch) == batch_size):
             yield tuple(batch)
             batch, params = [], 0
         batch.append(values)

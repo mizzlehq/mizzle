@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+from datetime import UTC
 from datetime import date as _date
 from datetime import datetime as _datetime
 from decimal import Decimal
+from typing import cast
 
 from mizzle.core.schema.column import Column
 
@@ -60,6 +62,28 @@ def date(name: str | None = None) -> Column[_date | None]:
 def timestamp(
     name: str | None = None, *, tz: bool = False, precision: int | None = None
 ) -> Column[_datetime | None]:
-    """``precision``: digits of fractional seconds kept, 0-6 (default 6)."""
+    """``precision``: digits of fractional seconds kept, 0-6 (default 6). ``tz=True`` values
+    are always read back as aware datetimes (in UTC)."""
     digits = f"({precision})" if precision is not None else ""
-    return Column(f"timestamp{'tz' if tz else ''}{digits}", (_datetime,), name)
+    if not tz:
+        return Column(f"timestamp{digits}", (_datetime,), name)
+    return Column(
+        f"timestamptz{digits}", (_datetime,), name, encoder=_tz_encode, decoder=_tz_decode
+    )
+
+
+_MIN_UTC = _datetime.min.replace(tzinfo=UTC)
+_MAX_UTC = _datetime.max.replace(tzinfo=UTC)
+
+
+def _tz_decode(value: object) -> object:
+    # asyncpg reads -infinity / infinity as naive datetime.min / max, even for timestamptz.
+    stamp = cast(_datetime, value)
+    return stamp if stamp.tzinfo is not None else stamp.replace(tzinfo=UTC)
+
+
+def _tz_encode(value: object) -> object:
+    # ... and only writes the naive ones back as infinity, so they round-trip.
+    if value in (_MAX_UTC, _MIN_UTC):
+        return cast(_datetime, value).replace(tzinfo=None)
+    return value

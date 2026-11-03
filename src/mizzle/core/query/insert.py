@@ -43,8 +43,11 @@ def check_values(table: type[Table], values: Mapping[str, object]) -> None:
         column.validate(value)
 
 
-def prepare_row(table: type[Table], row: Mapping[str, object]) -> dict[str, object]:
-    """Validate one insert row and apply Python-side defaults."""
+def prepare_row(
+    table: type[Table], row: Mapping[str, object], *, allow_identity: bool = False
+) -> dict[str, object]:
+    """Validate one insert row and apply Python-side defaults. ``allow_identity`` lets it
+    set ``GENERATED ALWAYS`` identity columns (for ``overriding_system_value()``)."""
     columns = table.__table__.columns
     if not row.keys() <= columns.keys():
         check_values(table, row)  # raises with the unknown names
@@ -52,7 +55,14 @@ def prepare_row(table: type[Table], row: Mapping[str, object]) -> dict[str, obje
     for attr, column in columns.items():
         if attr in row:
             value = row[attr]
-            if column.read_only:
+            if column.read_only and not (allow_identity and column.computed is None):
+                if column.computed is None:  # GENERATED ALWAYS identity (bulk paths)
+                    raise QueryError(
+                        f"{column.qualified_name} is GENERATED ALWAYS AS IDENTITY; the "
+                        "database assigns it. insert_many() and copy_into() cannot set it: "
+                        f"use db.insert({table.__name__}).values(...).overriding_system_value(), "
+                        "or make the column generated_by_default_as_identity()"
+                    )
                 column.check_writable()
             column.validate(value)
             out[attr] = value
@@ -94,6 +104,9 @@ class Insert[T: Table](Executable[int]):
     table: type[T]
     rows: tuple[dict[str, object], ...] = ()
     conflict: OnConflict | None = None
+    overriding: Literal["SYSTEM", "USER"] | None = None
+    # A GENERATED ALWAYS identity column the rows set: compiling fails without overriding.
+    identity: ColumnBase | None = None
 
     def values(self, rows: RowLike | Sequence[RowLike] | None = None, /, **fields: object) -> Self:
         """``values(email="a")``, ``values({"email": "a"})`` or ``values([{...}, {...}])``."""
@@ -109,7 +122,28 @@ class Insert[T: Table](Executable[int]):
                 raise QueryError("values() got an empty list")
         else:
             batch = [as_mapping(rows)]
-        return evolve(self, rows=tuple(prepare_row(self.table, row) for row in batch))
+        rows = tuple(prepare_row(self.table, row, allow_identity=True) for row in batch)
+        identity = next(
+            (
+                column
+                for attr, column in self.table.__table__.columns.items()
+                if column.identity is not None
+                and column.identity.always
+                and any(attr in row for row in rows)
+            ),
+            None,
+        )
+        return evolve(self, rows=rows, identity=identity)
+
+    def overriding_system_value(self) -> Self:
+        """``OVERRIDING SYSTEM VALUE``: store the given values of ``GENERATED ALWAYS``
+        identity columns. Without it, inserting them fails."""
+        return evolve(self, overriding="SYSTEM")
+
+    def overriding_user_value(self) -> Self:
+        """``OVERRIDING USER VALUE``: ignore the given values of identity columns; the
+        database assigns them."""
+        return evolve(self, overriding="USER")
 
     def on_conflict_do_nothing(
         self, target: ColumnBase | Sequence[ColumnBase] | None = None

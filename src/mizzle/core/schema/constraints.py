@@ -27,7 +27,8 @@ class Index:
     unique: bool = False
     predicate: Condition | None = None
     method: str | None = None  # access method; None is btree
-    opclass: str | None = None  # operator class of every key
+    # Operator class of every key, or one per key (None: the default).
+    opclass: str | tuple[str | None, ...] | None = None
     options: tuple[tuple[str, str], ...] = ()  # storage parameters, as text
 
     def on(self, *keys: ExprBase) -> Index:
@@ -37,12 +38,25 @@ class Index:
         """Partial index."""
         return replace(self, predicate=condition)
 
-    def using(self, method: str, opclass: str | None = None) -> Index:
-        """An access method (``gin``, ``gist``, ``hnsw``, ``ivfflat``...) and optionally a
-        non-default operator class for every key: ``.using("hnsw", "vector_cosine_ops")``."""
-        if opclass is not None:
+    def using(self, method: str, opclass: str | Sequence[str | None] | None = None) -> Index:
+        """An access method (``gin``, ``gist``, ``hnsw``, ``ivfflat``...) and optionally an
+        operator class for every key: ``.using("hnsw", "vector_cosine_ops")``, or one per
+        key: ``.using("btree", [None, "text_pattern_ops"])`` (None: the default)."""
+        if isinstance(opclass, str):
             _sql_name("operator class", opclass)
+        elif opclass is not None:
+            opclass = tuple(o if o is None else _sql_name("operator class", o) for o in opclass)
         return replace(self, method=_sql_name("method", method).lower(), opclass=opclass)
+
+    def opclasses(self, keys: int) -> list[str | None]:
+        """The operator class of each of ``keys`` keys."""
+        if isinstance(self.opclass, tuple):
+            if len(self.opclass) != keys:
+                raise SchemaError(
+                    f"index {self.name!r}: {keys} keys but {len(self.opclass)} opclasses"
+                )
+            return list(self.opclass)
+        return [self.opclass] * keys
 
     def with_(self, **options: int | float | str | bool) -> Index:
         """Storage parameters: ``.with_(m=16, ef_construction=64)``."""
@@ -126,6 +140,31 @@ class Policy:
     declared_roles: tuple[Role, ...] = ()  # Role objects in ``to``, created by migrations
 
 
+_PRIVILEGES = (
+    "select",
+    "insert",
+    "update",
+    "delete",
+    "truncate",
+    "references",
+    "trigger",
+    "maintain",
+    "all",
+)
+type Privilege = Literal[
+    "select", "insert", "update", "delete", "truncate", "references", "trigger", "maintain", "all"
+]
+
+
+@dataclass(frozen=True)
+class Grant:
+    """``GRANT privileges ON table TO roles``, kept in sync by migrations."""
+
+    privileges: tuple[str, ...]  # sorted; ("all",) for ALL
+    roles: tuple[str, ...]  # sorted; "public" is everyone
+    declared_roles: tuple[Role, ...] = ()  # Role objects in ``to``, created by migrations
+
+
 @dataclass(frozen=True)
 class RowLevelSecurity:
     enabled: bool = True
@@ -133,7 +172,7 @@ class RowLevelSecurity:
 
 
 type Constraint = (
-    Index | UniqueConstraint | PrimaryKey | ForeignKey | Check | Policy | RowLevelSecurity
+    Index | UniqueConstraint | PrimaryKey | ForeignKey | Check | Policy | RowLevelSecurity | Grant
 )
 
 
@@ -191,3 +230,18 @@ def policy(
     # PostgreSQL ignores the other roles when PUBLIC is one of them.
     roles = ("public",) if "public" in names else tuple(sorted(set(names)))
     return Policy(name, for_, roles, using, with_check, as_ == "permissive", managed)
+
+
+def grant(privileges: Privilege | Sequence[Privilege], *, to: Sequence[str | Role]) -> Grant:
+    """``grant(["select", "insert"], to=[reader])`` in a table's or view's ``config()``.
+    Migrations grant what is declared and revoke what was declared before and no longer
+    is; privileges the schema never declared for a role are left alone."""
+    wanted = [privileges] if isinstance(privileges, str) else list(privileges)
+    if not wanted or not to:
+        raise SchemaError("grant() needs at least one privilege and one role")
+    if bad := [p for p in wanted if p not in _PRIVILEGES]:
+        raise SchemaError(f"grant(): unknown privileges {bad}")
+    names = sorted({r.name if isinstance(r, Role) else r for r in to})
+    managed = tuple(r for r in to if isinstance(r, Role) and not r.existing)
+    privs = ("all",) if "all" in wanted else tuple(sorted(set(wanted)))
+    return Grant(privs, tuple(names), managed)

@@ -209,6 +209,21 @@ async def test_other_violations(db: Database) -> None:
     with pytest.raises(NotNullViolation) as info:
         await db.execute(sql("insert into users (email) values (null)"))
     assert info.value.column == "email"
+    assert info.value.sqlstate == "23502"
+
+
+async def test_restrict_foreign_key_is_a_foreign_key_violation(db: Database) -> None:
+    # RESTRICT reports SQLSTATE 23001, not 23503: both are ForeignKeyViolation.
+    with pytest.raises(ForeignKeyViolation) as info:
+        async with db.transaction() as tx:  # rolled back by the error
+            await tx.execute(sql("create table fk_parent (id int primary key)"))
+            await tx.execute(
+                sql("create table fk_child (p int references fk_parent on delete restrict)")
+            )
+            await tx.execute(sql("insert into fk_parent values (1)"))
+            await tx.execute(sql("insert into fk_child values (1)"))
+            await tx.execute(sql("delete from fk_parent"))
+    assert info.value.sqlstate == "23001"
 
 
 async def test_logger_hides_params_by_default(pg_url: str, driver: object) -> None:

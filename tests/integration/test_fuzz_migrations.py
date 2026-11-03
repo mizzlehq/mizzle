@@ -1,8 +1,11 @@
 """Random schemas through the migration engine.
 
 Schemas also get random extensions, views (plain and materialized) over their tables,
-row-level security, policies, a trigger function with triggers, and a SQL function some
-views call; mutations change all of them.
+row-level security, policies, grants, a trigger function with triggers (UPDATE OF columns,
+transition tables, INSTEAD OF on views), and a SQL function some views call; mutations
+change all of them, rename and move tables, rename columns, and make columns generated.
+Half of the schemas use ``casing="snake_case"`` (camelCase attributes), and the enum type
+may live in the other schema.
 
 A: empty -> schema, applied, introspected: no drift.
 B: schema S1 (with a few rows) -> random mutation S2, applied: no drift, untouched data kept.
@@ -13,9 +16,11 @@ The CLI test runs the same evolution through ``mizzle generate`` and ``mizzle mi
 import asyncio
 import contextlib
 import copy
+import dataclasses
 import datetime as dt
 import enum
 import os
+import re
 import tempfile
 import types
 import uuid
@@ -38,6 +43,7 @@ from mizzle import (
     extension,
     foreign_key,
     function,
+    grant,
     index,
     is_not_null,
     policy,
@@ -49,9 +55,10 @@ from mizzle import (
     unique_index,
 )
 from mizzle.core.errors import DatabaseError
+from mizzle.core.naming import Casing
 from mizzle.core.query.select import Select
 from mizzle.core.schema.column import ColumnBase, Computed, Identity, Reference, ReferentialAction
-from mizzle.core.schema.constraints import Constraint, PolicyCommand
+from mizzle.core.schema.constraints import Constraint, PolicyCommand, Privilege
 from mizzle.core.schema.objects import SchemaObject, TriggerEvent
 from mizzle.core.snapshot import Snapshot, empty_snapshot
 from mizzle.core.sql.nodes import ExprBase
@@ -60,7 +67,7 @@ from mizzle.dialects.postgres import PostgresDialect
 from mizzle.dialects.postgres.ddl import qualified, quote
 from mizzle.dialects.postgres.driver import PostgresDriver
 from mizzle.kit.cli import main
-from mizzle.kit.diff import diff
+from mizzle.kit.diff import RenameKind, diff
 from mizzle.kit.journal import MigrationsDir
 from mizzle.kit.migrate import apply_statements
 from mizzle.kit.snapshot import build_snapshot
@@ -284,6 +291,26 @@ FZ_ROLE = "mizzle_fz_role"
 TRIGGER_EVENTS: list[TriggerEvent] = ["insert", "delete", "update", "truncate"]
 COMMANDS: list[PolicyCommand] = ["all", "select", "insert", "update", "delete"]
 ENUM_EXTRAS = ["glad", "it's", "Mixed Case", "z"]
+PRIVILEGES: list[Privilege] = ["select", "insert", "update", "delete", "all"]
+# Sequence options of identity columns (start 10, increment 3 and more).
+# (min_value, max_value, cache, cycle)
+SEQ_OPTIONS: list[tuple[int | None, int | None, int | None, bool]] = [
+    (None, None, None, False),
+    (None, 30000, 5, False),
+    (2, None, None, True),
+]
+# Options of fz_calc (Function fields): settings and planner options.
+CALC_OPTIONS: list[dict[str, object]] = [
+    {},
+    {"strict": True, "parallel": "safe", "cost": 7.0},
+    {"settings": (("search_path", "public, pg_temp"),), "parallel": "restricted"},
+]
+SERVER = {"virtual": False}  # VIRTUAL generated columns: PostgreSQL 18+ (set by the runner)
+
+
+def camel(name: str) -> str:
+    """The attribute for db column ``name`` under snake_case casing: ``c_a`` -> ``cA``."""
+    return re.sub(r"_([a-z])", lambda m: m.group(1).upper(), name)
 
 
 @dataclass
@@ -296,6 +323,12 @@ class Col:
     pk: bool = False  # column-level .primary_key()
     identity: bool | None = None  # GENERATED ALWAYS (True) / BY DEFAULT (False) AS IDENTITY
     generated: bool = False  # GENERATED ALWAYS AS (KINDS[kind].generated) STORED
+    virtual: bool = False  # generated VIRTUAL instead of STORED
+    seq: int = 0  # identity: SEQ_OPTIONS[seq]
+    uid: str = ""  # stays the same when the column is renamed
+
+    def __post_init__(self) -> None:
+        self.uid = self.uid or self.name
 
 
 @dataclass
@@ -305,6 +338,7 @@ class Idx:
     unique: bool = False
     where: str | None = None  # column: partial index "WHERE col IS NOT NULL"
     expr: str | None = None  # text column: an index on lower(col) instead of cols
+    ops: list[str | None] = field(default_factory=list[str | None])  # opclass per text column
 
 
 @dataclass
@@ -334,6 +368,14 @@ class Trg:
     after: bool = False
     statement: bool = False  # FOR EACH STATEMENT
     when: str | None = None  # column: WHEN (NEW.col IS NOT NULL)
+    update_of: list[str] = field(default_factory=list[str])  # UPDATE OF columns
+    transition: bool = False  # REFERENCING NEW/OLD TABLE (AFTER, one event)
+
+
+@dataclass
+class Grt:
+    privileges: list[Privilege]
+    public: bool = False  # TO PUBLIC, else the fuzz role
 
 
 @dataclass
@@ -349,9 +391,17 @@ class Tbl:
     rls: int = 0  # 0 off, 1 enabled, 2 enabled and forced, 3 only forced
     policies: list[Pol] = field(default_factory=list[Pol])
     triggers: list[Trg] = field(default_factory=list[Trg])
+    grants: list[Grt] = field(default_factory=list[Grt])
+    uid: str = ""  # stays the same when the table is renamed or moved
+
+    def __post_init__(self) -> None:
+        self.uid = self.uid or self.name
 
     def col(self, name: str) -> Col | None:
         return next((c for c in self.cols if c.name == name), None)
+
+    def by_uid(self, uid: str) -> Col | None:
+        return next((c for c in self.cols if c.uid == uid), None)
 
     def key_lists(self) -> list[list[str]]:
         """Column lists a foreign key may reference."""
@@ -370,6 +420,8 @@ class Vw:
     materialized: bool = False
     indexed: bool = False  # materialized: an index on its first column
     calc: bool = False  # a column calling fz_calc()
+    grants: list[Grt] = field(default_factory=list[Grt])
+    instead: bool = False  # plain view: an INSTEAD OF INSERT trigger
 
 
 @dataclass
@@ -380,9 +432,26 @@ class Spec:
     views: list[Vw] = field(default_factory=list[Vw])
     fn_variant: int = 0  # body of the trigger function
     calc: int | None = None  # fz_calc(): None absent, else its number of arguments
+    calc_options: int = 0  # CALC_OPTIONS[calc_options]
+    enum_schema: str | None = None  # the enum type's schema (None: public)
+    snake: bool = False  # casing="snake_case": attributes are camelCase
 
     def table(self, name: str) -> Tbl | None:
         return next((t for t in self.tables if t.name == name), None)
+
+    def by_uid(self, uid: str) -> Tbl | None:
+        return next((t for t in self.tables if t.uid == uid), None)
+
+    @property
+    def casing(self) -> Casing | None:
+        return "snake_case" if self.snake else None
+
+    def attr(self, name: str) -> str:
+        return camel(name) if self.snake else name
+
+    @property
+    def enum_type(self) -> str:
+        return f"{self.enum_schema}.{ENUM}" if self.enum_schema else ENUM
 
 
 def _dedupe[T](items: list[T]) -> list[T]:
@@ -405,13 +474,16 @@ def sanitize(spec: Spec) -> Spec:
                 c.identity = None
             if kind.generated is None:
                 c.generated = False
+            c.virtual = c.virtual and c.generated and SERVER["virtual"]
             if c.identity is not None:
                 c.nullable, c.default = False, None
+            else:
+                c.seq = 0
             if c.generated:
                 c.default = None
             if c.default is not None and c.default >= len(kind.defaults):
                 c.default = None
-            if not kind.btree:
+            if not kind.btree or c.virtual:  # no keys on VIRTUAL columns
                 c.unique = c.pk = False
 
         def ok(cols: list[str], t: Tbl = t) -> bool:
@@ -419,8 +491,12 @@ def sanitize(spec: Spec) -> Spec:
             return (
                 bool(cols)
                 and len(set(cols)) == len(cols)
-                and all(c is not None and KINDS[c.kind].btree for c in found)
+                and all(c is not None and KINDS[c.kind].btree and not c.virtual for c in found)
             )
+
+        def virtual(name: str | None, t: Tbl = t) -> bool:
+            col = t.col(name) if name is not None else None
+            return col is not None and col.virtual
 
         t.pk = t.pk if ok(t.pk) else []
         flagged = [c for c in t.cols if c.pk]
@@ -430,13 +506,21 @@ def sanitize(spec: Spec) -> Spec:
         t.checks = _dedupe([n for n in t.checks if t.col(n) is not None])
         indexes: list[Idx] = []
         for i in t.indexes:
-            if i.where is not None and t.col(i.where) is None:
+            if i.where is not None and (t.col(i.where) is None or virtual(i.where)):
                 i.where = None
             expr_col = t.col(i.expr) if i.expr is not None else None
-            if i.expr is not None and (expr_col is None or not KINDS[expr_col.kind].text):
+            if i.expr is not None and (
+                expr_col is None or not KINDS[expr_col.kind].text or expr_col.virtual
+            ):
                 continue
             if (i.expr is None and not ok(i.cols)) or i.name in [j.name for j in indexes]:
                 continue
+            # Operator classes only on text columns (named default or a pattern one).
+            kinds = [_kind(t, n) for n in i.cols] if i.expr is None else []
+            ops = (i.ops + [None] * len(kinds))[: len(kinds)]
+            i.ops = [op if k in STR else None for op, k in zip(ops, kinds, strict=True)]
+            if not any(i.ops):
+                i.ops = []
             indexes.append(i)
         t.indexes = indexes
     for t in spec.tables:
@@ -451,6 +535,8 @@ def sanitize(spec: Spec) -> Spec:
                 continue
             if any(a is not None and a.generated for a in local):
                 continue  # a generated column cannot take ON UPDATE / ON DELETE actions
+            if any(b is not None and b.virtual for b in remote):
+                continue
             if any(
                 a is None or b is None or base_kind(a.kind) != base_kind(b.kind)
                 for a, b in zip(local, remote, strict=True)
@@ -489,8 +575,22 @@ def sanitize_objects(spec: Spec) -> None:
                 or trg.statement
                 or not set(trg.events) <= {"insert", "update"}  # NEW is there
                 or (col.generated and not trg.after)  # not yet computed in BEFORE
+                or col.virtual
             ):
                 trg.when = None
+            trg.update_of = (
+                _dedupe([n for n in trg.update_of if (c := t.col(n)) and not c.generated])
+                if "update" in trg.events
+                else []
+            )
+            # Transition tables: AFTER triggers with one event and no column list.
+            trg.transition = (
+                trg.transition
+                and trg.after
+                and len(trg.events) == 1
+                and trg.events[0] != "truncate"
+                and not trg.update_of
+            )
             if trg.name not in [u.name for u in triggers]:
                 triggers.append(trg)
         t.triggers = triggers
@@ -506,6 +606,7 @@ def sanitize_objects(spec: Spec) -> None:
             v.where = None
         v.indexed = v.indexed and v.materialized and KINDS[_kind(t, v.cols[0])].btree
         v.calc = v.calc and spec.calc is not None
+        v.instead = v.instead and not v.materialized
         views.append(v)
     spec.views = views
 
@@ -522,6 +623,7 @@ def build_schema(spec: Spec) -> tuple[list[type[Table]], list[SchemaObject]]:
     members = [(f"V{i}", v) for i, v in enumerate(spec.enum_values)]
     mood = cast(type[enum.Enum], enum.Enum("FzMood", members))
     classes: dict[str, type[Table]] = {}
+    a = spec.attr  # the attribute of a db column name
 
     def column(c: Col) -> ColumnBase:
         kind = KINDS[c.kind]
@@ -529,11 +631,14 @@ def build_schema(spec: Spec) -> tuple[list[type[Table]], list[SchemaObject]]:
         col.nullable = c.nullable and not c.pk and not kind.serial
         col.is_primary_key = c.pk
         col.is_unique = c.unique
+        if col.enum is not None:
+            col.enum_schema = spec.enum_schema
         if c.identity is not None:
-            col.identity = Identity(c.identity, *(None, None) if c.pk else (10, 3))
+            start, increment = (None, None) if c.pk else (10, 3)
+            col.identity = Identity(c.identity, start, increment, *SEQ_OPTIONS[c.seq])
             col.generated = True
         if c.generated:
-            col.computed = Computed(sql(cast(str, kind.generated)))
+            col.computed = Computed(sql(cast(str, kind.generated)), stored=not c.virtual)
             col.generated = True
         if c.default is not None:
             value = kind.defaults[c.default]
@@ -541,26 +646,29 @@ def build_schema(spec: Spec) -> tuple[list[type[Table]], list[SchemaObject]]:
                 value = mood(value)
             elif c.kind == "enum[]" and isinstance(value, list):
                 value = [mood(v) for v in cast(list[str], value)]
+            elif c.kind == "enum[]":  # the type's name, with its schema
+                value = sql(f"'{{}}'::{spec.enum_type}[]")
             col.default_value = value
         return col
 
     def ref_target(fk: Fk) -> Callable[[], list[ColumnBase]]:
-        return lambda: [classes[fk.ref].__table__.columns[n] for n in fk.ref_cols]
+        return lambda: [classes[fk.ref].__table__.columns[a(n)] for n in fk.ref_cols]
 
     for t in spec.tables:
         attrs: dict[str, object] = {}
         for c in t.cols:
-            attrs[c.name] = column(c)
+            attrs[a(c.name)] = column(c)
         for fk in t.fks:
             if fk.inline:
                 ref = ref_target(fk)
-                column_of = cast(ColumnBase, attrs[fk.cols[0]])
+                column_of = cast(ColumnBase, attrs[a(fk.cols[0])])
                 column_of.reference = Reference(
                     lambda ref=ref: ref()[0], fk.on_delete, fk.on_update
                 )
 
         def config(cls: type[Table], t: Tbl = t) -> list[Constraint]:
-            cols = cls.__table__.columns
+            table_cols = cls.__table__.columns
+            cols = {n: table_cols[a(n)] for n in [c.name for c in t.cols]}
             out: list[Constraint] = []
             if t.pk:
                 out.append(primary_key(*(cols[n] for n in t.pk)))
@@ -587,6 +695,8 @@ def build_schema(spec: Spec) -> tuple[list[type[Table]], list[SchemaObject]]:
                     ix = ix.on(sql(f"lower({quote(i.expr)})"))
                 else:
                     ix = ix.on(*(cols[n] for n in i.cols))
+                    if i.ops:
+                        ix = ix.using("btree", i.ops)
                 if i.where is not None:
                     ix = ix.where(sql(f"{quote(i.where)} IS NOT NULL"))
                 out.append(ix)
@@ -600,6 +710,7 @@ def build_schema(spec: Spec) -> tuple[list[type[Table]], list[SchemaObject]]:
                 for fk in t.fks
                 if not fk.inline
             ]
+            out += [grant(g.privileges, to=["public"] if g.public else [FZ_ROLE]) for g in t.grants]
             return out
 
         attrs["config"] = classmethod(config)
@@ -621,9 +732,10 @@ def build_schema(spec: Spec) -> tuple[list[type[Table]], list[SchemaObject]]:
         returns="integer",
         language="sql",
         args=", ".join(calc_args),
-        body="SELECT " + " + ".join(a.split()[0] for a in calc_args),
+        body="SELECT " + " + ".join(arg.split()[0] for arg in calc_args),
         volatility="immutable",
     )
+    calc_fn = dataclasses.replace(calc_fn, **CALC_OPTIONS[spec.calc_options])
     if spec.calc is not None:
         objects.append(calc_fn)
     for t in spec.tables:
@@ -638,6 +750,9 @@ def build_schema(spec: Spec) -> tuple[list[type[Table]], list[SchemaObject]]:
                     events=trg.events,
                     for_each="statement" if trg.statement else "row",
                     when=when,
+                    update_of=[classes[t.name].__table__.columns[a(n)] for n in trg.update_of],
+                    old_table="gone" if trg.transition and trg.events[0] != "insert" else None,
+                    new_table="came" if trg.transition and trg.events[0] != "delete" else None,
                 )
             )
 
@@ -653,18 +768,20 @@ def build_schema(spec: Spec) -> tuple[list[type[Table]], list[SchemaObject]]:
             calc_args: int = spec.calc or 0,
         ) -> ExprBase | Select[dict[str, object]]:
             cols = source.__table__.columns
-            fields: dict[str, ExprBase] = {c: cols[c] for c in v.cols}
+            fields: dict[str, ExprBase] = {c: cols[a(c)] for c in v.cols}
             if v.calc:
                 fields["calc"] = sql(f"fz_calc({', '.join(['1'] * calc_args)})")
             select = db.select(fields).from_(source)
-            return select.where(is_not_null(cols[v.where])) if v.where else select
+            return select.where(is_not_null(cols[a(v.where)])) if v.where else select
 
         def view_config(cls: type[Table], v: Vw = v) -> list[Constraint]:
-            first = cls.__table__.columns[v.cols[0]]
-            return [index(f"{v.name}_ix").on(first)] if v.indexed else []
+            first = cls.__table__.columns[a(v.cols[0])]
+            out: list[Constraint] = [index(f"{v.name}_ix").on(first)] if v.indexed else []
+            out += [grant(g.privileges, to=["public"] if g.public else [FZ_ROLE]) for g in v.grants]
+            return out
 
         names = [*v.cols, *(["calc"] if v.calc else [])]
-        view_attrs: dict[str, object] = {c: text() for c in names}
+        view_attrs: dict[str, object] = {a(c): text() for c in names}
         view_attrs["query"] = classmethod(query)
         view_attrs["config"] = classmethod(view_config)
         views.append(
@@ -675,6 +792,17 @@ def build_schema(spec: Spec) -> tuple[list[type[Table]], list[SchemaObject]]:
                 lambda ns, view_attrs=view_attrs: ns.update(view_attrs),
             )
         )
+    for v, view in zip(spec.views, views, strict=True):
+        if v.instead:
+            objects.append(
+                trigger(
+                    f"{v.name[:20]}_ins",
+                    on=view,
+                    execute=trigger_fn,
+                    timing="instead of",
+                    events=["insert"],
+                )
+            )
     return [*classes.values(), *views], objects
 
 
@@ -686,7 +814,7 @@ def _kind(t: Tbl, name: str) -> str:
 
 def snapshot_of(spec: Spec) -> Snapshot:
     tables, objects = build_schema(spec)
-    return build_snapshot(tables, dialect, objects=objects)
+    return build_snapshot(tables, dialect, spec.casing, objects=objects)
 
 
 # -- strategies ------------------------------------------------------------------------
@@ -700,8 +828,20 @@ def col_strategy(name: str, kinds: list[str] = KIND_NAMES) -> st.SearchStrategy[
         uq: bool,
         identity: bool | None,
         generated: bool,
+        virtual: bool,
+        seq: int,
     ) -> Col:
-        return Col(name, kind, nullable, default, uq, identity=identity, generated=generated)
+        return Col(
+            name,
+            kind,
+            nullable,
+            default,
+            uq,
+            identity=identity,
+            generated=generated,
+            virtual=virtual,
+            seq=seq,
+        )
 
     return st.builds(
         build,
@@ -711,7 +851,12 @@ def col_strategy(name: str, kinds: list[str] = KIND_NAMES) -> st.SearchStrategy[
         st.integers(0, 4).map(lambda n: n == 0),
         st.sampled_from([None, None, True, False]),
         st.integers(0, 4).map(lambda n: n == 0),
+        st.booleans(),
+        st.integers(0, len(SEQ_OPTIONS) - 1),
     )
+
+
+OPCLASSES = [None, "text_ops", "text_pattern_ops"]  # text_ops is the default one
 
 
 @st.composite
@@ -720,7 +865,8 @@ def index_strategy(draw: st.DrawFn, t: Tbl, name: str) -> Idx:
     cols = draw(st.lists(st.sampled_from(names), min_size=1, max_size=3, unique=True))
     where = draw(st.none() | st.sampled_from(names))
     expr = draw(st.none() | st.sampled_from(names)) if draw(st.booleans()) else None
-    return Idx(name, cols, draw(st.booleans()), where, expr)
+    ops = draw(st.lists(st.sampled_from(OPCLASSES), max_size=3))
+    return Idx(name, cols, draw(st.booleans()), where, expr, ops)
 
 
 @st.composite
@@ -752,7 +898,7 @@ def fk_strategy(draw: st.DrawFn, t: Tbl, spec: Spec) -> Fk | None:
 @st.composite
 def table_strategy(draw: st.DrawFn, name: str) -> Tbl:
     n = draw(st.integers(1, 6))
-    cols = [draw(col_strategy(f"c{i}")) for i in range(n)]
+    cols = [draw(col_strategy(f"c_{'abcdef'[i]}")) for i in range(n)]  # cA under snake_case
     t = Tbl(name, draw(st.sampled_from([None, None, "fz_s"])), cols)
     names = [c.name for c in cols]
     match draw(st.integers(0, 3)):
@@ -769,7 +915,14 @@ def table_strategy(draw: st.DrawFn, name: str) -> Tbl:
     t.indexes = [
         draw(index_strategy(t, f"{name[:40]}_ix{i}")) for i in range(draw(st.integers(0, 3)))
     ]
+    t.grants = draw(st.lists(grant_strategy(), max_size=2))
     return t
+
+
+def grant_strategy() -> st.SearchStrategy[Grt]:
+    return st.builds(
+        Grt, st.lists(st.sampled_from(PRIVILEGES), min_size=1, max_size=2), st.booleans()
+    )
 
 
 def enum_values(draw: st.DrawFn, values: list[str]) -> list[str]:
@@ -785,6 +938,8 @@ def enum_values(draw: st.DrawFn, values: list[str]) -> list[str]:
 def schemas(draw: st.DrawFn) -> Spec:
     names = draw(st.lists(st.sampled_from(TABLE_NAMES), min_size=1, max_size=4, unique=True))
     spec = Spec(enum_values(draw, ["happy", "sad"]), [])
+    spec.enum_schema = draw(st.sampled_from([None, None, "fz_s"]))
+    spec.snake = draw(st.booleans())
     for name in names:
         spec.tables.append(draw(table_strategy(name)))
     sanitize(spec)
@@ -802,6 +957,7 @@ def draw_objects(draw: st.DrawFn, spec: Spec) -> None:
     spec.extensions = draw(st.lists(st.sampled_from(EXTENSIONS), unique=True, max_size=2))
     spec.fn_variant = draw(st.integers(0, 2))
     spec.calc = draw(st.sampled_from([None, 1, 2]))
+    spec.calc_options = draw(st.integers(0, len(CALC_OPTIONS) - 1))
     for t in spec.tables:
         t.rls = draw(st.sampled_from([0, 0, 1, 2, 3]))
         t.policies = [draw(policy_strategy(t, f"p{i}")) for i in range(draw(st.integers(0, 2)))]
@@ -829,7 +985,16 @@ def policy_strategy(draw: st.DrawFn, t: Tbl, name: str) -> Pol:
 @st.composite
 def trigger_strategy(draw: st.DrawFn, t: Tbl, name: str) -> Trg:
     events = draw(st.lists(st.sampled_from(TRIGGER_EVENTS), min_size=1, max_size=3, unique=True))
-    return Trg(name, events, draw(st.booleans()), draw(st.booleans()), _col_or_none(draw, t))
+    names = [c.name for c in t.cols]
+    return Trg(
+        name,
+        events,
+        draw(st.booleans()),
+        draw(st.booleans()),
+        _col_or_none(draw, t),
+        draw(st.lists(st.sampled_from(names), max_size=2)),
+        draw(st.booleans()),
+    )
 
 
 @st.composite
@@ -845,16 +1010,59 @@ def view_strategy(draw: st.DrawFn, spec: Spec, name: str) -> Vw:
         draw(st.booleans()),
         draw(st.booleans()),
         draw(st.booleans()),
+        draw(st.lists(grant_strategy(), max_size=2)),
+        draw(st.booleans()),
     )
 
 
 # Mutation ops (see the match below); column changes are listed more than once.
-OPS = [*range(18), 2, 2, 2, 3, 4, 4, 14, *range(18, 30)]
+OPS = [*range(18), 2, 2, 2, 3, 4, 4, 14, *range(18, 38), 30, 31, 31, 33]
+# Names a table is renamed to (never one a dropped table had: that would be a rewrite).
+RENAMED = ["epsilon", "Renamed T", "t_" + "renamed" * 8]
+
+
+def rename_table(spec: Spec, t: Tbl, new: str) -> None:
+    for other in spec.tables:
+        for fk in other.fks:
+            if fk.ref == t.name:
+                fk.ref = new
+    for v in spec.views:
+        if v.table == t.name:
+            v.table = new
+    t.name = new
+
+
+def rename_column(spec: Spec, t: Tbl, old: str, new: str) -> None:
+    def rn(names: list[str]) -> list[str]:
+        return [new if n == old else n for n in names]
+
+    def rn1(name: str | None) -> str | None:
+        return new if name == old else name
+
+    col = t.col(old)
+    assert col is not None
+    col.name = new
+    t.pk, t.uniques, t.checks = rn(t.pk), [rn(u) for u in t.uniques], rn(t.checks)
+    for i in t.indexes:
+        i.cols, i.where, i.expr = rn(i.cols), rn1(i.where), rn1(i.expr)
+    for fk in t.fks:
+        fk.cols = rn(fk.cols)
+    for other in spec.tables:
+        for fk in other.fks:
+            if fk.ref == t.name:
+                fk.ref_cols = rn(fk.ref_cols)
+    for v in spec.views:
+        if v.table == t.name:
+            v.cols, v.where = rn(v.cols), rn1(v.where)
+    for p in t.policies:
+        p.using, p.check = rn1(p.using), rn1(p.check)
+    for trg in t.triggers:
+        trg.when, trg.update_of = rn1(trg.when), rn(trg.update_of)
 
 
 def original_kind(s1: Spec, t: Tbl, c: Col) -> str:
-    before = s1.table(t.name)
-    col = before.col(c.name) if before is not None else None
+    before = s1.by_uid(t.uid)
+    col = before.by_uid(c.uid) if before is not None else None
     return col.kind if col is not None else c.kind
 
 
@@ -963,6 +1171,31 @@ def mutated(draw: st.DrawFn, s1: Spec) -> Spec:
             case 29 if spec.views:
                 v = draw(st.sampled_from(spec.views))
                 v.where = None if v.where else c.name if v.table == t.name else None
+            case 30:  # renamed in its schema
+                free = [n for n in RENAMED if spec.table(n) is None]
+                if free:
+                    rename_table(spec, t, draw(st.sampled_from(free)))
+            case 31:
+                rename_column(spec, t, c.name, f"r{uuid.uuid4().hex[:4]}")
+            case 32:  # moved to the other schema
+                t.schema = None if t.schema else "fz_s"
+            case 33 if not c.generated and c.identity is None:
+                c.generated, c.virtual = True, draw(st.booleans())  # dropped and added again
+            case 33 if c.generated:
+                c.virtual = not c.virtual
+            case 34:
+                t.grants = draw(st.lists(grant_strategy(), max_size=2))
+            case 35 if spec.views:
+                v = draw(st.sampled_from(spec.views))
+                v.grants = draw(st.lists(grant_strategy(), max_size=2))
+                v.instead = draw(st.booleans())
+            case 36:
+                c.seq = draw(st.integers(0, len(SEQ_OPTIONS) - 1))
+                spec.calc_options = draw(st.integers(0, len(CALC_OPTIONS) - 1))
+            case 37 if t.indexes:
+                draw(st.sampled_from(t.indexes)).ops = draw(
+                    st.lists(st.sampled_from(OPCLASSES), max_size=3)
+                )
             case _:
                 pass
         sanitize(spec)
@@ -1075,24 +1308,66 @@ async def insert_rows(driver: PostgresDriver, spec: Spec) -> None:
 type Rows = dict[str, list[tuple[str | None, ...]]]
 
 
-async def kept_data(driver: PostgresDriver, s1: Spec, s2: Spec) -> Rows:
-    """Text of every column that keeps its name and kind from s1 to s2, per table."""
+async def kept_data(driver: PostgresDriver, s1: Spec, s2: Spec, *, after: bool = False) -> Rows:
+    """Text of every column that keeps its kind from s1 to s2 (renamed or not), per table.
+    ``after``: read the s2 names (the migration ran)."""
     out: Rows = {}
     async with driver.acquire() as conn:
         for t in s1.tables:
-            after = s2.table(t.name)
-            if after is None or after.schema != t.schema:
+            t2 = s2.by_uid(t.uid)
+            if t2 is None or t2.schema != t.schema:
                 continue
-            cols = [c.name for c in t.cols if (a := after.col(c.name)) and a.kind == c.kind]
-            if not cols:
+            pairs = [
+                (c, a)
+                for c in t.cols
+                if (a := t2.by_uid(c.uid)) and a.kind == c.kind and a.generated == c.generated
+            ]
+            if not pairs:
                 continue
-            select = ", ".join(f"{quote(n)}::text" for n in cols)
+            table = t2 if after else t
+            select = ", ".join(f"{quote((a if after else c).name)}::text" for c, a in pairs)
             rows = await conn.fetch(
-                f"SELECT {select} FROM {qualified(t.schema or 'public', t.name)}", []
+                f"SELECT {select} FROM {qualified(table.schema or 'public', table.name)}", []
             )
             values = [tuple(_opt_str(v) for v in row) for row in rows]
-            out[t.name] = sorted(values, key=repr)
+            out[t.uid] = sorted(values, key=repr)
     return out
+
+
+def resolver(
+    s1: Spec, s2: Spec
+) -> Callable[[RenameKind, str, list[str], list[str]], dict[str, str]]:
+    """Answers renames and moves as the specs made them (tables and columns keep a uid)."""
+
+    def find(spec: Spec, schema: str, name: str) -> Tbl | None:
+        return next(
+            (t for t in spec.tables if (t.schema or "public") == schema and t.name == name), None
+        )
+
+    def resolve(
+        kind: RenameKind, scope: str, removed: list[str], added: list[str]
+    ) -> dict[str, str]:
+        out: dict[str, str] = {}
+        for old in removed:
+            if kind == "table":
+                schema, name = old.split(".", 1) if scope == "*" else (scope, old)
+                t1 = find(s1, schema, name)
+                t2 = s2.by_uid(t1.uid) if t1 is not None else None
+                if t2 is not None:
+                    new = f"{t2.schema or 'public'}.{t2.name}" if scope == "*" else t2.name
+                    if new in added:
+                        out[old] = new
+                continue
+            schema, name = scope.split(".", 1)
+            t2 = find(s2, schema, name)
+            t1 = s1.by_uid(t2.uid) if t2 is not None else None
+            c1 = t1.col(old) if t1 is not None else None
+            c2 = t2.by_uid(c1.uid) if t2 is not None and c1 is not None else None
+            if c2 is not None and c2.name in added:
+                out[old] = c2.name
+        return out
+
+    return resolve
 
 
 def _opt_str(value: object) -> str | None:
@@ -1111,10 +1386,17 @@ def runner() -> Generator[tuple[asyncio.Runner, PostgresDriver, str]]:
         driver = loop.run(PostgresDriver.connect(url, pool_size=2))
         loop.run(reset(driver))
         loop.run(role(driver, f"DROP ROLE IF EXISTS {FZ_ROLE}; CREATE ROLE {FZ_ROLE}"))
+        SERVER["virtual"] = loop.run(server_version(driver)) >= 180000
         yield loop, driver, url
         loop.run(reset(driver))
         loop.run(role(driver, f"DROP ROLE {FZ_ROLE}"))
         loop.run(driver.close())
+
+
+async def server_version(driver: PostgresDriver) -> int:
+    async with driver.acquire() as conn:
+        [row] = await conn.fetch("SELECT current_setting('server_version_num')::int", [])
+        return int(cast(int, row[0]))
 
 
 async def role(driver: PostgresDriver, statement: str) -> None:
@@ -1167,13 +1449,15 @@ def test_evolve_has_no_drift(
     s1, s2 = evolution
     snap1, snap2 = snapshot_of(s1), snapshot_of(s2)
     create = migration(empty_snapshot("postgresql"), snap1)
-    steps = diff(snap1, snap2)
+    steps = diff(snap1, snap2, resolver(s1, s2))
     statements = dialect.render(steps)
     note("\n".join(s.sql for s in statements))
     event(f"with rows: {with_rows}")
+    event(f"casing: {s1.casing}")
     for step in steps:
         event(type(step).__name__)
-    assert migration(snap1, snapshot_of(s2)) == statements  # deterministic
+    # deterministic
+    assert dialect.render(diff(snap1, snapshot_of(s2), resolver(s1, s2))) == statements
 
     async def scenario() -> None:
         await reset(driver)
@@ -1199,7 +1483,7 @@ def test_evolve_has_no_drift(
         assert_no_drift(live, expected)
         if before is not None:
             event(f"kept rows checked: {sum(map(len, before.values())) > 0}")
-            assert await kept_data(driver, s1, s2) == before
+            assert await kept_data(driver, s1, s2, after=True) == before
         # Running the migration again would find nothing to do.
         assert dialect.render(diff(live, expected, compare_expressions=False)) == []
 
@@ -1223,8 +1507,9 @@ def _write_schema(root: Path, spec: Spec) -> None:
     CLI_SPECS[spec_id] = spec
     module = f"fuzz_schema_{spec_id}"
     (root / f"{module}.py").write_text(_schema_module(spec_id))
+    casing = 'casing = "snake_case"\n' if spec.snake else ""
     (root / "mizzle.toml").write_text(
-        f'schema = "{module}"\nout = "migrations"\nschema_filter = {SCHEMAS!r}\n'
+        f'schema = "{module}"\nout = "migrations"\nschema_filter = {SCHEMAS!r}\n{casing}'
     )
 
 

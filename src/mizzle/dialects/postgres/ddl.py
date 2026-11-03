@@ -14,12 +14,15 @@ from mizzle.core.snapshot import (
     ColumnSnap,
     ForeignKeySnap,
     FunctionSnap,
+    GeneratedSnap,
     IdentitySnap,
     IndexSnap,
     PolicySnap,
     RoleSnap,
     TableSnap,
     TriggerSnap,
+    keyword_default,
+    sequence_defaults,
 )
 from mizzle.core.sql.nodes import Node
 from mizzle.core.steps import (
@@ -58,11 +61,15 @@ from mizzle.core.steps import (
     DropTable,
     DropTrigger,
     DropView,
+    GrantPrivileges,
     RenameColumn,
     RenameConstraint,
     RenameIndex,
     RenameTable,
+    RestoreGrants,
+    SaveGrants,
     SetRowLevelSecurity,
+    SetTableSchema,
     Statement,
     Step,
 )
@@ -132,7 +139,10 @@ def normalize_type(sql_type: str) -> str:
 def column_type(column: ColumnBase) -> str:
     if column.enum is not None:
         array = "[]" if column.sql_type.endswith("[]") else ""
-        return type_ident(column.sql_type.removesuffix("[]")) + array
+        name = type_ident(column.sql_type.removesuffix("[]"))
+        if column.enum_schema not in (None, DEFAULT_SCHEMA):  # as format_type() prints it
+            name = f"{type_ident(column.enum_schema)}.{name}"
+        return name + array
     return normalize_type(column.sql_type)
 
 
@@ -150,7 +160,7 @@ def normalize_default(text: str | None) -> str | None:
         text = stripped
     if len(text) >= 2 and text[0] == text[-1] == "'" and _NUMBER.fullmatch(text[1:-1]):
         return text[1:-1]
-    return text
+    return keyword_default(text)  # PostgreSQL prints current_user as CURRENT_USER
 
 
 def compiler(casing: Casing | None) -> PostgresCompiler:
@@ -258,20 +268,38 @@ def _columns(names: Sequence[str]) -> str:
     return ", ".join(quote(n) for n in names)
 
 
-def _identity(identity: IdentitySnap) -> str:
+def _identity(identity: IdentitySnap, sql_type: str) -> str:
     text = f"GENERATED {'ALWAYS' if identity['always'] else 'BY DEFAULT'} AS IDENTITY"
-    options = _sequence_options(identity, None)
+    options = _sequence_options(identity, None, sql_type)
     return f"{text} ({' '.join(options)})" if options else text
 
 
-def _sequence_options(new: IdentitySnap, old: IdentitySnap | None) -> list[str]:
+def _sequence_options(new: IdentitySnap, old: IdentitySnap | None, sql_type: str) -> list[str]:
     """Options that differ from ``old`` (or from the database defaults)."""
-    default_start = 1 if new["increment"] > 0 else -1
-    start, increment = old["start"] if old else default_start, old["increment"] if old else 1
+    creating = old is None
+    if old is None:  # what the database picks when nothing is given
+        low, high = sequence_defaults(sql_type, new["increment"])
+        old = IdentitySnap(
+            always=new["always"],
+            start=new.get("min_value", low) if new["increment"] > 0 else new.get("max_value", high),
+            increment=1,
+        )
     parts: list[str] = []
-    if new["increment"] != increment:
+    if new["increment"] != old["increment"]:
         parts.append(f"INCREMENT BY {new['increment']}")
-    if new["start"] != start:
+    # NO MINVALUE / NO MAXVALUE pick the bounds for the direction at that time.
+    flipped = creating is False and (new["increment"] > 0) != (old["increment"] > 0)
+    for option, word in (("min_value", "MINVALUE"), ("max_value", "MAXVALUE")):
+        value = new.get(option)
+        if value is not None and (value != old.get(option) or flipped):
+            parts.append(f"{word} {value}")
+        elif value is None and (option in old or flipped):  # back to the default
+            parts.append(f"NO {word}")
+    if new.get("cache", 1) != old.get("cache", 1):
+        parts.append(f"CACHE {new.get('cache', 1)}")
+    if new.get("cycle", False) != old.get("cycle", False):
+        parts.append("CYCLE" if new.get("cycle") else "NO CYCLE")
+    if new["start"] != old["start"]:
         parts.append(f"START WITH {new['start']}")
     return parts
 
@@ -282,7 +310,7 @@ def column_definition(column: ColumnSnap) -> str:
         kind = "STORED" if generated["stored"] else "VIRTUAL"
         parts.append(f"GENERATED ALWAYS AS ({generated['expression']}) {kind}")
     if identity := column.get("identity"):
-        parts.append(_identity(identity))
+        parts.append(_identity(identity, column["type"]))
     if column["not_null"]:
         parts.append("NOT NULL")
     if column["default"] is not None:
@@ -317,7 +345,7 @@ def _create_table(table: TableSnap) -> str:
     return f"CREATE TABLE {qualified(table['schema'], table['name'])} (\n    {body}\n)"
 
 
-def _create_index(schema: str, table: str, index: IndexSnap) -> str:
+def create_index(schema: str, table: str, index: IndexSnap) -> str:
     unique = "UNIQUE " if index["unique"] else ""
     keys = index.get("expression")
     if keys is None:
@@ -350,17 +378,20 @@ def _literal(text: str) -> str:
     return "'" + text.replace("'", "''") + "'"
 
 
-def _alter_identity(step: AlterColumnIdentity) -> str:
+def _alter_identity(step: AlterColumnIdentity, sql_type: str) -> str:
     col = f"ALTER TABLE {qualified(step.schema, step.table)} ALTER COLUMN {quote(step.column)}"
     old, new = step.old, step.new
     if new is None:
         return f"{col} DROP IDENTITY"
     if old is None:
-        return f"{col} ADD {_identity(new)}"
+        return f"{col} ADD {_identity(new, sql_type)}"
     actions: list[str] = []
     if old["always"] != new["always"]:
         actions.append(f"SET GENERATED {'ALWAYS' if new['always'] else 'BY DEFAULT'}")
-    actions += [f"SET {option}" for option in _sequence_options(new, old)]
+    actions += [f"SET {option}" for option in _sequence_options(new, old, sql_type)]
+    if (new["increment"] > 0) != (old["increment"] > 0):
+        # The current value is on the wrong side of the new bounds: start over.
+        actions.append("RESTART")
     return f"{col} {' '.join(actions)}"
 
 
@@ -379,7 +410,55 @@ def _alter_generated(step: AlterColumnGenerated) -> str:
                 f"{where} is VIRTUAL: making it a plain column needs a custom migration"
             )
         return f"{col} DROP EXPRESSION"
-    return f"{col} SET EXPRESSION AS ({new['expression']})"  # PostgreSQL 17+
+    return _set_expression(step, new)
+
+
+def _set_expression(step: AlterColumnGenerated, new: GeneratedSnap) -> str:
+    """SET EXPRESSION needs PostgreSQL 17. Older servers drop the column and add it again
+    (the values are computed, so nothing is lost), then restore the indexes and
+    constraints that used it, and the foreign keys of other tables that reference it."""
+    table = qualified(step.schema, step.table)
+    if step.definition is None:
+        raise MigrationError(f"{step.table}.{step.column}: the column's definition is missing")
+    add = f"ALTER TABLE {table} ADD COLUMN {column_definition(step.definition)}"
+    set_expression = (
+        f"ALTER TABLE {table} ALTER COLUMN {quote(step.column)} "
+        f"SET EXPRESSION AS ({new['expression']})"
+    )
+    rel, att = _literal(table), _literal(step.column)
+    return (
+        "DO $mizzle$ DECLARE defs text[]; refs text[]; def text; r record; BEGIN\n"
+        "IF current_setting('server_version_num')::int >= 170000 THEN\n"
+        f"  EXECUTE {_literal(set_expression)};\n"
+        "ELSE\n"
+        "  SELECT array_agg(d) INTO defs FROM (\n"
+        "    SELECT format('ALTER TABLE %s ADD CONSTRAINT %I %s', "
+        f"{rel}, conname, pg_get_constraintdef(c.oid)) AS d\n"
+        "    FROM pg_constraint c JOIN pg_attribute a ON a.attrelid = c.conrelid\n"
+        f"    WHERE c.conrelid = {rel}::regclass AND a.attname = {att} "
+        "AND a.attnum = ANY(c.conkey)\n"
+        "    UNION ALL\n"
+        "    SELECT DISTINCT pg_get_indexdef(i.indexrelid) FROM pg_index i\n"
+        "    JOIN pg_depend dep ON dep.classid = 'pg_class'::regclass "
+        "AND dep.objid = i.indexrelid AND dep.refobjid = i.indrelid\n"
+        "    JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = dep.refobjsubid\n"
+        f"    WHERE i.indrelid = {rel}::regclass AND a.attname = {att}\n"
+        "      AND NOT EXISTS (SELECT 1 FROM pg_constraint c WHERE c.conindid = i.indexrelid)\n"
+        "  ) s;\n"
+        "  FOR r IN SELECT c.conrelid::regclass AS t, c.conname, pg_get_constraintdef(c.oid) AS d\n"
+        "    FROM pg_constraint c JOIN pg_attribute a ON a.attrelid = c.confrelid\n"
+        f"    WHERE c.contype = 'f' AND c.confrelid = {rel}::regclass AND a.attname = {att}\n"
+        "      AND a.attnum = ANY(c.confkey)\n"
+        "      AND NOT (c.conrelid = c.confrelid AND a.attnum = ANY(c.conkey)) LOOP\n"
+        "    refs := refs || format('ALTER TABLE %s ADD CONSTRAINT %I %s', r.t, r.conname, r.d);\n"
+        "    EXECUTE format('ALTER TABLE %s DROP CONSTRAINT %I', r.t, r.conname);\n"
+        "  END LOOP;\n"
+        f"  EXECUTE {_literal(f'ALTER TABLE {table} DROP COLUMN {quote(step.column)}')};\n"
+        f"  EXECUTE {_literal(add)};\n"
+        "  FOREACH def IN ARRAY coalesce(defs, '{}') LOOP EXECUTE def; END LOOP;\n"
+        "  FOREACH def IN ARRAY coalesce(refs, '{}') LOOP EXECUTE def; END LOOP;\n"
+        "END IF; END $mizzle$"
+    )
 
 
 def _alter_type(step: AlterColumnType) -> str:
@@ -423,6 +502,8 @@ def render_step(step: Step) -> Statement:
             return Statement(f"DROP TABLE {qualified(schema, name)}")
         case RenameTable(schema=schema, old=old, new=new):
             return alter(schema, old, f"RENAME TO {quote(new)}")
+        case SetTableSchema(schema=schema, name=name, new_schema=new_schema):
+            return alter(schema, name, f"SET SCHEMA {quote(new_schema)}")
         case AddColumn(schema=schema, table=table, column=column):
             return alter(schema, table, f"ADD COLUMN {column_definition(column)}")
         case DropColumn(schema=schema, table=table, name=name):
@@ -435,7 +516,7 @@ def render_step(step: Step) -> Statement:
             action = "SET NOT NULL" if not_null else "DROP NOT NULL"
             return alter(schema, table, f"ALTER COLUMN {quote(column)} {action}")
         case AlterColumnIdentity():
-            return Statement(_alter_identity(step))
+            return Statement(_alter_identity(step, step.sql_type))
         case AlterColumnGenerated():
             return Statement(_alter_generated(step))
         case AlterColumnDefault(schema=schema, table=table, column=column, default=default):
@@ -464,7 +545,7 @@ def render_step(step: Step) -> Statement:
         case RenameConstraint(schema=schema, table=table, old=old, new=new):
             return alter(schema, table, f"RENAME CONSTRAINT {quote(old)} TO {quote(new)}")
         case CreateIndex(schema=schema, table=table, index=index):
-            return Statement(_create_index(schema, table, index))
+            return Statement(create_index(schema, table, index))
         case DropIndex(schema=schema, name=name):
             return Statement(f"DROP INDEX {qualified(schema, name)}")
         case RenameIndex(schema=schema, old=old, new=new):
@@ -499,7 +580,7 @@ def render_step(step: Step) -> Statement:
         case CreateFunction(function=fn):
             return Statement(_create_function(fn))
         case DropFunction(schema=schema, name=name, args=args):
-            return Statement(f"DROP FUNCTION {qualified(schema, name)}({args})")
+            return Statement(f"DROP FUNCTION {qualified(schema, name)}({_without_defaults(args)})")
         case CreateView(view=view):
             kind = "MATERIALIZED VIEW" if view["materialized"] else "VIEW"
             name = qualified(view["schema"], view["name"])
@@ -532,6 +613,19 @@ def render_step(step: Step) -> Statement:
             return Statement(_create_trigger(schema, table, trigger, replace))
         case DropTrigger(schema=schema, table=table, name=name):
             return Statement(f"DROP TRIGGER {quote(name)} ON {qualified(schema, table)}")
+        case GrantPrivileges(
+            schema=schema, table=table, role=role, privileges=privileges, revoke=revoke
+        ):
+            what = ", ".join(p.upper() for p in privileges)
+            on = qualified(schema, table)
+            if revoke:
+                return Statement(f"REVOKE {what} ON {on} FROM {_role(role)}")
+            return Statement(f"GRANT {what} ON {on} TO {_role(role)}")
+        case SaveGrants(schema=schema, name=name):
+            return Statement(_save_grants(qualified(schema, name)))
+        case RestoreGrants(schema=schema, name=name, materialized=materialized):
+            kind = "MATERIALIZED VIEW" if materialized else "VIEW"
+            return Statement(_restore_grants(qualified(schema, name), kind))
         case _:
             raise MigrationError(f"PostgreSQL cannot render {type(step).__name__}")
 
@@ -545,15 +639,103 @@ def _dollar_quote(body: str) -> str:
     return f"{tag}{body}{tag}"
 
 
+_SAVED = "pg_temp.__mizzle_saved"
+
+
+def _save_grants(name: str) -> str:
+    """Keep a relation's ACL, owner and comment in a temporary table for _restore_grants:
+    a view that is dropped and created again would lose them."""
+    rel = _literal(name)
+    return (
+        "DO $mizzle$ BEGIN\n"
+        f"CREATE TEMP TABLE IF NOT EXISTS __mizzle_saved "
+        "(rel text PRIMARY KEY, acl aclitem[], owner oid, comment text);\n"
+        f"INSERT INTO {_SAVED} SELECT {rel}, c.relacl, c.relowner, "
+        "obj_description(c.oid, 'pg_class') FROM pg_class c "
+        f"WHERE c.oid = {rel}::regclass\n"
+        "ON CONFLICT (rel) DO UPDATE SET acl = EXCLUDED.acl, owner = EXCLUDED.owner, "
+        "comment = EXCLUDED.comment;\n"
+        "END $mizzle$"
+    )
+
+
+def _restore_grants(name: str, kind: str) -> str:
+    rel = _literal(name)
+    return (
+        "DO $mizzle$ DECLARE s record; a record; BEGIN\n"
+        "IF to_regclass('pg_temp.__mizzle_saved') IS NULL THEN RETURN; END IF;\n"
+        f"SELECT * INTO s FROM {_SAVED} WHERE rel = {rel};\n"
+        "IF NOT FOUND THEN RETURN; END IF;\n"
+        f"IF s.owner <> (SELECT relowner FROM pg_class WHERE oid = {rel}::regclass) THEN\n"
+        f"  EXECUTE format('ALTER {kind} %s OWNER TO %I', {rel}, pg_get_userbyid(s.owner));\n"
+        "END IF;\n"
+        "FOR a IN SELECT * FROM aclexplode(s.acl) WHERE grantee <> s.owner LOOP\n"
+        "  EXECUTE format('GRANT %s ON %s TO %s%s', a.privilege_type, "
+        f"{rel}, CASE WHEN a.grantee = 0 THEN 'PUBLIC' "
+        "ELSE quote_ident(pg_get_userbyid(a.grantee)) END, "
+        "CASE WHEN a.is_grantable THEN ' WITH GRANT OPTION' ELSE '' END);\n"
+        "END LOOP;\n"
+        "IF s.comment IS NOT NULL THEN\n"
+        f"  EXECUTE format('COMMENT ON {kind} %s IS %L', {rel}, s.comment);\n"
+        "END IF;\n"
+        f"DELETE FROM {_SAVED} WHERE rel = {rel};\n"
+        "END $mizzle$"
+    )
+
+
+def _without_defaults(args: str) -> str:
+    """Function arguments as DROP FUNCTION takes them: ``a integer DEFAULT 1`` -> ``a integer``."""
+    parts: list[str] = []
+    depth, start, quoted = 0, 0, False
+    for i, ch in enumerate(args + ","):
+        if ch == "'":
+            quoted = not quoted
+        elif not quoted and ch in "([":
+            depth += 1
+        elif not quoted and ch in ")]":
+            depth -= 1
+        elif not quoted and depth == 0 and ch == ",":
+            parts.append(args[start:i].strip())
+            start = i + 1
+    return ", ".join(re.split(r" DEFAULT | = ", p, maxsplit=1)[0] for p in parts if p)
+
+
+# A SQL-standard body (PostgreSQL 14+): written as is, not as a string.
+_SQL_BODY = re.compile(r"\s*(?:RETURN\b|BEGIN\s+ATOMIC\b)", re.IGNORECASE)
+
+
+def sql_standard_body(fn: FunctionSnap) -> bool:
+    return fn["language"] == "sql" and _SQL_BODY.match(fn["body"]) is not None
+
+
+def function_options(fn: FunctionSnap) -> str:
+    """Everything after ``LANGUAGE x`` and before the body."""
+    text = ""
+    if fn["volatility"] != "volatile":
+        text += f" {fn['volatility'].upper()}"
+    if fn.get("strict"):
+        text += " STRICT"
+    if fn["security_definer"]:
+        text += " SECURITY DEFINER"
+    if fn.get("leakproof"):
+        text += " LEAKPROOF"
+    if parallel := fn.get("parallel"):
+        text += f" PARALLEL {parallel.upper()}"
+    if (cost := fn.get("cost")) is not None:
+        text += f" COST {cost:g}"
+    for setting, value in fn.get("settings", {}).items():
+        text += f" SET {setting} = {value}"
+    return text
+
+
 def _create_function(fn: FunctionSnap) -> str:
     text = (
         f"CREATE OR REPLACE FUNCTION {qualified(fn['schema'], fn['name'])}({fn['args']}) "
         f"RETURNS {fn['returns']} LANGUAGE {type_ident(fn['language'])}"
     )
-    if fn["volatility"] != "volatile":
-        text += f" {fn['volatility'].upper()}"
-    if fn["security_definer"]:
-        text += " SECURITY DEFINER"
+    text += function_options(fn)
+    if sql_standard_body(fn):
+        return f"{text}\n{fn['body']}"
     return f"{text} AS {_dollar_quote(fn['body'])}"
 
 
@@ -570,14 +752,31 @@ def _policy_body(policy: PolicySnap) -> str:
     return text
 
 
+def trigger_events(trigger: TriggerSnap) -> str:
+    """``INSERT OR UPDATE OF a, b``."""
+    events: list[str] = []
+    for event in trigger["events"]:
+        if event == "update" and (columns := trigger.get("columns")):
+            events.append(f"UPDATE OF {_columns(columns)}")
+        else:
+            events.append(event.upper())
+    return " OR ".join(events)
+
+
 def _create_trigger(schema: str, table: str, trigger: TriggerSnap, replace: bool) -> str:
     fn_schema, _, fn_name = trigger["function"].partition(".")
-    events = " OR ".join(e.upper() for e in trigger["events"])
     text = (
         f"CREATE {'OR REPLACE ' if replace else ''}TRIGGER {quote(trigger['name'])} "
-        f"{trigger['timing'].upper()} {events} ON {qualified(schema, table)} "
-        f"FOR EACH {trigger['for_each'].upper()}"
+        f"{trigger['timing'].upper()} {trigger_events(trigger)} ON {qualified(schema, table)}"
     )
+    referencing = [
+        f"{side} TABLE AS {quote(name)}"
+        for side, name in (("OLD", trigger.get("old_table")), ("NEW", trigger.get("new_table")))
+        if name is not None
+    ]
+    if referencing:
+        text += f" REFERENCING {' '.join(referencing)}"
+    text += f" FOR EACH {trigger['for_each'].upper()}"
     if trigger["when"] is not None:
         text += f" WHEN ({trigger['when']})"
     return f"{text} EXECUTE FUNCTION {qualified(fn_schema, fn_name)}()"

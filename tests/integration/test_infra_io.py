@@ -8,7 +8,7 @@ from typing import Any, final
 
 import pytest
 
-from mizzle import Database, Table, gt
+from mizzle import Database, DatabaseError, Table, gt, sql
 from mizzle.pg import integer, jsonb, serial, text
 from tests.integration.test_infra import env
 from tests.integration.test_stress import assert_no_leak
@@ -73,19 +73,34 @@ async def test_through_pgbouncer(bouncer_url: str) -> None:
         await exercise(db)
 
 
-async def test_listen_through_pgbouncer_misses_notifications(bouncer_url: str) -> None:
-    # Documented limitation: in transaction mode LISTEN registers on whichever server
-    # connection ran it, so notifications never reach the client. Listen on the primary.
-    primary = env("MIZZLE_PRIMARY_URL")
-    async with (
-        await Database.connect(bouncer_url, statement_cache_size=0) as db,
-        await Database.connect(primary) as direct,
-        db.listen("bounced") as events,
-    ):
-        await direct.notify("bounced", "lost")
-        with pytest.raises(TimeoutError):
-            async with asyncio.timeout(0.5):
-                await anext(events)
+async def test_listen_through_pgbouncer_raises(bouncer_url: str) -> None:
+    # In transaction mode LISTEN registers on whichever server connection ran it, so
+    # notifications never reach the client. Behind any pooler listen() refuses unless told
+    # the pooler runs in session mode; a test notification alone cannot prove delivery.
+    for _ in range(20):  # not timing-dependent: every attempt raises
+        async with await Database.connect(bouncer_url, statement_cache_size=0) as db:
+            with pytest.raises(DatabaseError, match="pooler_session_mode=True"):
+                async with db.listen("bounced"):
+                    pass
+            assert await db.execute(sql("select 1 as one")) == [{"one": 1}]  # pool still fine
+
+
+async def test_listen_through_pgbouncer_in_session_mode() -> None:
+    url = env("MIZZLE_PGBOUNCER_SESSION_URL")
+    # pool_size=1: the listener holds the only pooled connection, so the test notification
+    # goes out on a connection outside the pool.
+    for pool_size in (2, 1):
+        async with await Database.connect(url, pool_size=pool_size) as db:
+            with pytest.raises(DatabaseError, match="pooler_session_mode=True"):
+                async with db.listen("pooled"):
+                    pass
+            async with db.listen("pooled", pooler_session_mode=True) as events:
+                async with await Database.connect(url, pool_size=1) as sender:
+                    await sender.notify("pooled", "hi")
+                async with asyncio.timeout(5):
+                    event = await anext(events)
+            assert event.payload == "hi"
+            assert_no_leak(db)
 
 
 @pytest.fixture

@@ -18,12 +18,13 @@ from mizzle.core.errors import QueryError
 from mizzle.core.naming import Casing
 from mizzle.core.schema.column import MISSING, ColumnBase
 from mizzle.core.sql.alias import TableAlias
-from mizzle.core.sql.functions import CaseBase
+from mizzle.core.sql.functions import CaseBase, column_of
 from mizzle.core.sql.nodes import (
     Between,
     BinaryOp,
     BoolOp,
     Cast,
+    CteColumn,
     Excluded,
     Exists,
     Fragment,
@@ -42,12 +43,13 @@ from mizzle.core.sql.nodes import (
     Postfix,
     Raw,
     Star,
+    Window,
 )
 
 if TYPE_CHECKING:
     from mizzle.core.query.insert import Insert, OnConflict
     from mizzle.core.query.returning import Returning
-    from mizzle.core.query.select import CompoundBase, CteColumn, SelectBase, Slot, Source
+    from mizzle.core.query.select import CompoundBase, SelectBase, Slot, Source
     from mizzle.core.query.update import Delete, Update
     from mizzle.core.schema.table import Table
 
@@ -89,13 +91,20 @@ class CompiledQuery:
         )
 
 
+def _plain_column(item: Node) -> bool:
+    expr = item.expr if isinstance(item, OrderBy) else item
+    return isinstance(expr, ColumnBase | CteColumn)
+
+
 type _Visitor = Callable[[Compiler, Node], str]
 # (compiler class, node class) -> unbound visit_* method; found once, then reused.
 _VISITORS: dict[tuple[type[Compiler], type[Node]], _Visitor] = {}
 
 
 # ponytail: never evicted; one entry per (table, set of columns) actually inserted.
-_INSERT_SQL: dict[tuple[type[Compiler], Casing | None, type[Table], tuple[str, ...], int], str] = {}
+_INSERT_SQL: dict[
+    tuple[type[Compiler], Casing | None, type[Table], tuple[str, ...], int, str | None], str
+] = {}
 
 
 class Compiler:
@@ -104,12 +113,16 @@ class Compiler:
     casing: Casing | None
     inline_literals: bool
     qualify_columns: bool
+    _qualify_default: bool
     _params: list[object]
     _placeholders: list[Placeholder | None]
     _raw: bool
     _locking: bool
     _dynamic: bool
-    _bound: dict[int, str]  # id(Param) -> its marker: a reused node reuses its parameter
+    # (id(Param), SQL type it is compared with) -> its marker: a reused node reuses its
+    # parameter, unless raw SQL holding it sits next to values of different types.
+    _bound: dict[tuple[int, str | None], str]
+    _context: str | None  # the SQL type a raw operand is compared with (see operand_of)
     _scopes: list[dict[type[Table], str]]  # table -> alias, for aliased (relational) queries
     _alias_count: int
 
@@ -125,12 +138,14 @@ class Compiler:
         self.casing = casing
         self.inline_literals = inline_literals
         self.qualify_columns = qualify_columns
+        self._qualify_default = qualify_columns
         self._params = []
         self._placeholders = []
         self._raw = False
         self._locking = False
         self._dynamic = False
         self._bound = {}
+        self._context = None
         self._scopes = []
         self._alias_count = 0
 
@@ -138,6 +153,7 @@ class Compiler:
         self._params, self._placeholders, self._raw, self._locking = [], [], False, False
         self._dynamic = False
         self._bound = {}
+        self._context = None
         text = self.visit(node)
         return CompiledQuery(
             text,
@@ -219,6 +235,24 @@ class Compiler:
         text = self.visit(node)
         return f"({text})" if isinstance(node, BoolOp | Not) else text
 
+    def operand_of(self, node: Node, other: Node) -> str:
+        """``node`` next to ``other`` in an operator. PostgreSQL types the parameters of
+        raw SQL from ``other``, so one ``sql("{}", x)`` used next to an integer and next
+        to text gets a parameter for each."""
+        if not isinstance(node, Raw):
+            return self.operand(node)
+        if isinstance(other, Cast):
+            return self._typed_raw(node, other.type)
+        column = column_of(other)
+        return self._typed_raw(node, None if column is None else column.sql_type)
+
+    def _typed_raw(self, node: Raw, sql_type: str | None) -> str:
+        self._context = sql_type
+        try:
+            return self.visit(node)
+        finally:
+            self._context = None
+
     def value(self, column: ColumnBase, value: object) -> str:
         """A value written into a column (INSERT / UPDATE SET)."""
         return self.visit(value) if isinstance(value, Node) else self.bind(column.encode(value))
@@ -238,17 +272,19 @@ class Compiler:
     def visit_Param(self, node: Param) -> str:
         # The same node twice (an expression both selected and grouped by) binds once, so
         # PostgreSQL sees identical expressions.
-        marker = self._bound.get(id(node))
+        key = (id(node), self._context)
+        marker = self._bound.get(key)
         if marker is None:
             value = node.column.encode(node.value) if node.column is not None else node.value
-            marker = self._bound[id(node)] = self.bind(value)
+            marker = self._bound[key] = self.bind(value)
         return marker
 
     def visit_Placeholder(self, node: Placeholder) -> str:
         return self.bind(None, node)
 
     def visit_BinaryOp(self, node: BinaryOp) -> str:
-        return f"{self.operand(node.left)} {node.op} {self.operand(node.right)}"
+        left, right = node.left, node.right
+        return f"{self.operand_of(left, right)} {node.op} {self.operand_of(right, left)}"
 
     def visit_BoolOp(self, node: BoolOp) -> str:
         return f" {node.op} ".join(self.operand(item) for item in node.items)
@@ -263,14 +299,15 @@ class Compiler:
         if isinstance(node.values, tuple):
             if not node.values:  # IN () is a syntax error; the meaning is "matches nothing"
                 return "true" if node.negate else "false"
-            inner = ", ".join(self.visit(v) for v in node.values)
+            inner = ", ".join(self.operand_of(v, node.item) for v in node.values)
         else:
             inner = self.visit(node.values)
         op = "NOT IN" if node.negate else "IN"
         return f"{self.operand(node.item)} {op} ({inner})"
 
     def visit_Between(self, node: Between) -> str:
-        item, low, high = self.operand(node.item), self.operand(node.low), self.operand(node.high)
+        item = self.operand_of(node.item, node.low)
+        low, high = self.operand_of(node.low, node.item), self.operand_of(node.high, node.item)
         return f"{item} BETWEEN {low} AND {high}"
 
     def visit_Exists(self, node: Exists) -> str:
@@ -289,7 +326,20 @@ class Compiler:
 
     def visit_Raw(self, node: Raw) -> str:
         self._raw = True
-        return "".join(p if isinstance(p, str) else self.visit(p) for p in node.parts)
+        # The context types only the Raw's own parameters, not nodes nested in it.
+        context = self._context
+        parts: list[str] = []
+        for part in node.parts:
+            if isinstance(part, str):
+                parts.append(part)
+            elif isinstance(part, Param):
+                self._context = context
+                parts.append(self.visit(part))
+            else:
+                self._context = None
+                parts.append(self.visit(part))
+        self._context = None
+        return "".join(parts)
 
     def visit_Nullable(self, node: Nullable) -> str:
         return self.visit(node.expr)
@@ -301,10 +351,13 @@ class Compiler:
         return f"excluded.{self.column_name(node.column)}"
 
     def visit_Operation(self, node: Operation) -> str:
-        return f"({self.operand(node.left)} {node.op} {self.operand(node.right)})"
+        left, right = node.left, node.right
+        return f"({self.operand_of(left, right)} {node.op} {self.operand_of(right, left)})"
 
     def visit_Cast(self, node: Cast) -> str:
-        return f"CAST({self.visit(node.expr)} AS {node.type})"
+        expr = node.expr
+        inner = self._typed_raw(expr, node.type) if isinstance(expr, Raw) else self.visit(expr)
+        return f"CAST({inner} AS {node.type})"
 
     def visit_Fragment(self, node: Fragment) -> str:
         return "".join(p if isinstance(p, str) else self.visit(p) for p in node.parts)
@@ -319,14 +372,22 @@ class Compiler:
         return " ".join(parts)
 
     def visit_Over(self, node: Over) -> str:
-        window: list[str] = []
-        if node.partition_by:
-            window.append("PARTITION BY " + ", ".join(self.visit(e) for e in node.partition_by))
-        if node.order_by:
-            window.append("ORDER BY " + ", ".join(self.visit(e) for e in node.order_by))
-        if node.frame is not None:
-            window.append(self.frame(node.frame))
-        return f"{self.visit(node.func)} OVER ({' '.join(window)})"
+        func, spec = self.visit(node.func), node.window
+        if spec.base is not None and not (spec.partition_by or spec.order_by or spec.frame):
+            return f"{func} OVER {self.quote(spec.base)}"
+        return f"{func} OVER ({self.window(spec)})"
+
+    def window(self, spec: Window) -> str:
+        parts: list[str] = []
+        if spec.base is not None:
+            parts.append(self.quote(spec.base))
+        if spec.partition_by:
+            parts.append("PARTITION BY " + ", ".join(self.visit(e) for e in spec.partition_by))
+        if spec.order_by:
+            parts.append("ORDER BY " + ", ".join(self.visit(e) for e in spec.order_by))
+        if spec.frame is not None:
+            parts.append(self.frame(spec.frame))
+        return " ".join(parts)
 
     def frame(self, frame: Frame) -> str:
         def bound(offset: int | None, unbounded: str) -> str:
@@ -346,6 +407,8 @@ class Compiler:
             if issubclass(source, TableAlias):
                 return f"{self.table_name(source.__alias_of__)} AS {self.table_name(source)}"
             return self.table_name(source)
+        if source.inline:
+            return f"({self.visit(source.query)}) AS {self.quote(source.alias or source.name)}"
         if source.alias is not None:
             return f"{self.quote(source.name)} AS {self.quote(source.alias)}"
         return self.quote(source.name)
@@ -359,10 +422,16 @@ class Compiler:
         return self.visit(value) if isinstance(value, Placeholder) else self.bind(value)
 
     def visit_CteColumn(self, node: CteColumn) -> str:
+        if not self.qualify_columns:
+            return self.quote(node.name)
         return f"{self.quote(node.cte.alias or node.cte.name)}.{self.quote(node.name)}"
 
     def visit_CompoundBase(self, node: CompoundBase) -> str:
         parts = [f"({self.visit(node.left)}) {node.op} ({self.visit(node.right)})"]
+        if not all(_plain_column(e) for e in node.order_by_):
+            # ORDER BY of a UNION... only takes output column names; ordering by an
+            # expression of them needs the combined rows as a subquery.
+            parts = ["SELECT * FROM (" + parts[0] + ') AS "_combined"']
         if node.order_by_:
             # The combined result has only its output columns: refer to them by name.
             qualify, self.qualify_columns = self.qualify_columns, False
@@ -388,6 +457,14 @@ class Compiler:
             self._scopes.pop()
 
     def _select_text(self, node: SelectBase) -> str:
+        # A nested SELECT (e.g. EXISTS in a UNION's ORDER BY) names its own tables again.
+        qualify, self.qualify_columns = self.qualify_columns, self._qualify_default
+        try:
+            return self._select_body(node)
+        finally:
+            self.qualify_columns = qualify
+
+    def _select_body(self, node: SelectBase) -> str:
         if node.lock is not None:
             self._locking = True
         # Clauses are emitted strictly left to right so $n numbering follows the text.
@@ -410,6 +487,9 @@ class Compiler:
             parts.append("GROUP BY " + ", ".join(self.visit(e) for e in node.group_by_))
         if node.having_ is not None:
             parts.append(f"HAVING {self.visit(node.having_)}")
+        if node.windows_:
+            windows = (f"{self.quote(n)} AS ({self.window(w)})" for n, w in node.windows_)
+            parts.append("WINDOW " + ", ".join(windows))
         if node.order_by_:
             parts.append("ORDER BY " + ", ".join(self.visit(e) for e in node.order_by_))
         if node.limit_ is not None:
@@ -457,13 +537,25 @@ class Compiler:
     def visit_Insert(self, node: Insert[Table]) -> str:
         if not node.rows:
             raise QueryError(f"insert into {node.table.__name__} has no values()")
+        if node.identity is not None and node.overriding is None:
+            raise QueryError(
+                f"{node.identity.qualified_name} is GENERATED ALWAYS AS IDENTITY; the "
+                "database assigns it. Use .overriding_system_value() to insert explicit values"
+            )
         # Fast path for the most common write: one row of plain values, no ON CONFLICT.
         # Its SQL depends only on which columns are set, so the text is cached and only
         # the values are bound (in column order, as the full path below binds them).
         if node.conflict is None and len(node.rows) == 1 and not self.inline_literals:
             row = node.rows[0]
             if row and not any(isinstance(v, Node) for v in row.values()):
-                key = (type(self), self.casing, node.table, tuple(row), len(self._params))
+                key = (
+                    type(self),
+                    self.casing,
+                    node.table,
+                    tuple(row),
+                    len(self._params),
+                    node.overriding,
+                )
                 text = _INSERT_SQL.get(key)
                 if text is None:
                     text = _INSERT_SQL[key] = self._insert_text(node)
@@ -494,7 +586,8 @@ class Compiler:
                 + ")"
                 for row in node.rows
             )
-            text = f"{head} ({names}) VALUES {rows}"
+            overriding = f" OVERRIDING {node.overriding} VALUE" if node.overriding else ""
+            text = f"{head} ({names}){overriding} VALUES {rows}"
         if node.conflict is not None:
             text += " " + self.on_conflict_clause(node.table, node.conflict)
         return text

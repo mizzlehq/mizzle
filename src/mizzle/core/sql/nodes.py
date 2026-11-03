@@ -5,14 +5,21 @@ Typing pattern: a node that internal code handles generically is a plain class (
 (``TypedPlaceholder[T]``, ``TypedFunc[T]``). Internal code never needs ``Any``.
 """
 
+# The operator overloads of Expr "overlap" only through bottom types (Expr is invariant, so
+# Expr[str] and Expr[datetime] share no value); both checkers would flag every pair.
+# mypy: disable-error-code="overload-overlap"
+# pyright: reportOverlappingOverload=false
+
 from __future__ import annotations
 
+import datetime
 from collections.abc import Sequence
 from dataclasses import dataclass
 from decimal import Decimal
 from typing import TYPE_CHECKING, Literal, overload
 
 if TYPE_CHECKING:
+    from mizzle.core.query.select import Cte
     from mizzle.core.schema.column import ColumnBase
 
 
@@ -31,6 +38,47 @@ class Expr[T](ExprBase):
     # so eq(Users.id, "x") is a type error (underscore names are ignored for variance).
     py_type: type[T] | None = None
 
+    # Text: ``Users.first + " " + Users.last`` is SQL ``||`` (NULL if either side is NULL).
+    @overload
+    def __add__(self: Expr[str], other: str | Expr[str], /) -> Expr[str]: ...
+    @overload
+    def __add__(self: Expr[str], other: Expr[str | None], /) -> Expr[str | None]: ...
+    @overload
+    def __add__(self: Expr[str | None], other: _Str, /) -> Expr[str | None]: ...
+    # Dates and times: ``timestamp + interval`` and ``date + interval`` give a timestamp;
+    # ``interval + interval`` an interval.
+    @overload
+    def __add__(
+        self: Expr[datetime.timedelta], other: _Interval, /
+    ) -> Expr[datetime.timedelta]: ...
+    @overload
+    def __add__(
+        self: Expr[datetime.timedelta], other: Expr[datetime.timedelta | None], /
+    ) -> Expr[datetime.timedelta | None]: ...
+    @overload
+    def __add__(
+        self: Expr[datetime.timedelta | None], other: _AnyInterval, /
+    ) -> Expr[datetime.timedelta | None]: ...
+    @overload
+    def __add__(self: Expr[datetime.datetime], other: _Interval, /) -> Expr[datetime.datetime]: ...
+    @overload
+    def __add__(self: Expr[datetime.date], other: _Interval, /) -> Expr[datetime.datetime]: ...
+    @overload
+    def __add__(
+        self: Expr[datetime.datetime], other: Expr[datetime.timedelta | None], /
+    ) -> Expr[datetime.datetime | None]: ...
+    @overload
+    def __add__(
+        self: Expr[datetime.date], other: Expr[datetime.timedelta | None], /
+    ) -> Expr[datetime.datetime | None]: ...
+    @overload
+    def __add__(
+        self: Expr[datetime.datetime | None], other: _AnyInterval, /
+    ) -> Expr[datetime.datetime | None]: ...
+    @overload
+    def __add__(
+        self: Expr[datetime.date | None], other: _AnyInterval, /
+    ) -> Expr[datetime.datetime | None]: ...
     # Arithmetic: ``Users.age + 1``. Both sides have the same numeric type (an int literal
     # also fits float and Decimal); NULL on either side makes the result NULL. As in SQL,
     # ``/`` on integers is integer division.
@@ -49,6 +97,62 @@ class Expr[T](ExprBase):
     def __add__(self: ExprBase, other: object, /) -> ExprBase:
         return _arith(self, "+", other)
 
+    # ``timestamp - interval`` is a timestamp, ``timestamp - timestamp`` an interval and
+    # ``date - date`` a number of days.
+    @overload
+    def __sub__(
+        self: Expr[datetime.timedelta], other: _Interval, /
+    ) -> Expr[datetime.timedelta]: ...
+    @overload
+    def __sub__(
+        self: Expr[datetime.timedelta], other: Expr[datetime.timedelta | None], /
+    ) -> Expr[datetime.timedelta | None]: ...
+    @overload
+    def __sub__(
+        self: Expr[datetime.timedelta | None], other: _AnyInterval, /
+    ) -> Expr[datetime.timedelta | None]: ...
+    @overload
+    def __sub__(self: Expr[datetime.datetime], other: _Interval, /) -> Expr[datetime.datetime]: ...
+    @overload
+    def __sub__(self: Expr[datetime.date], other: _Interval, /) -> Expr[datetime.datetime]: ...
+    @overload
+    def __sub__(
+        self: Expr[datetime.datetime], other: Expr[datetime.timedelta | None], /
+    ) -> Expr[datetime.datetime | None]: ...
+    @overload
+    def __sub__(
+        self: Expr[datetime.date], other: Expr[datetime.timedelta | None], /
+    ) -> Expr[datetime.datetime | None]: ...
+    @overload
+    def __sub__(
+        self: Expr[datetime.datetime | None], other: _AnyInterval, /
+    ) -> Expr[datetime.datetime | None]: ...
+    @overload
+    def __sub__(
+        self: Expr[datetime.date | None], other: _AnyInterval, /
+    ) -> Expr[datetime.datetime | None]: ...
+    @overload
+    def __sub__(
+        self: Expr[datetime.datetime], other: datetime.datetime | Expr[datetime.datetime], /
+    ) -> Expr[datetime.timedelta]: ...
+    @overload
+    def __sub__(
+        self: Expr[datetime.datetime], other: Expr[datetime.datetime | None], /
+    ) -> Expr[datetime.timedelta | None]: ...
+    @overload
+    def __sub__(
+        self: Expr[datetime.datetime | None], other: _Timestamp, /
+    ) -> Expr[datetime.timedelta | None]: ...
+    @overload
+    def __sub__(
+        self: Expr[datetime.date], other: datetime.date | Expr[datetime.date], /
+    ) -> Expr[int]: ...
+    @overload
+    def __sub__(
+        self: Expr[datetime.date], other: Expr[datetime.date | None], /
+    ) -> Expr[int | None]: ...
+    @overload
+    def __sub__(self: Expr[datetime.date | None], other: _Date, /) -> Expr[int | None]: ...
     @overload
     def __sub__[N: (int, float, Decimal)](
         self: Expr[N], other: N | int | Expr[N], /
@@ -94,12 +198,41 @@ class Expr[T](ExprBase):
     def __truediv__(self: ExprBase, other: object, /) -> ExprBase:
         return _arith(self, "/", other)
 
+    # ``timedelta(days=1) + Users.created_at``: a timestamp (or an interval).
+    @overload
+    def __radd__(
+        self: Expr[datetime.datetime], other: datetime.timedelta, /
+    ) -> Expr[datetime.datetime]: ...
+    @overload
+    def __radd__(
+        self: Expr[datetime.date], other: datetime.timedelta, /
+    ) -> Expr[datetime.datetime]: ...
+    @overload
+    def __radd__(
+        self: Expr[datetime.datetime | None], other: datetime.timedelta, /
+    ) -> Expr[datetime.datetime | None]: ...
+    @overload
+    def __radd__(
+        self: Expr[datetime.date | None], other: datetime.timedelta, /
+    ) -> Expr[datetime.datetime | None]: ...
+    @overload
+    def __radd__(
+        self: Expr[datetime.timedelta], other: datetime.timedelta, /
+    ) -> Expr[datetime.timedelta]: ...
+    @overload
+    def __radd__(
+        self: Expr[datetime.timedelta | None], other: datetime.timedelta, /
+    ) -> Expr[datetime.timedelta | None]: ...
     @overload
     def __radd__[N: (int, float, Decimal)](self: Expr[N], other: N | int, /) -> Expr[N]: ...
     @overload
     def __radd__[N: (int, float, Decimal)](
         self: Expr[N | None], other: N | int, /
     ) -> Expr[N | None]: ...
+    @overload
+    def __radd__(self: Expr[str], other: str, /) -> Expr[str]: ...
+    @overload
+    def __radd__(self: Expr[str | None], other: str, /) -> Expr[str | None]: ...
     def __radd__(self: ExprBase, other: object, /) -> ExprBase:
         return _arith(other, "+", self)
 
@@ -133,12 +266,25 @@ class Expr[T](ExprBase):
 
 # The right side of arithmetic on a nullable left side.
 type _Num[N] = N | int | Expr[N] | Expr[N | None]
+type _Str = str | Expr[str] | Expr[str | None]
+type _Interval = datetime.timedelta | Expr[datetime.timedelta]
+type _AnyInterval = _Interval | Expr[datetime.timedelta | None]
+type _Timestamp = datetime.datetime | Expr[datetime.datetime] | Expr[datetime.datetime | None]
+type _Date = datetime.date | Expr[datetime.date] | Expr[datetime.date | None]
 
 
 def _arith(left: object, op: str, right: object) -> ExprBase:
-    from mizzle.core.sql.functions import bind  # functions imports this module
+    from mizzle.core.sql.functions import bind, is_text  # functions imports this module
 
-    return TypedOperation[object](bind(left, (right,)), op, bind(right, (left,)))
+    if op == "+" and (is_text(left) or is_text(right)):
+        # Plain strings are cast to text: a column type would not tell || what they are.
+        return TypedOperation[object](bind(left), "||", bind(right))
+    # A Python interval next to a timestamp is an interval, not a value of that column.
+    return TypedOperation[object](
+        bind(left, () if isinstance(left, datetime.timedelta) else (right,)),
+        op,
+        bind(right, () if isinstance(right, datetime.timedelta) else (left,)),
+    )
 
 
 @dataclass(frozen=True)
@@ -246,12 +392,16 @@ class Aggregate[T](TypedFunc[T]):
 
     def over(
         self,
+        window: str | None = None,
+        /,
         *,
         partition_by: ExprBase | Sequence[ExprBase] = (),
         order_by: ExprBase | OrderBy | Sequence[ExprBase | OrderBy] = (),
         frame: Frame | None = None,
     ) -> Expr[T]:
-        return over(self, partition_by, order_by, frame)
+        """``.over(partition_by=..., order_by=...)``, or ``.over("w")`` for a window named
+        with ``query.window("w", ...)`` (other arguments then add to it)."""
+        return over(self, window, partition_by, order_by, frame)
 
 
 @dataclass(frozen=True)
@@ -279,13 +429,22 @@ class Frame:
 
 
 @dataclass(frozen=True)
-class Over(ExprBase):
-    """``func OVER (PARTITION BY ... ORDER BY ... frame)``."""
+class Window:
+    """A window: ``[base] PARTITION BY ... ORDER BY ... frame``; ``base`` names a window
+    of the query's ``WINDOW`` clause."""
 
-    func: Func
     partition_by: tuple[Node, ...]
     order_by: tuple[Node, ...]
     frame: Frame | None
+    base: str | None = None
+
+
+@dataclass(frozen=True)
+class Over(ExprBase):
+    """``func OVER (window)``."""
+
+    func: Func
+    window: Window
 
 
 @dataclass(frozen=True)
@@ -293,15 +452,25 @@ class TypedOver[T](Over, Expr[T]):
     pass
 
 
+def window(
+    base: str | None,
+    partition_by: ExprBase | Sequence[ExprBase],
+    order_by: ExprBase | OrderBy | Sequence[ExprBase | OrderBy],
+    frame: Frame | None,
+) -> Window:
+    partition = (partition_by,) if isinstance(partition_by, ExprBase) else tuple(partition_by)
+    order = (order_by,) if isinstance(order_by, ExprBase | OrderBy) else tuple(order_by)
+    return Window(partition, order, frame, base)
+
+
 def over[T](
     func: Func,
+    base: str | None,
     partition_by: ExprBase | Sequence[ExprBase],
     order_by: ExprBase | OrderBy | Sequence[ExprBase | OrderBy],
     frame: Frame | None,
 ) -> Expr[T]:
-    partition = (partition_by,) if isinstance(partition_by, ExprBase) else tuple(partition_by)
-    order = (order_by,) if isinstance(order_by, ExprBase | OrderBy) else tuple(order_by)
-    return TypedOver[T](func, partition, order, frame)
+    return TypedOver[T](func, window(base, partition_by, order_by, frame))
 
 
 @dataclass(frozen=True)
@@ -362,3 +531,17 @@ class Excluded(ExprBase):
     """``excluded.<column>`` inside ON CONFLICT DO UPDATE."""
 
     column: ColumnBase
+
+
+@dataclass(frozen=True, eq=False)
+class CteColumn(ExprBase):
+    """A column of a CTE or subquery, by name; see ``Cte.c()``."""
+
+    cte: Cte
+    name: str
+    type_: type[object] | None = None  # as declared by the user, unchecked
+
+
+@dataclass(frozen=True, eq=False)
+class TypedCteColumn[T](CteColumn, Expr[T]):
+    pass

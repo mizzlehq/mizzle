@@ -1,0 +1,1260 @@
+{
+  "version": 1,
+  "dialect": "postgresql",
+  "id": "647474d9-3065-4e98-87a4-482c57862d63",
+  "prev_id": "2bcb8634-0cbd-4c57-93a7-82cb30af63e5",
+  "schemas": [
+    "shop_audit",
+    "auth"
+  ],
+  "enums": {
+    "public.user_role": {
+      "schema": "public",
+      "name": "user_role",
+      "values": [
+        "customer",
+        "seller",
+        "admin"
+      ]
+    },
+    "public.order_status": {
+      "schema": "public",
+      "name": "order_status",
+      "values": [
+        "pending",
+        "paid",
+        "shipped",
+        "cancelled"
+      ]
+    },
+    "shop_audit.audit_action": {
+      "schema": "shop_audit",
+      "name": "audit_action",
+      "values": [
+        "insert",
+        "update",
+        "delete"
+      ]
+    }
+  },
+  "tables": {
+    "public.users": {
+      "schema": "public",
+      "name": "users",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "uuid",
+          "not_null": true,
+          "default": "gen_random_uuid()"
+        },
+        "email": {
+          "name": "email",
+          "type": "character varying(255)",
+          "not_null": true,
+          "default": null
+        },
+        "name": {
+          "name": "name",
+          "type": "text",
+          "not_null": true,
+          "default": null
+        },
+        "phone": {
+          "name": "phone",
+          "type": "text",
+          "not_null": false,
+          "default": null
+        },
+        "role": {
+          "name": "role",
+          "type": "user_role",
+          "not_null": true,
+          "default": "'customer'"
+        },
+        "tags": {
+          "name": "tags",
+          "type": "text[]",
+          "not_null": true,
+          "default": "'{}'"
+        },
+        "prefs": {
+          "name": "prefs",
+          "type": "jsonb",
+          "not_null": true,
+          "default": "'{}'"
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "timestamp with time zone",
+          "not_null": true,
+          "default": "now()"
+        },
+        "updated_at": {
+          "name": "updated_at",
+          "type": "timestamp with time zone",
+          "not_null": true,
+          "default": "now()"
+        }
+      },
+      "primary_key": {
+        "name": "users_pkey",
+        "columns": [
+          "id"
+        ]
+      },
+      "uniques": {},
+      "checks": {
+        "users_email_format": {
+          "name": "users_email_format",
+          "expression": "email LIKE '%_@_%'"
+        }
+      },
+      "foreign_keys": {},
+      "indexes": {
+        "users_email_lower_key": {
+          "name": "users_email_lower_key",
+          "columns": [],
+          "unique": true,
+          "where": null,
+          "expression": "lower(\"email\")"
+        }
+      }
+    },
+    "public.stores": {
+      "schema": "public",
+      "name": "stores",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "integer",
+          "not_null": true,
+          "default": null,
+          "identity": {
+            "always": true,
+            "start": 100,
+            "increment": 1
+          }
+        },
+        "owner_id": {
+          "name": "owner_id",
+          "type": "uuid",
+          "not_null": true,
+          "default": null
+        },
+        "slug": {
+          "name": "slug",
+          "type": "character varying(64)",
+          "not_null": true,
+          "default": null
+        },
+        "name": {
+          "name": "name",
+          "type": "text",
+          "not_null": true,
+          "default": null
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "timestamp with time zone",
+          "not_null": true,
+          "default": "now()"
+        }
+      },
+      "primary_key": {
+        "name": "stores_pkey",
+        "columns": [
+          "id"
+        ]
+      },
+      "uniques": {
+        "stores_slug_key": {
+          "name": "stores_slug_key",
+          "columns": [
+            "slug"
+          ]
+        }
+      },
+      "checks": {
+        "stores_slug_format": {
+          "name": "stores_slug_format",
+          "expression": "slug ~ '^[a-z0-9-]+$'"
+        }
+      },
+      "foreign_keys": {
+        "stores_owner_id_fkey": {
+          "name": "stores_owner_id_fkey",
+          "columns": [
+            "owner_id"
+          ],
+          "ref_schema": "public",
+          "ref_table": "users",
+          "ref_columns": [
+            "id"
+          ],
+          "on_delete": "restrict",
+          "on_update": null
+        }
+      },
+      "indexes": {},
+      "triggers": {
+        "stores_audit": {
+          "name": "stores_audit",
+          "timing": "after",
+          "events": [
+            "insert",
+            "delete"
+          ],
+          "for_each": "row",
+          "function": "shop_audit.log_change",
+          "when": null
+        }
+      }
+    },
+    "public.products": {
+      "schema": "public",
+      "name": "products",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "bigint",
+          "not_null": true,
+          "default": null,
+          "identity": {
+            "always": false,
+            "start": 1000,
+            "increment": 1
+          }
+        },
+        "store_id": {
+          "name": "store_id",
+          "type": "integer",
+          "not_null": true,
+          "default": null
+        },
+        "sku": {
+          "name": "sku",
+          "type": "text",
+          "not_null": true,
+          "default": null
+        },
+        "name": {
+          "name": "name",
+          "type": "text",
+          "not_null": true,
+          "default": null
+        },
+        "details": {
+          "name": "details",
+          "type": "text",
+          "not_null": false,
+          "default": null
+        },
+        "price": {
+          "name": "price",
+          "type": "numeric(10,2)",
+          "not_null": true,
+          "default": null
+        },
+        "tags": {
+          "name": "tags",
+          "type": "text[]",
+          "not_null": true,
+          "default": "'{}'"
+        },
+        "attrs": {
+          "name": "attrs",
+          "type": "jsonb",
+          "not_null": true,
+          "default": "'{}'"
+        },
+        "active": {
+          "name": "active",
+          "type": "boolean",
+          "not_null": true,
+          "default": "true"
+        },
+        "search": {
+          "name": "search",
+          "type": "tsvector",
+          "not_null": false,
+          "default": null,
+          "generated": {
+            "expression": "setweight(to_tsvector('english', name), 'A') || setweight(to_tsvector('english', coalesce(details, '')), 'B')",
+            "stored": true
+          }
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "timestamp with time zone",
+          "not_null": true,
+          "default": "now()"
+        },
+        "updated_at": {
+          "name": "updated_at",
+          "type": "timestamp with time zone",
+          "not_null": true,
+          "default": "now()"
+        }
+      },
+      "primary_key": {
+        "name": "products_pkey",
+        "columns": [
+          "id"
+        ]
+      },
+      "uniques": {
+        "products_store_id_sku_key": {
+          "name": "products_store_id_sku_key",
+          "columns": [
+            "store_id",
+            "sku"
+          ]
+        }
+      },
+      "checks": {
+        "products_price_positive": {
+          "name": "products_price_positive",
+          "expression": "price >= 0"
+        }
+      },
+      "foreign_keys": {
+        "products_store_id_fkey": {
+          "name": "products_store_id_fkey",
+          "columns": [
+            "store_id"
+          ],
+          "ref_schema": "public",
+          "ref_table": "stores",
+          "ref_columns": [
+            "id"
+          ],
+          "on_delete": "cascade",
+          "on_update": null
+        }
+      },
+      "indexes": {
+        "products_search_idx": {
+          "name": "products_search_idx",
+          "columns": [
+            "search"
+          ],
+          "unique": false,
+          "where": null,
+          "method": "gin"
+        },
+        "products_tags_idx": {
+          "name": "products_tags_idx",
+          "columns": [
+            "tags"
+          ],
+          "unique": false,
+          "where": null,
+          "method": "gin"
+        },
+        "products_name_trgm_idx": {
+          "name": "products_name_trgm_idx",
+          "columns": [
+            "name"
+          ],
+          "unique": false,
+          "where": null,
+          "opclasses": [
+            "gin_trgm_ops"
+          ],
+          "method": "gin"
+        },
+        "products_active_store_idx": {
+          "name": "products_active_store_idx",
+          "columns": [
+            "store_id"
+          ],
+          "unique": false,
+          "where": "active"
+        }
+      },
+      "triggers": {
+        "products_price_changed": {
+          "name": "products_price_changed",
+          "timing": "after",
+          "events": [
+            "update"
+          ],
+          "for_each": "row",
+          "function": "public.price_changed",
+          "when": "OLD.price IS DISTINCT FROM NEW.price",
+          "columns": [
+            "price"
+          ]
+        }
+      }
+    },
+    "public.inventory": {
+      "schema": "public",
+      "name": "inventory",
+      "columns": {
+        "product_id": {
+          "name": "product_id",
+          "type": "bigint",
+          "not_null": true,
+          "default": null
+        },
+        "warehouse": {
+          "name": "warehouse",
+          "type": "text",
+          "not_null": true,
+          "default": null
+        },
+        "quantity": {
+          "name": "quantity",
+          "type": "integer",
+          "not_null": true,
+          "default": "0"
+        },
+        "updated_at": {
+          "name": "updated_at",
+          "type": "timestamp with time zone",
+          "not_null": true,
+          "default": "now()"
+        }
+      },
+      "primary_key": {
+        "name": "inventory_pkey",
+        "columns": [
+          "product_id",
+          "warehouse"
+        ]
+      },
+      "uniques": {},
+      "checks": {
+        "inventory_quantity_not_negative": {
+          "name": "inventory_quantity_not_negative",
+          "expression": "quantity >= 0"
+        }
+      },
+      "foreign_keys": {
+        "inventory_product_id_fkey": {
+          "name": "inventory_product_id_fkey",
+          "columns": [
+            "product_id"
+          ],
+          "ref_schema": "public",
+          "ref_table": "products",
+          "ref_columns": [
+            "id"
+          ],
+          "on_delete": "cascade",
+          "on_update": null
+        }
+      },
+      "indexes": {}
+    },
+    "public.orders": {
+      "schema": "public",
+      "name": "orders",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "bigint",
+          "not_null": true,
+          "default": null,
+          "identity": {
+            "always": true,
+            "start": 1,
+            "increment": 1
+          }
+        },
+        "user_id": {
+          "name": "user_id",
+          "type": "uuid",
+          "not_null": true,
+          "default": null
+        },
+        "store_id": {
+          "name": "store_id",
+          "type": "integer",
+          "not_null": true,
+          "default": null
+        },
+        "status": {
+          "name": "status",
+          "type": "order_status",
+          "not_null": true,
+          "default": "'pending'"
+        },
+        "total": {
+          "name": "total",
+          "type": "numeric(12,2)",
+          "not_null": true,
+          "default": "0"
+        },
+        "note": {
+          "name": "note",
+          "type": "text",
+          "not_null": false,
+          "default": null
+        },
+        "placed_at": {
+          "name": "placed_at",
+          "type": "timestamp with time zone",
+          "not_null": true,
+          "default": "now()"
+        }
+      },
+      "primary_key": {
+        "name": "orders_pkey",
+        "columns": [
+          "id"
+        ]
+      },
+      "uniques": {},
+      "checks": {},
+      "foreign_keys": {
+        "orders_user_id_fkey": {
+          "name": "orders_user_id_fkey",
+          "columns": [
+            "user_id"
+          ],
+          "ref_schema": "public",
+          "ref_table": "users",
+          "ref_columns": [
+            "id"
+          ],
+          "on_delete": "cascade",
+          "on_update": null
+        },
+        "orders_store_id_fkey": {
+          "name": "orders_store_id_fkey",
+          "columns": [
+            "store_id"
+          ],
+          "ref_schema": "public",
+          "ref_table": "stores",
+          "ref_columns": [
+            "id"
+          ],
+          "on_delete": "cascade",
+          "on_update": null
+        }
+      },
+      "indexes": {
+        "orders_user_placed_idx": {
+          "name": "orders_user_placed_idx",
+          "columns": [
+            "user_id",
+            "placed_at"
+          ],
+          "unique": false,
+          "where": null
+        },
+        "orders_open_idx": {
+          "name": "orders_open_idx",
+          "columns": [
+            "store_id"
+          ],
+          "unique": false,
+          "where": "status IN ('pending', 'paid')"
+        }
+      },
+      "grants": {
+        "shop_authenticated": [
+          "select"
+        ]
+      },
+      "rls": {
+        "enabled": true,
+        "force": false
+      },
+      "policies": {
+        "orders_owner": {
+          "name": "orders_owner",
+          "command": "select",
+          "permissive": true,
+          "roles": [
+            "shop_authenticated"
+          ],
+          "using": "\"user_id\" = (select auth.uid())",
+          "with_check": null
+        }
+      },
+      "triggers": {
+        "orders_audit": {
+          "name": "orders_audit",
+          "timing": "after",
+          "events": [
+            "insert",
+            "delete",
+            "update"
+          ],
+          "for_each": "row",
+          "function": "shop_audit.log_change",
+          "when": null
+        }
+      }
+    },
+    "public.order_items": {
+      "schema": "public",
+      "name": "order_items",
+      "columns": {
+        "order_id": {
+          "name": "order_id",
+          "type": "bigint",
+          "not_null": true,
+          "default": null
+        },
+        "line": {
+          "name": "line",
+          "type": "smallint",
+          "not_null": true,
+          "default": null
+        },
+        "product_id": {
+          "name": "product_id",
+          "type": "bigint",
+          "not_null": true,
+          "default": null
+        },
+        "quantity": {
+          "name": "quantity",
+          "type": "integer",
+          "not_null": true,
+          "default": null
+        },
+        "unit_price": {
+          "name": "unit_price",
+          "type": "numeric(10,2)",
+          "not_null": true,
+          "default": null
+        },
+        "line_total": {
+          "name": "line_total",
+          "type": "numeric(12,2)",
+          "not_null": false,
+          "default": null,
+          "generated": {
+            "expression": "quantity * unit_price",
+            "stored": true
+          }
+        }
+      },
+      "primary_key": {
+        "name": "order_items_pkey",
+        "columns": [
+          "order_id",
+          "line"
+        ]
+      },
+      "uniques": {},
+      "checks": {
+        "order_items_quantity_positive": {
+          "name": "order_items_quantity_positive",
+          "expression": "quantity > 0"
+        }
+      },
+      "foreign_keys": {
+        "order_items_order_id_fkey": {
+          "name": "order_items_order_id_fkey",
+          "columns": [
+            "order_id"
+          ],
+          "ref_schema": "public",
+          "ref_table": "orders",
+          "ref_columns": [
+            "id"
+          ],
+          "on_delete": "cascade",
+          "on_update": null
+        },
+        "order_items_product_id_fkey": {
+          "name": "order_items_product_id_fkey",
+          "columns": [
+            "product_id"
+          ],
+          "ref_schema": "public",
+          "ref_table": "products",
+          "ref_columns": [
+            "id"
+          ],
+          "on_delete": "restrict",
+          "on_update": null
+        }
+      },
+      "indexes": {
+        "order_items_product_idx": {
+          "name": "order_items_product_idx",
+          "columns": [
+            "product_id"
+          ],
+          "unique": false,
+          "where": null
+        }
+      }
+    },
+    "public.reviews": {
+      "schema": "public",
+      "name": "reviews",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "serial",
+          "not_null": true,
+          "default": null
+        },
+        "product_id": {
+          "name": "product_id",
+          "type": "bigint",
+          "not_null": true,
+          "default": null
+        },
+        "user_id": {
+          "name": "user_id",
+          "type": "uuid",
+          "not_null": true,
+          "default": null
+        },
+        "rating": {
+          "name": "rating",
+          "type": "smallint",
+          "not_null": true,
+          "default": null
+        },
+        "body": {
+          "name": "body",
+          "type": "text",
+          "not_null": true,
+          "default": "''"
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "timestamp with time zone",
+          "not_null": true,
+          "default": "now()"
+        }
+      },
+      "primary_key": {
+        "name": "reviews_pkey",
+        "columns": [
+          "id"
+        ]
+      },
+      "uniques": {
+        "reviews_product_id_user_id_key": {
+          "name": "reviews_product_id_user_id_key",
+          "columns": [
+            "product_id",
+            "user_id"
+          ]
+        }
+      },
+      "checks": {
+        "reviews_rating_range": {
+          "name": "reviews_rating_range",
+          "expression": "rating BETWEEN 1 AND 5"
+        }
+      },
+      "foreign_keys": {
+        "reviews_product_id_fkey": {
+          "name": "reviews_product_id_fkey",
+          "columns": [
+            "product_id"
+          ],
+          "ref_schema": "public",
+          "ref_table": "products",
+          "ref_columns": [
+            "id"
+          ],
+          "on_delete": "cascade",
+          "on_update": null
+        },
+        "reviews_user_id_fkey": {
+          "name": "reviews_user_id_fkey",
+          "columns": [
+            "user_id"
+          ],
+          "ref_schema": "public",
+          "ref_table": "users",
+          "ref_columns": [
+            "id"
+          ],
+          "on_delete": "cascade",
+          "on_update": null
+        }
+      },
+      "indexes": {},
+      "rls": {
+        "enabled": true,
+        "force": false
+      },
+      "grants": {
+        "shop_authenticated": [
+          "delete",
+          "insert",
+          "select",
+          "update"
+        ]
+      },
+      "policies": {
+        "reviews_owner_select": {
+          "name": "reviews_owner_select",
+          "command": "select",
+          "permissive": true,
+          "roles": [
+            "shop_authenticated"
+          ],
+          "using": "true",
+          "with_check": null
+        },
+        "reviews_owner_insert": {
+          "name": "reviews_owner_insert",
+          "command": "insert",
+          "permissive": true,
+          "roles": [
+            "shop_authenticated"
+          ],
+          "using": null,
+          "with_check": "\"user_id\" = (select auth.uid())"
+        },
+        "reviews_owner_update": {
+          "name": "reviews_owner_update",
+          "command": "update",
+          "permissive": true,
+          "roles": [
+            "shop_authenticated"
+          ],
+          "using": "\"user_id\" = (select auth.uid())",
+          "with_check": "\"user_id\" = (select auth.uid())"
+        },
+        "reviews_owner_delete": {
+          "name": "reviews_owner_delete",
+          "command": "delete",
+          "permissive": true,
+          "roles": [
+            "shop_authenticated"
+          ],
+          "using": "\"user_id\" = (select auth.uid())",
+          "with_check": null
+        }
+      }
+    },
+    "public.notifications": {
+      "schema": "public",
+      "name": "notifications",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "bigint",
+          "not_null": true,
+          "default": null,
+          "identity": {
+            "always": true,
+            "start": 1,
+            "increment": 1
+          }
+        },
+        "user_id": {
+          "name": "user_id",
+          "type": "uuid",
+          "not_null": true,
+          "default": null
+        },
+        "kind": {
+          "name": "kind",
+          "type": "text",
+          "not_null": true,
+          "default": null
+        },
+        "payload": {
+          "name": "payload",
+          "type": "jsonb",
+          "not_null": true,
+          "default": "'{}'"
+        },
+        "read_at": {
+          "name": "read_at",
+          "type": "timestamp with time zone",
+          "not_null": false,
+          "default": null
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "timestamp with time zone",
+          "not_null": true,
+          "default": "now()"
+        }
+      },
+      "primary_key": {
+        "name": "notifications_pkey",
+        "columns": [
+          "id"
+        ]
+      },
+      "uniques": {},
+      "checks": {},
+      "foreign_keys": {
+        "notifications_user_id_fkey": {
+          "name": "notifications_user_id_fkey",
+          "columns": [
+            "user_id"
+          ],
+          "ref_schema": "public",
+          "ref_table": "users",
+          "ref_columns": [
+            "id"
+          ],
+          "on_delete": "cascade",
+          "on_update": null
+        }
+      },
+      "indexes": {
+        "notifications_unread_idx": {
+          "name": "notifications_unread_idx",
+          "columns": [
+            "user_id"
+          ],
+          "unique": false,
+          "where": "read_at IS NULL"
+        }
+      },
+      "rls": {
+        "enabled": true,
+        "force": true
+      },
+      "grants": {
+        "shop_authenticated": [
+          "select",
+          "update"
+        ],
+        "shop_support": [
+          "select"
+        ]
+      },
+      "policies": {
+        "notifications_own": {
+          "name": "notifications_own",
+          "command": "all",
+          "permissive": true,
+          "roles": [
+            "shop_authenticated"
+          ],
+          "using": "\"user_id\" = (select auth.uid())",
+          "with_check": null
+        },
+        "notifications_support": {
+          "name": "notifications_support",
+          "command": "select",
+          "permissive": true,
+          "roles": [
+            "shop_support"
+          ],
+          "using": "true",
+          "with_check": null
+        }
+      }
+    },
+    "shop_audit.audit_log": {
+      "schema": "shop_audit",
+      "name": "audit_log",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "bigint",
+          "not_null": true,
+          "default": null,
+          "identity": {
+            "always": true,
+            "start": 1,
+            "increment": 1
+          }
+        },
+        "table_name": {
+          "name": "table_name",
+          "type": "text",
+          "not_null": true,
+          "default": null
+        },
+        "action": {
+          "name": "action",
+          "type": "shop_audit.audit_action",
+          "not_null": true,
+          "default": null
+        },
+        "row_id": {
+          "name": "row_id",
+          "type": "text",
+          "not_null": true,
+          "default": null
+        },
+        "data": {
+          "name": "data",
+          "type": "jsonb",
+          "not_null": false,
+          "default": null
+        },
+        "actor": {
+          "name": "actor",
+          "type": "text",
+          "not_null": true,
+          "default": "CURRENT_USER"
+        },
+        "at": {
+          "name": "at",
+          "type": "timestamp with time zone",
+          "not_null": true,
+          "default": "now()"
+        }
+      },
+      "primary_key": {
+        "name": "audit_log_pkey",
+        "columns": [
+          "id"
+        ]
+      },
+      "uniques": {},
+      "checks": {},
+      "foreign_keys": {},
+      "indexes": {
+        "audit_log_row_idx": {
+          "name": "audit_log_row_idx",
+          "columns": [
+            "table_name",
+            "row_id"
+          ],
+          "unique": false,
+          "where": null
+        }
+      },
+      "grants": {
+        "shop_support": [
+          "select"
+        ]
+      }
+    },
+    "public.product_embeddings": {
+      "schema": "public",
+      "name": "product_embeddings",
+      "columns": {
+        "product_id": {
+          "name": "product_id",
+          "type": "bigint",
+          "not_null": true,
+          "default": null
+        },
+        "embedding": {
+          "name": "embedding",
+          "type": "vector(3)",
+          "not_null": true,
+          "default": null
+        },
+        "half": {
+          "name": "half",
+          "type": "halfvec(3)",
+          "not_null": false,
+          "default": null
+        },
+        "keywords": {
+          "name": "keywords",
+          "type": "sparsevec(8)",
+          "not_null": false,
+          "default": null
+        }
+      },
+      "primary_key": {
+        "name": "product_embeddings_pkey",
+        "columns": [
+          "product_id"
+        ]
+      },
+      "uniques": {},
+      "checks": {},
+      "foreign_keys": {
+        "product_embeddings_product_id_fkey": {
+          "name": "product_embeddings_product_id_fkey",
+          "columns": [
+            "product_id"
+          ],
+          "ref_schema": "public",
+          "ref_table": "products",
+          "ref_columns": [
+            "id"
+          ],
+          "on_delete": "cascade",
+          "on_update": null
+        }
+      },
+      "indexes": {
+        "product_embeddings_hnsw": {
+          "name": "product_embeddings_hnsw",
+          "columns": [
+            "embedding"
+          ],
+          "unique": false,
+          "where": null,
+          "opclasses": [
+            "vector_cosine_ops"
+          ],
+          "method": "hnsw",
+          "options": {
+            "m": "16",
+            "ef_construction": "64"
+          }
+        },
+        "product_embeddings_half_hnsw": {
+          "name": "product_embeddings_half_hnsw",
+          "columns": [
+            "half"
+          ],
+          "unique": false,
+          "where": null,
+          "opclasses": [
+            "halfvec_l2_ops"
+          ],
+          "method": "hnsw"
+        }
+      }
+    }
+  },
+  "roles": {
+    "shop_support": {
+      "name": "shop_support",
+      "login": false,
+      "create_db": false,
+      "create_role": false,
+      "inherit": true
+    }
+  },
+  "views": {
+    "public.product_ratings": {
+      "schema": "public",
+      "name": "product_ratings",
+      "definition": "SELECT \"reviews\".\"product_id\" AS \"product_id\", count(*) AS \"reviews\", avg(\"reviews\".\"rating\") AS \"rating\" FROM \"reviews\" GROUP BY \"reviews\".\"product_id\"",
+      "materialized": false,
+      "columns": {
+        "product_id": {
+          "name": "product_id",
+          "type": "bigint",
+          "not_null": false,
+          "default": null
+        },
+        "reviews": {
+          "name": "reviews",
+          "type": "bigint",
+          "not_null": false,
+          "default": null
+        },
+        "rating": {
+          "name": "rating",
+          "type": "numeric",
+          "not_null": false,
+          "default": null
+        }
+      },
+      "grants": {
+        "shop_authenticated": [
+          "select"
+        ]
+      }
+    },
+    "public.store_sales": {
+      "schema": "public",
+      "name": "store_sales",
+      "definition": "SELECT \"orders\".\"store_id\" AS \"store_id\", count(*) AS \"orders\", sum(\"orders\".\"total\") AS \"revenue\" FROM \"orders\" WHERE \"orders\".\"status\" = 'paid' GROUP BY \"orders\".\"store_id\"",
+      "materialized": true,
+      "columns": {
+        "store_id": {
+          "name": "store_id",
+          "type": "integer",
+          "not_null": false,
+          "default": null
+        },
+        "orders": {
+          "name": "orders",
+          "type": "bigint",
+          "not_null": false,
+          "default": null
+        },
+        "revenue": {
+          "name": "revenue",
+          "type": "numeric",
+          "not_null": false,
+          "default": null
+        }
+      },
+      "indexes": {
+        "store_sales_store_key": {
+          "name": "store_sales_store_key",
+          "columns": [
+            "store_id"
+          ],
+          "unique": true,
+          "where": null
+        }
+      }
+    },
+    "public.top_products": {
+      "schema": "public",
+      "name": "top_products",
+      "definition": "SELECT \"order_items\".\"product_id\" AS \"product_id\", sum(\"order_items\".\"quantity\") AS \"sold\" FROM \"order_items\" GROUP BY \"order_items\".\"product_id\"",
+      "materialized": false,
+      "columns": {
+        "product_id": {
+          "name": "product_id",
+          "type": "bigint",
+          "not_null": false,
+          "default": null
+        },
+        "sold": {
+          "name": "sold",
+          "type": "bigint",
+          "not_null": false,
+          "default": null
+        }
+      }
+    }
+  },
+  "extensions": {
+    "vector": {
+      "name": "vector"
+    },
+    "pg_trgm": {
+      "name": "pg_trgm"
+    },
+    "pgcrypto": {
+      "name": "pgcrypto"
+    }
+  },
+  "functions": {
+    "auth.uid()": {
+      "schema": "auth",
+      "name": "uid",
+      "args": "",
+      "returns": "uuid",
+      "language": "sql",
+      "body": "SELECT nullif(current_setting('request.jwt.claims', true)::jsonb ->> 'sub', '')::uuid",
+      "volatility": "stable",
+      "security_definer": false
+    },
+    "shop_audit.log_change()": {
+      "schema": "shop_audit",
+      "name": "log_change",
+      "args": "",
+      "returns": "trigger",
+      "language": "plpgsql",
+      "body": "\nBEGIN\n  INSERT INTO shop_audit.audit_log (table_name, action, row_id, data)\n  VALUES (\n    TG_TABLE_NAME,\n    lower(TG_OP)::shop_audit.audit_action,\n    CASE WHEN TG_OP = 'DELETE' THEN OLD.id::text ELSE NEW.id::text END,\n    CASE WHEN TG_OP = 'DELETE' THEN to_jsonb(OLD) ELSE to_jsonb(NEW) END\n  );\n  RETURN NULL;\nEND\n",
+      "volatility": "volatile",
+      "security_definer": true,
+      "settings": {
+        "search_path": "pg_catalog, pg_temp"
+      }
+    },
+    "public.price_changed()": {
+      "schema": "public",
+      "name": "price_changed",
+      "args": "",
+      "returns": "trigger",
+      "language": "plpgsql",
+      "body": "\nBEGIN\n  PERFORM pg_notify('shop_price', json_build_object(\n    'product_id', NEW.id, 'old', OLD.price, 'new', NEW.price)::text);\n  INSERT INTO notifications (user_id, kind, payload)\n  SELECT s.owner_id, 'price_changed',\n         jsonb_build_object('product_id', NEW.id, 'old', OLD.price, 'new', NEW.price)\n  FROM stores s WHERE s.id = NEW.store_id;\n  RETURN NULL;\nEND\n",
+      "volatility": "volatile",
+      "security_definer": false
+    }
+  }
+}

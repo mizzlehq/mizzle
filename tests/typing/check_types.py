@@ -11,6 +11,7 @@ from typing import Any, assert_type
 
 from mizzle.core.query.builder import QueryBuilder
 from mizzle.core.schema.column import Column
+from mizzle.core.sql.nodes import Expr
 from mizzle.core.sql.operators import count, eq, nullable
 from tests.models import Posts, Role, Users
 
@@ -97,7 +98,6 @@ async def expressions(qb: QueryBuilder) -> None:
         to_tsvector,
         ts_rank,
     )
-    from mizzle.core.sql.nodes import Expr
     from mizzle.pg import integer, text
 
     assert_type(Users.id + 1, Expr[int])
@@ -161,3 +161,38 @@ async def expressions(qb: QueryBuilder) -> None:
     union = qb.select(Users.id).from_(Users).union(qb.select(Posts.author_id).from_(Posts))
     assert_type(await union.order_by(Users.id).limit(5), list[tuple[int]])
     qb.select(Users.id).from_(Users).union(qb.select(Users.email).from_(Users))  # type: ignore[arg-type]  # pyright: ignore[reportArgumentType]
+
+
+def date_time_and_text_operators(
+    stamp: Expr[datetime.datetime],
+    maybe_stamp: Expr[datetime.datetime | None],
+    day: Expr[datetime.date],
+    maybe_day: Expr[datetime.date | None],
+    interval: Expr[datetime.timedelta | None],
+    every: Expr[datetime.timedelta],
+) -> None:
+    week = datetime.timedelta(days=7)
+    assert_type(stamp + week, Expr[datetime.datetime])
+    assert_type(stamp - interval, Expr[datetime.datetime | None])
+    assert_type(maybe_stamp + week, Expr[datetime.datetime | None])
+    assert_type(day + week, Expr[datetime.datetime])
+    assert_type(stamp - stamp, Expr[datetime.timedelta])
+    assert_type(stamp - maybe_stamp, Expr[datetime.timedelta | None])
+    assert_type(stamp - datetime.datetime.now(), Expr[datetime.timedelta])
+    assert_type(day - day, Expr[int])
+    assert_type(maybe_day - day, Expr[int | None])
+    assert_type(every + week, Expr[datetime.timedelta])
+    assert_type(every - every, Expr[datetime.timedelta])
+    assert_type(every + interval, Expr[datetime.timedelta | None])
+    assert_type(interval - week, Expr[datetime.timedelta | None])
+    assert_type(week + stamp, Expr[datetime.datetime])
+    assert_type(week + day, Expr[datetime.datetime])
+    assert_type(week + maybe_stamp, Expr[datetime.datetime | None])
+    assert_type(week + maybe_day, Expr[datetime.datetime | None])
+    assert_type(week + every, Expr[datetime.timedelta])
+    assert_type(week + interval, Expr[datetime.timedelta | None])
+    assert_type(Users.email + "!" + Users.email, Expr[str])
+    assert_type(Users.email + Users.bio, Expr[str | None])
+    assert_type("<" + Users.bio, Expr[str | None])
+    assert_type(Users.id + 1, Expr[int])
+    _ = stamp + 1  # type: ignore[operator]  # pyright: ignore[reportOperatorIssue]
