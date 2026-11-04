@@ -30,6 +30,7 @@ class Index:
     # Operator class of every key, or one per key (None: the default).
     opclass: str | tuple[str | None, ...] | None = None
     options: tuple[tuple[str, str], ...] = ()  # storage parameters, as text
+    nulls_not_distinct: bool = False  # UNIQUE index: NULLs are equal (PostgreSQL 15+)
 
     def on(self, *keys: ExprBase) -> Index:
         return replace(self, columns=keys)
@@ -72,12 +73,17 @@ class Index:
 class UniqueConstraint:
     columns: tuple[ColumnBase, ...]
     name: str | None = None
+    nulls_not_distinct: bool = False  # treat NULLs as equal (PostgreSQL 15+)
+    deferrable: bool = False
+    initially_deferred: bool = False
 
 
 @dataclass(frozen=True)
 class PrimaryKey:
     columns: tuple[ColumnBase, ...]
     name: str | None = None
+    deferrable: bool = False
+    initially_deferred: bool = False
 
 
 @dataclass(frozen=True)
@@ -87,12 +93,16 @@ class ForeignKey:
     name: str | None = None
     on_delete: ReferentialAction | None = None
     on_update: ReferentialAction | None = None
+    deferrable: bool = False
+    initially_deferred: bool = False
+    not_valid: bool = False  # ADD ... NOT VALID: skip checking existing rows
 
 
 @dataclass(frozen=True)
 class Check:
     name: str
     condition: Condition
+    not_valid: bool = False  # ADD ... NOT VALID: skip checking existing rows
 
 
 type PolicyCommand = Literal["all", "select", "insert", "update", "delete"]
@@ -176,20 +186,31 @@ type Constraint = (
 )
 
 
-def index(name: str) -> Index:
-    return Index(name)
+def index(name: str, *, nulls_not_distinct: bool = False) -> Index:
+    return Index(name, nulls_not_distinct=nulls_not_distinct)
 
 
-def unique_index(name: str) -> Index:
-    return Index(name, unique=True)
+def unique_index(name: str, *, nulls_not_distinct: bool = False) -> Index:
+    return Index(name, unique=True, nulls_not_distinct=nulls_not_distinct)
 
 
-def unique(*columns: ColumnBase, name: str | None = None) -> UniqueConstraint:
-    return UniqueConstraint(columns, name)
+def unique(
+    *columns: ColumnBase,
+    name: str | None = None,
+    nulls_not_distinct: bool = False,
+    deferrable: bool = False,
+    initially_deferred: bool = False,
+) -> UniqueConstraint:
+    return UniqueConstraint(columns, name, nulls_not_distinct, deferrable, initially_deferred)
 
 
-def primary_key(*columns: ColumnBase, name: str | None = None) -> PrimaryKey:
-    return PrimaryKey(columns, name)
+def primary_key(
+    *columns: ColumnBase,
+    name: str | None = None,
+    deferrable: bool = False,
+    initially_deferred: bool = False,
+) -> PrimaryKey:
+    return PrimaryKey(columns, name, deferrable, initially_deferred)
 
 
 def foreign_key(
@@ -199,12 +220,24 @@ def foreign_key(
     name: str | None = None,
     on_delete: ReferentialAction | None = None,
     on_update: ReferentialAction | None = None,
+    deferrable: bool = False,
+    initially_deferred: bool = False,
+    not_valid: bool = False,
 ) -> ForeignKey:
-    return ForeignKey(tuple(columns), references, name, on_delete, on_update)
+    return ForeignKey(
+        tuple(columns),
+        references,
+        name,
+        on_delete,
+        on_update,
+        deferrable,
+        initially_deferred,
+        not_valid,
+    )
 
 
-def check(name: str, condition: Condition) -> Check:
-    return Check(name, condition)
+def check(name: str, condition: Condition, *, not_valid: bool = False) -> Check:
+    return Check(name, condition, not_valid)
 
 
 def rls(*, enabled: bool = True, force: bool = False) -> RowLevelSecurity:

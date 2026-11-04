@@ -53,16 +53,23 @@ class ColumnSnap(TypedDict):
 class PrimaryKeySnap(TypedDict):
     name: str
     columns: list[str]
+    deferrable: NotRequired[bool]
+    initially_deferred: NotRequired[bool]
 
 
 class UniqueSnap(TypedDict):
     name: str
     columns: list[str]
+    # Absent when the default (NULLs are distinct), so older snapshots compare equal.
+    nulls_not_distinct: NotRequired[bool]
+    deferrable: NotRequired[bool]
+    initially_deferred: NotRequired[bool]
 
 
 class CheckSnap(TypedDict):
     name: str
     expression: str
+    not_valid: NotRequired[bool]
 
 
 class ForeignKeySnap(TypedDict):
@@ -73,6 +80,9 @@ class ForeignKeySnap(TypedDict):
     ref_columns: list[str]
     on_delete: str | None  # None means the database default (NO ACTION)
     on_update: str | None
+    deferrable: NotRequired[bool]
+    initially_deferred: NotRequired[bool]
+    not_valid: NotRequired[bool]
 
 
 class IndexSnap(TypedDict):
@@ -88,6 +98,7 @@ class IndexSnap(TypedDict):
     # Expression indexes carry theirs inside ``expression``.
     opclasses: NotRequired[list[str | None]]
     options: NotRequired[dict[str, str]]  # storage parameters: WITH (m = 16, ...)
+    nulls_not_distinct: NotRequired[bool]  # UNIQUE index: NULLs are equal
 
 
 class RlsSnap(TypedDict):

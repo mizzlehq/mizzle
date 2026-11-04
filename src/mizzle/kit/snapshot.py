@@ -119,10 +119,22 @@ def build_snapshot(
                     stored=computed.stored,
                 )
             if column.is_primary_key:
-                snap["primary_key"] = PrimaryKeySnap(name=trunc(f"{tname}_pkey"), columns=[cname])
+                col_pk = PrimaryKeySnap(name=trunc(f"{tname}_pkey"), columns=[cname])
+                if column.pk_deferrable:
+                    col_pk["deferrable"] = True
+                if column.pk_initially_deferred:
+                    col_pk["initially_deferred"] = True
+                snap["primary_key"] = col_pk
             if column.is_unique:
                 name = column.unique_name or trunc(f"{tname}_{cname}_key")
-                snap["uniques"][name] = UniqueSnap(name=name, columns=[cname])
+                u = UniqueSnap(name=name, columns=[cname])
+                if column.unique_nulls_not_distinct:
+                    u["nulls_not_distinct"] = True
+                if column.unique_deferrable:
+                    u["deferrable"] = True
+                if column.unique_initially_deferred:
+                    u["initially_deferred"] = True
+                snap["uniques"][name] = u
             for i, condition in enumerate(column.checks):
                 name = trunc(f"{tname}_{cname}_check{i or ''}")
                 expression = dialect.expression(condition, casing)
@@ -131,7 +143,7 @@ def build_snapshot(
                 target = column.reference.target()
                 assert target.table is not None  # checked by validate_tables
                 name = trunc(f"{tname}_{cname}_fkey")
-                snap["foreign_keys"][name] = ForeignKeySnap(
+                fk = ForeignKeySnap(
                     name=name,
                     columns=[cname],
                     ref_schema=schema_of(target.table),
@@ -140,6 +152,13 @@ def build_snapshot(
                     on_delete=_action(column.reference.on_delete),
                     on_update=_action(column.reference.on_update),
                 )
+                if column.reference.deferrable:
+                    fk["deferrable"] = True
+                if column.reference.initially_deferred:
+                    fk["initially_deferred"] = True
+                if column.reference.not_valid:
+                    fk["not_valid"] = True
+                snap["foreign_keys"][name] = fk
 
         for constraint in table.config():
             match constraint:
@@ -148,12 +167,22 @@ def build_snapshot(
                 case UniqueConstraint():
                     cols = names(constraint.columns)
                     name = constraint.name or trunc(f"{tname}_{'_'.join(cols)}_key")
-                    snap["uniques"][name] = UniqueSnap(name=name, columns=cols)
+                    u = UniqueSnap(name=name, columns=cols)
+                    if constraint.nulls_not_distinct:
+                        u["nulls_not_distinct"] = True
+                    if constraint.deferrable:
+                        u["deferrable"] = True
+                    if constraint.initially_deferred:
+                        u["initially_deferred"] = True
+                    snap["uniques"][name] = u
                 case PrimaryKey():
                     name = constraint.name or trunc(f"{tname}_pkey")
-                    snap["primary_key"] = PrimaryKeySnap(
-                        name=name, columns=names(constraint.columns)
-                    )
+                    tbl_pk = PrimaryKeySnap(name=name, columns=names(constraint.columns))
+                    if constraint.deferrable:
+                        tbl_pk["deferrable"] = True
+                    if constraint.initially_deferred:
+                        tbl_pk["initially_deferred"] = True
+                    snap["primary_key"] = tbl_pk
                     for cname in names(constraint.columns):  # the database enforces this
                         snap["columns"][cname]["not_null"] = True
                 case ForeignKey():
@@ -165,7 +194,7 @@ def build_snapshot(
                             f"{table.__name__}: a foreign key must reference one table"
                         )
                     name = constraint.name or trunc(f"{tname}_{'_'.join(cols)}_fkey")
-                    snap["foreign_keys"][name] = ForeignKeySnap(
+                    fk = ForeignKeySnap(
                         name=name,
                         columns=cols,
                         ref_schema=schema_of(ref_table),
@@ -174,11 +203,19 @@ def build_snapshot(
                         on_delete=_action(constraint.on_delete),
                         on_update=_action(constraint.on_update),
                     )
+                    if constraint.deferrable:
+                        fk["deferrable"] = True
+                    if constraint.initially_deferred:
+                        fk["initially_deferred"] = True
+                    if constraint.not_valid:
+                        fk["not_valid"] = True
+                    snap["foreign_keys"][name] = fk
                 case Check():
                     expression = dialect.expression(constraint.condition, casing)
-                    snap["checks"][constraint.name] = CheckSnap(
-                        name=constraint.name, expression=expression
-                    )
+                    c = CheckSnap(name=constraint.name, expression=expression)
+                    if constraint.not_valid:
+                        c["not_valid"] = True
+                    snap["checks"][constraint.name] = c
                 case Policy():
                     snap.setdefault("policies", {})[constraint.name] = _policy(
                         constraint, dialect, casing
@@ -286,6 +323,8 @@ def _index(constraint: Index, dialect: Dialect, casing: Casing | None) -> IndexS
         index["method"] = constraint.method
     if constraint.options:
         index["options"] = dict(constraint.options)
+    if constraint.nulls_not_distinct:
+        index["nulls_not_distinct"] = True
     return index
 
 

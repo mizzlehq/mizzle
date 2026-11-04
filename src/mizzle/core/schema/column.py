@@ -33,6 +33,9 @@ class Reference:
     target: Callable[[], ColumnBase]
     on_delete: ReferentialAction | None = None
     on_update: ReferentialAction | None = None
+    deferrable: bool = False
+    initially_deferred: bool = False
+    not_valid: bool = False
 
 
 @dataclass(frozen=True)
@@ -79,6 +82,11 @@ class ColumnBase(ExprBase):
     is_primary_key: bool
     is_unique: bool
     unique_name: str | None
+    unique_nulls_not_distinct: bool
+    pk_deferrable: bool
+    pk_initially_deferred: bool
+    unique_deferrable: bool
+    unique_initially_deferred: bool
     default_value: object
     default_factory: Callable[[], object] | None
     reference: Reference | None
@@ -114,6 +122,11 @@ class ColumnBase(ExprBase):
         self.is_primary_key = False
         self.is_unique = False
         self.unique_name = None
+        self.unique_nulls_not_distinct = False
+        self.pk_deferrable = False
+        self.pk_initially_deferred = False
+        self.unique_deferrable = False
+        self.unique_initially_deferred = False
         self.default_value = MISSING  # a value, an SQL expression, or MISSING
         self.default_factory = None
         self.reference = None
@@ -200,6 +213,11 @@ class ColumnBase(ExprBase):
         primary_key: bool | None = None,
         unique_name: str | None = None,
         unique: bool | None = None,
+        nulls_not_distinct: bool | None = None,
+        pk_deferrable: bool | None = None,
+        pk_initially_deferred: bool | None = None,
+        unique_deferrable: bool | None = None,
+        unique_initially_deferred: bool | None = None,
         default: object = MISSING,
         default_factory: Callable[[], object] | None = None,
         reference: Reference | None = None,
@@ -223,6 +241,16 @@ class ColumnBase(ExprBase):
         if unique is not None:
             self.is_unique = unique
             self.unique_name = unique_name
+        if nulls_not_distinct is not None:
+            self.unique_nulls_not_distinct = nulls_not_distinct
+        if pk_deferrable is not None:
+            self.pk_deferrable = pk_deferrable
+        if pk_initially_deferred is not None:
+            self.pk_initially_deferred = pk_initially_deferred
+        if unique_deferrable is not None:
+            self.unique_deferrable = unique_deferrable
+        if unique_initially_deferred is not None:
+            self.unique_initially_deferred = unique_initially_deferred
         if default is not MISSING:
             self.default_value = default
         if default_factory is not None:
@@ -259,15 +287,41 @@ class Column[T](ColumnBase, Expr[T]):
         return self
 
     @overload
-    def primary_key[U](self: Column[U | None]) -> Column[U]: ...
+    def primary_key[U](
+        self: Column[U | None], *, deferrable: bool = False, initially_deferred: bool = False
+    ) -> Column[U]: ...
     @overload
-    def primary_key(self) -> Self: ...
-    def primary_key(self) -> ColumnBase:
-        self._set(primary_key=True, nullable=False)
+    def primary_key(
+        self, *, deferrable: bool = False, initially_deferred: bool = False
+    ) -> Self: ...
+    def primary_key(
+        self, *, deferrable: bool = False, initially_deferred: bool = False
+    ) -> ColumnBase:
+        self._set(
+            primary_key=True,
+            nullable=False,
+            pk_deferrable=deferrable,
+            pk_initially_deferred=initially_deferred,
+        )
         return self
 
-    def unique(self, name: str | None = None) -> Self:
-        self._set(unique=True, unique_name=name)
+    def unique(
+        self,
+        name: str | None = None,
+        *,
+        nulls_not_distinct: bool = False,
+        deferrable: bool = False,
+        initially_deferred: bool = False,
+    ) -> Self:
+        """A unique constraint on this column. ``nulls_not_distinct=True`` treats NULLs as
+        equal (PostgreSQL 15+), so two rows cannot both be NULL."""
+        self._set(
+            unique=True,
+            unique_name=name,
+            nulls_not_distinct=nulls_not_distinct,
+            unique_deferrable=deferrable,
+            unique_initially_deferred=initially_deferred,
+        )
         return self
 
     def default(self, value: T | ExprBase) -> Self:
@@ -286,8 +340,15 @@ class Column[T](ColumnBase, Expr[T]):
         *,
         on_delete: ReferentialAction | None = None,
         on_update: ReferentialAction | None = None,
+        deferrable: bool = False,
+        initially_deferred: bool = False,
+        not_valid: bool = False,
     ) -> Self:
-        self._set(reference=Reference(target, on_delete, on_update))
+        self._set(
+            reference=Reference(
+                target, on_delete, on_update, deferrable, initially_deferred, not_valid
+            )
+        )
         return self
 
     def check(self, condition: Condition) -> Self:

@@ -8,7 +8,7 @@ import ipaddress
 import keyword
 import re
 import uuid
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 
 from mizzle import pg
 from mizzle.core.schema.column import ColumnBase
@@ -193,8 +193,11 @@ class _SchemaWriter:
         pk = table["primary_key"]
         is_pk = pk is not None and pk["columns"] == [cname] and pk["name"] == f"{tname}_pkey"
         identity = column.get("identity")
-        if is_pk:
-            code += ".primary_key()"
+        if is_pk and pk is not None:
+            pk_opts = ", ".join(
+                f"{opt}=True" for opt in ("deferrable", "initially_deferred") if pk.get(opt)
+            )
+            code += f".primary_key({pk_opts})" if pk_opts else ".primary_key()"
         elif (
             column["not_null"]
             and identity is None
@@ -225,7 +228,13 @@ class _SchemaWriter:
             code += f".generated_always_as({_sql(generated['expression'])}{stored})"
         unique = table["uniques"].get(f"{tname}_{cname}_key")
         if unique is not None and unique["columns"] == [cname]:
-            code += ".unique()"
+            u_opts: list[str] = []
+            if unique.get("nulls_not_distinct"):
+                u_opts.append("nulls_not_distinct=True")
+            u_opts += [
+                f"{opt}=True" for opt in ("deferrable", "initially_deferred") if unique.get(opt)
+            ]
+            code += f".unique({', '.join(u_opts)})" if u_opts else ".unique()"
         if column["default"] is not None:
             code += f".default({self.default(column)})"
         fk = table["foreign_keys"].get(f"{tname}_{cname}_fkey")
@@ -235,6 +244,11 @@ class _SchemaWriter:
                 ref_attr = self.attrs[f"{fk['ref_schema']}.{fk['ref_table']}"][fk["ref_columns"][0]]
                 options = "".join(
                     f", {opt}={fk[opt]!r}" for opt in ("on_delete", "on_update") if fk[opt]
+                )
+                options += "".join(
+                    f", {opt}=True"
+                    for opt in ("deferrable", "initially_deferred", "not_valid")
+                    if fk.get(opt)
                 )
                 code += f".references(lambda: {target}.{ref_attr}{options})"
         return code
@@ -349,12 +363,18 @@ class _SchemaWriter:
         def cols(names: Sequence[str]) -> str:
             return ", ".join(f"cls.{attrs[n]}" for n in names)
 
+        def flags(snap: Mapping[str, object], names: Sequence[str]) -> str:
+            return "".join(f", {n}=True" for n in names if snap.get(n))
+
         pk = table["primary_key"]
         if pk is not None and not (len(pk["columns"]) == 1 and pk["name"] == f"{tname}_pkey"):
-            items.append(f"primary_key({cols(pk['columns'])}, name={pk['name']!r})")
+            defer = flags(pk, ("deferrable", "initially_deferred"))
+            items.append(f"primary_key({cols(pk['columns'])}, name={pk['name']!r}{defer})")
         for u in table["uniques"].values():
             if not (len(u["columns"]) == 1 and u["name"] == f"{tname}_{u['columns'][0]}_key"):
-                items.append(f"unique({cols(u['columns'])}, name={u['name']!r})")
+                flag = ", nulls_not_distinct=True" if u.get("nulls_not_distinct") else ""
+                flag += flags(u, ("deferrable", "initially_deferred"))
+                items.append(f"unique({cols(u['columns'])}, name={u['name']!r}{flag})")
         for fk in table["foreign_keys"].values():
             col = fk["columns"][0]
             if len(fk["columns"]) == 1 and fk["name"] == f"{tname}_{col}_fkey":
@@ -367,12 +387,14 @@ class _SchemaWriter:
                 continue
             refs = ", ".join(f"{target}.{self.attrs[ref_key][c]}" for c in fk["ref_columns"])
             options = "".join(f", {o}={fk[o]!r}" for o in ("on_delete", "on_update") if fk[o])
+            options += flags(fk, ("deferrable", "initially_deferred", "not_valid"))
             items.append(
                 f"foreign_key([{cols(fk['columns'])}], lambda: [{refs}], "
                 f"name={fk['name']!r}{options})"
             )
         for c in table["checks"].values():
-            items.append(f"check({c['name']!r}, {_sql(c['expression'])})")
+            not_valid = ", not_valid=True" if c.get("not_valid") else ""
+            items.append(f"check({c['name']!r}, {_sql(c['expression'])}{not_valid})")
         items += [_index_item(i, attrs) for i in table["indexes"].values()]
         if rls := table.get("rls"):
             args = [] if rls["enabled"] else ["enabled=False"]
@@ -624,12 +646,13 @@ def _grant_items(grants: GrantsSnap) -> list[str]:
 
 def _index_item(i: IndexSnap, attrs: dict[str, str]) -> str:
     fn = "unique_index" if i["unique"] else "index"
+    flag = ", nulls_not_distinct=True" if i.get("nulls_not_distinct") else ""
     keys = (
         _sql(i["expression"])
         if "expression" in i
         else ", ".join(f"cls.{attrs[n]}" for n in i["columns"])
     )
-    code = f"{fn}({i['name']!r})"
+    code = f"{fn}({i['name']!r}{flag})"
     opclasses = i.get("opclasses", [])
     opclass: str | list[str | None] | None = opclasses[0] if opclasses else None
     if len(set(opclasses)) > 1:

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import datetime
 import re
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from typing import cast
 
 from mizzle.core.errors import MigrationError
@@ -21,6 +21,7 @@ from mizzle.core.snapshot import (
     RoleSnap,
     TableSnap,
     TriggerSnap,
+    UniqueSnap,
     keyword_default,
     sequence_defaults,
 )
@@ -327,19 +328,37 @@ def _foreign_key(fk: ForeignKeySnap) -> str:
         text += f" ON DELETE {fk['on_delete'].upper()}"
     if fk["on_update"]:
         text += f" ON UPDATE {fk['on_update'].upper()}"
+    text += _deferred(fk)
+    if fk.get("not_valid"):
+        text += " NOT VALID"
     return text
+
+
+def _unique_fragment(u: UniqueSnap) -> str:
+    return "UNIQUE NULLS NOT DISTINCT " if u.get("nulls_not_distinct") else "UNIQUE "
+
+
+def _deferred(snap: Mapping[str, object]) -> str:
+    if snap.get("initially_deferred"):
+        return " DEFERRABLE INITIALLY DEFERRED"
+    return " DEFERRABLE" if snap.get("deferrable") else ""
 
 
 def _create_table(table: TableSnap) -> str:
     lines = [column_definition(c) for c in table["columns"].values()]
     if pk := table["primary_key"]:
-        lines.append(f"CONSTRAINT {quote(pk['name'])} PRIMARY KEY ({_columns(pk['columns'])})")
+        lines.append(
+            f"CONSTRAINT {quote(pk['name'])} PRIMARY KEY ({_columns(pk['columns'])}){_deferred(pk)}"
+        )
     lines += [
-        f"CONSTRAINT {quote(u['name'])} UNIQUE ({_columns(u['columns'])})"
+        f"CONSTRAINT {quote(u['name'])} {_unique_fragment(u)}({_columns(u['columns'])})"
+        f"{_deferred(u)}"
         for u in table["uniques"].values()
     ]
     lines += [
-        f"CONSTRAINT {quote(c['name'])} CHECK ({c['expression']})" for c in table["checks"].values()
+        f"CONSTRAINT {quote(c['name'])} CHECK ({c['expression']})"
+        for c in table["checks"].values()
+        if not c.get("not_valid")  # NOT VALID is only valid on ALTER TABLE ADD CONSTRAINT
     ]
     body = ",\n    ".join(lines)
     return f"CREATE TABLE {qualified(table['schema'], table['name'])} (\n    {body}\n)"
@@ -357,6 +376,8 @@ def create_index(schema: str, table: str, index: IndexSnap) -> str:
     using = f" USING {index['method']}" if "method" in index else ""
     text = f"CREATE {unique}INDEX {quote(index['name'])} ON {qualified(schema, table)}{using}"
     text += f" ({keys})"
+    if index["unique"] and index.get("nulls_not_distinct"):
+        text += " NULLS NOT DISTINCT"
     if options := index.get("options"):
         text += " WITH (" + ", ".join(f"{k} = {_literal(v)}" for k, v in options.items()) + ")"
     return text + (f" WHERE {index['where']}" if index["where"] else "")
@@ -526,17 +547,22 @@ def render_step(step: Step) -> Statement:
             return alter(
                 schema,
                 table,
-                f"ADD CONSTRAINT {quote(pk['name'])} PRIMARY KEY ({_columns(pk['columns'])})",
+                f"ADD CONSTRAINT {quote(pk['name'])} PRIMARY KEY ({_columns(pk['columns'])})"
+                f"{_deferred(pk)}",
             )
         case AddUnique(schema=schema, table=table, unique=u):
             return alter(
                 schema,
                 table,
-                f"ADD CONSTRAINT {quote(u['name'])} UNIQUE ({_columns(u['columns'])})",
+                f"ADD CONSTRAINT {quote(u['name'])} {_unique_fragment(u)}"
+                f"({_columns(u['columns'])}){_deferred(u)}",
             )
         case AddCheck(schema=schema, table=table, check=c):
+            not_valid = " NOT VALID" if c.get("not_valid") else ""
             return alter(
-                schema, table, f"ADD CONSTRAINT {quote(c['name'])} CHECK ({c['expression']})"
+                schema,
+                table,
+                f"ADD CONSTRAINT {quote(c['name'])} CHECK ({c['expression']}){not_valid}",
             )
         case AddForeignKey(schema=schema, table=table, foreign_key=fk):
             return alter(schema, table, f"ADD {_foreign_key(fk)}")

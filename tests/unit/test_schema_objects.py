@@ -13,14 +13,17 @@ from mizzle import (
     SchemaError,
     Table,
     View,
+    check,
     count,
     eq,
     extension,
+    foreign_key,
     function,
     policy,
     rls,
     sql,
     trigger,
+    unique,
     unique_index,
 )
 from mizzle.core.schema.objects import SchemaObject
@@ -395,3 +398,79 @@ def test_pull_round_trip(tmp_path: Path) -> None:
     ]
     objects = [v for v in members if isinstance(v, type(trgm) | type(touch) | type(users_touch))]
     assert diff(original, build_snapshot(tables, dialect, objects=objects)) == []
+
+
+@final
+class RefPk(Table, name="ref_pk"):
+    id = integer().primary_key()
+
+
+@final
+class Curve(Table, name="curve"):
+    id = integer().primary_key(deferrable=True, initially_deferred=True)
+    pair = text().unique(nulls_not_distinct=True, deferrable=True)
+    tag = text()
+    ptr = integer()
+
+    @classmethod
+    @override
+    def config(cls) -> list[Constraint]:
+        return [
+            unique(cls.tag, name="curve_tag_uniq", deferrable=True),
+            foreign_key(
+                [cls.ptr],
+                lambda: [RefPk.id],
+                name="curve_ptr_fkey",
+                deferrable=True,
+                initially_deferred=True,
+                not_valid=True,
+            ),
+            check("curve_ptr_pos", sql("ptr > 0"), not_valid=True),
+        ]
+
+
+def test_constraint_modifiers_sql() -> None:
+    statements = sqls(empty_snapshot("postgresql"), snap([RefPk, Curve], objects=[]))
+    create = next(s for s in statements if s.startswith('CREATE TABLE "curve"'))
+    assert 'CONSTRAINT "curve_pkey" PRIMARY KEY ("id") DEFERRABLE INITIALLY DEFERRED' in create
+    assert 'CONSTRAINT "curve_pair_key" UNIQUE NULLS NOT DISTINCT ("pair") DEFERRABLE' in create
+    assert "curve_ptr_pos" not in create  # NOT VALID is added afterwards, not in CREATE TABLE
+    assert 'CONSTRAINT "curve_tag_uniq" UNIQUE ("tag") DEFERRABLE' in create
+    assert (
+        'ALTER TABLE "curve" ADD CONSTRAINT "curve_ptr_fkey" FOREIGN KEY ("ptr") '
+        'REFERENCES "ref_pk" ("id") DEFERRABLE INITIALLY DEFERRED NOT VALID' in statements
+    )
+    assert (
+        'ALTER TABLE "curve" ADD CONSTRAINT "curve_ptr_pos" CHECK (ptr > 0) NOT VALID' in statements
+    )
+
+
+def test_constraint_modifiers_snapshot_and_pull(tmp_path: Path) -> None:
+    original = snap([RefPk, Curve], objects=[])
+    curve = original["tables"]["public.curve"]
+    assert curve["primary_key"] is not None
+    assert curve["primary_key"].get("deferrable") and curve["primary_key"].get("initially_deferred")
+    assert curve["uniques"]["curve_pair_key"].get("nulls_not_distinct")
+    assert curve["uniques"]["curve_pair_key"].get("deferrable")
+    assert curve["foreign_keys"]["curve_ptr_fkey"].get("not_valid")
+    assert curve["checks"]["curve_ptr_pos"].get("not_valid")
+
+    source = render_schema_module(original)
+    assert ".primary_key(deferrable=True, initially_deferred=True)" in source
+    assert ".unique(nulls_not_distinct=True, deferrable=True)" in source
+    assert "not_valid=True" in source
+
+    path = tmp_path / "pulled_modifiers.py"
+    path.write_text(source)
+    spec = importlib.util.spec_from_file_location("pulled_modifiers", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["pulled_modifiers"] = module
+    spec.loader.exec_module(module)
+    members = list(vars(module).values())
+    tables = [
+        v
+        for v in members
+        if isinstance(v, type) and issubclass(v, Table) and "__table__" in vars(v)
+    ]
+    assert diff(original, build_snapshot(tables, dialect)) == []

@@ -518,6 +518,8 @@ def _diff_table(old: TableSnap, new: TableSnap, plan: _Plan, compare_expressions
         return _without_name(a) == _without_name(b)
 
     def same_check(a: CheckSnap, b: CheckSnap) -> bool:
+        if a.get("not_valid") != b.get("not_valid"):
+            return False
         return not compare_expressions or a["expression"] == b["expression"]
 
     old_pk = {old["primary_key"]["name"]: old["primary_key"]} if old["primary_key"] else {}
@@ -558,7 +560,7 @@ def _diff_table(old: TableSnap, new: TableSnap, plan: _Plan, compare_expressions
     def same_index(a: IndexSnap, b: IndexSnap) -> bool:
         if a["columns"] != b["columns"] or a["unique"] != b["unique"]:
             return False
-        for extra in ("method", "opclasses", "options"):
+        for extra in ("method", "opclasses", "options", "nulls_not_distinct"):
             if a.get(extra) != b.get(extra):
                 return False
         if not compare_expressions:  # the database reformats expressions; compare shapes
@@ -598,6 +600,11 @@ def diff(
             plan.create_tables.append(CreateTable(table))
             plan.create_indexes += [
                 CreateIndex(table["schema"], table["name"], i) for i in table["indexes"].values()
+            ]
+            plan.add_constraints += [
+                AddCheck(table["schema"], table["name"], c)
+                for c in table["checks"].values()
+                if c.get("not_valid")  # CREATE TABLE cannot declare it NOT VALID
             ]
             plan.add_fks += [
                 AddForeignKey(table["schema"], table["name"], fk)

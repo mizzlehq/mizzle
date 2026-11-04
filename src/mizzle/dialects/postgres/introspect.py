@@ -9,19 +9,23 @@ from typing import Protocol, cast
 
 from mizzle.core.errors import DatabaseError, SchemaError
 from mizzle.core.snapshot import (
+    CheckSnap,
     ColumnSnap,
     EnumSnap,
     ExtensionSnap,
+    ForeignKeySnap,
     FunctionSnap,
     GeneratedSnap,
     IdentitySnap,
     IndexSnap,
     PolicySnap,
+    PrimaryKeySnap,
     RlsSnap,
     RoleSnap,
     Snapshot,
     TableSnap,
     TriggerSnap,
+    UniqueSnap,
     ViewSnap,
     default_cost,
     empty_snapshot,
@@ -85,7 +89,11 @@ SELECT con.conrelid AS table_oid, con.conname AS name, con.contype::text AS kind
              JOIN pg_attribute a ON a.attrelid = con.confrelid AND a.attnum = k.n
              ORDER BY k.ord) AS ref_columns,
        con.confdeltype::text AS on_delete, con.confupdtype::text AS on_update,
-       pg_get_constraintdef(con.oid) AS definition
+       pg_get_constraintdef(con.oid) AS definition,
+       con.condeferrable AS deferrable, con.condeferred AS initially_deferred,
+       con.convalidated AS validated,
+       EXISTS (SELECT 1 FROM pg_index i WHERE i.indexrelid = con.conindid
+               AND i.indnullsnotdistinct) AS nulls_not_distinct
 FROM pg_constraint con
 LEFT JOIN pg_class fc ON fc.oid = con.confrelid
 LEFT JOIN pg_namespace fn ON fn.oid = fc.relnamespace
@@ -107,7 +115,8 @@ SELECT i.indrelid AS table_oid, ic.relname AS name, i.indisunique AS unique,
        ARRAY(SELECT CASE WHEN oc.opcdefault THEN NULL ELSE oc.opcname END
              FROM unnest(i.indclass::oid[]) WITH ORDINALITY k(o, ord)
              JOIN pg_opclass oc ON oc.oid = k.o ORDER BY k.ord) AS opclasses,
-       coalesce(ic.reloptions, '{}') AS options
+       coalesce(ic.reloptions, '{}') AS options,
+       i.indnullsnotdistinct AS nulls_not_distinct
 FROM pg_index i
 JOIN pg_class ic ON ic.oid = i.indexrelid
 JOIN pg_am am ON am.oid = ic.relam
@@ -368,6 +377,8 @@ def _index(row: _Row) -> IndexSnap:
         index["opclasses"] = opclasses
     if method != "btree":
         index["method"] = method
+    if bool(row["nulls_not_distinct"]):
+        index["nulls_not_distinct"] = True
     if options := _strs(row["options"]):
         index["options"] = dict(o.split("=", 1) for o in options)
     return index
@@ -414,22 +425,44 @@ async def introspect(
         name, columns = str(row["name"]), _strs(row["columns"])
         match row["kind"]:
             case "p":
-                table["primary_key"] = {"name": name, "columns": columns}
+                pk = PrimaryKeySnap(name=name, columns=columns)
+                if row["deferrable"]:
+                    pk["deferrable"] = True
+                if row["initially_deferred"]:
+                    pk["initially_deferred"] = True
+                table["primary_key"] = pk
             case "u":
-                table["uniques"][name] = {"name": name, "columns": columns}
+                unique = UniqueSnap(name=name, columns=columns)
+                if row["nulls_not_distinct"]:
+                    unique["nulls_not_distinct"] = True
+                if row["deferrable"]:
+                    unique["deferrable"] = True
+                if row["initially_deferred"]:
+                    unique["initially_deferred"] = True
+                table["uniques"][name] = unique
             case "c":
                 expression = _check_expression(str(row["definition"]))
-                table["checks"][name] = {"name": name, "expression": expression}
+                check = CheckSnap(name=name, expression=expression)
+                if not row["validated"]:
+                    check["not_valid"] = True
+                table["checks"][name] = check
             case "f":
-                table["foreign_keys"][name] = {
-                    "name": name,
-                    "columns": columns,
-                    "ref_schema": str(row["ref_schema"]),
-                    "ref_table": str(row["ref_table"]),
-                    "ref_columns": _strs(row["ref_columns"]),
-                    "on_delete": _ACTIONS[str(row["on_delete"])],
-                    "on_update": _ACTIONS[str(row["on_update"])],
-                }
+                fk = ForeignKeySnap(
+                    name=name,
+                    columns=columns,
+                    ref_schema=str(row["ref_schema"]),
+                    ref_table=str(row["ref_table"]),
+                    ref_columns=_strs(row["ref_columns"]),
+                    on_delete=_ACTIONS[str(row["on_delete"])],
+                    on_update=_ACTIONS[str(row["on_update"])],
+                )
+                if row["deferrable"]:
+                    fk["deferrable"] = True
+                if row["initially_deferred"]:
+                    fk["initially_deferred"] = True
+                if not row["validated"]:
+                    fk["not_valid"] = True
+                table["foreign_keys"][name] = fk
             case _:
                 pass
 

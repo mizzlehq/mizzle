@@ -17,12 +17,16 @@ from mizzle import (
     QueryBuilder,
     Table,
     View,
+    check,
     function,
     grant,
     index,
+    primary_key,
     role,
     sql,
     trigger,
+    unique,
+    unique_index,
 )
 from mizzle.core.schema.column import Computed
 from mizzle.core.schema.objects import Extension, Function, SchemaObject, Trigger
@@ -558,3 +562,133 @@ class Audit(Table, name="audit", schema="mg"):
 async def test_sql_keyword_defaults_converge(driver: PostgresDriver) -> None:
     """PostgreSQL prints them in upper case: push must find nothing left to do."""
     await migrate(driver, empty_snapshot("postgresql"), snap([Audit]))
+
+
+# -- NULLS NOT DISTINCT (PostgreSQL 15+) ----------------------------------------------------
+
+
+def nulls(kind: str) -> type[Table]:
+    @final
+    class Nulls(Table, name="nulls", schema="mg"):
+        a = integer().unique(nulls_not_distinct=True) if kind == "column" else integer()
+        b = text()
+
+        @classmethod
+        @override
+        def config(cls) -> list[Constraint]:
+            if kind == "unique":
+                return [unique(cls.b, nulls_not_distinct=True)]
+            if kind == "index":
+                return [unique_index("nulls_b", nulls_not_distinct=True).on(cls.b)]
+            return []
+
+    return Nulls
+
+
+async def test_nulls_not_distinct_round_trip(driver: PostgresDriver, tmp_path: Path) -> None:
+    column_unique = snap([nulls("column")])
+    await migrate(driver, empty_snapshot("postgresql"), column_unique)
+    assert (await live(driver))["tables"]["mg.nulls"]["uniques"]["nulls_a_key"].get(
+        "nulls_not_distinct"
+    )
+    await assert_pull_round_trip(driver, tmp_path)
+
+    distinct = snap([nulls("distinct")])
+    steps = await migrate(driver, column_unique, distinct)
+    assert any(s.describe().startswith("drop unique") for s in steps)
+    await assert_pull_round_trip(driver, tmp_path)
+
+    constraint = snap([nulls("unique")])
+    await migrate(driver, distinct, constraint)
+    live_unique = (await live(driver))["tables"]["mg.nulls"]["uniques"]
+    assert any(u.get("nulls_not_distinct") for u in live_unique.values())
+    await assert_pull_round_trip(driver, tmp_path)
+
+    named_index = snap([nulls("index")])
+    await migrate(driver, constraint, named_index)
+    index_snap = (await live(driver))["tables"]["mg.nulls"]["indexes"]["nulls_b"]
+    assert index_snap.get("nulls_not_distinct") is True
+    await assert_pull_round_trip(driver, tmp_path)
+
+
+# -- deferrable / NOT VALID constraints ----------------------------------------------------
+
+
+@final
+class DefColumn(Table, name="def_column", schema="mg"):
+    id = integer().primary_key(deferrable=True, initially_deferred=True)
+    code = text().unique(deferrable=True)
+
+
+@final
+class DefColumnPlain(Table, name="def_column", schema="mg"):
+    id = integer().primary_key()
+    code = text().unique()
+
+
+@final
+class DefTable(Table, name="def_table", schema="mg"):
+    code = text()
+    ref = text()
+
+    @classmethod
+    @override
+    def config(cls) -> list[Constraint]:
+        return [
+            primary_key(
+                cls.code, name="def_table_code_pk", deferrable=True, initially_deferred=True
+            ),
+            unique(cls.ref, name="def_table_ref_uniq", deferrable=True),
+        ]
+
+
+@final
+class DefParent(Table, name="def_parent", schema="mg"):
+    code = text().primary_key()
+
+
+@final
+class DefFk(Table, name="def_fk", schema="mg"):
+    ref = text().references(
+        lambda: DefParent.code, deferrable=True, initially_deferred=True, not_valid=True
+    )
+
+
+@final
+class DefCheck(Table, name="def_check", schema="mg"):
+    amount = integer()
+
+    @classmethod
+    @override
+    def config(cls) -> list[Constraint]:
+        return [check("def_check_amount", sql("amount is null or amount > 0"), not_valid=True)]
+
+
+async def test_deferrable_and_not_valid_round_trip(driver: PostgresDriver, tmp_path: Path) -> None:
+    tables = [DefColumn, DefTable, DefParent, DefFk, DefCheck]
+    await migrate(driver, empty_snapshot("postgresql"), snap(tables))
+    live_tables = (await live(driver))["tables"]
+    pk = live_tables["mg.def_column"]["primary_key"]
+    assert pk is not None
+    assert pk.get("deferrable") and pk.get("initially_deferred")
+    assert live_tables["mg.def_column"]["uniques"]["def_column_code_key"].get("deferrable")
+    table_pk = live_tables["mg.def_table"]["primary_key"]
+    assert table_pk is not None
+    assert table_pk.get("initially_deferred")
+    assert live_tables["mg.def_table"]["uniques"]["def_table_ref_uniq"].get("deferrable")
+    fk = live_tables["mg.def_fk"]["foreign_keys"]["def_fk_ref_fkey"]
+    assert fk.get("deferrable") and fk.get("initially_deferred") and fk.get("not_valid")
+    assert live_tables["mg.def_check"]["checks"]["def_check_amount"].get("not_valid")
+    await assert_pull_round_trip(driver, tmp_path)
+
+    # Turning the column-level options off rewrites the constraints, and the result is clean.
+    plain = snap([DefColumnPlain, DefTable, DefParent, DefFk, DefCheck])
+    steps = await migrate(driver, snap(tables), plain)
+    described = [s.describe() for s in steps]
+    assert any(d.startswith("drop primary key") for d in described), described
+    remaining = (await live(driver))["tables"]["mg.def_column"]
+    remaining_pk = remaining["primary_key"]
+    assert remaining_pk is not None
+    assert not remaining_pk.get("deferrable")
+    assert not remaining["uniques"]["def_column_code_key"].get("deferrable")
+    await assert_pull_round_trip(driver, tmp_path)
