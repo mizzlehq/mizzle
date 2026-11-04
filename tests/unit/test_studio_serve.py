@@ -37,11 +37,15 @@ def _record_run(app: object, *, host: str, port: int, log_level: str) -> None:
 
 
 SERVED: list[tuple[object, str, int]] = []
+OPENED: list[str] = []
 
 
 @pytest.fixture(autouse=True)
-def clear_served() -> None:
+def no_browser(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Never launch a browser from a test (it really would open one)."""
     SERVED.clear()
+    OPENED.clear()
+    monkeypatch.setattr(studio_server, "webbrowser", types.SimpleNamespace(open=OPENED.append))
 
 
 @pytest.fixture(autouse=True)
@@ -52,13 +56,13 @@ def clean_env(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def test_remote_bind_without_credentials_is_refused(config: Config, no_ui: None) -> None:
     with pytest.raises(MigrationError, match="without credentials"):
-        studio_server.serve(config, port=1, read_only=False, open_browser=False, host="0.0.0.0")
+        studio_server.serve(config, port=4983, read_only=False, open_browser=False, host="0.0.0.0")
 
 
 def test_remote_bind_accepts_a_basic_auth_password(config: Config, no_ui: None) -> None:
     studio_server.serve(
         config,
-        port=1,
+        port=4983,
         read_only=False,
         open_browser=False,
         host="0.0.0.0",
@@ -72,7 +76,7 @@ def test_remote_bind_accepts_basic_auth_from_the_environment(
 ) -> None:
     # SS4: the environment form keeps the password out of `ps`.
     monkeypatch.setenv("MIZZLE_STUDIO_AUTH", "admin:secret")
-    studio_server.serve(config, port=1, read_only=False, open_browser=False, host="0.0.0.0")
+    studio_server.serve(config, port=4983, read_only=False, open_browser=False, host="0.0.0.0")
     assert SERVED
 
 
@@ -80,11 +84,11 @@ def test_remote_bind_rejects_a_short_token(config: Config, no_ui: None) -> None:
     # SS4: a one-character token is guessable, so a remote bind needs a real one.
     with pytest.raises(MigrationError, match="at least 32 characters"):
         studio_server.serve(
-            config, port=1, read_only=False, open_browser=False, host="0.0.0.0", token="a"
+            config, port=4983, read_only=False, open_browser=False, host="0.0.0.0", token="a"
         )
     studio_server.serve(
         config,
-        port=1,
+        port=4983,
         read_only=False,
         open_browser=False,
         host="0.0.0.0",
@@ -96,9 +100,11 @@ def test_remote_bind_rejects_a_short_token(config: Config, no_ui: None) -> None:
 def test_loopback_accepts_the_generated_token(config: Config, no_ui: None) -> None:
     # Loopback is reachable only from this machine, so the short-token rule does not apply.
     studio_server.serve(
-        config, port=1, read_only=False, open_browser=True, host="127.0.0.1", token="short"
+        config, port=4983, read_only=False, open_browser=True, host="127.0.0.1", token="short"
     )
     assert SERVED
+    # The URL it "opens" carries the token in the fragment, so it never reaches the server.
+    assert OPENED == ["http://127.0.0.1:4983/#token=short"]
 
 
 def test_origins_are_the_loopback_urls(config: Config) -> None:
