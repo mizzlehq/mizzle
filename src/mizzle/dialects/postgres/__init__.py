@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from collections.abc import Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 
 from mizzle.core.errors import MigrationLockTimeout
 from mizzle.core.naming import Casing
@@ -37,6 +37,8 @@ class PostgresDialect:
         max_idle: float = 300.0,
         query_timeout: float | None = None,
         reset_connections: ResetMode = "auto",
+        on_connect: Callable[[Connection], Awaitable[None]] | None = None,
+        server_settings: Mapping[str, str] | None = None,
     ) -> PostgresDriver:
         return await PostgresDriver.connect(
             url,
@@ -46,6 +48,8 @@ class PostgresDialect:
             max_idle=max_idle,
             query_timeout=query_timeout,
             reset_connections=reset_connections,
+            on_connect=on_connect,
+            server_settings=server_settings,
         )
 
     def column_type(self, column: ColumnBase) -> str:

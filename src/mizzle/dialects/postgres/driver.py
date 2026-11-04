@@ -8,8 +8,17 @@ import json
 import logging
 import math
 import re
+import time
 import uuid
-from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Iterable, Sequence
+from collections.abc import (
+    AsyncGenerator,
+    AsyncIterator,
+    Awaitable,
+    Callable,
+    Iterable,
+    Mapping,
+    Sequence,
+)
 from contextlib import asynccontextmanager
 from decimal import Decimal
 from typing import TYPE_CHECKING, Literal, Self, cast, final
@@ -38,6 +47,7 @@ from mizzle.dialects.base import (
     IsolationLevel,
     Notification,
     Overflow,
+    PoolStats,
     ResetMode,
 )
 
@@ -366,6 +376,7 @@ class PostgresConnection:
         overflow: Overflow = "raise",
         probe: Callable[[str], Awaitable[None]] | None = None,
         pooler_session_mode: bool = False,
+        decoder: Callable[[str], object] | None = None,
     ) -> AsyncGenerator[AsyncIterator[Notification]]:
         self.dirty = True  # the pool's reset runs UNLISTEN * even if removing a listener fails
         conn = self._conn
@@ -446,7 +457,7 @@ class PostgresConnection:
                 added.append(channel)
             if pooled and probe is not None:  # session mode: still check it works
                 await self._check_delivery(probe)
-            yield _Notifications(queue, resume if max_queue is not None else None)
+            yield _Notifications(queue, resume if max_queue is not None else None, decoder)
         finally:
             resume()  # UNLISTEN below needs the socket read again
             try:
@@ -532,17 +543,20 @@ class _Notifications:
     """The iterator ``listen()`` yields. A class, not an async generator: a timeout or
     cancellation while waiting must not end the iteration."""
 
-    __slots__ = ("_on_take", "_queue")
+    __slots__ = ("_decoder", "_on_take", "_queue")
     _queue: asyncio.Queue[Notification | _End]
     _on_take: Callable[[], None] | None
+    _decoder: Callable[[str], object] | None
 
     def __init__(
         self,
         queue: asyncio.Queue[Notification | _End],
         on_take: Callable[[], None] | None = None,
+        decoder: Callable[[str], object] | None = None,
     ) -> None:
         self._queue = queue
         self._on_take = on_take
+        self._decoder = decoder
 
     def __aiter__(self) -> Self:
         return self
@@ -552,6 +566,10 @@ class _Notifications:
         if isinstance(event, Notification):
             if self._on_take is not None and self._queue.empty():
                 self._on_take()  # overflow="block": caught up, read the socket again
+            if self._decoder is not None:
+                return Notification(
+                    event.channel, event.payload, event.pid, self._decoder(event.payload)
+                )
             return event
         self._queue.put_nowait(event)  # stays failed
         if event is _End.OVERFLOW:
@@ -617,21 +635,25 @@ class _Acquire:
     """``async with driver.acquire() as conn``. A plain class: this runs for every query,
     and is cheaper than an ``@asynccontextmanager`` generator."""
 
-    __slots__ = ("_conn", "_pool", "_wrapper")
+    __slots__ = ("_conn", "_driver", "_pool", "_wrapper")
     _pool: asyncpg.Pool
+    _driver: PostgresDriver
     _conn: PoolConnectionProxy | None
     _wrapper: PostgresConnection | None
 
-    def __init__(self, pool: asyncpg.Pool) -> None:
+    def __init__(self, pool: asyncpg.Pool, driver: PostgresDriver) -> None:
         self._pool = pool
+        self._driver = driver
         self._conn = None
         self._wrapper = None
 
     async def __aenter__(self) -> PostgresConnection:
+        start = time.perf_counter()
         try:
             self._conn = await self._pool.acquire()
         except (OSError, asyncpg.PostgresError) as exc:
             raise DbConnectionError(f"could not acquire a connection: {exc}") from exc
+        self._driver.last_acquire_ms = (time.perf_counter() - start) * 1000
         self._wrapper = PostgresConnection(self._conn)
         return self._wrapper
 
@@ -666,10 +688,12 @@ def _is_closed(conn: asyncpg.Connection | PoolConnectionProxy) -> bool:
 class PostgresDriver:
     _pool: asyncpg.Pool
     _url: str | None  # for one-off connections outside the pool (never logged)
+    last_acquire_ms: float
 
     def __init__(self, pool: asyncpg.Pool, url: str | None = None) -> None:
         self._pool = pool
         self._url = url
+        self.last_acquire_ms = 0.0
 
     @classmethod
     async def connect(
@@ -682,9 +706,19 @@ class PostgresDriver:
         max_idle: float = 300.0,
         query_timeout: float | None = None,
         reset_connections: ResetMode = "auto",
+        on_connect: Callable[[PostgresConnection], Awaitable[None]] | None = None,
+        server_settings: Mapping[str, str] | None = None,
     ) -> PostgresDriver:
         """``statement_cache_size=0`` is needed behind PgBouncer in transaction mode.
-        ``max_idle`` closes connections unused for that many seconds (0 keeps them)."""
+        ``max_idle`` closes connections unused for that many seconds (0 keeps them).
+        ``on_connect`` runs on each new connection (session settings, ``search_path``);
+        ``server_settings`` sets PostgreSQL GUCs for every connection."""
+
+        async def init(conn: asyncpg.Connection) -> None:
+            await _init_connection(conn)
+            if on_connect is not None:
+                await on_connect(PostgresConnection(conn))
+
         try:
             pool = await asyncpg.create_pool(
                 url,
@@ -693,7 +727,8 @@ class PostgresDriver:
                 max_inactive_connection_lifetime=max_idle,
                 command_timeout=query_timeout,
                 statement_cache_size=statement_cache_size,
-                init=_init_connection,
+                server_settings=None if server_settings is None else dict(server_settings),
+                init=init if on_connect is not None else _init_connection,
                 connection_class=_PoolConnection,
                 # None: asyncpg's own full reset on every release.
                 reset=_reset_connection if reset_connections == "auto" else None,
@@ -704,7 +739,19 @@ class PostgresDriver:
         return cls(pool, url)
 
     def acquire(self) -> _Acquire:
-        return _Acquire(self._pool)
+        return _Acquire(self._pool, self)
+
+    def stats(self) -> PoolStats:
+        size = self._pool.get_size()
+        idle = self._pool.get_idle_size()
+        return PoolStats(
+            size=size,
+            idle=idle,
+            in_use=size - idle,
+            max_size=self._pool.get_max_size(),
+            min_size=self._pool.get_min_size(),
+            wait_ms=self.last_acquire_ms,
+        )
 
     async def close(self) -> None:
         await self._pool.close()

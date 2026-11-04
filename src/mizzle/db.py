@@ -15,6 +15,7 @@ from collections.abc import (
     Generator,
     Iterable,
     Iterator,
+    Mapping,
     Sequence,
 )
 from contextlib import (
@@ -49,6 +50,7 @@ from mizzle.dialects.base import (
     IsolationLevel,
     Notification,
     Overflow,
+    PoolStats,
     Reconnected,
     ResetMode,
 )
@@ -90,6 +92,7 @@ class Session(QueryBuilder):
     _casing: Casing | None
     _logger: QueryLogger | None
     _log_params: bool
+    _slow_query_ms: float | None
     _conn: Connection | None
     _lock: asyncio.Lock
 
@@ -101,6 +104,7 @@ class Session(QueryBuilder):
         casing: Casing | None = None,
         logger: QueryLogger | None = None,
         log_params: bool = False,
+        slow_query_ms: float | None = None,
         connection: Connection | None = None,
         replicas: Sequence[Driver] = (),
     ) -> None:
@@ -114,6 +118,7 @@ class Session(QueryBuilder):
         self._casing = casing
         self._logger = logger
         self._log_params = log_params
+        self._slow_query_ms = slow_query_ms
         self._conn = connection
         # One connection runs one statement at a time; the lock lets asyncio.gather()
         # inside a transaction queue up instead of failing.
@@ -352,6 +357,7 @@ class Session(QueryBuilder):
         max_queue: int | None = None,
         overflow: Overflow = "raise",
         pooler_session_mode: bool = False,
+        decoder: Callable[[str], object] | None = None,
     ) -> AbstractAsyncContextManager[AsyncIterator[Notification]]: ...
     @overload
     def listen(
@@ -361,6 +367,7 @@ class Session(QueryBuilder):
         max_queue: int | None = None,
         overflow: Overflow = "raise",
         pooler_session_mode: bool = False,
+        decoder: Callable[[str], object] | None = None,
     ) -> AbstractAsyncContextManager[AsyncIterator[Notification | Reconnected]]: ...
     def listen(
         self,
@@ -369,6 +376,7 @@ class Session(QueryBuilder):
         max_queue: int | None = None,
         overflow: Overflow = "raise",
         pooler_session_mode: bool = False,
+        decoder: Callable[[str], object] | None = None,
     ) -> AbstractAsyncContextManager[AsyncIterator[Notification | Reconnected]]:
         """Receive ``NOTIFY`` messages sent to ``channels``, on a pooled connection held
         until the block exits::
@@ -392,7 +400,16 @@ class Session(QueryBuilder):
         Through a connection pooler, listen() raises ``DatabaseError``: PgBouncer in
         transaction or statement mode drops notifications. Connect it directly to
         PostgreSQL, or pass ``pooler_session_mode=True`` when the pooler runs in session
-        mode (listen() then checks that a test notification arrives)."""
+        mode (listen() then checks that a test notification arrives).
+
+        ``decoder`` (e.g. ``json.loads``) runs on each ``payload`` and the result is on
+        ``Notification.data``, for notifications that carry JSON::
+
+            async with db.listen("orders", decoder=json.loads) as events:
+                async for event in events:
+                    handle(event.data)
+
+        A decoder that raises ends the iteration with that error."""
         if self._conn is not None:
             raise QueryError("listen() needs its own connection; call it outside a transaction")
         if not channels:
@@ -407,7 +424,12 @@ class Session(QueryBuilder):
                 # The pooler check's test notification must not wait for a pooled
                 # connection: with pool_size=1 the listener holds the only one.
                 conn.listen(
-                    channels, max_queue, overflow, driver.notify_unpooled, pooler_session_mode
+                    channels,
+                    max_queue,
+                    overflow,
+                    driver.notify_unpooled,
+                    pooler_session_mode,
+                    decoder,
                 )
             )
 
@@ -421,6 +443,19 @@ class Session(QueryBuilder):
         await self._call(
             CompiledQuery("SELECT pg_notify($1, $2)", (channel, payload), (None, None)), "execute"
         )
+
+    async def ping(self) -> bool:
+        """``True`` when the database answers a trivial query, ``False`` when it cannot be
+        reached. For readiness probes; runs ``SELECT 1`` on the primary."""
+        try:
+            await self._call(CompiledQuery("SELECT 1", (), ()), "execute")
+        except DbConnectionError:
+            return False
+        return True
+
+    def pool_stats(self) -> PoolStats:
+        """Connection-pool counters for the primary pool (see ``PoolStats``)."""
+        return self._require_driver().stats()
 
     @property
     def primary(self) -> Session:
@@ -465,27 +500,51 @@ class Session(QueryBuilder):
 
     @asynccontextmanager
     async def transaction(
-        self, isolation: IsolationLevel | None = None, *, readonly: bool = False
+        self,
+        isolation: IsolationLevel | None = None,
+        *,
+        readonly: bool = False,
+        after_commit: Callable[[], Awaitable[None]] | None = None,
+        after_rollback: Callable[[], Awaitable[None]] | None = None,
     ) -> AsyncGenerator[Session]:
-        """Commit on success, roll back on error. Nested calls create savepoints."""
+        """Commit on success, roll back on error. Nested calls create savepoints.
+
+        ``after_commit`` runs only once the data is committed, and ``after_rollback`` after
+        a rollback, both outside the transaction: use them for side effects (send an email,
+        enqueue a job) that must not happen when the transaction did not commit."""
         if self._conn is not None:
             if isolation is not None or readonly:
                 raise QueryError("isolation and readonly apply to the outermost transaction only")
-            async with self._conn.transaction():
-                yield self
+            try:
+                async with self._conn.transaction():
+                    yield self
+            except BaseException:
+                if after_rollback is not None:
+                    await after_rollback()
+                raise
+            if after_commit is not None:
+                await after_commit()
             return
         driver = self._require_driver()
-        async with driver.acquire() as conn, conn.transaction(isolation, readonly):
-            tx = Session(
-                dialect=self._dialect,
-                driver=driver,
-                casing=self._casing,
-                logger=self._logger,
-                log_params=self._log_params,
-                connection=conn,
-            )
-            tx._timeout = self._timeout
-            yield tx
+        try:
+            async with driver.acquire() as conn, conn.transaction(isolation, readonly):
+                tx = Session(
+                    dialect=self._dialect,
+                    driver=driver,
+                    casing=self._casing,
+                    logger=self._logger,
+                    log_params=self._log_params,
+                    slow_query_ms=self._slow_query_ms,
+                    connection=conn,
+                )
+                tx._timeout = self._timeout
+                yield tx
+        except BaseException:
+            if after_rollback is not None:
+                await after_rollback()
+            raise
+        if after_commit is not None:
+            await after_commit()
 
     @property
     def dialect(self) -> Dialect:
@@ -510,6 +569,7 @@ class Session(QueryBuilder):
             casing=self._casing,
             logger=self._logger,
             log_params=self._log_params,
+            slow_query_ms=self._slow_query_ms,
             connection=self._conn,
             replicas=self._replicas,
         )
@@ -565,7 +625,7 @@ class Session(QueryBuilder):
     async def _call(
         self, query: CompiledQuery, kind: _CallKind, read_only: bool = False
     ) -> list[Row] | int | list[dict[str, object]]:
-        if self._logger is None:
+        if self._logger is None and self._slow_query_ms is None:
             try:
                 async with self._connection(read_only) as conn:
                     return await self._send(conn, query, kind)
@@ -584,8 +644,8 @@ class Session(QueryBuilder):
 
     @contextmanager
     def _logged(self, query: CompiledQuery) -> Generator[None]:
-        """Pass a QueryEvent to the logger hook when the block ends."""
-        if self._logger is None:
+        """Time the block; log slow queries and pass a QueryEvent to the logger hook."""
+        if self._logger is None and self._slow_query_ms is None:
             yield
             return
         start = time.perf_counter()
@@ -598,16 +658,20 @@ class Session(QueryBuilder):
             error = exc
             raise
         finally:
-            event = QueryEvent(
-                query.sql,
-                query.params if self._log_params else None,
-                (time.perf_counter() - start) * 1000,
-                error,
-            )
-            try:
-                self._logger(event)
-            except Exception:
-                log.exception("mizzle query logger raised")
+            duration_ms = (time.perf_counter() - start) * 1000
+            if self._slow_query_ms is not None and duration_ms >= self._slow_query_ms:
+                log.warning("mizzle: slow query (%.1f ms): %s", duration_ms, query.sql)
+            if self._logger is not None:
+                event = QueryEvent(
+                    query.sql,
+                    query.params if self._log_params else None,
+                    duration_ms,
+                    error,
+                )
+                try:
+                    self._logger(event)
+                except Exception:
+                    log.exception("mizzle query logger raised")
 
     async def _after_lost_connection(self, query: CompiledQuery, read_only: bool) -> bool:
         """Handle a lost connection; return whether the statement may run again.
@@ -813,6 +877,7 @@ class Database(Session):
         casing: Casing | None = None,
         logger: QueryLogger | None = None,
         log_params: bool = False,
+        slow_query_ms: float | None = None,
         driver: Driver | None = None,
     ) -> None:
         validate_tables(schema, casing)
@@ -823,6 +888,7 @@ class Database(Session):
             casing=casing,
             logger=logger,
             log_params=log_params,
+            slow_query_ms=slow_query_ms,
         )
 
     @classmethod
@@ -841,12 +907,23 @@ class Database(Session):
         casing: Casing | None = None,
         logger: QueryLogger | None = None,
         log_params: bool = False,
+        slow_query_ms: float | None = None,
+        on_connect: Callable[[Connection], Awaitable[None]] | None = None,
+        server_settings: Mapping[str, str] | None = None,
+        connect_retries: int = 0,
+        connect_backoff: float = 0.5,
     ) -> Self:
         """Open a pool to ``url`` and one to each read replica URL (same pool settings).
 
         ``max_idle`` closes connections unused for that many seconds. ``query_timeout``
         cancels statements that run longer (seconds; None: no limit).
         ``statement_cache_size=0`` is needed behind PgBouncer in transaction mode.
+
+        ``slow_query_ms`` logs a warning for statements that take at least that long.
+        ``on_connect`` runs on each new connection (e.g. ``SET search_path`` or session
+        settings); ``server_settings`` sets PostgreSQL GUCs for every connection.
+        ``connect_retries`` (with ``connect_backoff`` seconds, doubling each time) retries
+        a failed connection, to survive a database that is not up yet.
 
         ``reset_connections="auto"`` (the default) resets a connection's session state when
         it goes back to the pool only after a statement that may have changed it: raw
@@ -860,22 +937,42 @@ class Database(Session):
             if dialect_for_url(replica).name != dialect.name:
                 raise MizzleError("replica URLs must use the same database as the primary")
         db = cls(
-            dialect=dialect, schema=schema, casing=casing, logger=logger, log_params=log_params
+            dialect=dialect,
+            schema=schema,
+            casing=casing,
+            logger=logger,
+            log_params=log_params,
+            slow_query_ms=slow_query_ms,
         )
         drivers: list[Driver] = []
         try:
-            for target in (url, *replicas):
-                drivers.append(
-                    await dialect.connect(
-                        target,
-                        pool_size=pool_size,
-                        pool_min_size=pool_min_size,
-                        max_idle=max_idle,
-                        query_timeout=query_timeout,
-                        statement_cache_size=statement_cache_size,
-                        reset_connections=reset_connections,
-                    )
-                )
+            for attempt in itertools.count():
+                try:
+                    for target in (url, *replicas):
+                        drivers.append(
+                            await dialect.connect(
+                                target,
+                                pool_size=pool_size,
+                                pool_min_size=pool_min_size,
+                                max_idle=max_idle,
+                                query_timeout=query_timeout,
+                                statement_cache_size=statement_cache_size,
+                                reset_connections=reset_connections,
+                                on_connect=on_connect,
+                                server_settings=server_settings,
+                            )
+                        )
+                except DbConnectionError:
+                    for driver in drivers:
+                        await driver.close()
+                    drivers.clear()
+                    if attempt >= connect_retries:
+                        raise
+                    delay = connect_backoff * 2.0**attempt
+                    log.warning("mizzle: could not connect; retrying in %.1fs", delay)
+                    await asyncio.sleep(delay)
+                else:
+                    break
         except BaseException:
             for driver in drivers:
                 await driver.close()
