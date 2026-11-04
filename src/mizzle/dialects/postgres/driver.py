@@ -249,6 +249,17 @@ class PostgresConnection:
         except Exception as exc:
             raise _translate(exc, sql) from None
 
+    async def executemany(
+        self, sql: str, params: Sequence[Sequence[object]], timeout: float | None = None
+    ) -> int:
+        self.dirty = True
+        try:
+            # asyncpg pipelines these in as few round trips as it can.
+            await self._conn.executemany(sql, params, timeout=timeout)
+        except Exception as exc:
+            raise _translate(exc, sql) from None
+        return len(params)
+
     @asynccontextmanager
     async def transaction(
         self, isolation: IsolationLevel | None = None, readonly: bool = False

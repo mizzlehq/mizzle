@@ -95,6 +95,13 @@ class Connection(Protocol):
         *,
         session_safe: bool = False,
     ) -> int: ...
+    async def executemany(
+        self, sql: str, params: Sequence[Sequence[object]], timeout: float | None = None
+    ) -> int:
+        """Run one parameterized statement for each parameter set, pipelined; returns the
+        number of sets."""
+        ...
+
     def transaction(
         self, isolation: IsolationLevel | None = None, readonly: bool = False
     ) -> AbstractAsyncContextManager[None]: ...

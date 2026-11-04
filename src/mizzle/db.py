@@ -20,10 +20,12 @@ from collections.abc import (
 )
 from contextlib import (
     AbstractAsyncContextManager,
+    AbstractContextManager,
     AsyncExitStack,
     aclosing,
     asynccontextmanager,
     contextmanager,
+    nullcontext,
 )
 from dataclasses import dataclass
 from typing import Literal, Self, final, overload
@@ -55,6 +57,7 @@ from mizzle.dialects.base import (
     ResetMode,
 )
 from mizzle.dialects.postgres import PostgresDialect
+from mizzle.tracing import Tracer
 
 log = logging.getLogger("mizzle")
 
@@ -93,6 +96,7 @@ class Session(QueryBuilder):
     _logger: QueryLogger | None
     _log_params: bool
     _slow_query_ms: float | None
+    _tracer: Tracer | None
     _conn: Connection | None
     _lock: asyncio.Lock
 
@@ -105,6 +109,7 @@ class Session(QueryBuilder):
         logger: QueryLogger | None = None,
         log_params: bool = False,
         slow_query_ms: float | None = None,
+        tracer: Tracer | None = None,
         connection: Connection | None = None,
         replicas: Sequence[Driver] = (),
     ) -> None:
@@ -119,6 +124,7 @@ class Session(QueryBuilder):
         self._logger = logger
         self._log_params = log_params
         self._slow_query_ms = slow_query_ms
+        self._tracer = tracer
         self._conn = connection
         # One connection runs one statement at a time; the lock lets asyncio.gather()
         # inside a transaction queue up instead of failing.
@@ -181,6 +187,23 @@ class Session(QueryBuilder):
         if compiled.has_placeholders:
             raise QueryError("execute() does not take placeholders")
         return await self._call(compiled, "dicts")
+
+    async def executemany(self, statement: Raw, params: Sequence[Sequence[object]]) -> int:
+        """Run one statement (with ``$1``, ``$2``, ... placeholders) for each parameter set,
+        pipelined in as few round trips as there can be. Returns how many sets ran. For
+        inserting many rows prefer ``insert_many()``, and for bulk loads ``copy_into()``."""
+        compiled = self.compile(statement)
+        if compiled.params or compiled.has_placeholders:
+            raise QueryError(
+                "executemany() takes plain SQL with $1, $2, ... placeholders and their values"
+            )
+        with self._logged(compiled):
+            try:
+                async with self._connection() as conn:
+                    return await conn.executemany(compiled.sql, params, self._timeout)
+            except DbConnectionError:
+                await self._after_lost_connection(compiled, False)
+                raise
 
     async def explain(self, statement: Node, *, analyze: bool = False) -> list[dict[str, object]]:
         """The query plan (``EXPLAIN``) as rows of dicts, one per plan line.
@@ -515,34 +538,37 @@ class Session(QueryBuilder):
         if self._conn is not None:
             if isolation is not None or readonly:
                 raise QueryError("isolation and readonly apply to the outermost transaction only")
-            try:
-                async with self._conn.transaction():
-                    yield self
-            except BaseException:
-                if after_rollback is not None:
-                    await after_rollback()
-                raise
+            with self._transaction_span(isolation):
+                try:
+                    async with self._conn.transaction():
+                        yield self
+                except BaseException:
+                    if after_rollback is not None:
+                        await after_rollback()
+                    raise
             if after_commit is not None:
                 await after_commit()
             return
         driver = self._require_driver()
-        try:
-            async with driver.acquire() as conn, conn.transaction(isolation, readonly):
-                tx = Session(
-                    dialect=self._dialect,
-                    driver=driver,
-                    casing=self._casing,
-                    logger=self._logger,
-                    log_params=self._log_params,
-                    slow_query_ms=self._slow_query_ms,
-                    connection=conn,
-                )
-                tx._timeout = self._timeout
-                yield tx
-        except BaseException:
-            if after_rollback is not None:
-                await after_rollback()
-            raise
+        with self._transaction_span(isolation):
+            try:
+                async with driver.acquire() as conn, conn.transaction(isolation, readonly):
+                    tx = Session(
+                        dialect=self._dialect,
+                        driver=driver,
+                        casing=self._casing,
+                        logger=self._logger,
+                        log_params=self._log_params,
+                        slow_query_ms=self._slow_query_ms,
+                        tracer=self._tracer,
+                        connection=conn,
+                    )
+                    tx._timeout = self._timeout
+                    yield tx
+            except BaseException:
+                if after_rollback is not None:
+                    await after_rollback()
+                raise
         if after_commit is not None:
             await after_commit()
 
@@ -570,6 +596,7 @@ class Session(QueryBuilder):
             logger=self._logger,
             log_params=self._log_params,
             slow_query_ms=self._slow_query_ms,
+            tracer=self._tracer,
             connection=self._conn,
             replicas=self._replicas,
         )
@@ -625,7 +652,7 @@ class Session(QueryBuilder):
     async def _call(
         self, query: CompiledQuery, kind: _CallKind, read_only: bool = False
     ) -> list[Row] | int | list[dict[str, object]]:
-        if self._logger is None and self._slow_query_ms is None:
+        if self._logger is None and self._slow_query_ms is None and self._tracer is None:
             try:
                 async with self._connection(read_only) as conn:
                     return await self._send(conn, query, kind)
@@ -642,36 +669,50 @@ class Session(QueryBuilder):
                     raise
             return await self._retry_read(query, kind, read_only)
 
+    def _span(self, query: CompiledQuery) -> AbstractContextManager[object]:
+        if self._tracer is None:
+            return nullcontext()
+        return self._tracer.statement(query.sql, query.params if self._log_params else None)
+
     @contextmanager
-    def _logged(self, query: CompiledQuery) -> Generator[None]:
-        """Time the block; log slow queries and pass a QueryEvent to the logger hook."""
-        if self._logger is None and self._slow_query_ms is None:
+    def _transaction_span(self, isolation: IsolationLevel | None) -> Generator[None]:
+        if self._tracer is None:
             yield
             return
-        start = time.perf_counter()
-        error: BaseException | None = None
-        try:
+        with self._tracer.transaction(isolation):
             yield
-        except GeneratorExit:  # a stream the caller stopped early: not an error
-            raise
-        except BaseException as exc:
-            error = exc
-            raise
-        finally:
-            duration_ms = (time.perf_counter() - start) * 1000
-            if self._slow_query_ms is not None and duration_ms >= self._slow_query_ms:
-                log.warning("mizzle: slow query (%.1f ms): %s", duration_ms, query.sql)
-            if self._logger is not None:
-                event = QueryEvent(
-                    query.sql,
-                    query.params if self._log_params else None,
-                    duration_ms,
-                    error,
-                )
-                try:
-                    self._logger(event)
-                except Exception:
-                    log.exception("mizzle query logger raised")
+
+    @contextmanager
+    def _logged(self, query: CompiledQuery) -> Generator[None]:
+        """Time the block; trace it, log slow queries and pass a QueryEvent to the logger."""
+        if self._logger is None and self._slow_query_ms is None and self._tracer is None:
+            yield
+            return
+        with self._span(query):
+            start = time.perf_counter()
+            error: BaseException | None = None
+            try:
+                yield
+            except GeneratorExit:  # a stream the caller stopped early: not an error
+                raise
+            except BaseException as exc:
+                error = exc
+                raise
+            finally:
+                duration_ms = (time.perf_counter() - start) * 1000
+                if self._slow_query_ms is not None and duration_ms >= self._slow_query_ms:
+                    log.warning("mizzle: slow query (%.1f ms): %s", duration_ms, query.sql)
+                if self._logger is not None:
+                    event = QueryEvent(
+                        query.sql,
+                        query.params if self._log_params else None,
+                        duration_ms,
+                        error,
+                    )
+                    try:
+                        self._logger(event)
+                    except Exception:
+                        log.exception("mizzle query logger raised")
 
     async def _after_lost_connection(self, query: CompiledQuery, read_only: bool) -> bool:
         """Handle a lost connection; return whether the statement may run again.
@@ -878,6 +919,7 @@ class Database(Session):
         logger: QueryLogger | None = None,
         log_params: bool = False,
         slow_query_ms: float | None = None,
+        tracer: Tracer | None = None,
         driver: Driver | None = None,
     ) -> None:
         validate_tables(schema, casing)
@@ -889,6 +931,7 @@ class Database(Session):
             logger=logger,
             log_params=log_params,
             slow_query_ms=slow_query_ms,
+            tracer=tracer,
         )
 
     @classmethod
@@ -908,6 +951,7 @@ class Database(Session):
         logger: QueryLogger | None = None,
         log_params: bool = False,
         slow_query_ms: float | None = None,
+        tracer: Tracer | None = None,
         on_connect: Callable[[Connection], Awaitable[None]] | None = None,
         server_settings: Mapping[str, str] | None = None,
         connect_retries: int = 0,
@@ -920,8 +964,9 @@ class Database(Session):
         ``statement_cache_size=0`` is needed behind PgBouncer in transaction mode.
 
         ``slow_query_ms`` logs a warning for statements that take at least that long.
-        ``on_connect`` runs on each new connection (e.g. ``SET search_path`` or session
-        settings); ``server_settings`` sets PostgreSQL GUCs for every connection.
+        ``tracer`` (see ``mizzle.tracing``) opens a span around each statement and
+        transaction. ``on_connect`` runs on each new connection (e.g. ``SET search_path`` or
+        session settings); ``server_settings`` sets PostgreSQL GUCs for every connection.
         ``connect_retries`` (with ``connect_backoff`` seconds, doubling each time) retries
         a failed connection, to survive a database that is not up yet.
 
@@ -943,6 +988,7 @@ class Database(Session):
             logger=logger,
             log_params=log_params,
             slow_query_ms=slow_query_ms,
+            tracer=tracer,
         )
         drivers: list[Driver] = []
         try:

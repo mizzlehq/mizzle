@@ -2,11 +2,13 @@
 
 import json
 import logging
+from collections.abc import Generator
+from contextlib import contextmanager
 from typing import Any
 
 import pytest
 
-from mizzle import ConnectionError, Database, DatabaseError, eq, sql
+from mizzle import ConnectionError, Database, DatabaseError, QueryError, eq, placeholder, sql
 from mizzle.dialects.base import Connection
 from mizzle.dialects.postgres import PostgresDialect
 from mizzle.dialects.postgres.driver import PostgresDriver
@@ -108,3 +110,49 @@ async def test_transaction_callbacks(db: Database) -> None:
             await tx.insert(Users).values(email="rt8@x.io")
     assert events == ["commit", "rollback"]
     assert await db.select().from_(Users).where(eq(Users.email, "rt8@x.io")) != []
+
+
+class _Span:
+    def __init__(self) -> None:
+        self.attributes: dict[str, object] = {}
+
+
+class RecordingTracer:
+    def __init__(self) -> None:
+        self.statements: list[str] = []
+        self.transactions = 0
+
+    @contextmanager
+    def statement(self, sql: str, params: tuple[object, ...] | None) -> Generator[_Span]:
+        self.statements.append(sql)
+        yield _Span()
+
+    @contextmanager
+    def transaction(self, isolation: object = None) -> Generator[_Span]:
+        self.transactions += 1
+        yield _Span()
+
+
+async def test_tracer_wraps_statements_and_transactions(pg_url: str) -> None:
+    tracer = RecordingTracer()
+    async with (
+        await Database.connect(pg_url, schema=[Users, Posts], tracer=tracer) as db,
+        db.transaction(),
+    ):
+        await db.execute(sql("SELECT 1"))
+    assert tracer.transactions == 1
+    assert "SELECT 1" in tracer.statements
+
+
+async def test_executemany_pipelines_many_sets(db: Database) -> None:
+    ran = await db.executemany(
+        sql("INSERT INTO users (email) VALUES ($1)"), [("e1@x.io",), ("e2@x.io",), ("e3@x.io",)]
+    )
+    assert ran == 3
+    found = await db.select(Users.email).from_(Users).order_by(Users.email)
+    assert [email for (email,) in found] == ["e1@x.io", "e2@x.io", "e3@x.io"]
+
+    with pytest.raises(QueryError):  # mizzle values, not external parameter sets
+        await db.executemany(
+            sql("INSERT INTO users (email) VALUES (", placeholder("email"), ")"), [("x",)]
+        )
