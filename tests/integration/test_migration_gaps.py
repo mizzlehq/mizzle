@@ -774,3 +774,39 @@ async def test_table_and_column_comments(driver: PostgresDriver, tmp_path: Path)
     assert table.get("comment") == "a renamed table"
     assert "comment" not in table["columns"]["id"]
     await assert_pull_round_trip(driver, tmp_path)
+
+
+# -- unlogged tables and storage parameters -------------------------------------------------
+
+
+@final
+class Cache(Table, name="cache", schema="mg", unlogged=True, storage={"fillfactor": 70}):
+    id = integer().not_null()
+    payload = text()
+
+
+@final
+class CacheLogged(
+    Table, name="cache", schema="mg", storage={"fillfactor": 90, "autovacuum_enabled": "false"}
+):
+    id = integer().not_null()
+    payload = text()
+
+
+async def test_unlogged_and_storage_parameters(driver: PostgresDriver, tmp_path: Path) -> None:
+    v1 = snap([Cache])
+    await migrate(driver, empty_snapshot("postgresql"), v1)
+    table = (await live(driver))["tables"]["mg.cache"]
+    assert table.get("unlogged") is True
+    assert table.get("options") == {"fillfactor": "70"}
+    await assert_pull_round_trip(driver, tmp_path)
+
+    v2 = snap([CacheLogged])
+    steps = await migrate(driver, v1, v2)
+    described = [s.describe() for s in steps]
+    assert any(d.startswith("set cache logged") for d in described), described
+    assert any("storage of cache" in d for d in described), described
+    table = (await live(driver))["tables"]["mg.cache"]
+    assert "unlogged" not in table
+    assert table.get("options") == {"fillfactor": "90", "autovacuum_enabled": "false"}
+    await assert_pull_round_trip(driver, tmp_path)

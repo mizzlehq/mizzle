@@ -550,3 +550,39 @@ def test_column_collation_sql_and_pull(tmp_path: Path) -> None:
         if isinstance(v, type) and issubclass(v, Table) and "__table__" in vars(v)
     ]
     assert diff(original, build_snapshot(tables, dialect)) == []
+
+
+@final
+class Unlogged(Table, name="unlogged", unlogged=True, storage={"fillfactor": 70}):
+    id = integer().not_null()
+    blob = text()
+
+
+def test_unlogged_and_storage_sql_and_pull(tmp_path: Path) -> None:
+    original = snap([Unlogged], objects=[])
+    table = original["tables"]["public.unlogged"]
+    assert table.get("unlogged") is True
+    assert table.get("options") == {"fillfactor": "70"}
+
+    create = next(s for s in sqls(empty_snapshot("postgresql"), original) if "unlogged" in s)
+    assert create.startswith('CREATE UNLOGGED TABLE "unlogged"')
+    assert "WITH (fillfactor=70)" in create
+
+    source = render_schema_module(original)
+    assert "unlogged=True" in source
+    assert "storage={'fillfactor': '70'}" in source
+
+    path = tmp_path / "pulled_unlogged.py"
+    path.write_text(source)
+    spec = importlib.util.spec_from_file_location("pulled_unlogged", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["pulled_unlogged"] = module
+    spec.loader.exec_module(module)
+    members = list(vars(module).values())
+    tables = [
+        v
+        for v in members
+        if isinstance(v, type) and issubclass(v, Table) and "__table__" in vars(v)
+    ]
+    assert diff(original, build_snapshot(tables, dialect)) == []

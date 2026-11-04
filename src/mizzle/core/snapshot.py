@@ -150,6 +150,8 @@ class TableSnap(TypedDict):
     triggers: NotRequired[dict[str, TriggerSnap]]
     grants: NotRequired[GrantsSnap]
     comment: NotRequired[str]  # COMMENT ON TABLE
+    unlogged: NotRequired[bool]  # CREATE UNLOGGED TABLE
+    options: NotRequired[dict[str, str]]  # storage parameters: WITH (fillfactor=70)
 
 
 class EnumSnap(TypedDict):

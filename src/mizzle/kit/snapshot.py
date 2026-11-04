@@ -102,6 +102,10 @@ def build_snapshot(
         )
         if info.comment is not None:
             snap["comment"] = info.comment
+        if info.unlogged:
+            snap["unlogged"] = True
+        if info.storage:
+            snap["options"] = dict(info.storage)
         for column in info.columns.values():
             cname = column.db_name(casing)
             if column.enum is not None:

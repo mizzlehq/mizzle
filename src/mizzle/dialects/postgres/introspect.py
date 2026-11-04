@@ -54,7 +54,8 @@ _NEXTVAL = re.compile(r"nextval\('.*'::regclass\)")
 _TABLES = """
 SELECT c.oid, n.nspname AS schema, c.relname AS name,
        c.relrowsecurity AS rls, c.relforcerowsecurity AS rls_force,
-       obj_description(c.oid, 'pg_class') AS comment
+       obj_description(c.oid, 'pg_class') AS comment,
+       c.relpersistence::text AS persistence, coalesce(c.reloptions, '{}') AS options
 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
 WHERE c.relkind IN ('r', 'p') AND n.nspname = ANY($1::text[]) AND c.relname <> $2
   AND NOT c.relispartition
@@ -438,6 +439,10 @@ async def introspect(
             snap["rls"] = RlsSnap(enabled=bool(t["rls"]), force=bool(t["rls_force"]))
         if (comment := _opt_str(t["comment"])) is not None:
             snap["comment"] = comment
+        if str(t["persistence"]) == "u":
+            snap["unlogged"] = True
+        if options := _strs(t["options"]):
+            snap["options"] = dict(o.split("=", 1) for o in options)
         by_oid[_int(t["oid"])] = snap
         snapshot["tables"][key(schema, name)] = snap
         _add_schema(snapshot, schema)

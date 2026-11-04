@@ -265,6 +265,39 @@ class SetColumnComment(Step):
 
 
 @dataclass(frozen=True)
+class SetTableLogged(Step):
+    """``ALTER TABLE ... SET LOGGED`` / ``SET UNLOGGED``."""
+
+    schema: str
+    table: str
+    unlogged: bool
+
+    @override
+    def describe(self) -> str:
+        return f"set {self.table} {'unlogged' if self.unlogged else 'logged'}"
+
+
+@dataclass(frozen=True)
+class AlterTableStorage(Step):
+    """Change a table's storage parameters: ``SET (...)`` for the new or changed ones and
+    ``RESET (...)`` for the removed ones."""
+
+    schema: str
+    table: str
+    set_options: dict[str, str]
+    reset_options: tuple[str, ...] = ()
+
+    @override
+    def describe(self) -> str:
+        parts: list[str] = []
+        if self.set_options:
+            parts.append("set " + ", ".join(f"{k}={v}" for k, v in self.set_options.items()))
+        if self.reset_options:
+            parts.append("reset " + ", ".join(self.reset_options))
+        return f"storage of {self.table}: {'; '.join(parts)}"
+
+
+@dataclass(frozen=True)
 class AlterColumnNullability(Step):
     schema: str
     table: str

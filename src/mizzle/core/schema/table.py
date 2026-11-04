@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import ClassVar, Self, override
 
@@ -30,6 +30,8 @@ class TableInfo:
     columns: dict[str, ColumnBase]  # attribute name -> column, in declaration order
     relations: dict[str, Relation] = field(default_factory=dict[str, Relation])
     comment: str | None = None
+    unlogged: bool = False
+    storage: dict[str, str] | None = None  # WITH (fillfactor=70, ...)
 
 
 class Table:
@@ -41,6 +43,8 @@ class Table:
         name: str | None = None,
         schema: str | None = None,
         comment: str | None = None,
+        unlogged: bool = False,
+        storage: Mapping[str, str | int] | None = None,
         abstract: bool = False,
         **kwargs: object,
     ) -> None:
@@ -59,8 +63,9 @@ class Table:
         if not columns:
             raise SchemaError(f"table class {cls.__name__} declares no columns")
         relations = {attr: v for attr, v in members.items() if isinstance(v, Relation)}
+        options = {k: str(v) for k, v in storage.items()} if storage is not None else None
         cls.__table__ = TableInfo(
-            name or snake_case(cls.__name__), schema, columns, relations, comment
+            name or snake_case(cls.__name__), schema, columns, relations, comment, unlogged, options
         )
 
     @classmethod

@@ -42,6 +42,7 @@ from mizzle.core.steps import (
     AlterExtension,
     AlterPolicy,
     AlterRole,
+    AlterTableStorage,
     CreateEnum,
     CreateExtension,
     CreateFunction,
@@ -73,6 +74,7 @@ from mizzle.core.steps import (
     SetColumnComment,
     SetRowLevelSecurity,
     SetTableComment,
+    SetTableLogged,
     SetTableSchema,
     Statement,
     Step,
@@ -367,7 +369,11 @@ def _create_table(table: TableSnap) -> str:
         if not c.get("not_valid")  # NOT VALID is only valid on ALTER TABLE ADD CONSTRAINT
     ]
     body = ",\n    ".join(lines)
-    return f"CREATE TABLE {qualified(table['schema'], table['name'])} (\n    {body}\n)"
+    kind = "CREATE UNLOGGED TABLE" if table.get("unlogged") else "CREATE TABLE"
+    text = f"{kind} {qualified(table['schema'], table['name'])} (\n    {body}\n)"
+    if options := table.get("options"):
+        text += " WITH (" + ", ".join(f"{k}={v}" for k, v in options.items()) + ")"
+    return text
 
 
 def create_index(schema: str, table: str, index: IndexSnap) -> str:
@@ -531,6 +537,19 @@ def render_step(step: Step) -> Statement:
             return alter(schema, old, f"RENAME TO {quote(new)}")
         case SetTableSchema(schema=schema, name=name, new_schema=new_schema):
             return alter(schema, name, f"SET SCHEMA {quote(new_schema)}")
+        case SetTableLogged(schema=schema, table=table, unlogged=unlogged):
+            return alter(schema, table, "SET UNLOGGED" if unlogged else "SET LOGGED")
+        case AlterTableStorage(
+            schema=schema, table=table, set_options=set_options, reset_options=reset_options
+        ):
+            actions: list[str] = []
+            if reset_options:
+                actions.append("RESET (" + ", ".join(reset_options) + ")")
+            if set_options:
+                actions.append(
+                    "SET (" + ", ".join(f"{k}={v}" for k, v in set_options.items()) + ")"
+                )
+            return alter(schema, table, ", ".join(actions))
         case AddColumn(schema=schema, table=table, column=column):
             return alter(schema, table, f"ADD COLUMN {column_definition(column)}")
         case DropColumn(schema=schema, table=table, name=name):

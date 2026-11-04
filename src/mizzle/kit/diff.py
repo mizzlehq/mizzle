@@ -38,6 +38,7 @@ from mizzle.core.steps import (
     AlterExtension,
     AlterPolicy,
     AlterRole,
+    AlterTableStorage,
     ConstraintKind,
     CreateEnum,
     CreateExtension,
@@ -70,6 +71,7 @@ from mizzle.core.steps import (
     SetColumnComment,
     SetRowLevelSecurity,
     SetTableComment,
+    SetTableLogged,
     SetTableSchema,
     Step,
 )
@@ -167,6 +169,7 @@ class _Plan:
     create_tables: list[Step] = field(default_factory=list[Step])
     add_columns: list[Step] = field(default_factory=list[Step])
     alter_columns: list[Step] = field(default_factory=list[Step])
+    table_options: list[Step] = field(default_factory=list[Step])
     drop_columns: list[Step] = field(default_factory=list[Step])
     add_constraints: list[Step] = field(default_factory=list[Step])
     create_indexes: list[Step] = field(default_factory=list[Step])
@@ -209,6 +212,7 @@ class _Plan:
             *self.create_tables,
             *self.add_columns,
             *self.alter_columns,
+            *self.table_options,
             *self.drop_columns,
             *self.add_constraints,
             *self.create_indexes,
@@ -515,6 +519,14 @@ def _diff_table(old: TableSnap, new: TableSnap, plan: _Plan, compare_expressions
     for cname in old["columns"]:
         if cname not in new["columns"]:
             plan.drop_columns.append(DropColumn(schema, name, cname))
+
+    if bool(old.get("unlogged")) != bool(new.get("unlogged")):
+        plan.table_options.append(SetTableLogged(schema, name, bool(new.get("unlogged"))))
+    old_options, new_options = old.get("options", {}), new.get("options", {})
+    changed_options = {k: v for k, v in new_options.items() if old_options.get(k) != v}
+    removed_options = tuple(k for k in old_options if k not in new_options)
+    if changed_options or removed_options:
+        plan.table_options.append(AlterTableStorage(schema, name, changed_options, removed_options))
 
     def drop(kind: ConstraintKind) -> Callable[[str], None]:
         bucket = plan.drop_fks if kind == "foreign_key" else plan.drop_constraints

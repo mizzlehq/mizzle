@@ -519,6 +519,10 @@ class _SchemaWriter:
                 kw += f", schema={table['schema']!r}"
             if comment := table.get("comment"):
                 kw += f", comment={comment!r}"
+            if table.get("unlogged"):
+                kw += ", unlogged=True"
+            if options := table.get("options"):
+                kw += f", storage={options!r}"
             lines = ["@final", f"class {self.table_classes[k]}(Table, {kw}):"]
             for cname, column in table["columns"].items():
                 lines.append(f"    {attrs[cname]} = {self.column(table, column, attrs[cname])}")
