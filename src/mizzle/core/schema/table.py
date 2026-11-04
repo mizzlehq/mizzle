@@ -37,6 +37,14 @@ class TableInfo:
     partition_by: str | None = None  # PARTITION BY key, as PostgreSQL prints it
 
 
+def _storage_text(value: str | int | bool) -> str:
+    """A storage option value as PostgreSQL prints it back: booleans lower-case, the rest
+    verbatim (PostgreSQL keeps ``off`` as ``off``, not ``false``)."""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    return str(value)
+
+
 class Table:
     __table__: ClassVar[TableInfo]
 
@@ -47,7 +55,7 @@ class Table:
         schema: str | None = None,
         comment: str | None = None,
         unlogged: bool = False,
-        storage: Mapping[str, str | int] | None = None,
+        storage: Mapping[str, str | int | bool] | None = None,
         partition_by: str | None = None,
         abstract: bool = False,
         **kwargs: object,
@@ -67,7 +75,11 @@ class Table:
         if not columns:
             raise SchemaError(f"table class {cls.__name__} declares no columns")
         relations = {attr: v for attr, v in members.items() if isinstance(v, Relation)}
-        options = {k: str(v) for k, v in storage.items()} if storage is not None else None
+        options = (
+            {k.lower(): _storage_text(v) for k, v in storage.items()}
+            if storage is not None
+            else None
+        )
         cls.__table__ = TableInfo(
             name or snake_case(cls.__name__),
             schema,
@@ -196,3 +208,5 @@ def validate_tables(tables: Sequence[type[Table]], casing: Casing | None = None)
             )
         if info.partition_by is not None and not info.partition_by.strip():
             raise SchemaError(f"{table.__name__}: partition_by cannot be empty")
+        if info.partition_by is not None and info.unlogged:
+            raise SchemaError(f"{table.__name__}: a partitioned table cannot be unlogged")

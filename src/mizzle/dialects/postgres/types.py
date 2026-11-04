@@ -158,7 +158,7 @@ def macaddr8(name: str | None = None) -> Column[str | None]:
 def bit(length: int | None = None, name: str | None = None) -> Column[BitString | None]:
     """A fixed-length bit string. ``bit()`` is ``bit(1)``; values read and write as
     ``asyncpg.BitString``."""
-    return Column("bit" if length is None else f"bit({length})", (BitString,), name)
+    return Column(f"bit({length or 1})", (BitString,), name)
 
 
 def varbit(length: int | None = None, name: str | None = None) -> Column[BitString | None]:

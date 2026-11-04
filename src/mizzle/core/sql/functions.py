@@ -159,6 +159,12 @@ def _whole(name: str, value: int) -> int:
     return value
 
 
+def _number(name: str, value: int | float) -> int | float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):  # pyright: ignore[reportUnnecessaryIsInstance]
+        raise QueryError(f"{name} must be a number; got {value!r}")
+    return value
+
+
 # -- CASE -----------------------------------------------------------------------------
 
 
@@ -970,14 +976,14 @@ def make_interval(
     secs: float = 0.0,
 ) -> Expr[datetime.timedelta]:
     """Build an interval from named parts: ``make_interval(days=7)``."""
-    parts = (
-        ("years", years),
-        ("months", months),
-        ("weeks", weeks),
-        ("days", days),
-        ("hours", hours),
-        ("mins", mins),
-        ("secs", secs),
+    parts: tuple[tuple[str, int | float], ...] = (
+        ("years", _whole("years", years)),
+        ("months", _whole("months", months)),
+        ("weeks", _whole("weeks", weeks)),
+        ("days", _whole("days", days)),
+        ("hours", _whole("hours", hours)),
+        ("mins", _whole("mins", mins)),
+        ("secs", _number("secs", secs)),
     )
     args = [Fragment((f"{name} => {value!r}",)) for name, value in parts if value]
     return TypedFunc[datetime.timedelta]("make_interval", tuple(args))

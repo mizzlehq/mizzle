@@ -15,9 +15,11 @@ from mizzle import (
     View,
     composite,
     domain,
+    exclusion,
     function,
     grant,
     index,
+    make_interval,
     partition,
     sql,
 )
@@ -28,7 +30,7 @@ from mizzle.dialects.postgres import PostgresDialect
 from mizzle.dialects.postgres.ddl import _without_defaults
 from mizzle.kit.diff import StrictRenames, diff, no_renames
 from mizzle.kit.snapshot import build_snapshot
-from mizzle.pg import integer, pg_composite, pg_domain, text
+from mizzle.pg import bit, integer, pg_composite, pg_domain, text
 from mizzle.studio.ddl import build_steps, statement_rows
 
 dialect = PostgresDialect()
@@ -758,3 +760,103 @@ def test_studio_ddl_changes_an_existing_table() -> None:
             {"operation": "drop_column", "schema": "public", "table": "notes", "name": "nope"},
             current,
         )
+
+
+# -- ISSUES.md fixes: injection, drift and ordering ---------------------------------------
+
+
+def test_storage_options_cannot_break_out_of_the_with_clause() -> None:
+    @final
+    class Widget(Table, name="widget", storage={"fillfactor": "70); DROP TABLE victim; --"}):
+        id = integer().primary_key()
+
+    sql = sqls(empty_snapshot("postgresql"), build_snapshot([Widget], dialect))[0]
+    assert "WITH (fillfactor='70); DROP TABLE victim; --')" in sql
+
+    @final
+    class Bad(Table, name="bad", storage={"fillfactor; DROP TABLE victim; --": 70}):
+        id = integer().primary_key()
+
+    with pytest.raises(SchemaError, match="storage parameter"):
+        sqls(empty_snapshot("postgresql"), build_snapshot([Bad], dialect))
+
+
+def test_exclusion_operators_cannot_break_out_of_the_constraint() -> None:
+    @final
+    class Room(Table, name="room"):
+        slot = integer().not_null()
+
+        @classmethod
+        @override
+        def config(cls) -> list[Constraint]:
+            return [exclusion((cls.slot, "=); DROP TABLE victim; --"), name="bad")]
+
+    with pytest.raises(SchemaError, match="exclusion operator"):
+        sqls(empty_snapshot("postgresql"), build_snapshot([Room], dialect))
+
+
+def test_make_interval_rejects_values_that_are_not_numbers() -> None:
+    assert make_interval(days=7) is not None
+    with pytest.raises(QueryError, match="must be an int"):
+        make_interval(days="7")  # pyright: ignore[reportArgumentType]
+    with pytest.raises(QueryError, match="must be a number"):
+        make_interval(secs="0.5")  # pyright: ignore[reportArgumentType]
+
+
+def test_initially_deferred_implies_deferrable() -> None:
+    @final
+    class Order(Table, name="order"):
+        id = integer().primary_key(initially_deferred=True)
+        code = text().unique(initially_deferred=True)
+
+    table = build_snapshot([Order], dialect)["tables"]["public.order"]
+    pk = table["primary_key"]
+    assert pk is not None and pk.get("deferrable")
+    assert table["uniques"]["order_code_key"].get("deferrable")
+
+
+def test_changing_a_collated_column_keeps_the_collation() -> None:
+    @final
+    class Item(Table, name="item"):
+        code = text().collate("C")
+
+    before = build_snapshot([Item], dialect)
+    after = copy.deepcopy(before)
+    after["tables"]["public.item"]["columns"]["code"]["type"] = "character varying(20)"
+    statements = dialect.render(diff(before, after))
+    assert statements[0].sql == (
+        'ALTER TABLE "item" ALTER COLUMN "code" SET DATA TYPE character varying(20) '
+        'COLLATE "C" USING "code"::character varying(20)'
+    )
+
+
+def test_composites_are_created_after_the_composites_they_use() -> None:
+    inner = composite("z_inner", [("a", "integer")])
+    outer = composite("a_outer", [("inner", "z_inner")])
+    snap = build_snapshot([], dialect, objects=[outer, inner])  # declared out of order
+    creates = [s for s in sqls(empty_snapshot("postgresql"), snap) if s.startswith("CREATE TYPE")]
+    assert creates[0].startswith('CREATE TYPE "z_inner"')
+    assert creates[1].startswith('CREATE TYPE "a_outer"')
+
+
+def test_storage_option_keys_and_bools_are_normalized() -> None:
+    @final
+    class Cache(Table, name="cache", storage={"FillFactor": 70, "autovacuum_enabled": False}):
+        id = integer().primary_key()
+
+    options = build_snapshot([Cache], dialect)["tables"]["public.cache"].get("options")
+    assert options == {"fillfactor": "70", "autovacuum_enabled": "false"}
+
+
+def test_bit_without_a_length_is_bit_one() -> None:
+    assert bit().sql_type == "bit(1)"
+    assert bit(4).sql_type == "bit(4)"
+
+
+def test_a_partitioned_table_cannot_be_unlogged() -> None:
+    @final
+    class P(Table, name="p", partition_by="RANGE (at)", unlogged=True):
+        at = text()
+
+    with pytest.raises(SchemaError, match="cannot be unlogged"):
+        build_snapshot([P], dialect)

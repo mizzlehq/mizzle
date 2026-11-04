@@ -61,8 +61,10 @@ SELECT c.oid, n.nspname AS schema, c.relname AS name,
        c.relrowsecurity AS rls, c.relforcerowsecurity AS rls_force,
        obj_description(c.oid, 'pg_class') AS comment,
        c.relpersistence::text AS persistence, coalesce(c.reloptions, '{}') AS options,
+       coalesce(tc.reloptions, '{}') AS toast_options,
        pg_get_partkeydef(c.oid) AS partition_by
 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+LEFT JOIN pg_class tc ON tc.oid = c.reltoastrelid
 WHERE c.relkind IN ('r', 'p') AND n.nspname = ANY($1::text[]) AND c.relname <> $2
   AND NOT c.relispartition
 ORDER BY n.nspname, c.relname
@@ -488,10 +490,32 @@ def _check_expression(definition: str) -> str:
     return expr[1:-1] if expr.startswith("(") and expr.endswith(")") else expr
 
 
+async def _server_version_num(conn: Connection) -> int:
+    [row] = await conn.fetch_dicts("SHOW server_version_num", [])
+    return int(str(row["server_version_num"]))
+
+
+# pg_index.indnullsnotdistinct exists from PostgreSQL 15; on 14 every index reads as
+# distinct, so the column is replaced with a literal false.
+def _constraints_query(version: int) -> str:
+    if version >= 150000:
+        return _CONSTRAINTS
+    return _CONSTRAINTS.replace("AND i.indnullsnotdistinct", "AND false")
+
+
+def _indexes_query(version: int) -> str:
+    if version >= 150000:
+        return _INDEXES
+    return _INDEXES.replace(
+        "i.indnullsnotdistinct AS nulls_not_distinct", "false AS nulls_not_distinct"
+    )
+
+
 async def introspect(
     conn: Connection, schemas: Sequence[str] = (DEFAULT_SCHEMA,), roles: Sequence[str] = ()
 ) -> Snapshot:
     snapshot = empty_snapshot("postgresql")
+    version = await _server_version_num(conn)
     schema_list = list(schemas)
     tables = await conn.fetch_dicts(_TABLES, [schema_list, MIGRATIONS_TABLE])
     by_oid: dict[int, TableSnap] = {}
@@ -513,7 +537,10 @@ async def introspect(
             snap["comment"] = comment
         if str(t["persistence"]) == "u":
             snap["unlogged"] = True
-        if options := _strs(t["options"]):
+        if options := [
+            *_strs(t["options"]),
+            *(f"toast.{o}" for o in _strs(t["toast_options"])),
+        ]:
             snap["options"] = dict(o.split("=", 1) for o in options)
         if (partkey := _opt_str(t["partition_by"])) is not None:
             snap["partition_by"] = partkey
@@ -531,7 +558,7 @@ async def introspect(
         column = _column(row)
         by_oid[_int(row["table_oid"])]["columns"][column["name"]] = column
 
-    for row in await conn.fetch_dicts(_CONSTRAINTS, [oids]):
+    for row in await conn.fetch_dicts(_constraints_query(version), [oids]):
         table = by_oid[_int(row["table_oid"])]
         name, columns = str(row["name"]), _strs(row["columns"])
         match row["kind"]:
@@ -595,7 +622,7 @@ async def introspect(
             case _:
                 pass
 
-    for row in await conn.fetch_dicts(_INDEXES, [oids]):
+    for row in await conn.fetch_dicts(_indexes_query(version), [oids]):
         index = _index(row)
         by_oid[_int(row["table_oid"])]["indexes"][index["name"]] = index
 
@@ -620,7 +647,7 @@ async def introspect(
             _strs(row["privileges"])
         )
 
-    await _introspect_objects(conn, schema_list, snapshot, roles)
+    await _introspect_objects(conn, schema_list, snapshot, roles, version)
 
     for row in await conn.fetch_dicts(_ENUMS, [schema_list]):
         schema, name = str(row["schema"]), str(row["name"])
@@ -646,6 +673,7 @@ async def introspect(
             domain["checks"] = sorted(checks)
         snapshot.setdefault("domains", {})[key(schema, name)] = domain
         _add_schema(snapshot, schema)
+    _drop_domain_collations(snapshot)
 
     for row in await conn.fetch_dicts(_COMPOSITES, [schema_list]):
         schema, name = str(row["schema"]), str(row["name"])
@@ -665,8 +693,31 @@ def _add_schema(snapshot: Snapshot, schema: str) -> None:
         snapshot["schemas"].append(schema)
 
 
+def _drop_domain_collations(snapshot: Snapshot) -> None:
+    """A domain's collation is inherited by every column of that domain, but the column does
+    not name it: read it only when it differs, so it does not show as drift forever."""
+    domains = snapshot.get("domains", {})
+    if not domains:
+        return
+    relations = [*snapshot["tables"].values(), *snapshot.get("views", {}).values()]
+    for relation in relations:
+        for column in relation["columns"].values():
+            if column.get("collation") is None:
+                continue
+            domain = _domain_of(column["type"], domains)
+            if domain is not None and domain.get("collation") == column.get("collation"):
+                del column["collation"]
+
+
+def _domain_of(sql_type: str, domains: dict[str, DomainSnap]) -> DomainSnap | None:
+    if sql_type in domains:
+        return domains[sql_type]
+    matches = [d for d in domains.values() if d["name"] == sql_type]
+    return matches[0] if len(matches) == 1 else None
+
+
 async def _introspect_objects(
-    conn: Connection, schemas: list[str], snapshot: Snapshot, roles: Sequence[str]
+    conn: Connection, schemas: list[str], snapshot: Snapshot, roles: Sequence[str], version: int
 ) -> None:
     """Views, functions and extensions."""
     views: dict[int, ViewSnap] = {}
@@ -686,7 +737,7 @@ async def _introspect_objects(
         for row in await conn.fetch_dicts(_COLUMNS, [list(views)]):
             column = _column(row)
             views[_int(row["table_oid"])]["columns"][column["name"]] = column
-        for row in await conn.fetch_dicts(_INDEXES, [list(views)]):
+        for row in await conn.fetch_dicts(_indexes_query(version), [list(views)]):
             index = _index(row)
             views[_int(row["table_oid"])].setdefault("indexes", {})[index["name"]] = index
         for row in await conn.fetch_dicts(_TRIGGERS, [list(views)]):
@@ -721,11 +772,11 @@ async def _introspect_objects(
         snapshot.setdefault("extensions", {})[ext["name"]] = ext
 
 
-async def _normalize_indexes(snapshot: Snapshot, read_back: _ReadBack) -> None:
+async def _normalize_indexes(snapshot: Snapshot, read_back: _ReadBack, version: int) -> None:
     """Operator classes (naming the default one is the same as naming none) and expression
     keys as the database prints them, from the index made on a temporary table."""
     rel = f"to_regclass('pg_temp.{quote(_NORM)}')"
-    query = _INDEXES.replace("ANY($1::oid[])", f"ANY(ARRAY[{rel}::oid])")
+    query = _indexes_query(version).replace("ANY($1::oid[])", f"ANY(ARRAY[{rel}::oid])")
     for table in snapshot["tables"].values():
         columns = ", ".join(
             f"{quote(c['name'])} {SERIAL_TYPES.get(c['type'], c['type'])}"
@@ -792,6 +843,7 @@ async def normalize_snapshot(conn: Connection, snapshot: Snapshot) -> Snapshot:
     against the current database (on a new table, using a new column...) keeps its text:
     it differs from the database anyway, so it is created or replaced."""
     out = copy.deepcopy(snapshot)
+    version = await _server_version_num(conn)
 
     async def read_back(statements: list[str], query: str) -> _Row | None:
         try:
@@ -808,14 +860,14 @@ async def normalize_snapshot(conn: Connection, snapshot: Snapshot) -> Snapshot:
     try:
         async with conn.transaction():
             await conn.execute("SET LOCAL check_function_bodies = off", [])
-            await _normalize(out, read_back)
+            await _normalize(out, read_back, version)
             raise _Undo
     except _Undo:
         pass
     return out
 
 
-async def _normalize(snapshot: Snapshot, read_back: _ReadBack) -> None:
+async def _normalize(snapshot: Snapshot, read_back: _ReadBack, version: int) -> None:
     norm = f"pg_temp.{quote(_NORM)}"
     # Looked up when each query runs (a missing object reads as NULL, never as text).
     rel, proc = f"to_regclass('{norm}')", f"to_regproc('{norm}')"
@@ -864,13 +916,38 @@ async def _normalize(snapshot: Snapshot, read_back: _ReadBack) -> None:
     if functions:  # keyed by the arguments as printed
         snapshot["functions"] = {function_key(f): f for f in functions.values()}
 
-    await _normalize_indexes(snapshot, read_back)
+    await _normalize_indexes(snapshot, read_back, version)
     await _normalize_grants(snapshot, read_back)
 
     for table in snapshot["tables"].values():
         like = (
             f"CREATE TEMP TABLE {quote(_NORM)} (LIKE {qualified(table['schema'], table['name'])})"
         )
+        if (partition_by := table.get("partition_by")) is not None:
+            # The key as PostgreSQL prints it, so RANGE (at) matches range (at).
+            row = await read_back(
+                [f"{like} PARTITION BY {partition_by}"],
+                f"SELECT pg_get_partkeydef({rel}) AS k",
+            )
+            if row is not None and row["k"] is not None:
+                table["partition_by"] = str(row["k"])
+        if partitions := table.get("partitions"):
+            # Create each partition for real (rolled back after) so a timestamptz bound
+            # reads back as the database prints it, not as the user spelled it.
+            parent = qualified(table["schema"], table["name"])
+            reg = qualified(table["schema"], _NORM).replace("'", "''")
+            for pname, bound in partitions.items():
+                create = (
+                    f"CREATE TABLE {qualified(table['schema'], _NORM)} "
+                    f"PARTITION OF {parent} {bound}"
+                )
+                row = await read_back(
+                    [create],
+                    "SELECT pg_get_expr(c.relpartbound, c.oid) AS b FROM pg_class c "
+                    f"WHERE c.oid = to_regclass('{reg}')",
+                )
+                if row is not None and row["b"] is not None:
+                    partitions[pname] = str(row["b"])
         for policy in table.get("policies", {}).values():
             create = f"CREATE POLICY p ON {norm} FOR {policy['command'].upper()}"
             if policy["using"] is not None:

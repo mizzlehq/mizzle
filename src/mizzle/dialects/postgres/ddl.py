@@ -7,7 +7,7 @@ import re
 from collections.abc import Mapping, Sequence
 from typing import cast
 
-from mizzle.core.errors import MigrationError
+from mizzle.core.errors import MigrationError, SchemaError
 from mizzle.core.naming import Casing
 from mizzle.core.schema.column import MISSING, ColumnBase
 from mizzle.core.snapshot import (
@@ -369,12 +369,34 @@ def _exclusion_key(e: ExclusionElementSnap) -> str:
     return quote(column) if column is not None else e.get("expression", "")
 
 
+# An operator is made of PostgreSQL's operator characters, or names one with the
+# ``OPERATOR(schema.op)`` form. Anything else (a `;`, a `)`, a quote) is rejected.
+_OPERATOR_SYMBOL = "+-*/<>=~!@#%^&|`?"
+_EXCLUSION_OPERATOR = re.compile(
+    rf"(?:[{re.escape(_OPERATOR_SYMBOL)}]+\Z"
+    rf"|OPERATOR\([A-Za-z_][A-Za-z0-9_]*\."
+    rf"(?:[{re.escape(_OPERATOR_SYMBOL)}]+|[A-Za-z_][A-Za-z0-9_]*)\)\Z)",
+    re.IGNORECASE,
+)
+_EXCLUSION_METHOD = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
+
+
 def _exclusion_fragment(excl: ExclusionSnap) -> str:
-    keys = ", ".join(f"{_exclusion_key(e)} WITH {e['operator']}" for e in excl["elements"])
+    keys = ", ".join(
+        f"{_exclusion_key(e)} WITH {_exclusion_operator(e['operator'])}" for e in excl["elements"]
+    )
+    if not _EXCLUSION_METHOD.fullmatch(excl["method"]):
+        raise SchemaError(f"invalid exclusion method {excl['method']!r}")
     text = f"EXCLUDE USING {excl['method']} ({keys})"
     if where := excl.get("where"):
         text += f" WHERE ({where})"
     return text + _deferred(excl)
+
+
+def _exclusion_operator(operator: str) -> str:
+    if not _EXCLUSION_OPERATOR.fullmatch(operator):
+        raise SchemaError(f"invalid exclusion operator {operator!r}")
+    return operator
 
 
 def _create_table(table: TableSnap) -> str:
@@ -403,7 +425,7 @@ def _create_table(table: TableSnap) -> str:
     if partition_by := table.get("partition_by"):
         text += f" PARTITION BY {partition_by}"
     if options := table.get("options"):
-        text += " WITH (" + ", ".join(f"{k}={v}" for k, v in options.items()) + ")"
+        text += " WITH (" + ", ".join(_storage_option(k, v) for k, v in options.items()) + ")"
     return text
 
 
@@ -422,7 +444,11 @@ def create_index(schema: str, table: str, index: IndexSnap) -> str:
     if index["unique"] and index.get("nulls_not_distinct"):
         text += " NULLS NOT DISTINCT"
     if options := index.get("options"):
-        text += " WITH (" + ", ".join(f"{k} = {_literal(v)}" for k, v in options.items()) + ")"
+        text += (
+            " WITH ("
+            + ", ".join(f"{_option_key(k)} = {_literal(v)}" for k, v in options.items())
+            + ")"
+        )
     return text + (f" WHERE {index['where']}" if index["where"] else "")
 
 
@@ -440,6 +466,26 @@ def _role_options(role: RoleSnap) -> str:
 
 def _literal(text: str) -> str:
     return "'" + text.replace("'", "''") + "'"
+
+
+# Storage parameter names are identifiers, optionally in the toast namespace. Values are a
+# number, a boolean or a quoted literal, so a value can never end the WITH (...) clause.
+_OPTION_KEY = re.compile(r"(?:toast\.)?[a-z_][a-z0-9_]*\Z", re.IGNORECASE)
+_OPTION_NUMBER = re.compile(r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?\Z")
+
+
+def _option_key(name: str) -> str:
+    if not _OPTION_KEY.fullmatch(str(name)):
+        raise SchemaError(f"invalid storage parameter name {name!r}")
+    return str(name)
+
+
+def _storage_option(name: str, value: object) -> str:
+    key = _option_key(name)
+    text = "true" if value is True else "false" if value is False else str(value)
+    if _OPTION_NUMBER.fullmatch(text) or text in ("true", "false"):
+        return f"{key}={text}"
+    return f"{key}={_literal(text)}"
 
 
 def _alter_identity(step: AlterColumnIdentity, sql_type: str) -> str:
@@ -531,9 +577,10 @@ def _alter_type(step: AlterColumnType) -> str:
             f"changing {step.table}.{step.column} to or from a serial type needs a custom migration"
         )
     col = quote(step.column)
+    collate = f" COLLATE {quote(step.collation)}" if step.collation else ""
     text = (
         f"ALTER TABLE {qualified(step.schema, step.table)} ALTER COLUMN {col} "
-        f"SET DATA TYPE {step.new_type}"
+        f"SET DATA TYPE {step.new_type}{collate}"
     )
     return text if step.generated else f"{text} USING {col}::{step.new_type}"
 
@@ -609,10 +656,10 @@ def render_step(step: Step) -> Statement:
         ):
             actions: list[str] = []
             if reset_options:
-                actions.append("RESET (" + ", ".join(reset_options) + ")")
+                actions.append("RESET (" + ", ".join(_option_key(k) for k in reset_options) + ")")
             if set_options:
                 actions.append(
-                    "SET (" + ", ".join(f"{k}={v}" for k, v in set_options.items()) + ")"
+                    "SET (" + ", ".join(_storage_option(k, v) for k, v in set_options.items()) + ")"
                 )
             return alter(schema, table, ", ".join(actions))
         case AddColumn(schema=schema, table=table, column=column):

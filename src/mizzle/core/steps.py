@@ -276,6 +276,7 @@ class AlterColumnType(Step):
     old_type: str
     new_type: str
     generated: bool = False  # a generated column: recomputed, so no USING cast
+    collation: str | None = None  # keep the column's COLLATE across the type change
 
     @property
     @override

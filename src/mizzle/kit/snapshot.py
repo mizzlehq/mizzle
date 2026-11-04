@@ -344,7 +344,26 @@ def build_snapshot(
                 if obj.new_table is not None:
                     trg["new_table"] = obj.new_table
                 on.setdefault("triggers", {})[obj.name] = trg
+    _imply_deferrable(snapshot)
     return snapshot
+
+
+def _imply_deferrable(snapshot: Snapshot) -> None:
+    """INITIALLY DEFERRED requires DEFERRABLE (PostgreSQL rejects it alone), and the
+    database always reports both; store both so a declared schema does not drift."""
+    for table in snapshot["tables"].values():
+        pk = table["primary_key"]
+        if pk is not None and pk.get("initially_deferred"):
+            pk["deferrable"] = True
+        for unique in table["uniques"].values():
+            if unique.get("initially_deferred"):
+                unique["deferrable"] = True
+        for fk in table["foreign_keys"].values():
+            if fk.get("initially_deferred"):
+                fk["deferrable"] = True
+        for excl in table.get("exclusions", {}).values():
+            if excl.get("initially_deferred"):
+                excl["deferrable"] = True
 
 
 def _check_trigger(trigger: Trigger) -> None:

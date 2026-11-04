@@ -135,16 +135,22 @@ def map_error(exc: BaseException, sql: str) -> MizzleError | None:
             return None
 
 
-# SQL that older servers reject as a syntax error: (word they stop at, feature, version).
+# SQL that older servers reject as a syntax error: (word they stop at, feature, version,
+# another token the SQL must contain so the word is not matched in an unrelated statement).
 _NEWER_SYNTAX = (
-    ("EXPRESSION", "ALTER COLUMN ... SET EXPRESSION", 17),
-    ("VIRTUAL", "VIRTUAL generated columns", 18),
+    ("EXPRESSION", "ALTER COLUMN ... SET EXPRESSION", 17, None),
+    ("VIRTUAL", "VIRTUAL generated columns", 18, None),
+    ("MERGE", "MERGE", 15, None),
+    ("RETURNING", "MERGE ... RETURNING", 17, "MERGE"),
+    ("SOURCE", "MERGE ... WHEN NOT MATCHED BY SOURCE", 17, "MERGE"),
+    ("NULLS", "a unique constraint or index with NULLS NOT DISTINCT", 15, "NULLS NOT DISTINCT"),
 )
 
 
 def _needs_newer_server(message: str, sql: str) -> str | None:
-    for word, feature, version in _NEWER_SYNTAX:
-        if f'at or near "{word}"' in message and word in sql.upper():
+    upper = sql.upper()
+    for word, feature, version, also in _NEWER_SYNTAX:
+        if f'at or near "{word}"' in message and word in upper and (also is None or also in upper):
             return f"{feature} needs PostgreSQL {version} or later"
     return None
 

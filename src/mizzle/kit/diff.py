@@ -12,6 +12,7 @@ from mizzle.core.errors import MigrationError
 from mizzle.core.snapshot import (
     CheckSnap,
     ColumnSnap,
+    CompositeSnap,
     DomainSnap,
     ExclusionSnap,
     GrantsSnap,
@@ -322,17 +323,46 @@ def _diff_composites(old: Snapshot, new: Snapshot, plan: _Plan) -> None:
     snapshot)."""
     old_types = old.get("composites", {})
     new_types = new.get("composites", {})
+    created = {k: composite for k, composite in new_types.items() if k not in old_types}
+    for k in _composite_order(created):  # a composite's fields must exist before it does
+        plan.composites.append(CreateComposite(created[k]))
     for k, composite in new_types.items():
         before = old_types.get(k)
-        if before is None:
-            plan.composites.append(CreateComposite(composite))
-        elif before["fields"] != composite["fields"]:
+        if before is not None and before["fields"] != composite["fields"]:
             raise MigrationError(
                 f"composite type {composite['name']}: changing its fields needs a custom migration"
             )
-    for k, composite in old_types.items():
-        if k not in new_types:
-            plan.drop_composites.append(DropComposite(composite["schema"], composite["name"]))
+    dropped = {k: composite for k, composite in old_types.items() if k not in new_types}
+    for k in reversed(_composite_order(dropped)):  # the dependants drop first
+        plan.drop_composites.append(DropComposite(dropped[k]["schema"], dropped[k]["name"]))
+
+
+def _composite_order(composites: Mapping[str, CompositeSnap]) -> list[str]:
+    """Keys in an order where a composite comes after every composite its fields use (a
+    cycle is impossible in PostgreSQL, but is finished off rather than looping)."""
+    by_name: dict[str, list[str]] = {}
+    for k, composite in composites.items():
+        by_name.setdefault(composite["name"], []).append(k)
+
+    def resolve(sql_type: str) -> str | None:
+        if sql_type in composites:
+            return sql_type
+        matches = by_name.get(sql_type, [])
+        return matches[0] if len(matches) == 1 else None
+
+    needs = {
+        k: {r for f in composite["fields"] if (r := resolve(f["type"])) is not None} - {k}
+        for k, composite in composites.items()
+    }
+    order: list[str] = []
+    done: set[str] = set()
+    while len(order) < len(composites):
+        ready = [k for k in sorted(composites) if k not in done and needs[k] <= done]
+        if not ready:
+            ready = [k for k in sorted(composites) if k not in done]
+        order.append(ready[0])
+        done.add(ready[0])
+    return order
 
 
 def _rename_columns_in(table: TableSnap, mapping: Mapping[str, str]) -> None:
@@ -588,6 +618,7 @@ def _diff_table(old: TableSnap, new: TableSnap, plan: _Plan, compare_expressions
                     before["type"],
                     column["type"],
                     generated="generated" in before,
+                    collation=column.get("collation"),
                 )
             )
         old_generated, new_generated = before.get("generated"), column.get("generated")
@@ -606,7 +637,7 @@ def _diff_table(old: TableSnap, new: TableSnap, plan: _Plan, compare_expressions
             )
         if _default(old_default) != _default(column["default"]):
             plan.alter_columns.append(AlterColumnDefault(schema, name, cname, column["default"]))
-        if before.get("collation") != column.get("collation"):
+        if before.get("collation") != column.get("collation") and before["type"] == column["type"]:
             plan.alter_columns.append(
                 AlterColumnCollation(schema, name, cname, column["type"], column.get("collation"))
             )
