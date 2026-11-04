@@ -893,7 +893,8 @@ def _py_type(column: ColumnBase, imports: set[str]) -> str:
 def render_types_module(tables: Sequence[type[Table]]) -> str:
     """TypedDicts for a table's values: ``<Name>Row`` for a full selected row (including
     generated columns), and ``<Name>Insert`` / ``<Name>Update`` for writes. Use them with
-    ``db.insert(Users).values(UsersInsert(...))`` and to name the shape a select returns.
+    ``db.insert(Users).values(UsersInsert(...))`` and
+    ``select({...}).as_rows(UsersRow)`` to name the shape a select returns.
 
     Views are left out: read them through queries, never write them."""
     imports: set[str] = set()

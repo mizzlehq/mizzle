@@ -307,3 +307,51 @@ async def test_ctes_run_on_insert_update_and_delete(db: Database) -> None:
     ]
     deleted = db.with_(keep).delete(Posts).where(eq(Posts.author_id, 3))
     assert await deleted == 1
+
+
+async def test_lateral_join_without_a_condition(db: Database) -> None:
+    # T6: ON true is written for you, so no sql("true") is needed (and the query stays
+    # session-safe).
+    await seed(db)
+    # ON true pairs every outer row with the subquery's rows, so scope the subquery.
+    posts = db.select(Posts.id).from_(Posts).where(eq(Posts.author_id, 1)).subquery("p")
+    rows = await (
+        db.select(Users.email, posts.c("id", int))
+        .from_(Users)
+        .join_lateral(posts)
+        .order_by(Users.id, posts.c("id", int))
+    )
+    assert rows == [
+        ("ann@x", 1),
+        ("ann@x", 2),
+        ("bob@y", 1),
+        ("bob@y", 2),
+        ("cid@x", 1),
+        ("cid@x", 2),
+    ]
+
+
+async def test_one_keeps_a_tighter_user_limit(db: Database) -> None:
+    # T4: one() must not rewrite a limit the caller already set to be exact.
+    await seed(db)
+    row = await db.select(Users.email).from_(Users).order_by(Users.email).limit(1).one()
+    assert row == ("ann@x",)
+
+
+async def test_as_rows_names_a_projection(db: Database) -> None:
+    from typing import TypedDict
+
+    class UserRow(TypedDict):
+        id: int
+        email: str
+
+    await seed(db)
+    rows = (
+        await db.select({"id": Users.id, "email": Users.email})
+        .from_(Users)
+        .as_rows(UserRow)
+        .order_by(Users.id)
+    )
+    assert rows[0] == {"id": 1, "email": "ann@x"}
+    with pytest.raises(QueryError, match="projection has"):
+        db.select({"id": Users.id}).from_(Users).as_rows(UserRow)
