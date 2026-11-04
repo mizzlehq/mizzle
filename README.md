@@ -148,7 +148,9 @@ read replicas, timeouts and retries. See the
 
 The [example app](https://github.com/mizzlehq/mizzle/tree/main/examples/social) is a
 complete FastAPI service built with mizzle: schema, migrations, relational queries,
-Pydantic models, seed data and tests. Full documentation is on the way.
+Pydantic models, seed data and tests. Full documentation is at
+[mizzle.readthedocs.io](https://mizzle.readthedocs.io), with
+[llms.txt](https://mizzle.readthedocs.io/llms.txt) for LLM tools.
 
 ## License
 

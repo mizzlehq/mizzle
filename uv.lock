@@ -755,7 +755,6 @@ wheels = [
 
 [[package]]
 name = "mizzle"
-version = "0.2.4"
 source = { editable = "." }
 dependencies = [
     { name = "asyncpg" },
@@ -798,7 +797,7 @@ requires-dist = [
     { name = "starlette", marker = "extra == 'studio'", specifier = ">=0.40" },
     { name = "uvicorn", marker = "extra == 'studio'", specifier = ">=0.30" },
 ]
-provides-extras = ["studio", "pydantic"]
+provides-extras = ["pydantic", "studio"]
 
 [package.metadata.requires-dev]
 dev = [

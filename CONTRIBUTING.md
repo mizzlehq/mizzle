@@ -33,7 +33,8 @@ the GitHub Release and verifies its SHA-256.
 
 ## Releasing
 
-1. Bump the version in `pyproject.toml` and `src/mizzle/__init__.py`.
+1. Bump `__version__` in `src/mizzle/__init__.py`. That is the single source of truth:
+   `pyproject.toml` reads it through `[tool.hatch.version]`.
 2. Add a `## X.Y.Z` section to `CHANGELOG.md`. It becomes the GitHub Release notes, and the
    release stops early if it is missing.
 3. Push a tag: `git tag -a vX.Y.Z -m "mizzle X.Y.Z" && git push origin vX.Y.Z`.

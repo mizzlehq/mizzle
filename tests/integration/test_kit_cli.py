@@ -201,6 +201,33 @@ async def test_check_detects_fork(project: Path, monkeypatch: pytest.MonkeyPatch
     assert await cli("check") == 1
 
 
+async def test_status(project: Path, kit_url: str, capsys: pytest.CaptureFixture[str]) -> None:
+    assert await cli("status") == 0
+    assert "No migrations." in capsys.readouterr().out
+
+    assert await cli("generate") == 0
+    capsys.readouterr()
+    assert await cli("status") == 0
+    out = capsys.readouterr().out
+    assert "0001_" in out and "pending" in out and "0 applied, 1 pending." in out
+    conn = await asyncpg.connect(kit_url)
+    created = await conn.fetchval("SELECT to_regclass('public.__mizzle_migrations')")
+    await conn.close()
+    assert created is None  # status only reads
+
+    assert await cli("migrate") == 0
+    capsys.readouterr()
+    assert await cli("status") == 0
+    out = capsys.readouterr().out
+    assert "applied" in out and "1 applied, 0 pending." in out
+
+    # An applied migration edited on disk is reported.
+    sql = next(project.glob("migrations/0001_*/migration.sql"))
+    sql.write_text(sql.read_text() + "\n-- edited\n")
+    assert await cli("status") == 0
+    assert "changed after it was applied" in capsys.readouterr().out
+
+
 async def test_push_then_pull_roundtrip(
     project: Path, kit_url: str, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:

@@ -11,33 +11,48 @@ from mizzle import (
     QueryError,
     Reconnected,
     SerializationFailure,
+    eq,
     exists,
+    placeholder,
 )
 from mizzle.dialects.base import Connection, Driver
 from tests.models import Posts, Users
 
 
 class FakeConnection:
-    def __init__(self, name: str) -> None:
-        self.name = name
+    def __init__(self, name: str, seen: list[tuple[str, object]] | None = None) -> None:
+        self.name, self.seen = name, seen
 
     async def fetch(
         self, sql: str, params: object, timeout: float | None = None, *, session_safe: bool = False
     ) -> list[object]:
         return []
 
+    async def fetch_dicts(
+        self, sql: str, params: object, timeout: float | None = None
+    ) -> list[object]:
+        if self.seen is not None:
+            self.seen.append((sql, params))
+        return []
+
 
 class FakeDriver:
-    def __init__(self, name: str, log: list[str], down: bool = False) -> None:
-        self.name, self.log, self.down = name, log, down
+    def __init__(
+        self,
+        name: str,
+        log: list[str],
+        down: bool = False,
+        seen: list[tuple[str, object]] | None = None,
+    ) -> None:
+        self.name, self.log, self.down, self.seen = name, log, down, seen
 
     @asynccontextmanager
     async def acquire(self) -> AsyncGenerator[Connection]:
         if self.down:
             raise ConnectionError("down")
         self.log.append(self.name)
-        # Only fetch() is used here.
-        yield cast(Connection, cast(object, FakeConnection(self.name)))
+        # Only fetch() and fetch_dicts() are used here.
+        yield cast(Connection, cast(object, FakeConnection(self.name, self.seen)))
 
     async def close(self) -> None:
         pass
@@ -80,6 +95,22 @@ def test_evolve_rejects_unknown_fields() -> None:
 
     with pytest.raises(TypeError, match="no field"):
         evolve(Database().select().from_(Users), nope=1)
+
+
+async def test_explain_compiles_explain_and_guards_writes() -> None:
+    log: list[str] = []
+    seen: list[tuple[str, object]] = []
+    db = Database(schema=[Users, Posts], driver=cast(Driver, FakeDriver("primary", log, seen=seen)))
+
+    await db.explain(db.select().from_(Users).where(eq(Users.id, 1)))
+    await db.explain(db.select().from_(Users), analyze=True)
+    assert seen[0][0].startswith("EXPLAIN (FORMAT TEXT) SELECT")
+    assert seen[1][0].startswith("EXPLAIN (ANALYZE, FORMAT TEXT) SELECT")
+
+    with pytest.raises(QueryError, match="only selects"):
+        await db.explain(db.insert(Users).values(email="a@b"), analyze=True)
+    with pytest.raises(QueryError, match="placeholder"):
+        await db.explain(db.select().from_(Users).where(eq(Users.id, placeholder("id"))))
 
 
 async def test_retry() -> None:

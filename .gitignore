@@ -7,6 +7,8 @@ dist/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+.hypothesis/
+.cache/
 
 # Studio UI: local dev build, and the release manifest (written by release.yml)
 src/mizzle/studio/static/

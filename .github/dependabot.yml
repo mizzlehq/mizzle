@@ -1,0 +1,44 @@
+version: 2
+updates:
+  # Python runtime and dev dependencies (uv.lock, pyproject.toml).
+  - package-ecosystem: uv
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      python-dev:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
+
+  # The Studio UI: pnpm.
+  - package-ecosystem: npm
+    directory: /studio-ui
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      studio-ui:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
+
+  # Example apps are their own projects with their own lockfiles.
+  - package-ecosystem: uv
+    directory: /examples/social
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 3
+  - package-ecosystem: uv
+    directory: /examples/shop
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 3
+
+  # Keep the workflow actions current.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]

@@ -131,6 +131,13 @@ async def test_raw_execute(db: Database) -> None:
     assert rows == [{"email": "ann", "n": 7}]
 
 
+async def test_explain(db: Database) -> None:
+    plan = await db.explain(db.select().from_(Users).where(eq(Users.email, "ann")))
+    assert plan and "QUERY PLAN" in plan[0]
+    analyzed = await db.explain(db.select().from_(Users), analyze=True)
+    assert analyzed and "QUERY PLAN" in analyzed[0]
+
+
 async def test_server_data_error_hides_value(db: Database) -> None:
     with pytest.raises(DatabaseError, match="value hidden") as info:
         await db.execute(sql("select {}::text::role", "secret-x"))

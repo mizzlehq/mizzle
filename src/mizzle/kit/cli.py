@@ -1,4 +1,5 @@
-"""The ``mizzle`` command line: generate, migrate, push, pull, check, drop, typegen, studio."""
+"""The ``mizzle`` command line: generate, migrate, push, pull, check, drop, status,
+typegen, studio."""
 
 from __future__ import annotations
 
@@ -12,7 +13,7 @@ from collections.abc import Awaitable, Callable, Sequence
 from pathlib import Path
 from typing import Protocol, cast
 
-from mizzle.core.errors import DataLossBlocked, MigrationError, MizzleError
+from mizzle.core.errors import DatabaseError, DataLossBlocked, MigrationError, MizzleError
 from mizzle.core.snapshot import Snapshot
 from mizzle.core.steps import Step
 from mizzle.dialects.base import Dialect, Driver
@@ -44,6 +45,7 @@ class Args(Protocol):
     port: int
     read_only: bool
     no_open: bool
+    download_ui: bool
     ui_path: str | None
     schema: str
     url_env: str
@@ -302,6 +304,57 @@ def cmd_check(config: Config, _args: Args) -> int:
     return 0
 
 
+def cmd_status(config: Config, _args: Args) -> int:
+    directory = MigrationsDir(config.out, config.dialect_name)
+    migrations = directory.migrations()
+    if not migrations:
+        print("No migrations.")
+        return 0
+    applied: dict[str, str] | None = None
+    try:
+        config.url()
+    except MigrationError:
+        pass  # no database URL: still list what is on disk
+    else:
+
+        async def load(driver: Driver, dialect: Dialect) -> dict[str, str]:
+            # Read only: no migrations table (or schema) yet means nothing is applied.
+            async with driver.acquire() as conn:
+                try:
+                    return await dialect.applied_migrations(conn, config.migrations_schema)
+                except DatabaseError as exc:
+                    if exc.sqlstate in ("42P01", "3F000"):  # undefined table / schema
+                        return {}
+                    raise
+
+        applied = asyncio.run(_with_driver(config, load))
+
+    width = max(len(m.name) for m in migrations)
+    pending = 0
+    for migration in migrations:
+        if applied is None:
+            state = "unknown (set the database URL to compare)"
+        elif migration.name not in applied:
+            state = "pending"
+            pending += 1
+        elif applied[migration.name] != migration.hash():
+            state = "applied (changed after it was applied)"
+        else:
+            state = "applied"
+        print(f"  {migration.name:<{width}}  {state}")
+    if applied is None:
+        print(
+            f"\n{len(migrations)} migration(s). Set ${config.url_env} to compare with the database."
+        )
+        return 0
+    on_disk = {m.name for m in migrations}
+    for name in applied:
+        if name not in on_disk:
+            print(f"  {name:<{width}}  applied but missing on disk")
+    print(f"\n{len(migrations) - pending} applied, {pending} pending.")
+    return 0
+
+
 def cmd_drop(config: Config, args: Args) -> int:
     directory = MigrationsDir(config.out, config.dialect_name)
     migrations = directory.migrations()
@@ -359,6 +412,12 @@ def cmd_init(args: Args) -> int:
 
 
 def cmd_studio(config: Config, args: Args) -> int:
+    if args.download_ui:
+        # Prefetch for offline use: this needs no Studio extra, only the standard library.
+        from mizzle.studio.assets import ui_path
+
+        print(f"Studio UI at {ui_path(args.ui_path)}")
+        return 0
     try:
         from mizzle.studio.server import serve
     except ImportError as exc:
@@ -431,6 +490,9 @@ def _parser() -> argparse.ArgumentParser:
     p = sub.add_parser("check", help="validate the migrations folder")
     p.set_defaults(func=cmd_check)
 
+    p = sub.add_parser("status", help="show which migrations are applied and which are pending")
+    p.set_defaults(func=cmd_status)
+
     p = sub.add_parser("drop", help="delete the latest (unapplied) migration")
     p.add_argument("--force", action="store_true", help="drop without checking the database")
     p.set_defaults(func=cmd_drop)
@@ -443,6 +505,11 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--port", type=int, default=4983)
     p.add_argument("--read-only", action="store_true")
     p.add_argument("--no-open", action="store_true", help="do not open a browser")
+    p.add_argument(
+        "--download-ui",
+        action="store_true",
+        help="download and verify the Studio UI, then exit (prefetch for offline use)",
+    )
     p.add_argument(
         "--ui-path",
         help="folder with a built Studio UI (offline use; default: download on first run)",

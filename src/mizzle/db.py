@@ -177,6 +177,29 @@ class Session(QueryBuilder):
             raise QueryError("execute() does not take placeholders")
         return await self._call(compiled, "dicts")
 
+    async def explain(self, statement: Node, *, analyze: bool = False) -> list[dict[str, object]]:
+        """The query plan (``EXPLAIN``) as rows of dicts, one per plan line.
+
+        ``analyze=True`` adds real row counts and timings but runs ``statement``, so only
+        selects are allowed."""
+        compiled = self.compile(statement)
+        if compiled.has_placeholders:
+            raise QueryError("explain() does not take placeholders; inline the values instead")
+        is_read = isinstance(statement, SelectBase | RelationalStatement)
+        if analyze and not is_read:
+            raise QueryError("explain(analyze=True) runs the statement; only selects are allowed")
+        options = "ANALYZE, " if analyze else ""
+        explained = CompiledQuery(
+            f"EXPLAIN ({options}FORMAT TEXT) {compiled.sql}",
+            compiled.params,
+            compiled.placeholders,
+            compiled.raw,
+            compiled.locking,
+            compiled.dynamic,
+            compiled.opaque,
+        )
+        return await self._call(explained, "dicts", is_read and not compiled.locking)
+
     async def refresh(self, view: type[View], *, concurrently: bool = False) -> None:
         """``REFRESH MATERIALIZED VIEW``. ``concurrently=True`` keeps the view readable
         meanwhile; it needs a unique index on the view."""
@@ -537,7 +560,7 @@ class Session(QueryBuilder):
     async def _call(self, query: CompiledQuery, kind: Literal["execute"]) -> int: ...
     @overload
     async def _call(
-        self, query: CompiledQuery, kind: Literal["dicts"]
+        self, query: CompiledQuery, kind: Literal["dicts"], read_only: bool = ...
     ) -> list[dict[str, object]]: ...
     async def _call(
         self, query: CompiledQuery, kind: _CallKind, read_only: bool = False

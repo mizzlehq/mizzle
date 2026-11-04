@@ -1,6 +1,6 @@
 [project]
 name = "mizzle"
-version = "0.2.4"
+dynamic = ["version"]
 description = "Fully typed async ORM for PostgreSQL: SQL-like queries, schema-driven migrations and a data studio"
 keywords = ["orm", "postgresql", "asyncpg", "async", "sql", "query-builder", "migrations", "typed"]
 classifiers = [
@@ -40,6 +40,11 @@ mizzle = "mizzle.kit.cli:main"
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[tool.hatch.version]
+# Single source of truth: the version is read from __version__ in this file. Bump it in
+# one place only (see CONTRIBUTING.md, Releasing).
+path = "src/mizzle/__init__.py"
 
 [tool.hatch.build]
 # The Studio UI is NOT shipped: `mizzle studio` downloads it on first run from the GitHub
@@ -143,6 +148,7 @@ files = ["src", "tests/typing"]
 
 [tool.coverage.run]
 source = ["mizzle"]
+branch = true
 
 [tool.coverage.report]
 fail_under = 90

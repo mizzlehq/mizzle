@@ -574,6 +574,19 @@ ranked2 = await db.select(Users.id, sql("{} * 2", Users.id)).from_(Users)
 - On Python 3.14 you can write a t-string: `sql(t"... WHERE id = {user_id}")`.
 - `db.execute()` returns rows as dicts.
 
+## Explain a query
+
+```python
+plan = await db.explain(db.select().from_(Users).where(eq(Users.email, "a@b")))
+# list[dict[str, object]]: one row per plan line
+
+analyzed = await db.explain(db.select().from_(Users), analyze=True)
+```
+
+`analyze=True` adds real row counts and timings but runs the statement, so only selects
+are allowed. The plan routes like the statement itself (a read may use a replica), and
+`explain()` does not take `placeholder()` values.
+
 ## Prepared queries and SQL text
 
 ```python

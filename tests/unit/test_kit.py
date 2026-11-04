@@ -17,7 +17,7 @@ from mizzle.dialects.postgres import PostgresDialect
 from mizzle.dialects.postgres.ddl import normalize_default, normalize_type
 from mizzle.kit.config import load_config
 from mizzle.kit.diff import StrictRenames, diff
-from mizzle.kit.journal import BREAKPOINT, format_sql, parse_sql
+from mizzle.kit.journal import BREAKPOINT, MigrationsDir, format_sql, parse_sql
 from mizzle.kit.snapshot import build_snapshot
 from tests.models import Posts, Users
 
@@ -241,6 +241,42 @@ def test_dotenv_is_loaded_without_overriding(
     assert os.environ["PLAIN"] == "value"
     assert os.environ["QUOTED"] == "a # not a comment"
     assert os.environ["ALREADY"] == "from-env"
+
+
+def test_status_lists_migrations_without_a_url(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from mizzle.kit.cli import main
+
+    (tmp_path / "mizzle.toml").write_text('schema = "x"\nout = "migrations"\n')
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    assert main(["status"]) == 0
+    assert "No migrations." in capsys.readouterr().out
+
+    directory = MigrationsDir(tmp_path / "migrations", "postgresql")
+    directory.write("create_users", [], empty_snapshot("postgresql"))
+    assert main(["status"]) == 0
+    out = capsys.readouterr().out
+    assert "0001_create_users" in out
+    assert "unknown" in out
+    assert "Set $DATABASE_URL" in out
+
+
+def test_studio_download_ui_uses_an_explicit_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from mizzle.kit.cli import main
+
+    ui = tmp_path / "ui"
+    ui.mkdir()
+    (ui / "index.html").write_text("<!doctype html>")
+    (tmp_path / "mizzle.toml").write_text('schema = "x"\n')
+    monkeypatch.chdir(tmp_path)
+    assert main(["studio", "--download-ui", "--ui-path", str(ui)]) == 0
+    out = capsys.readouterr().out
+    assert "Studio UI at" in out
+    assert str(ui) in out
 
 
 def test_schema_file(tmp_path: Path) -> None:

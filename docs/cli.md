@@ -11,6 +11,7 @@ Run `mizzle <command> --help` for all options. Every command reads `mizzle.toml`
 | `mizzle push` | Sync the schema to the database directly (development). |
 | `mizzle pull` | Write a schema module from an existing database. |
 | `mizzle check` | Validate the migrations folder. |
+| `mizzle status` | Show which migrations are applied and which are pending. |
 | `mizzle drop` | Delete the latest (unapplied) migration. |
 | `mizzle typegen` | Write insert/update TypedDicts. |
 | `mizzle studio` | Browse and edit data in the browser. |
@@ -68,6 +69,23 @@ that runs nothing ([Following a schema another app owns](guide/migrations.md#fol
 Fails when the journal and the migration folders disagree. Warns when a `migration.sql`
 was edited after `generate` (custom migrations are expected to be edited). Run it in CI.
 
+## status
+
+```bash
+mizzle status
+```
+
+Lists every migration with its state: `applied`, `pending`, `applied (changed after it was
+applied)`, or a name the database has but the folder does not. Set the database URL to
+compare with the database; without it, the state is `unknown`.
+
+```text
+  0001_create_users   applied
+  0002_add_posts      pending
+
+1 applied, 1 pending.
+```
+
 ## studio
 
 ```bash
@@ -75,4 +93,6 @@ mizzle studio --read-only --port 4983
 ```
 
 The UI downloads on first run (verified by SHA-256). `--ui-path` uses a local build
-instead, for offline machines.
+instead, for offline machines. To prefetch the UI ahead of time (for example while
+building an image), run `mizzle studio --download-ui`; it downloads and verifies the UI,
+prints where it landed, and exits without starting the server.
