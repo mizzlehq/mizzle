@@ -8,6 +8,7 @@ from typing import cast, overload
 from mizzle.core.errors import QueryError
 from mizzle.core.query.base import Runner
 from mizzle.core.query.insert import Insert
+from mizzle.core.query.merge import Merge
 from mizzle.core.query.relational import RelationalQuery
 from mizzle.core.query.select import Cte, Projection, Select, Slot
 from mizzle.core.query.update import Delete, Update
@@ -77,6 +78,10 @@ class QueryBuilder:
 
     def delete[T: Table](self, table: type[T]) -> Delete[T]:
         return Delete(self.runner, table)
+
+    def merge[T: Table](self, table: type[T]) -> Merge[T]:
+        """``MERGE INTO table USING source ON ... WHEN ...`` (PostgreSQL 15+)."""
+        return Merge(self.runner, table)
 
     @overload
     def select(self) -> SelectAll: ...

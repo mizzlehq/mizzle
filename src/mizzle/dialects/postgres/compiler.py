@@ -12,6 +12,7 @@ from mizzle.core.sql.nodes import ExprBase, Node
 
 if TYPE_CHECKING:
     from mizzle.core.query.insert import OnConflict
+    from mizzle.core.query.merge import Merge, MergeWhen
     from mizzle.core.query.relational import LoadPlan, RelationalStatement
     from mizzle.core.query.returning import Returning
     from mizzle.core.schema.column import ColumnBase
@@ -45,6 +46,47 @@ class PostgresCompiler(Compiler):
         else:
             exprs = projection.values() if isinstance(projection, dict) else projection
         return "RETURNING " + ", ".join(self.visit(expr) for expr in exprs)
+
+    def visit_Merge(self, node: Merge[Table]) -> str:
+        if node.source_ is None:
+            raise QueryError(f"merge({node.table.__name__}) needs .using(...)")
+        if node.on_ is None:
+            raise QueryError(f"merge({node.table.__name__}) needs .on(...)")
+        if not node.when_:
+            raise QueryError(f"merge({node.table.__name__}) needs at least one when_* clause")
+        text = (
+            f"MERGE INTO {self.table_name(node.table)} USING {self.source(node.source_)}"
+            f" ON {self.visit(node.on_)}"
+        )
+        return text + "".join(f" {self._merge_when(node.table, w)}" for w in node.when_)
+
+    def _merge_when(self, table: type[Table], clause: MergeWhen) -> str:
+        if clause.matched:
+            head = "WHEN MATCHED"
+        elif clause.by_source:
+            head = "WHEN NOT MATCHED BY SOURCE"
+        else:
+            head = "WHEN NOT MATCHED"
+        if clause.condition is not None:
+            head += f" AND {self.visit(clause.condition)}"
+        columns = table.__table__.columns
+        if clause.action == "update":
+            changes = ", ".join(
+                f"{self.column_name(columns[key])} = {self.value(columns[key], value)}"
+                for key, value in clause.set_.items()
+            )
+            body = f"UPDATE SET {changes}"
+        elif clause.action == "delete":
+            body = "DELETE"
+        elif clause.action == "insert":
+            names = ", ".join(self.column_name(columns[key]) for key in clause.insert_)
+            values = ", ".join(
+                self.value(columns[key], value) for key, value in clause.insert_.items()
+            )
+            body = f"INSERT ({names}) VALUES ({values})"
+        else:
+            body = "DO NOTHING"
+        return f"{head} THEN {body}"
 
     @override
     def on_conflict_clause(self, table: type[Table], conflict: OnConflict, /) -> str:
