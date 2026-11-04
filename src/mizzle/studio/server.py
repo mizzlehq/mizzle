@@ -30,7 +30,7 @@ import secrets
 import sys
 import webbrowser
 from collections.abc import AsyncGenerator, Awaitable, Callable, Mapping, Sequence
-from contextlib import asynccontextmanager
+from contextlib import aclosing, asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import cast, override
@@ -40,12 +40,13 @@ from starlette.applications import Starlette
 from starlette.middleware import Middleware
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
 from starlette.requests import Request
-from starlette.responses import HTMLResponse, JSONResponse, Response
+from starlette.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 from starlette.routing import BaseRoute, Mount, Route
 from starlette.staticfiles import StaticFiles
 from starlette.types import ASGIApp
 
 from mizzle.core.errors import MigrationError, MizzleError
+from mizzle.core.query.base import Row
 from mizzle.core.snapshot import ColumnSnap, Snapshot, TableSnap, key
 from mizzle.dialects.base import Connection, Dialect, Driver
 from mizzle.dialects.postgres.ddl import SERIAL_TYPES, qualified, quote
@@ -56,7 +57,6 @@ from mizzle.studio.ddl import build_steps, statement_rows
 STATIC_DIR = Path(__file__).parent / "static"
 MAX_SQL_ROWS = 1000
 MAX_PAGE = 500
-MAX_EXPORT_ROWS = 100_000
 MAX_HISTORY = 100
 _COMPARE = {"eq": "=", "ne": "<>", "lt": "<", "lte": "<=", "gt": ">", "gte": ">="}
 _DOLLAR = re.compile(r"\$[A-Za-z_][A-Za-z0-9_]*\$|\$\$")
@@ -283,16 +283,39 @@ def _order_sql(table: TableSnap, q: Mapping[str, str]) -> str:
     return ""
 
 
-def _skip_quoted(text: str, i: int, quote: str) -> int:
+def _skip_quoted(text: str, i: int, quote: str, *, escapes: bool = False) -> int:
+    """The index just past the closing ``quote``.
+
+    ``escapes`` is for an ``E'...'`` string, where a backslash quotes the next character
+    (``E'it\'s'``); a plain ``'...'`` has no backslash escapes, so it must not be treated
+    as one.
+    """
     i += 1
     while i < len(text):
-        if text[i] == quote:
+        ch = text[i]
+        if escapes and ch == "\\":
+            i += 2
+            continue
+        if ch == quote:
             if i + 1 < len(text) and text[i + 1] == quote:  # doubled: an escaped quote
                 i += 2
                 continue
             return i + 1
         i += 1
     return len(text)
+
+
+def _skip_block_comment(text: str, i: int) -> int:
+    """The index just past a ``/* ... */`` comment, nesting as PostgreSQL does."""
+    depth, i = 1, i + 2
+    while i < len(text) and depth:
+        if text.startswith("/*", i):
+            depth, i = depth + 1, i + 2
+        elif text.startswith("*/", i):
+            depth, i = depth - 1, i + 2
+        else:
+            i += 1
+    return i
 
 
 def split_statements(text: str) -> list[str]:
@@ -303,7 +326,11 @@ def split_statements(text: str) -> list[str]:
     while i < n:
         ch = text[i]
         if ch in "'\"":
-            i = _skip_quoted(text, i, ch)
+            # E'...' (also e'...') has backslash escapes; a bare '...' does not.
+            escapes = ch == "'" and i > 0 and text[i - 1] in "Ee" and not _is_ident_char(
+                text, i - 2
+            )
+            i = _skip_quoted(text, i, ch, escapes=escapes)
         elif ch == "$":
             tag = _DOLLAR.match(text, i)
             if tag is None:
@@ -315,8 +342,7 @@ def split_statements(text: str) -> list[str]:
             newline = text.find("\n", i)
             i = n if newline == -1 else newline + 1
         elif text.startswith("/*", i):
-            close = text.find("*/", i + 2)
-            i = n if close == -1 else close + 2
+            i = _skip_block_comment(text, i)
         elif ch == ";":
             parts.append(text[start:i])
             start = i = i + 1
@@ -324,6 +350,14 @@ def split_statements(text: str) -> list[str]:
             i += 1
     parts.append(text[start:])
     return [p.strip() for p in parts if _has_sql(p)]
+
+
+def _is_ident_char(text: str, index: int) -> bool:
+    """Whether the character before an ``E`` makes it part of a longer word (``SOME'x'``)."""
+    if index < 0:
+        return False
+    char = text[index]
+    return char.isalnum() or char in "_$"
 
 
 def _has_sql(chunk: str) -> bool:
@@ -348,17 +382,6 @@ def _cell(value: object) -> str:
     if isinstance(value, bool):
         return "true" if value else "false"
     return _csv_safe(str(value))
-
-
-def _to_csv(table: TableSnap, rows: Sequence[object]) -> str:
-    columns = list(table["columns"])
-    out = io.StringIO()
-    writer = csv.writer(out)
-    writer.writerow(columns)
-    for row in rows:
-        values: dict[str, object] = cast(dict[str, object], row) if isinstance(row, dict) else {}
-        writer.writerow([_cell(values.get(c)) for c in columns])
-    return out.getvalue()
 
 
 def jsonable(value: object) -> JSON:
@@ -460,8 +483,26 @@ async def list_rows(studio: Studio, request: Request) -> Response:
     return JSONResponse({"total": total[0], "rows": [jsonable(r[0]) for r in rows]})
 
 
+def _download_name(schema: str, table: str, fmt: str) -> str:
+    """``Content-Disposition`` for an arbitrary table name.
+
+    Names come from the database, so they can be non-Latin-1 (which used to raise
+    ``UnicodeEncodeError`` inside the header) or contain ``"`` (which broke the quoting).
+    RFC 5987 ``filename*`` carries the real name; ``filename`` keeps an ASCII fallback.
+    """
+    name = f"{schema}.{table}.{fmt}"
+    ascii_name = name.encode("ascii", "replace").decode("ascii").replace('"', "_")
+    from urllib.parse import quote as url_quote
+
+    return f"attachment; filename=\"{ascii_name}\"; filename*=UTF-8''{url_quote(name, safe='')}"
+
+
 async def export_rows(studio: Studio, request: Request) -> Response:
-    """Download every matching row as CSV or JSON (not just the current page)."""
+    """Download every matching row as CSV or JSON (not just the current page).
+
+    The rows are streamed from a server-side cursor, so a large export does not have to fit
+    in memory, and nothing is silently cut short.
+    """
     table = await _table(studio, request)
     q = request.query_params
     fmt = q.get("format", "csv").lower()
@@ -475,16 +516,47 @@ async def export_rows(studio: Studio, request: Request) -> Response:
     where = _where(table, filters, params)
     order_sql = _order_sql(table, q)
     source = f"{qualified(table['schema'], table['name'])} AS t"
-    async with studio.pool().acquire() as conn:
-        rows = await conn.fetch(
-            f"SELECT to_jsonb(t) FROM {source}{where}{order_sql} LIMIT {MAX_EXPORT_ROWS}", params
-        )
-    data = [jsonable(r[0]) for r in rows]
-    filename = f"{table['schema']}.{table['name']}.{fmt}"
-    disposition = {"Content-Disposition": f'attachment; filename="{filename}"'}
-    if fmt == "json":
-        return JSONResponse(data, headers=disposition)
-    return Response(_to_csv(table, data), media_type="text/csv", headers=disposition)
+    sql = f"SELECT to_jsonb(t) FROM {source}{where}{order_sql}"
+    headers = {
+        "Content-Disposition": _download_name(table["schema"], table["name"], fmt),
+        "Cache-Control": "no-store",
+    }
+    columns = list(table["columns"])
+    batch_size = 1000
+
+    async def body() -> AsyncGenerator[bytes]:
+        async with studio.pool().acquire() as conn, conn.transaction():
+            if fmt == "csv":
+                buffer = io.StringIO()
+                writer = csv.writer(buffer)
+                writer.writerow(columns)
+                yield buffer.getvalue().encode()
+            else:
+                yield b"["
+            first = True
+            async with aclosing(conn.cursor(sql, params, batch_size)) as batches:
+                async for batch in batches:
+                    if fmt == "csv":
+                        yield _csv_chunk(columns, batch)
+                        continue
+                    for row in batch:
+                        text = json.dumps(jsonable(row[0]))
+                        yield (b"" if first else b",") + text.encode()
+                        first = False
+            if fmt == "json":
+                yield b"]"
+
+    media = "text/csv; charset=utf-8" if fmt == "csv" else "application/json"
+    return StreamingResponse(body(), media_type=media, headers=headers)
+
+
+def _csv_chunk(columns: Sequence[str], batch: Sequence[Row]) -> bytes:
+    buffer = io.StringIO()
+    writer = csv.writer(buffer)
+    for row in batch:
+        values = cast("Mapping[str, object]", row[0])
+        writer.writerow([_cell(values.get(c)) for c in columns])
+    return buffer.getvalue().encode()
 
 
 async def insert_row(studio: Studio, request: Request) -> Response:
@@ -556,13 +628,9 @@ def _reject_read_only(statements: Sequence[str]) -> None:
     for statement in statements:
         body = _strip_leading_comments(statement)
         if (match := _READ_ONLY_DENIED.match(body)) is not None:
-            raise StudioError(
-                f"{match.group(0).upper()} is not allowed in read-only mode", 403
-            )
+            raise StudioError(f"{match.group(0).upper()} is not allowed in read-only mode", 403)
         if (call := _READ_ONLY_DENIED_CALLS.search(body)) is not None:
-            raise StudioError(
-                f"{call.group(0)} is not allowed in read-only mode", 403
-            )
+            raise StudioError(f"{call.group(0)} is not allowed in read-only mode", 403)
 
 
 def _strip_leading_comments(statement: str) -> str:
@@ -899,8 +967,12 @@ def create_app(
         Route("/api/queries/history", _api(studio, get_history), methods=["GET"]),
         Route("/api/queries/history", _api(studio, clear_history), methods=["DELETE"]),
         Route("/api/queries/saved", _api(studio, list_saved), methods=["GET"]),
-        Route("/api/queries/saved/{name}", _api(studio, put_saved), methods=["PUT"]),
-        Route("/api/queries/saved/{name}", _api(studio, delete_saved), methods=["DELETE"]),
+        # ``:path`` so a saved-query name may contain "/" (it is a user-chosen label, not a
+        # path segment); the default converter stopped at the slash and answered 405.
+        Route("/api/queries/saved/{name:path}", _api(studio, put_saved), methods=["PUT"]),
+        Route(
+            "/api/queries/saved/{name:path}", _api(studio, delete_saved), methods=["DELETE"]
+        ),
     ]
     if (static_dir / "index.html").exists():
         routes.append(Mount("/", StaticFiles(directory=static_dir, html=True)))
@@ -932,9 +1004,7 @@ def _is_superuser(url: str) -> bool:
         except Exception:
             return False
         try:
-            rows = await conn.fetch(
-                "SELECT rolsuper FROM pg_roles WHERE rolname = current_user"
-            )
+            rows = await conn.fetch("SELECT rolsuper FROM pg_roles WHERE rolname = current_user")
             [row] = cast("Sequence[Sequence[object]]", rows)
             return bool(row[0])
         finally:
