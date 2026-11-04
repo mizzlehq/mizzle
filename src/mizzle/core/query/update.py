@@ -27,6 +27,8 @@ class Update[T: Table](Executable[int]):
     values_: dict[str, object] = field(default_factory=dict[str, object])
     where_: Condition | None = None
     all_rows_: bool = False
+    # UPDATE ... FROM: other tables to join into the update.
+    from_sources: tuple[type[Table], ...] = ()
 
     def set(self, values: RowLike | None = None, /, **fields: object) -> Self:
         """``set(bio="x")``, ``set({"bio": "x"})`` or ``set(pydantic_model)``."""
@@ -35,6 +37,13 @@ class Update[T: Table](Executable[int]):
         changes = dict(as_mapping(values)) if values is not None else fields
         check_values(self.table, changes)
         return evolve(self, values_={**self.values_, **changes})
+
+    def from_(self, *sources: type[Table]) -> Self:
+        """``UPDATE ... FROM other``: join another table into the update; reference its
+        columns in ``set_`` and ``where``."""
+        if not sources:
+            raise QueryError("from_() needs at least one table")
+        return evolve(self, from_sources=(*self.from_sources, *sources))
 
     def where(self, condition: Condition) -> Self:
         """Add a filter. Calling ``where`` again ANDs the conditions."""
@@ -60,11 +69,20 @@ class Delete[T: Table](Executable[int]):
     table: type[T]
     where_: Condition | None = None
     all_rows_: bool = False
+    # DELETE ... USING: other tables to join into the delete.
+    using_: tuple[type[Table], ...] = ()
 
     def where(self, condition: Condition) -> Self:
         """Add a filter. Calling ``where`` again ANDs the conditions."""
         combined = condition if self.where_ is None else and_(self.where_, condition)
         return evolve(self, where_=combined)
+
+    def using(self, *sources: type[Table]) -> Self:
+        """``DELETE ... USING other``: match rows against another table; reference its
+        columns in ``where``."""
+        if not sources:
+            raise QueryError("using() needs at least one table")
+        return evolve(self, using_=(*self.using_, *sources))
 
     def all_rows(self) -> Self:
         """Allow running without ``.where()``."""

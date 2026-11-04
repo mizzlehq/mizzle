@@ -85,6 +85,66 @@ def test_distinct_and_lock(qb: QueryBuilder) -> None:
         qb.select().from_(Users).for_update(skip_locked=True, nowait=True)
 
 
+def test_distinct_on(qb: QueryBuilder) -> None:
+    q = (
+        qb.select(Users.id, Users.email)
+        .from_(Users)
+        .distinct_on(Users.email)
+        .order_by(desc(Users.id))
+    )
+    assert q.to_sql() == (
+        'SELECT DISTINCT ON ("users"."email") "users"."id", "users"."email" '
+        'FROM "users" ORDER BY "users"."id" DESC',
+        (),
+    )
+
+
+def test_distinct_on_validation(qb: QueryBuilder) -> None:
+    with pytest.raises(QueryError, match="at least one expression"):
+        qb.select().from_(Users).distinct_on()
+    with pytest.raises(QueryError, match="cannot be combined"):
+        qb.select(Users.id).from_(Users).distinct().distinct_on(Users.id).to_sql()
+
+
+def test_row_lock_strengths(qb: QueryBuilder) -> None:
+    base = qb.select(Users.id).from_(Users)
+    assert base.for_share().to_sql()[0].endswith("FOR SHARE")
+    assert base.for_no_key_update().to_sql()[0].endswith("FOR NO KEY UPDATE")
+    assert (
+        base.for_key_share(of=[Users], nowait=True)
+        .to_sql()[0]
+        .endswith('FOR KEY SHARE OF "users" NOWAIT')
+    )
+    with pytest.raises(QueryError, match="not both"):
+        base.for_share(skip_locked=True, nowait=True)
+
+
+async def test_first_one_scalar(qb: QueryBuilder, runner: FakeRunner) -> None:
+    query = qb.select(Users.id).from_(Users)
+    runner.rows = [(1,)]
+    assert await query.first() == (1,)
+    runner.rows = []
+    assert await query.first() is None
+    assert await query.scalar() is None
+    runner.rows = [(7,)]
+    assert await query.scalar() == 7
+    assert await query.one() == (7,)
+    assert await qb.select({"n": Users.id}).from_(Users).scalar() == 7
+    runner.rows = [(1,), (2,)]
+    with pytest.raises(QueryError, match="more than one row"):
+        await query.one()
+    runner.rows = []
+    with pytest.raises(QueryError, match="no rows"):
+        await query.one()
+
+
+async def test_scalar_shape_validation(qb: QueryBuilder) -> None:
+    with pytest.raises(QueryError, match="exactly one selected column"):
+        await qb.select(Users.id, Users.email).from_(Users).scalar()
+    with pytest.raises(QueryError, match="explicit select"):
+        await qb.select().from_(Users).scalar()
+
+
 @pytest.mark.parametrize("bad", [-1, True])
 def test_limit_validation(qb: QueryBuilder, bad: int) -> None:
     with pytest.raises(QueryError):

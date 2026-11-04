@@ -130,6 +130,57 @@ def test_on_conflict_validation(qb: QueryBuilder) -> None:
         q.on_conflict_do_update(target=Users.email, set_={"nope": 1})
 
 
+def test_on_conflict_on_constraint(qb: QueryBuilder) -> None:
+    q = (
+        qb.insert(Users)
+        .values(email="a")
+        .on_conflict_do_update(constraint="users_email_key", set_={"bio": "x"})
+    )
+    assert q.to_sql() == (
+        'INSERT INTO "users" ("email") VALUES ($1) '
+        'ON CONFLICT ON CONSTRAINT "users_email_key" DO UPDATE SET "bio" = $2',
+        ("a", "x"),
+    )
+    nothing = (
+        qb.insert(Users).values(email="a").on_conflict_do_nothing(constraint="users_email_key")
+    )
+    assert nothing.to_sql()[0].endswith('ON CONFLICT ON CONSTRAINT "users_email_key" DO NOTHING')
+
+
+def test_on_conflict_target_or_constraint(qb: QueryBuilder) -> None:
+    q = qb.insert(Users).values(email="a")
+    with pytest.raises(QueryError, match="not both"):
+        q.on_conflict_do_nothing(target=Users.email, constraint="users_email_key")
+    with pytest.raises(QueryError, match="needs a target or a constraint"):
+        q.on_conflict_do_update(set_={"bio": "x"})
+    with pytest.raises(QueryError, match="cannot be empty"):
+        q.on_conflict_do_nothing(constraint="")
+
+
+def test_insert_from_select(qb: QueryBuilder) -> None:
+    source = qb.select(Users.email, Users.bio).from_(Users).where(eq(Users.role, Role.ADMIN))
+    q = qb.insert(Users).from_select([Users.email, Users.bio], source)
+    assert q.to_sql() == (
+        'INSERT INTO "users" ("email", "bio") '
+        'SELECT "users"."email", "users"."bio" FROM "users" WHERE "users"."role" = $1',
+        ("admin",),
+    )
+
+
+def test_insert_from_select_validation(qb: QueryBuilder) -> None:
+    one = qb.select(Users.email).from_(Users)
+    with pytest.raises(QueryError, match="outputs 1"):
+        qb.insert(Users).from_select([Users.email, Users.bio], one)
+    with pytest.raises(QueryError, match="not a column of Users"):
+        qb.insert(Users).from_select(Posts.title, qb.select(Posts.title).from_(Posts))
+    with pytest.raises(QueryError, match="at least one target column"):
+        qb.insert(Users).from_select([], one)
+    with pytest.raises(QueryError, match="already has values"):
+        qb.insert(Users).values(email="a").from_select(Users.email, one)
+    with pytest.raises(QueryError, match="already has from_select"):
+        qb.insert(Users).from_select(Users.email, one).values(email="a")
+
+
 async def test_insert_returning(qb: QueryBuilder, runner: FakeRunner) -> None:
     q = qb.insert(Users).values(email="a").returning()
     assert q.to_sql()[0] == f'INSERT INTO "users" ("email") VALUES ($1) RETURNING {USER_COLS}'
@@ -181,6 +232,27 @@ def test_update_validation(qb: QueryBuilder) -> None:
         qb.update(Users).set(nope=1)
     with pytest.raises(QueryError, match="NOT NULL"):
         qb.update(Users).set(email=None)
+
+
+def test_update_from(qb: QueryBuilder) -> None:
+    q = qb.update(Posts).set(title=Users.bio).from_(Users).where(eq(Posts.author_id, Users.id))
+    assert q.to_sql() == (
+        'UPDATE "posts" SET "title" = "users"."bio" FROM "users" '
+        'WHERE "posts"."author_id" = "users"."id"',
+        (),
+    )
+    with pytest.raises(QueryError, match="at least one table"):
+        qb.update(Posts).set(title="x").from_()
+
+
+def test_delete_using(qb: QueryBuilder) -> None:
+    q = qb.delete(Posts).using(Users).where(eq(Posts.author_id, Users.id))
+    assert q.to_sql() == (
+        'DELETE FROM "posts" USING "users" WHERE "posts"."author_id" = "users"."id"',
+        (),
+    )
+    with pytest.raises(QueryError, match="at least one table"):
+        qb.delete(Posts).using()
 
 
 def test_delete(qb: QueryBuilder) -> None:

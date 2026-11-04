@@ -40,9 +40,12 @@ class PostgresCompiler(Compiler):
 
     @override
     def on_conflict_clause(self, table: type[Table], conflict: OnConflict, /) -> str:
-        target = ""
-        if conflict.target:
+        if conflict.constraint is not None:
+            target = f"ON CONSTRAINT {self.quote(conflict.constraint)} "
+        elif conflict.target:
             target = "(" + ", ".join(self.column_name(c) for c in conflict.target) + ") "
+        else:
+            target = ""
         if conflict.action == "nothing":
             return f"ON CONFLICT {target}DO NOTHING"
         text = f"ON CONFLICT {target}DO UPDATE SET {self.set_list(table, conflict.set_)}"

@@ -491,7 +491,15 @@ class Compiler:
         if node.ctes:
             ctes = ", ".join(f"{self.quote(c.name)} AS ({self.visit(c.query)})" for c in node.ctes)
             parts.append(f"WITH {ctes}")
-        parts.append("SELECT DISTINCT" if node.distinct_ else "SELECT")
+        if node.distinct_ and node.distinct_on_:
+            raise QueryError("distinct() and distinct_on() cannot be combined")
+        if node.distinct_on_:
+            columns = ", ".join(self.visit(e) for e in node.distinct_on_)
+            parts.append(f"SELECT DISTINCT ON ({columns})")
+        elif node.distinct_:
+            parts.append("SELECT DISTINCT")
+        else:
+            parts.append("SELECT")
         if isinstance(node.projection, dict):
             items = [f"{self.visit(e)} AS {self.quote(k)}" for k, e in node.projection.items()]
         else:
@@ -517,7 +525,7 @@ class Compiler:
         if node.offset_ is not None:
             parts.append(f"OFFSET {self.count_value(node.offset_)}")
         if node.lock is not None:
-            lock = "FOR UPDATE"
+            lock = f"FOR {node.lock.strength}"
             if node.lock.of:
                 lock += " OF " + ", ".join(self.quote(t.__table__.name) for t in node.lock.of)
             if node.lock.skip_locked:
@@ -555,6 +563,8 @@ class Compiler:
         return ", ".join(items)
 
     def visit_Insert(self, node: Insert[Table]) -> str:
+        if node.source is not None:
+            return self._insert_select_text(node, node.source)
         if not node.rows:
             raise QueryError(f"insert into {node.table.__name__} has no values()")
         if node.identity is not None and node.overriding is None:
@@ -589,6 +599,21 @@ class Compiler:
                     self._placeholders.append(None)
                 return text
         return self._insert_text(node)
+
+    def _insert_select_text(self, node: Insert[Table], source: SelectBase | CompoundBase) -> str:
+        if node.identity is not None and node.overriding is None:
+            raise QueryError(
+                f"{node.identity.qualified_name} is GENERATED ALWAYS AS IDENTITY; the "
+                "database assigns it. Use .overriding_system_value() to insert explicit values"
+            )
+        names = ", ".join(self.column_name(c) for c in node.source_columns)
+        overriding = f" OVERRIDING {node.overriding} VALUE" if node.overriding else ""
+        text = (
+            f"INSERT INTO {self.table_name(node.table)} ({names}){overriding} {self.visit(source)}"
+        )
+        if node.conflict is not None:
+            text += " " + self.on_conflict_clause(node.table, node.conflict)
+        return text
 
     def _insert_text(self, node: Insert[Table]) -> str:
         columns = node.table.__table__.columns
@@ -636,6 +661,8 @@ class Compiler:
             raise QueryError(f"update({node.table.__name__}) needs .set(...)")
         self._require_filter(node, "update")
         text = f"UPDATE {self.table_name(node.table)} SET {self.set_list(node.table, node.values_)}"
+        if node.from_sources:
+            text += " FROM " + ", ".join(self.source(t) for t in node.from_sources)
         if node.where_ is not None:
             text += f" WHERE {self.visit(node.where_)}"
         return text
@@ -643,6 +670,8 @@ class Compiler:
     def visit_Delete(self, node: Delete[Table]) -> str:
         self._require_filter(node, "delete")
         text = f"DELETE FROM {self.table_name(node.table)}"
+        if node.using_:
+            text += " USING " + ", ".join(self.source(t) for t in node.using_)
         if node.where_ is not None:
             text += f" WHERE {self.visit(node.where_)}"
         return text

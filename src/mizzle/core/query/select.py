@@ -42,6 +42,8 @@ type Source = type[Table] | Cte
 type Slot = ExprBase | type[Table]
 # None: whole rows of the source table. Tuple: one result slot per item. Dict: named fields.
 type Projection = tuple[Slot, ...] | dict[str, ExprBase] | None
+# FOR UPDATE / FOR NO KEY UPDATE / FOR SHARE / FOR KEY SHARE.
+type LockStrength = Literal["UPDATE", "NO KEY UPDATE", "SHARE", "KEY SHARE"]
 
 
 @dataclass(frozen=True)
@@ -56,6 +58,7 @@ class Lock:
     of: tuple[type[Table], ...] = ()
     skip_locked: bool = False
     nowait: bool = False
+    strength: LockStrength = "UPDATE"
 
 
 @dataclass(frozen=True, eq=False)
@@ -118,6 +121,7 @@ class SelectBase(Node):
     limit_: int | Placeholder | None = None
     offset_: int | Placeholder | None = None
     distinct_: bool = False
+    distinct_on_: tuple[ExprBase, ...] = ()
     lock: Lock | None = None
     windows_: tuple[tuple[str, Window], ...] = ()
 
@@ -174,12 +178,47 @@ class SelectBase(Node):
     def distinct(self) -> Self:
         return evolve(self, distinct_=True)
 
+    def distinct_on(self, *exprs: ExprBase) -> Self:
+        """``DISTINCT ON (exprs)``: keep one row per distinct combination of ``exprs``.
+        PostgreSQL wants ``order_by`` to start with the same expressions."""
+        if not exprs:
+            raise QueryError("distinct_on() needs at least one expression")
+        return evolve(self, distinct_on_=exprs)
+
     def for_update(
         self, *, of: Sequence[type[Table]] = (), skip_locked: bool = False, nowait: bool = False
     ) -> Self:
+        return self._lock("UPDATE", of, skip_locked=skip_locked, nowait=nowait)
+
+    def for_no_key_update(
+        self, *, of: Sequence[type[Table]] = (), skip_locked: bool = False, nowait: bool = False
+    ) -> Self:
+        """``FOR NO KEY UPDATE``: like ``FOR UPDATE``, but does not block foreign-key checks."""
+        return self._lock("NO KEY UPDATE", of, skip_locked=skip_locked, nowait=nowait)
+
+    def for_share(
+        self, *, of: Sequence[type[Table]] = (), skip_locked: bool = False, nowait: bool = False
+    ) -> Self:
+        """``FOR SHARE``: a shared lock; several readers can hold it at once."""
+        return self._lock("SHARE", of, skip_locked=skip_locked, nowait=nowait)
+
+    def for_key_share(
+        self, *, of: Sequence[type[Table]] = (), skip_locked: bool = False, nowait: bool = False
+    ) -> Self:
+        """``FOR KEY SHARE``: the weakest row lock; blocks only key-changing updates."""
+        return self._lock("KEY SHARE", of, skip_locked=skip_locked, nowait=nowait)
+
+    def _lock(
+        self,
+        strength: LockStrength,
+        of: Sequence[type[Table]],
+        *,
+        skip_locked: bool,
+        nowait: bool,
+    ) -> Self:
         if skip_locked and nowait:
-            raise QueryError("for_update() takes skip_locked or nowait, not both")
-        return evolve(self, lock=Lock(tuple(of), skip_locked, nowait))
+            raise QueryError("a row lock takes skip_locked or nowait, not both")
+        return evolve(self, lock=Lock(tuple(of), skip_locked, nowait, strength))
 
     def cte(self, name: str) -> Cte:
         """Use this query as a named CTE: ``db.with_(cte).select(...).from_(cte)``."""
@@ -390,6 +429,38 @@ class Select[R](SelectBase, Executable[list[R]], SetOps[R]):
         rows = await self.runner.fetch(compiled, read_only=True)
         decode = self.decoder()
         return cast(list[R], [decode(row) for row in rows])
+
+    async def first(self) -> R | None:
+        """The first row, or ``None`` when the query returns none. Adds ``LIMIT 1`` when the
+        query has no limit of its own."""
+        rows = await (self if self.limit_ is not None else self.limit(1))
+        return rows[0] if rows else None
+
+    async def one(self) -> R:
+        """Exactly one row. Raises ``QueryError`` when there are none or more than one."""
+        rows = await self.limit(2)
+        if not rows:
+            raise QueryError("one() found no rows; use first() for an optional row")
+        if len(rows) > 1:
+            raise QueryError("one() found more than one row")
+        return rows[0]
+
+    async def scalar(self) -> object:
+        """The single selected value of the first row, or ``None``. The query must select
+        exactly one column."""
+        projection = self.projection
+        if isinstance(projection, tuple | dict):
+            width = len(projection)
+        else:
+            raise QueryError("scalar() needs an explicit select(expr)")
+        if width != 1:
+            raise QueryError(f"scalar() needs exactly one selected column; got {width}")
+        row = await self.first()
+        if row is None:
+            return None
+        if isinstance(row, dict):
+            return next(iter(cast(dict[str, object], row).values()))
+        return cast(tuple[object, ...], row)[0]
 
     async def stream(self, batch_size: int = 1000) -> AsyncGenerator[R]:
         """Rows one by one, read ``batch_size`` at a time from a server-side cursor, so
