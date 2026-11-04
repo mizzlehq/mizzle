@@ -190,12 +190,37 @@ Studio binds `127.0.0.1` and requires a bearer token (printed in the URL it open
 someone at the machine can reach it. To use it remotely, bind another host and set credentials:
 
 ```bash
-mizzle studio --host 0.0.0.0 --auth admin:$(cat /run/secrets/studio-password)
+# The password comes from the environment, not argv: `ps` shows command lines.
+export MIZZLE_STUDIO_AUTH="admin:$(cat /run/secrets/studio-password)"
+mizzle studio --host 0.0.0.0
 ```
 
-Binding a non-loopback host without `--auth` (or `--token` / `MIZZLE_STUDIO_TOKEN`) is
-refused. Basic auth is over HTTP, so put it behind TLS (a reverse proxy) when the network is
-not trusted.
+Binding a non-loopback host without `--auth` / `MIZZLE_STUDIO_AUTH` (or
+`--token` / `MIZZLE_STUDIO_TOKEN`) is refused. A token used for a remote bind must be at
+least 32 characters; omit `--token` to have one generated. Basic auth is over HTTP, so put
+it behind TLS (a reverse proxy) when the network is not trusted.
+
+Behind that proxy, set `MIZZLE_STUDIO_ORIGIN` to the public origin (comma-separated for
+several) so Studio's cross-site request check accepts the browser's `Origin`:
+
+```bash
+export MIZZLE_STUDIO_ORIGIN="https://studio.example.com"
+```
+
+Without it, a request that carries an `Origin` header is refused, which fails closed.
+
+Studio refuses cross-site requests: a state-changing call must be `Content-Type:
+application/json` and must not come from another site (`Sec-Fetch-Site` / `Origin`). This
+matters because a browser attaches cached Basic credentials to a form post from any page.
+
+Read-only mode blocks writes and also refuses statements that could leave the read-only
+transaction or act on the server: `BEGIN`/`COMMIT`/`ROLLBACK`/`SAVEPOINT`, `SET`/`RESET`,
+`COPY`, `DO`, `NOTIFY`, `pg_read_file`, `pg_terminate_backend` and similar. That blocklist
+cannot cover everything a superuser can do, so a read-only Studio started on a superuser
+connection prints a warning: use a non-superuser role.
+
+CSV export prefixes a cell starting with `=`, `+`, `-` or `@` with an apostrophe, so a
+spreadsheet treats it as text rather than a formula. JSON export is unaltered.
 
 In the browser, a table's **Structure** tab can create and alter tables and columns: add a
 table, add or drop a column, change a column's type, nullability or default, and drop a
