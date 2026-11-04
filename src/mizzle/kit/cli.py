@@ -45,6 +45,8 @@ class Args(Protocol):
     sql: bool
     json: bool
     check: bool
+    fix: bool
+    template: str | None
     out: str | None
     port: int
     read_only: bool
@@ -149,8 +151,11 @@ def cmd_generate(config: Config, args: Args) -> int:
     current = build_snapshot(
         tables, dialect, config.casing, prev_id=prev_id, objects=config.load_objects()
     )
+    if args.template and not args.custom:
+        raise MigrationError("--template only applies to --custom migrations")
     if args.custom:
-        migration = directory.write(args.name or "custom", [], current, CUSTOM_HEADER)
+        header = Path(args.template).read_text(encoding="utf-8") if args.template else CUSTOM_HEADER
+        migration = directory.write(args.name or "custom", [], current, header, custom=True)
         print(f"Created {migration.sql_path}")
         return 0
     steps = diff(previous, current, _resolver(args, dialect))
@@ -219,6 +224,41 @@ def _migrate_dry_run(config: Config, _args: Args, directory: MigrationsDir) -> i
         print(f"-- {migration.name}")
         print(migration.sql().rstrip())
     print(f"\n{len(pending)} pending migration(s); nothing was applied (--dry-run).")
+    return 0
+
+
+def cmd_reset(config: Config, args: Args) -> int:
+    """Drop the managed schemas and re-run every migration from scratch."""
+    directory = MigrationsDir(config.out, config.dialect_name)
+    if not directory.migrations():
+        print("No migrations to run.")
+        return 0
+    if not args.force:
+        if not _interactive():
+            raise MigrationError("reset drops the schema; pass --force to confirm")
+        if not _confirm(f"Drop and recreate {config.schema_filter}, then re-run every migration?"):
+            return 1
+
+    async def wipe(driver: Driver, _dialect: Dialect) -> None:
+        async with driver.acquire() as conn:
+            for schema in config.schema_filter:
+                name = '"' + schema.replace('"', '""') + '"'
+                await conn.execute(f"DROP SCHEMA IF EXISTS {name} CASCADE", [])
+                await conn.execute(f"CREATE SCHEMA {name}", [])
+
+    async def run(driver: Driver, dialect: Dialect) -> list[str]:
+        return await run_migrations(
+            driver,
+            dialect,
+            directory,
+            schema=config.migrations_schema,
+            lock_timeout=args.lock_timeout,
+            on_apply=lambda m: print(f"Applying {m.name}"),
+        )
+
+    asyncio.run(_with_driver(config, wipe))
+    applied = asyncio.run(_with_driver(config, run))
+    print(f"Reset: applied {len(applied)} migration(s).")
     return 0
 
 
@@ -308,8 +348,14 @@ CUSTOM_HEADER = "-- Custom migration. Separate statements with: -- mizzle:breakp
 _CUSTOM_HASH = hashlib.sha256(format_sql([], CUSTOM_HEADER).encode()).hexdigest()
 
 
-def cmd_check(config: Config, _args: Args) -> int:
+def cmd_check(config: Config, args: Args) -> int:
     directory = MigrationsDir(config.out, config.dialect_name)
+    if args.fix:
+        fixes = directory.repair()
+        for fix in fixes:
+            print(f"fixed: {fix}")
+        if not fixes:
+            print("Nothing to fix.")
     problems: list[str] = []
     warnings: list[str] = []
     journal = directory.journal()
@@ -319,7 +365,11 @@ def cmd_check(config: Config, _args: Args) -> int:
         if not migration.sql_path.exists() or not migration.snapshot_path.exists():
             problems.append(f"{migration.name}: migration.sql or snapshot.json is missing")
             continue
-        if migration.hash() != entry["hash"] and entry["hash"] != _CUSTOM_HASH:
+        if (
+            migration.hash() != entry["hash"]
+            and entry["hash"] != _CUSTOM_HASH
+            and not migration.custom
+        ):
             # A --custom migration is meant to be written after generate.
             warnings.append(f"{migration.name}: migration.sql was edited after generate")
         snapshot = migration.snapshot()
@@ -568,6 +618,7 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--sql", action="store_true", help="print the SQL instead of writing a migration"
     )
+    p.add_argument("--template", help="file whose contents seed a --custom migration")
     renames(p)
     p.set_defaults(func=cmd_generate)
 
@@ -575,6 +626,11 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--lock-timeout", type=float, default=60.0)
     p.add_argument("--dry-run", action="store_true", help="print the SQL, apply nothing")
     p.set_defaults(func=cmd_migrate)
+
+    p = sub.add_parser("reset", help="drop the schema and re-run every migration")
+    p.add_argument("--force", action="store_true", help="do not ask before dropping")
+    p.add_argument("--lock-timeout", type=float, default=60.0)
+    p.set_defaults(func=cmd_reset)
 
     p = sub.add_parser("push", help="sync the schema to the database directly (development)")
     p.add_argument("--force", action="store_true", help="do not ask before applying")
@@ -599,6 +655,7 @@ def _parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_pull)
 
     p = sub.add_parser("check", help="validate the migrations folder")
+    p.add_argument("--fix", action="store_true", help="repair journal and prev_id inconsistencies")
     p.set_defaults(func=cmd_check)
 
     p = sub.add_parser("status", help="show which migrations are applied and which are pending")

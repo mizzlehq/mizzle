@@ -202,6 +202,54 @@ async def test_check_detects_fork(project: Path, monkeypatch: pytest.MonkeyPatch
     assert await cli("check") == 1
 
 
+async def test_check_fix_repairs_journal(project: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    assert await cli("generate") == 0
+    sql = next(project.glob("migrations/0001_*/migration.sql"))
+    sql.write_text(sql.read_text() + "-- edited\n")
+    snapshot = next(project.glob("migrations/0001_*/snapshot.json"))
+    data = json.loads(snapshot.read_text())
+    data["prev_id"] = "bogus"
+    snapshot.write_text(json.dumps(data, indent=2) + "\n")
+    capsys.readouterr()
+    assert await cli("check") == 1  # a broken prev_id is a problem
+    assert await cli("check", "--fix") == 0
+    out = capsys.readouterr().out
+    assert "hash refreshed" in out and "prev_id re-linked" in out
+    assert await cli("check") == 0
+
+
+async def test_custom_migration_template(project: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    template = project / "seed.sql"
+    template.write_text("-- seed data\nSELECT 1;\n")
+    assert await cli("generate", "--custom", "--name", "seed", "--template", str(template)) == 0
+    custom = next(project.glob("migrations/0001_seed/migration.sql"))
+    assert custom.read_text().startswith("-- seed data\nSELECT 1;\n")
+    custom.write_text(custom.read_text() + "SELECT 2;\n")  # editing it is expected
+    capsys.readouterr()
+    assert await cli("check") == 0
+    assert "edited" not in capsys.readouterr().out
+    assert await cli("generate", "--template", str(template)) == 1  # needs --custom
+
+
+async def test_reset_reruns_every_migration(
+    project: Path, kit_url: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert await cli("generate") == 0
+    assert await cli("migrate") == 0
+    conn = await asyncpg.connect(kit_url)
+    await conn.execute("INSERT INTO users (email, name) VALUES ('a@b.c', 'a')")
+    assert await conn.fetchval("SELECT count(*) FROM users") == 1
+    await conn.close()
+    capsys.readouterr()
+
+    assert await cli("reset") == 1  # non-interactive: needs --force
+    assert await cli("reset", "--force") == 0
+    assert "Reset: applied 1 migration(s)." in capsys.readouterr().out
+    conn = await asyncpg.connect(kit_url)
+    assert await conn.fetchval("SELECT count(*) FROM users") == 0  # dropped and recreated
+    await conn.close()
+
+
 async def test_status(project: Path, kit_url: str, capsys: pytest.CaptureFixture[str]) -> None:
     assert await cli("status") == 0
     assert "No migrations." in capsys.readouterr().out

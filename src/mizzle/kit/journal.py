@@ -15,7 +15,7 @@ import re
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TypedDict, cast
+from typing import NotRequired, TypedDict, cast
 
 from mizzle.core.errors import MigrationError
 from mizzle.core.snapshot import Snapshot, empty_snapshot
@@ -24,6 +24,7 @@ from mizzle.core.steps import Statement
 BREAKPOINT = "-- mizzle:breakpoint"
 NO_TRANSACTION = "-- mizzle:no-transaction"
 JOURNAL_VERSION = 1
+_INDEX = re.compile(r"^(\d+)_")
 
 
 class JournalEntry(TypedDict):
@@ -31,6 +32,8 @@ class JournalEntry(TypedDict):
     name: str
     hash: str
     created_at: str
+    # A hand-written (or templated) migration: its SQL is expected to change after generate.
+    custom: NotRequired[bool]
 
 
 class Journal(TypedDict):
@@ -67,6 +70,7 @@ class Migration:
     index: int
     name: str  # folder name, e.g. "0001_create_users"; also the id stored in the database
     path: Path
+    custom: bool = False  # a hand-written migration may be edited after generate
 
     @property
     def sql_path(self) -> Path:
@@ -100,7 +104,10 @@ def _parse_entry(raw: object, source: Path) -> JournalEntry:
             and isinstance(hash_, str)
             and isinstance(created_at, str)
         ):
-            return JournalEntry(index=index, name=name, hash=hash_, created_at=created_at)
+            parsed = JournalEntry(index=index, name=name, hash=hash_, created_at=created_at)
+            if entry.get("custom") is True:
+                parsed["custom"] = True
+            return parsed
     raise MigrationError(f"{source}: malformed journal entry {raw!r}")
 
 
@@ -143,7 +150,7 @@ class MigrationsDir:
 
     def migrations(self) -> list[Migration]:
         return [
-            Migration(e["index"], e["name"], self.root / e["name"])
+            Migration(e["index"], e["name"], self.root / e["name"], bool(e.get("custom")))
             for e in self.journal()["entries"]
         ]
 
@@ -152,23 +159,29 @@ class MigrationsDir:
         return migrations[-1].snapshot() if migrations else empty_snapshot(self.dialect)
 
     def write(
-        self, name: str, statements: list[Statement], snapshot: Snapshot, header: str = ""
+        self,
+        name: str,
+        statements: list[Statement],
+        snapshot: Snapshot,
+        header: str = "",
+        custom: bool = False,
     ) -> Migration:
         journal = self.journal()
         index = journal["entries"][-1]["index"] + 1 if journal["entries"] else 1
         folder = f"{index:04d}_{slugify(name)}"
-        migration = Migration(index, folder, self.root / folder)
+        migration = Migration(index, folder, self.root / folder, custom)
         migration.path.mkdir(parents=True, exist_ok=False)
         migration.sql_path.write_text(format_sql(statements, header), encoding="utf-8")
         migration.snapshot_path.write_text(json.dumps(snapshot, indent=2) + "\n", encoding="utf-8")
-        journal["entries"].append(
-            JournalEntry(
-                index=index,
-                name=folder,
-                hash=migration.hash(),
-                created_at=datetime.datetime.now(datetime.UTC).isoformat(timespec="seconds"),
-            )
+        entry = JournalEntry(
+            index=index,
+            name=folder,
+            hash=migration.hash(),
+            created_at=datetime.datetime.now(datetime.UTC).isoformat(timespec="seconds"),
         )
+        if custom:
+            entry["custom"] = True
+        journal["entries"].append(entry)
         self._save_journal(journal)
         return migration
 
@@ -177,7 +190,63 @@ class MigrationsDir:
         if not journal["entries"]:
             raise MigrationError("there are no migrations to drop")
         entry = journal["entries"].pop()
-        migration = Migration(entry["index"], entry["name"], self.root / entry["name"])
+        migration = Migration(
+            entry["index"], entry["name"], self.root / entry["name"], bool(entry.get("custom"))
+        )
         shutil.rmtree(migration.path, ignore_errors=True)
         self._save_journal(journal)
         return migration
+
+    def repair(self) -> list[str]:
+        """Reconcile the journal with the folders on disk: add folders it is missing, drop
+        entries whose folder is gone, refresh hashes and re-link the ``prev_id`` chain.
+        Returns the fixes applied (empty when nothing changed)."""
+        if not self.root.exists():
+            return []
+        journal = self.journal()
+        known = {e["index"]: e for e in journal["entries"]}
+        on_disk: dict[int, str] = {}
+        for folder in sorted(p for p in self.root.iterdir() if p.is_dir() and p.name != "meta"):
+            match = _INDEX.match(folder.name)
+            if match is not None:
+                on_disk[int(match.group(1))] = folder.name
+        fixes: list[str] = []
+        entries: list[JournalEntry] = []
+        prev_id: str | None = None
+        for index in sorted(on_disk):
+            name = on_disk[index]
+            migration = Migration(index, name, self.root / name)
+            if not migration.sql_path.exists() or not migration.snapshot_path.exists():
+                continue  # `check` reports the missing file as an error
+            old = known.get(index)
+            digest = migration.hash()
+            if old is None:
+                created = datetime.datetime.fromtimestamp(
+                    migration.path.stat().st_mtime, datetime.UTC
+                ).isoformat(timespec="seconds")
+                fixes.append(f"{name}: added to the journal")
+            else:
+                created = old["created_at"]
+                if old["name"] != name:
+                    fixes.append(f"{name}: journal name updated")
+                if old["hash"] != digest:
+                    fixes.append(f"{name}: hash refreshed")
+            entry = JournalEntry(index=index, name=name, hash=digest, created_at=created)
+            if old is not None and old.get("custom"):
+                entry["custom"] = True
+            entries.append(entry)
+            snapshot = migration.snapshot()
+            if snapshot["prev_id"] != prev_id:
+                snapshot["prev_id"] = prev_id
+                migration.snapshot_path.write_text(
+                    json.dumps(snapshot, indent=2) + "\n", encoding="utf-8"
+                )
+                fixes.append(f"{name}: prev_id re-linked")
+            prev_id = snapshot["id"]
+        for index, old in known.items():
+            if index not in on_disk:
+                fixes.append(f"{old['name']}: removed from the journal (folder is gone)")
+        journal["entries"] = entries
+        if fixes:
+            self._save_journal(journal)
+        return fixes
