@@ -1,6 +1,10 @@
 """MERGE (QB14) against a live database."""
 
+import pytest
+
 from mizzle import Database, eq, is_not_null, lt
+from mizzle.core.errors import QueryError
+from mizzle.dialects.postgres.driver import PostgresDriver
 from tests.models import Posts, Role, Users
 
 
@@ -20,7 +24,24 @@ async def seed(db: Database) -> None:
     )
 
 
-async def test_merge_upsert(db: Database) -> None:
+async def _version(driver: PostgresDriver) -> int:
+    async with driver.acquire() as conn:
+        [row] = await conn.fetch("SHOW server_version_num", [])
+        return int(str(row[0]))
+
+
+async def _needs_17(driver: PostgresDriver) -> None:
+    if await _version(driver) < 170000:
+        pytest.skip("MERGE ... RETURNING / NOT MATCHED BY SOURCE need PostgreSQL 17")
+
+
+async def _needs_15(driver: PostgresDriver) -> None:
+    if await _version(driver) < 150000:
+        pytest.skip("MERGE needs PostgreSQL 15")
+
+
+async def test_merge_upsert(db: Database, driver: PostgresDriver) -> None:
+    await _needs_15(driver)
     await seed(db)
     source = db.select(Users.id, Users.email).from_(Users).subquery("src")
     sid, email = source.c("id", int), source.c("email", str)
@@ -36,7 +57,8 @@ async def test_merge_upsert(db: Database) -> None:
     assert rows == [(1, "ann@x"), (2, "bob@y"), (3, "cid@x")]
 
 
-async def test_merge_delete_matched(db: Database) -> None:
+async def test_merge_delete_matched(db: Database, driver: PostgresDriver) -> None:
+    await _needs_15(driver)
     await seed(db)
     affected = await (
         db.merge(Posts)
@@ -48,7 +70,8 @@ async def test_merge_delete_matched(db: Database) -> None:
     assert await db.select(Posts.id).from_(Posts) == []
 
 
-async def test_merge_not_matched_by_source(db: Database) -> None:
+async def test_merge_not_matched_by_source(db: Database, driver: PostgresDriver) -> None:
+    await _needs_17(driver)
     await seed(db)
     source = db.select(Users.id).from_(Users).where(lt(Users.id, 3)).subquery("src")
     affected = await (
@@ -61,7 +84,8 @@ async def test_merge_not_matched_by_source(db: Database) -> None:
     assert await db.select(Posts.author_id).from_(Posts) == [(1,)]
 
 
-async def test_merge_returning(db: Database) -> None:
+async def test_merge_returning(db: Database, driver: PostgresDriver) -> None:
+    await _needs_17(driver)
     await seed(db)
     source = db.select(Users.id).from_(Users).where(eq(Users.id, 2)).subquery("src")
     sid = source.c("id", int)
@@ -73,3 +97,23 @@ async def test_merge_returning(db: Database) -> None:
         .returning(Posts.author_id, Posts.title)
     )
     assert rows == [(2, "new")]
+
+
+async def test_merge_17_syntax_on_an_older_server_names_the_version(
+    db: Database, driver: PostgresDriver
+) -> None:
+    # Q3: where the syntax is unavailable the error says which version is needed, rather
+    # than a bare "syntax error at or near ...".
+    if await _version(driver) >= 170000:
+        pytest.skip("this server supports MERGE ... RETURNING")
+    await seed(db)
+    source = db.select(Users.id).from_(Users).subquery("src")
+    query = (
+        db.merge(Posts)
+        .using(source)
+        .on(eq(Posts.author_id, source.c("id", int)))
+        .when_matched_then_update({"title": "x"})
+        .returning(Posts.id)
+    )
+    with pytest.raises(QueryError, match=r"needs PostgreSQL 17"):
+        await query

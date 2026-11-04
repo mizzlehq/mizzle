@@ -638,6 +638,13 @@ def nulls(kind: str) -> type[Table]:
 
 
 async def test_nulls_not_distinct_round_trip(driver: PostgresDriver, tmp_path: Path) -> None:
+    # S6: NULLS NOT DISTINCT is PostgreSQL 15+. On 14 the guard names the version instead
+    # of a raw syntax error.
+    if await server_version(driver) < 150000:
+        query = snap([nulls("column")])
+        with pytest.raises(DatabaseError, match=r"NULLS NOT DISTINCT needs PostgreSQL 15"):
+            await migrate(driver, empty_snapshot("postgresql"), query)
+        return
     column_unique = snap([nulls("column")])
     await migrate(driver, empty_snapshot("postgresql"), column_unique)
     assert (await live(driver))["tables"]["mg.nulls"]["uniques"]["nulls_a_key"].get(
