@@ -292,13 +292,24 @@ def test_rollup_cube_grouping_sets(qb: QueryBuilder) -> None:
 def test_tablesample(qb: QueryBuilder) -> None:
     q = qb.select(Users.id).from_(Users).tablesample("SYSTEM", 10, seed=42)
     assert q.to_sql() == (
-        'SELECT "users"."id" FROM "users" TABLESAMPLE SYSTEM (10) REPEATABLE (42)',
-        (),
+        'SELECT "users"."id" FROM "users" TABLESAMPLE SYSTEM ($1) REPEATABLE ($2)',
+        (10, 42),
+    )
+    # Q8: the seed and percent keep full precision (bound, not formatted with :g).
+    precise = qb.select(Users.id).from_(Users).tablesample("SYSTEM", 12.3456789, seed=123456789)
+    assert precise.to_sql() == (
+        'SELECT "users"."id" FROM "users" TABLESAMPLE SYSTEM ($1) REPEATABLE ($2)',
+        (12.3456789, 123456789),
     )
     plain = qb.select(Users.id).from_(Users).tablesample("BERNOULLI", 2.5)
-    assert plain.to_sql()[0].endswith("TABLESAMPLE BERNOULLI (2.5)")
+    assert plain.to_sql() == (
+        'SELECT "users"."id" FROM "users" TABLESAMPLE BERNOULLI ($1)',
+        (2.5,),
+    )
     with pytest.raises(QueryError, match="between 0 and 100"):
         qb.select().from_(Users).tablesample("SYSTEM", 101)
+    with pytest.raises(QueryError, match="finite"):
+        qb.select().from_(Users).tablesample("SYSTEM", 10, seed=float("nan"))
     with pytest.raises(QueryError, match="SYSTEM or BERNOULLI"):
         bad = cast("Literal['SYSTEM', 'BERNOULLI']", cast(object, "NOPE"))
         qb.select().from_(Users).tablesample(bad, 10)
@@ -332,4 +343,16 @@ def test_data_modifying_cte(qb: QueryBuilder) -> None:
         '"posts"."id", "posts"."author_id", "posts"."title", "posts"."meta") '
         'SELECT count(*) FROM "moved"',
         ("x",),
+    )
+
+
+def test_dict_returning_inside_a_cte_is_aliased(qb: QueryBuilder) -> None:
+    # Q7: a named RETURNING projection must alias its outputs or the CTE column does
+    # not exist (``m.c("c", ...)`` -> column m.c does not exist).
+    m = qb.delete(Posts).where(eq(Posts.id, 1)).returning({"c": Posts.id}).cte("m")
+    q = qb.with_(m).select(m.c("c", int)).from_(m)
+    assert q.to_sql() == (
+        'WITH "m" AS (DELETE FROM "posts" WHERE "posts"."id" = $1 '
+        'RETURNING "posts"."id" AS "c") SELECT "m"."c" FROM "m"',
+        (1,),
     )

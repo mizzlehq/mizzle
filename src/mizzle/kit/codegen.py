@@ -531,7 +531,12 @@ class _SchemaWriter:
                 args.append(f"default={default!r}")
             if domain.get("not_null"):
                 args.append("not_null=True")
-            args += [f"check={check!r}" for check in domain.get("checks", [])]
+            checks = domain.get("checks", [])
+            if len(checks) == 1:
+                args.append(f"check={checks[0]!r}")
+            elif checks:
+                # S7: a second keyword argument is a SyntaxError; use checks=[...].
+                args.append(f"checks={list(checks)!r}")
             if collation := domain.get("collation"):
                 args.append(f"collation={collation!r}")
             domains_code.append(f"d_{_identifier(name)} = domain({', '.join(args)})")

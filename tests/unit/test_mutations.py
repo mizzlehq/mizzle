@@ -210,7 +210,8 @@ def test_returning_expressions_sql(qb: QueryBuilder) -> None:
         .returning({"id": Users.id, "n": count()})
     )
     assert mapped.to_sql() == (
-        'UPDATE "users" SET "bio" = $1 WHERE "users"."id" = $2 RETURNING "users"."id", count(*)',
+        'UPDATE "users" SET "bio" = $1 WHERE "users"."id" = $2 '
+        'RETURNING "users"."id" AS "id", count(*) AS "n"',
         ("x", 1),
     )
 
@@ -290,6 +291,26 @@ def test_update_from(qb: QueryBuilder) -> None:
     )
     with pytest.raises(QueryError, match="at least one table"):
         qb.update(Posts).set(title="x").from_()
+
+
+def test_update_from_and_delete_using_accept_a_cte(qb: QueryBuilder) -> None:
+    # Q14: a CTE/subquery is a valid source for UPDATE ... FROM and DELETE ... USING,
+    # not only a table.
+    sub = qb.select({"uid": Users.id}).from_(Users).subquery("u")
+    uid = sub.c("uid", int)
+    upd = qb.update(Posts).set(title="x").from_(sub).where(eq(Posts.author_id, uid))
+    assert upd.to_sql() == (
+        'UPDATE "posts" SET "title" = $1 '
+        'FROM (SELECT "users"."id" AS "uid" FROM "users") AS "u" '
+        'WHERE "posts"."author_id" = "u"."uid"',
+        ("x",),
+    )
+    dele = qb.delete(Posts).using(sub).where(eq(Posts.author_id, uid))
+    assert dele.to_sql() == (
+        'DELETE FROM "posts" USING (SELECT "users"."id" AS "uid" FROM "users") AS "u" '
+        'WHERE "posts"."author_id" = "u"."uid"',
+        (),
+    )
 
 
 def test_delete_using(qb: QueryBuilder) -> None:

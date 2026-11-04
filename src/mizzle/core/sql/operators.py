@@ -5,14 +5,14 @@ Functions, not overloaded ``==``: overloading ``__eq__`` on columns breaks hashi
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable
 from dataclasses import replace
 from decimal import Decimal
 from typing import Literal, cast, overload
 
 from mizzle.core.errors import QueryError
 from mizzle.core.schema.column import ColumnBase
-from mizzle.core.sql.functions import bind, sql_type_of
+from mizzle.core.sql.functions import bind, column_of, path_keys, sql_type_of
 from mizzle.core.sql.nodes import (
     Aggregate,
     AnyAll,
@@ -290,53 +290,62 @@ def is_not_distinct_from[T](left: Expr[T], right: Operand[T] | None) -> Expr[boo
 # -- quantified comparison (EX1) ------------------------------------------------------
 
 
-def _quantified(values: object) -> Node:
-    if isinstance(values, Node):
-        return values
-    if not isinstance(values, Iterable):
-        return bind(values)
-    items: list[object] = list(values)
+def _quantified(quantifier: Literal["ANY", "ALL"], values: object) -> AnyAll[object]:
+    if isinstance(values, (str, bytes)):
+        raise QueryError("any_()/all_() take a sequence of values, not a string; wrap it in a list")
+    if isinstance(values, Node) or not isinstance(values, Iterable):
+        return AnyAll[object](quantifier, bind(values))
+    items = tuple(values)
     if not items:
         raise QueryError("any_()/all_() need at least one value")
-    kind = next((t for v in items if (t := sql_type_of(v)) is not None), "text")
-    return Cast(Param(items), kind + "[]")
+    # Keep the raw values: the compiler casts the array to the type of the value it is
+    # compared against (an enum array, not text[]).
+    return AnyAll[object](quantifier, values=items)
 
 
 @overload
 def any_[T](values: Expr[list[T]]) -> Expr[T]: ...
 @overload
-def any_[T](values: Sequence[T]) -> Expr[T]: ...
+def any_[T](values: list[T] | tuple[T, ...]) -> Expr[T]: ...
 @overload
 def any_[T](values: Node) -> Expr[T]: ...
 def any_[T](values: object) -> Expr[T]:
     """``= ANY (values)``: true when the compared value equals any of them. Use it with
     ``eq(col, any_([...]))``, or against an array column or a subquery."""
-    return AnyAll[T]("ANY", _quantified(values))
+    return cast("AnyAll[T]", _quantified("ANY", values))
 
 
 @overload
 def all_[T](values: Expr[list[T]]) -> Expr[T]: ...
 @overload
-def all_[T](values: Sequence[T]) -> Expr[T]: ...
+def all_[T](values: list[T] | tuple[T, ...]) -> Expr[T]: ...
 @overload
 def all_[T](values: Node) -> Expr[T]: ...
 def all_[T](values: object) -> Expr[T]:
     """``= ALL (values)``: true when the value equals every one of them."""
-    return AnyAll[T]("ALL", _quantified(values))
+    return cast("AnyAll[T]", _quantified("ALL", values))
 
 
 # -- container operators (EX3, EX4) ---------------------------------------------------
 
 
-def _container(value: object) -> Node:
+def _container(value: object, like: object = None) -> Node:
     if isinstance(value, Node):
         return value
+    column = column_of(like) if like is not None else None
+    on_json = column is not None and column.sql_type in ("jsonb", "json")
+    on_array = column is not None and column.item is not None
     if isinstance(value, dict):
         return Cast(Param(cast("dict[str, object]", value)), "jsonb")
     if isinstance(value, (list, tuple, set, frozenset)):
         items: list[object] = list(cast("Iterable[object]", value))
         if not items:
             raise QueryError("an empty container is never a useful operand")
+        if on_json:
+            return Cast(Param(items), "jsonb")
+        if on_array:
+            assert column is not None
+            return Cast(Param(items, column), column.sql_type)
         kind = next((t for v in items if (t := sql_type_of(v)) is not None), "text")
         return Cast(Param(items), kind + "[]")
     return bind(value)
@@ -344,17 +353,17 @@ def _container(value: object) -> Node:
 
 def contains(left: ExprBase, right: object) -> Expr[bool]:
     """``left @> right``: left contains right (arrays, ranges, jsonb)."""
-    return BinaryOp(left, "@>", _container(right))
+    return BinaryOp(left, "@>", _container(right, left))
 
 
 def contained_by(left: ExprBase, right: object) -> Expr[bool]:
     """``left <@ right``: left is contained by right."""
-    return BinaryOp(left, "<@", _container(right))
+    return BinaryOp(left, "<@", _container(right, left))
 
 
 def overlaps(left: ExprBase, right: object) -> Expr[bool]:
     """``left && right``: the two share any element (arrays, ranges)."""
-    return BinaryOp(left, "&&", _container(right))
+    return BinaryOp(left, "&&", _container(right, left))
 
 
 def _json_key(key: str | int) -> Node:
@@ -373,14 +382,16 @@ def get_field_text(value: ExprBase, key: str | int) -> Expr[str | None]:
     return PostfixOp[str | None](value, "->>", _json_key(key))
 
 
-def get_path[T](value: Expr[T], path: Sequence[str]) -> Expr[T]:
+def get_path[T](value: Expr[T], path: list[str] | tuple[str, ...]) -> Expr[T]:
     """``value #> path``: a jsonb value at a text-array path."""
-    return PostfixOp[T](value, "#>", Cast(Param(list(path)), "text[]"))
+    return PostfixOp[T](value, "#>", Cast(Param(path_keys(path, "get_path")), "text[]"))
 
 
-def get_path_text(value: ExprBase, path: Sequence[str]) -> Expr[str | None]:
+def get_path_text(value: ExprBase, path: list[str] | tuple[str, ...]) -> Expr[str | None]:
     """``value #>> path``: a jsonb value at a path, as text."""
-    return PostfixOp[str | None](value, "#>>", Cast(Param(list(path)), "text[]"))
+    return PostfixOp[str | None](
+        value, "#>>", Cast(Param(path_keys(path, "get_path_text")), "text[]")
+    )
 
 
 def has_key(value: ExprBase, key: str) -> Expr[bool]:
@@ -388,14 +399,14 @@ def has_key(value: ExprBase, key: str) -> Expr[bool]:
     return BinaryOp(value, "?", Cast(Param(key), "text"))
 
 
-def has_any_key(value: ExprBase, keys: Sequence[str]) -> Expr[bool]:
+def has_any_key(value: ExprBase, keys: list[str] | tuple[str, ...]) -> Expr[bool]:
     """``value ?| keys``: the jsonb object has any of these top-level keys."""
-    return BinaryOp(value, "?|", Cast(Param(list(keys)), "text[]"))
+    return BinaryOp(value, "?|", Cast(Param(path_keys(keys, "has_any_key")), "text[]"))
 
 
-def has_all_keys(value: ExprBase, keys: Sequence[str]) -> Expr[bool]:
+def has_all_keys(value: ExprBase, keys: list[str] | tuple[str, ...]) -> Expr[bool]:
     """``value ?& keys``: the jsonb object has all of these top-level keys."""
-    return BinaryOp(value, "?&", Cast(Param(list(keys)), "text[]"))
+    return BinaryOp(value, "?&", Cast(Param(path_keys(keys, "has_all_keys")), "text[]"))
 
 
 # -- more aggregates (EX7) ------------------------------------------------------------
@@ -403,7 +414,7 @@ def has_all_keys(value: ExprBase, keys: Sequence[str]) -> Expr[bool]:
 
 def array_agg[T](expr: Expr[T]) -> Aggregate[list[T] | None]:
     """Collects the values into an array (NULL when there are no rows)."""
-    return Aggregate[list[T] | None]("array_agg", (expr,))
+    return Aggregate[list[T] | None]("array_agg", (expr,), keeps_type=True, returns_array=True)
 
 
 def string_agg[T](expr: Expr[T], delimiter: str | Expr[str]) -> Aggregate[str | None]:
@@ -474,7 +485,10 @@ def _fraction(fraction: float) -> Node:
 def mode[T](expr: Expr[T]) -> Aggregate[T | None]:
     """The most frequent value: ``mode(Users.role)``."""
     return Aggregate[T | None](
-        "mode", (), within_group_=(OrderBy(expr, descending=False, nulls=None),)
+        "mode",
+        (),
+        keeps_type=True,
+        within_group_=(OrderBy(expr, descending=False, nulls=None),),
     )
 
 
@@ -488,5 +502,8 @@ def percentile_cont(fraction: float, expr: _Number) -> Aggregate[float | Decimal
 def percentile_disc[T](fraction: float, expr: Expr[T]) -> Aggregate[T | None]:
     """Discrete percentile: the first value whose cumulative fraction reaches ``fraction``."""
     return Aggregate[T | None](
-        "percentile_disc", (_fraction(fraction),), within_group_=(OrderBy(expr, False, None),)
+        "percentile_disc",
+        (_fraction(fraction),),
+        keeps_type=True,
+        within_group_=(OrderBy(expr, False, None),),
     )

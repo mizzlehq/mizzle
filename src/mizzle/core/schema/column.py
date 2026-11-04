@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import enum
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Final, Literal, Self, overload, override
+from typing import TYPE_CHECKING, Final, Literal, Self, cast, overload, override
 
 from mizzle.core.errors import QueryError
 from mizzle.core.naming import Casing, snake_case
@@ -200,6 +200,29 @@ class ColumnBase(ExprBase):
 
     def decode(self, value: object) -> object:
         return value if value is None or self.decoder is None else self.decoder(value)
+
+    def array_column(self) -> ColumnBase:
+        """This column's array type (``integer[]``, ``color[]``), encoding and decoding each
+        element through the column. ``mizzle.pg.array`` delegates here."""
+        item = self
+
+        def encode(values: object) -> object:
+            return [item.encode(v) for v in cast(Iterable[object], values)]
+
+        def decode(values: object) -> object:
+            return [item.decode(v) for v in cast(Iterable[object], values)]
+
+        column: ColumnBase = Column[list[object] | None](
+            f"{self.sql_type}[]",
+            (list, tuple),
+            self.name,
+            encoder=encode if self.encoder else None,
+            decoder=decode if self.decoder else None,
+        )
+        column.enum = self.enum
+        column.enum_schema = self.enum_schema
+        column.item = self
+        return column
 
     @override
     def __repr__(self) -> str:

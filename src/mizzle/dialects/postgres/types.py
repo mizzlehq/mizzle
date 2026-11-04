@@ -409,22 +409,8 @@ def inner_product(left: VectorOperand, right: VectorOperand) -> Expr[float]:
 
 def array[T](item: Column[T], name: str | None = None) -> Column[list[T] | None]:
     # Only called with list/tuple values (column accepts) or arrays decoded by asyncpg.
-    def encode(values: object) -> object:
-        return [item.encode(v) for v in cast(Iterable[object], values)]
-
-    def decode(values: object) -> object:
-        return [item.decode(v) for v in cast(Iterable[object], values)]
-
-    column: Column[list[T] | None] = Column(
-        f"{item.sql_type}[]",
-        (list, tuple),
-        name,
-        encoder=encode if item.encoder else None,
-        decoder=decode if item.decoder else None,
-    )
-    column.enum = item.enum
-    column.enum_schema = item.enum_schema
-    column.item = item
+    column = cast(Column[list[T] | None], item.array_column())
+    column.name = name
     return column
 
 

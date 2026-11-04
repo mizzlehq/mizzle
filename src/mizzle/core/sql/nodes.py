@@ -375,10 +375,13 @@ class Star(Node):
 
 @dataclass(frozen=True)
 class AnyAll[T](Expr[T]):
-    """``= ANY (array)`` / ``> ALL (subquery)``: the right side of a quantified comparison."""
+    """``= ANY (array)`` / ``> ALL (subquery)``: the right side of a quantified comparison.
+    A Python sequence is kept raw (``values``) so the compiler can cast the array to the
+    type of the value it is compared against (an enum array, not ``text[]``)."""
 
     quantifier: Literal["ANY", "ALL"]
-    value: Node
+    value: Node | None = None
+    values: tuple[object, ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -419,6 +422,9 @@ class Func(ExprBase):
     # The result has the type of its arguments (min, coalesce, lag...): a column among them
     # decodes it (e.g. back into an enum).
     keeps_type: bool = False
+    # The result is an array of the arguments' type (array_agg): a column among them
+    # decodes each element.
+    returns_array: bool = False
     # Named by the user (func[T]("name")): mizzle cannot know it leaves the session alone
     # (set_config, pg_advisory_lock...), so reset_connections="auto" resets after it.
     opaque: bool = False

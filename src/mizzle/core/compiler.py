@@ -18,7 +18,7 @@ from mizzle.core.errors import QueryError
 from mizzle.core.naming import Casing
 from mizzle.core.schema.column import MISSING, ColumnBase
 from mizzle.core.sql.alias import TableAlias
-from mizzle.core.sql.functions import CaseBase, column_of
+from mizzle.core.sql.functions import CaseBase, column_of, sql_type_of
 from mizzle.core.sql.nodes import (
     Aggregate,
     AnyAll,
@@ -317,7 +317,19 @@ class Compiler:
 
     def visit_BinaryOp(self, node: BinaryOp) -> str:
         left, right = node.left, node.right
-        return f"{self.operand_of(left, right)} {node.op} {self.operand_of(right, left)}"
+        lhs = self._operand_for(left, right)
+        rhs = self._operand_for(right, left)
+        return f"{lhs} {node.op} {rhs}"
+
+    def _operand_for(self, node: Node, other: Node) -> str:
+        # `col = ANY([...])`: the array's element type comes from the value it is
+        # compared against, so an enum list is a `role[]` parameter, not `text[]`.
+        if issubclass(type(node), AnyAll):
+            quantified = cast("AnyAll[object]", node)
+            if quantified.values is not None:
+                inner = self._quantified_array(quantified.values, other)
+                return f"{quantified.quantifier} ({inner})"
+        return self.operand_of(node, other)
 
     def visit_BoolOp(self, node: BoolOp) -> str:
         return f" {node.op} ".join(self.operand(item) for item in node.items)
@@ -332,7 +344,23 @@ class Compiler:
         return f"{self.operand(node.item)} {node.op} {self.visit(node.right)}"
 
     def visit_AnyAll(self, node: AnyAll[object]) -> str:
+        if node.values is not None:
+            return f"{node.quantifier} ({self._quantified_array(node.values, None)})"
+        if node.value is None:
+            raise QueryError("ANY/ALL without a value")
         return f"{node.quantifier} ({self.visit(node.value)})"
+
+    def _quantified_array(self, values: tuple[object, ...], other: Node | None) -> str:
+        """The array operand of ``ANY``/``ALL``. Next to a column it is a parameter
+        typed (and encoded) like that column's array; otherwise the Python values
+        decide the cast."""
+        items = list(values)
+        column = column_of(other) if other is not None else None
+        if column is not None:
+            array_column = column if column.item is not None else column.array_column()
+            return self.visit(Param(items, array_column))
+        kind = next((t for v in items if (t := sql_type_of(v)) is not None), "text")
+        return self.visit(Cast(Param(items), kind + "[]"))
 
     def visit_InList(self, node: InList) -> str:
         if isinstance(node.values, tuple):
@@ -558,9 +586,9 @@ class Compiler:
         from_ = f"FROM {self.source(node.source)}"
         if node.tablesample_ is not None:
             sample = node.tablesample_
-            clause = f"TABLESAMPLE {sample.method} ({sample.percent:g})"
+            clause = f"TABLESAMPLE {sample.method} ({self.bind(sample.percent)})"
             if sample.seed is not None:
-                clause += f" REPEATABLE ({sample.seed:g})"
+                clause += f" REPEATABLE ({self.bind(sample.seed)})"
             from_ += " " + clause
         parts.append(from_)
         for join in node.joins:

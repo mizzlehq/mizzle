@@ -16,11 +16,11 @@ from dataclasses import dataclass, field
 from dataclasses import replace as _replace
 from decimal import Decimal
 from typing import Literal, overload
-from typing import cast as _cast
 
 from mizzle.core.errors import QueryError
 from mizzle.core.schema.column import Column, ColumnBase
 from mizzle.core.sql.nodes import (
+    Aggregate,
     BinaryOp,
     Cast,
     Condition,
@@ -76,12 +76,23 @@ def column_of(node: object) -> ColumnBase | None:
             return column_of(node.expr)
         case Cast():
             return node.column
+        case Aggregate(keeps_type=True, returns_array=True):
+            column = _first_column(node.args)
+            return None if column is None else column.array_column()
+        case Aggregate(keeps_type=True):
+            grouped: list[object] = [
+                item.expr if isinstance(item, OrderBy) else item for item in node.within_group_
+            ]
+            return _first_column((*node.args, *grouped))
         case Func(keeps_type=True):
             return _first_column(node.args)
         case Over():
             return column_of(node.func)
         case CteColumn():
             return node.cte.source_column(node.name)
+        case PostfixOp(op="->" | "#>"):
+            # A jsonb extraction returns jsonb: the source column carries the type.
+            return column_of(node.item)
         case CaseBase():
             return _first_column((*(v for _, v in node.whens), node.default))
         case _:
@@ -874,19 +885,27 @@ def array_length[T](array: Array[T], dimension: int = 1) -> Expr[int | None]:
     )
 
 
+def _array_element(value: object, array: object) -> Node:
+    """Bind ``value`` as an element of ``array``: the element column types and encodes it
+    (``array_remove(colors, Role.ADMIN)`` -> ``array_remove(role[], role)``)."""
+    column = column_of(array)
+    item = column.item if column is not None else None
+    return bind(value, () if item is None else (item,))
+
+
 def array_position[T](array: Array[T], value: T | Expr[T]) -> Expr[int | None]:
     """1-based position of ``value`` in ``array``, or NULL when absent."""
-    return TypedFunc[int | None]("array_position", (array, bind(value)))
+    return TypedFunc[int | None]("array_position", (array, _array_element(value, array)))
 
 
 def array_append[T](array: Array[T], value: T | Expr[T]) -> Expr[list[T]]:
     """``array`` with ``value`` appended at the end."""
-    return TypedFunc[list[T]]("array_append", (array, bind(value)))
+    return TypedFunc[list[T]]("array_append", (array, _array_element(value, array)))
 
 
 def array_remove[T](array: Array[T], value: T | Expr[T]) -> Expr[list[T]]:
     """``array`` with every element equal to ``value`` removed."""
-    return TypedFunc[list[T]]("array_remove", (array, bind(value)))
+    return TypedFunc[list[T]]("array_remove", (array, _array_element(value, array)))
 
 
 def array_cat[T](left: Array[T], right: Array[T]) -> Expr[list[T]]:
@@ -898,13 +917,18 @@ def array_cat[T](left: Array[T], right: Array[T]) -> Expr[list[T]]:
 
 
 def _jsonb(value: object) -> Node:
+    # Any Python value is JSON: a dict/list encode as before, a scalar (int, str, bool)
+    # encodes as a jsonb scalar too (``jsonb_set(meta, ["a"], 5)``), not as bigint/text.
     if isinstance(value, Node):
         return value
-    if isinstance(value, dict):
-        return Cast(Param(_cast("dict[str, object]", value)), "jsonb")
-    if isinstance(value, list):
-        return Cast(Param(_cast("list[object]", value)), "jsonb")
-    return bind(value)
+    return Cast(Param(value), "jsonb")
+
+
+def path_keys(path: Iterable[str], name: str) -> list[str]:
+    """A JSON path or key list. Reject a bare string: iterating it would give characters."""
+    if isinstance(path, (str, bytes)):
+        raise QueryError(f"{name}() takes a list of keys, not a single string")
+    return list(path)
 
 
 def jsonb_set(
@@ -914,7 +938,7 @@ def jsonb_set(
     return _func(
         "jsonb_set",
         target,
-        Cast(Param(list(path)), "text[]"),
+        Cast(Param(path_keys(path, "jsonb_set")), "text[]"),
         _jsonb(value),
         Fragment(("true" if create else "false",)),
     )

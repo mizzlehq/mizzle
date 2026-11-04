@@ -13,6 +13,7 @@ from typing import Literal, Self, override
 from mizzle.core.compiler import CompiledQuery
 from mizzle.core.errors import QueryError
 from mizzle.core.query.base import evolve
+from mizzle.core.query.insert import check_values, prepare_row
 from mizzle.core.query.returning import ReturningMixin
 from mizzle.core.query.select import Cte, Source
 from mizzle.core.schema.table import Table
@@ -58,7 +59,9 @@ class Merge[T: Table](ReturningMixin[T]):
     ) -> Self:
         """``WHEN MATCHED [AND where] THEN UPDATE SET ...``. Values may be expressions
         (the source row) or plain Python values."""
-        self._check_set(set_)
+        if not set_:
+            raise QueryError("when_matched_then_update() needs a non-empty set(...)")
+        check_values(self.table, set_)
         return self._add(MergeWhen(True, "update", condition=where, set_=dict(set_)))
 
     def when_matched_then_delete(self, where: Condition | None = None) -> Self:
@@ -73,11 +76,11 @@ class Merge[T: Table](ReturningMixin[T]):
         self, values: Mapping[str, object], where: Condition | None = None
     ) -> Self:
         """``WHEN NOT MATCHED [AND where] THEN INSERT (...) VALUES (...)``. The values are
-        usually the source row's columns."""
-        self._check_set(values)
+        usually the source row's columns. Python-side defaults fill omitted columns."""
         if not values:
             raise QueryError("when_not_matched_then_insert() needs a non-empty values")
-        return self._add(MergeWhen(False, "insert", condition=where, insert_=dict(values)))
+        prepared = prepare_row(self.table, values)
+        return self._add(MergeWhen(False, "insert", condition=where, insert_=prepared))
 
     def when_not_matched_then_do_nothing(self, where: Condition | None = None) -> Self:
         """``WHEN NOT MATCHED [AND where] THEN DO NOTHING``."""
@@ -87,7 +90,9 @@ class Merge[T: Table](ReturningMixin[T]):
         self, set_: Mapping[str, object], where: Condition | None = None
     ) -> Self:
         """``WHEN NOT MATCHED BY SOURCE [AND where] THEN UPDATE SET ...`` (PostgreSQL 17)."""
-        self._check_set(set_)
+        if not set_:
+            raise QueryError("when_not_matched_by_source_then_update() needs a non-empty set(...)")
+        check_values(self.table, set_)
         return self._add(
             MergeWhen(False, "update", by_source=True, condition=where, set_=dict(set_))
         )
@@ -98,11 +103,6 @@ class Merge[T: Table](ReturningMixin[T]):
 
     def _add(self, clause: MergeWhen) -> Self:
         return evolve(self, when_=(*self.when_, clause))
-
-    def _check_set(self, values: Mapping[str, object]) -> None:
-        columns = self.table.__table__.columns
-        if unknown := [key for key in values if key not in columns]:
-            raise QueryError(f"{self.table.__name__} has no column(s): {', '.join(unknown)}")
 
     @override
     async def run_compiled(self, compiled: CompiledQuery) -> int:

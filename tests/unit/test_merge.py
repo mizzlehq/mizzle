@@ -4,9 +4,18 @@ import pytest
 
 from mizzle.core.errors import QueryError
 from mizzle.core.query.builder import QueryBuilder
+from mizzle.core.schema.table import Table
+from mizzle.core.schema.types import text
 from mizzle.core.sql.operators import eq, gt, is_not_null
+from mizzle.dialects.postgres.types import serial
 from tests.models import Posts, Users
 from tests.unit.conftest import FakeRunner
+
+
+class Readings(Table, name="merge_readings"):
+    id = serial().primary_key()
+    sensor = text().not_null()
+    unit = text().not_null().default_fn(lambda: "celsius")
 
 
 def merge_q(qb: QueryBuilder):
@@ -49,13 +58,13 @@ def test_merge_subquery_source(qb: QueryBuilder) -> None:
         qb.merge(Posts)
         .using(source)
         .on(eq(Posts.author_id, source.c("id", int)))
-        .when_not_matched_then_insert({"author_id": source.c("id", int)})
+        .when_not_matched_then_insert({"author_id": source.c("id", int), "title": "seed"})
     )
     assert q.to_sql() == (
         'MERGE INTO "posts" USING (SELECT "users"."id" FROM "users" WHERE "users"."id" = $1) '
         'AS "src" ON "posts"."author_id" = "src"."id" '
-        'WHEN NOT MATCHED THEN INSERT ("author_id") VALUES ("src"."id")',
-        (1,),
+        'WHEN NOT MATCHED THEN INSERT ("author_id", "title") VALUES ("src"."id", $2)',
+        (1, "seed"),
     )
 
 
@@ -86,3 +95,30 @@ def test_merge_validation(qb: QueryBuilder) -> None:
         qb.merge(Posts).using(Users).on(eq(Posts.author_id, Users.id)).when_not_matched_then_insert(
             {}
         )
+
+
+def test_merge_insert_applies_python_defaults(qb: QueryBuilder) -> None:
+    # Q4: a column with .default_fn() that the source does not supply is filled here,
+    # not left to the database (which has no default for it).
+    q = (
+        qb.merge(Readings)
+        .using(Users)
+        .on(eq(Readings.sensor, Users.email))
+        .when_not_matched_then_insert({"sensor": Users.email})
+    )
+    assert q.to_sql() == (
+        'MERGE INTO "merge_readings" USING "users" ON "merge_readings"."sensor" = "users"."email" '
+        'WHEN NOT MATCHED THEN INSERT ("sensor", "unit") VALUES ("users"."email", $1)',
+        ("celsius",),
+    )
+
+
+def test_merge_update_validates_and_needs_a_set(qb: QueryBuilder) -> None:
+    # Q5: the same checks Update.set() makes, and no empty SET.
+    base = qb.merge(Posts).using(Users).on(eq(Posts.author_id, Users.id))
+    with pytest.raises(QueryError, match="non-empty"):
+        base.when_matched_then_update({})
+    with pytest.raises(QueryError, match="no column"):
+        base.when_matched_then_update({"nope": 1})
+    with pytest.raises(QueryError, match="expects str"):
+        base.when_matched_then_update({"title": 123})

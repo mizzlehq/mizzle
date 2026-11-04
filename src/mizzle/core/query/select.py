@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from collections.abc import AsyncGenerator, Callable, Sequence
 from contextlib import aclosing
 from dataclasses import dataclass, field, replace
@@ -205,6 +206,8 @@ class SelectBase(Node):
             raise QueryError(f"tablesample() method must be SYSTEM or BERNOULLI; got {method!r}")
         if not 0 <= percent <= 100:
             raise QueryError("tablesample() percent must be between 0 and 100")
+        if seed is not None and not math.isfinite(seed):
+            raise QueryError("tablesample() seed must be a finite number")
         return evolve(self, tablesample_=Tablesample(method, float(percent), seed))
 
     def group_by(self, *exprs: ExprBase) -> Self:

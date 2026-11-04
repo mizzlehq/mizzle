@@ -40,12 +40,15 @@ class PostgresCompiler(Compiler):
     @override
     def returning_clause(self, node: Returning[object], /) -> str:
         projection = node.projection
-        exprs: Iterable[ExprBase]
         if projection is None:
-            exprs = node.table.__table__.columns.values()
-        else:
-            exprs = projection.values() if isinstance(projection, dict) else projection
-        return "RETURNING " + ", ".join(self.visit(expr) for expr in exprs)
+            exprs: Iterable[ExprBase] = node.table.__table__.columns.values()
+            return "RETURNING " + ", ".join(self.visit(expr) for expr in exprs)
+        if isinstance(projection, dict):
+            # A named projection: alias each expression, or a CTE over it cannot name
+            # the output (``m.c("c", ...)`` -> column m.c does not exist).
+            items = [f"{self.visit(e)} AS {self.quote(k)}" for k, e in projection.items()]
+            return "RETURNING " + ", ".join(items)
+        return "RETURNING " + ", ".join(self.visit(expr) for expr in projection)
 
     def visit_Merge(self, node: Merge[Table]) -> str:
         self._note_write()
@@ -73,10 +76,9 @@ class PostgresCompiler(Compiler):
             head += f" AND {self.visit(clause.condition)}"
         columns = table.__table__.columns
         if clause.action == "update":
-            changes = ", ".join(
-                f"{self.column_name(columns[key])} = {self.value(columns[key], value)}"
-                for key, value in clause.set_.items()
-            )
+            changes = self.set_list(table, clause.set_)
+            if not changes:
+                raise QueryError("MERGE ... THEN UPDATE SET needs at least one column")
             body = f"UPDATE SET {changes}"
         elif clause.action == "delete":
             body = "DELETE"

@@ -63,7 +63,7 @@ from tests.models import Posts, Role, Users
 
 def test_any_all(qb: QueryBuilder) -> None:
     assert qb.select(Users.id).from_(Users).where(eq(Users.id, any_([1, 2, 3]))).to_sql() == (
-        'SELECT "users"."id" FROM "users" WHERE "users"."id" = ANY (CAST($1 AS bigint[]))',
+        'SELECT "users"."id" FROM "users" WHERE "users"."id" = ANY ($1)',
         ([1, 2, 3],),
     )
     assert (
@@ -71,10 +71,20 @@ def test_any_all(qb: QueryBuilder) -> None:
         .from_(Users)
         .where(gt(Users.id, all_([1, 2])))
         .to_sql()[0]
-        .endswith('"users"."id" > ALL (CAST($1 AS bigint[]))')
+        .endswith('"users"."id" > ALL ($1)')
     )
     with pytest.raises(QueryError, match="at least one value"):
         any_([])
+    # Q9: next to an enum column the array is typed/encoded as the enum, not text.
+    assert qb.select(Users.id).from_(Users).where(
+        eq(Users.role, any_([Role.ADMIN, Role.USER]))
+    ).to_sql() == (
+        'SELECT "users"."id" FROM "users" WHERE "users"."role" = ANY ($1)',
+        (["admin", "user"],),
+    )
+    # Q10: a bare string is a sequence of characters; refuse it.
+    with pytest.raises(QueryError, match="not a string"):
+        any_("abc")  # pyright: ignore[reportCallIssue, reportArgumentType]
 
 
 def test_distinct_from(qb: QueryBuilder) -> None:
@@ -208,7 +218,7 @@ def test_array_functions(qb: QueryBuilder) -> None:
     assert q.to_sql() == (
         "SELECT unnest(CAST(ARRAY[1,2] AS integer[])), "
         "array_length(CAST(ARRAY[1,2] AS integer[]), 1), "
-        'array_position(CAST(ARRAY[1,2] AS integer[]), CAST($1 AS bigint)) FROM "users"',
+        'array_position(CAST(ARRAY[1,2] AS integer[]), $1) FROM "users"',
         (2,),
     )
 

@@ -5,8 +5,11 @@ import datetime
 from decimal import Decimal
 from typing import cast
 
+import pytest
+
 from mizzle import (
     Database,
+    QueryError,
     age,
     all_,
     any_,
@@ -240,3 +243,48 @@ async def test_collate_and_at_time_zone(db: Database) -> None:
         await db.select(at_time_zone(Users.created_at, "UTC")).from_(Users).where(eq(Users.id, 1))
     )[0][0]
     assert isinstance(converted, datetime.datetime)
+
+
+async def test_enum_any_and_arrays(db: Database) -> None:
+    # Q9/Q11/Q13: enum lists/arrays are typed as the enum, not text.
+    await seed(db)
+    some = await db.select(Users.email).from_(Users).where(eq(Users.role, any_([Role.ADMIN])))
+    assert sorted(some) == [("ann@x",)]
+    roles = db.select({"v": array_agg(Users.role)}).from_(Users).subquery("roles")
+    v = roles.c("v", list[Role])
+    assert await db.select(contains(v, [Role.ADMIN])).from_(roles) == [(True,)]
+    removed = (await db.select(array_remove(v, Role.ADMIN)).from_(roles))[0][0]
+    assert sorted(removed) == [Role.USER, Role.USER]
+    order = await db.select(v).from_(roles).order_by(array_length(v))
+    assert isinstance(order[0][0][0], Role)
+    top = (await db.select(mode(Users.role)).from_(Users))[0][0]
+    assert isinstance(top, Role)
+    disc = (await db.select(percentile_disc(0.0, Users.role)).from_(Users))[0][0]
+    assert isinstance(disc, Role)
+
+
+async def test_jsonb_set_scalar_and_contains_array(db: Database) -> None:
+    # Q12: a scalar set value and a jsonb list operand are encoded as jsonb.
+    await seed(db)
+    rows = await db.select(jsonb_set(Posts.meta, ["a"], 5)).from_(Posts).where(eq(Posts.id, 1))
+    assert rows == [({"a": 5, "tags": ["c", "d"]},)]
+    text_rows = (
+        await db.select(jsonb_set(Posts.meta, ["a"], "hi")).from_(Posts).where(eq(Posts.id, 1))
+    )
+    assert text_rows == [({"a": "hi", "tags": ["c", "d"]},)]
+    tagged = (
+        await db.select(Posts.title)
+        .from_(Posts)
+        .where(contains(get_field(Posts.meta, "tags"), ["c"]))
+    )
+    assert tagged == [("cat",)]
+
+
+async def test_string_keys_are_rejected(db: Database) -> None:
+    # Q10: a bare string is a sequence of characters, not a JSON path.
+    for call in (
+        lambda: get_path(Posts.meta, "ab"),  # pyright: ignore[reportArgumentType]
+        lambda: has_all_keys(Posts.meta, "ab"),  # pyright: ignore[reportArgumentType]
+    ):
+        with pytest.raises(QueryError, match="not a single string"):
+            call()

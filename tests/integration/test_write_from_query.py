@@ -168,3 +168,20 @@ async def test_returning_projection_in_cte(db: Database) -> None:
         .order_by(moved.c("id", int))
     )
     assert rows == [(1, "cat"), (2, "dog")]
+
+
+async def test_update_from_and_delete_using_a_subquery(db: Database) -> None:
+    # Q14: an inline subquery is accepted as the source at runtime.
+    await seed(db)
+    sub = db.select({"email": Users.email}).from_(Users).where(eq(Users.id, 1)).subquery("one")
+    email = sub.c("email", str)
+    updated = await db.update(Posts).set(title=email).from_(sub).where(eq(Posts.author_id, 1))
+    assert updated == 2
+    assert await db.select(Posts.title).from_(Posts).order_by(Posts.id) == [
+        ("ann@x",),
+        ("ann@x",),
+        ("bird",),
+    ]
+    deleted = await db.delete(Posts).using(sub).where(eq(Posts.title, email))
+    assert deleted == 2
+    assert await db.select(Posts.title).from_(Posts) == [("bird",)]
