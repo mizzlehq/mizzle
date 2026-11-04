@@ -2,6 +2,7 @@ import { cn } from "cn"
 import {
   DatabaseIcon,
   GitForkIcon,
+  PlusIcon,
   RefreshCwIcon,
   SearchIcon,
   TableIcon,
@@ -26,6 +27,7 @@ type Props = {
   onOpenSql: () => void
   onOpenDiagram: () => void
   onRefresh: () => void
+  onCreateTable: () => void
 }
 
 export function TableSidebar({
@@ -37,6 +39,7 @@ export function TableSidebar({
   onOpenSql,
   onOpenDiagram,
   onRefresh,
+  onCreateTable,
 }: Props) {
   const [search, setSearch] = useState("")
   const groups = useMemo(() => {
@@ -109,6 +112,15 @@ export function TableSidebar({
         </nav>
       </ScrollArea>
       <div className="border-t p-2">
+        <Button
+          variant="ghost"
+          className="w-full justify-start"
+          onClick={onCreateTable}
+          disabled={readOnly}
+        >
+          <PlusIcon />
+          New table
+        </Button>
         <Button
           variant={view === "diagram" ? "secondary" : "ghost"}
           className="w-full justify-start"

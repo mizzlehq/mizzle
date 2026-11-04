@@ -1,6 +1,9 @@
-import { KeyRoundIcon, LinkIcon } from "lucide-react"
+import { KeyRoundIcon, LinkIcon, PencilIcon, PlusIcon, TrashIcon } from "lucide-react"
+import { useState } from "react"
 
+import { DdlDialog, type ColumnInfo } from "@/components/ddl-dialog"
 import { Badge } from "@/components/ui/badge"
+import { Button } from "@/components/ui/button"
 import {
   Table,
   TableBody,
@@ -11,7 +14,23 @@ import {
 } from "@/components/ui/table"
 import type { TableInfo } from "@/lib/api"
 
-export function StructureView({ table }: { table: TableInfo }) {
+type DialogState =
+  | { kind: "add_column" }
+  | { kind: "alter_column"; column: ColumnInfo }
+  | { kind: "drop_column"; column: ColumnInfo }
+  | { kind: "drop_table" }
+  | null
+
+export function StructureView({
+  table,
+  readOnly,
+  onChanged,
+}: {
+  table: TableInfo
+  readOnly: boolean
+  onChanged: () => void
+}) {
+  const [dialog, setDialog] = useState<DialogState>(null)
   const pk = new Set(table.primary_key?.columns ?? [])
   const unique = new Set(
     Object.values(table.uniques)
@@ -47,11 +66,31 @@ export function StructureView({ table }: { table: TableInfo }) {
       detail: `(${i.columns.join(", ")})${i.where ? ` where ${i.where}` : ""}`,
     })),
   ]
+  const asInfo = (c: TableInfo["columns"][string]): ColumnInfo => ({
+    name: c.name,
+    type: c.type,
+    not_null: c.not_null,
+    default: c.default,
+  })
 
   return (
     <div className="space-y-6 p-4">
       <section>
-        <h2 className="mb-2 font-medium text-sm">Columns</h2>
+        <div className="mb-2 flex items-center justify-between">
+          <h2 className="font-medium text-sm">Columns</h2>
+          {!readOnly && (
+            <div className="flex gap-2">
+              <Button variant="outline" size="sm" onClick={() => setDialog({ kind: "add_column" })}>
+                <PlusIcon />
+                Add column
+              </Button>
+              <Button variant="outline" size="sm" onClick={() => setDialog({ kind: "drop_table" })}>
+                <TrashIcon />
+                Drop table
+              </Button>
+            </div>
+          )}
+        </div>
         <div className="rounded-lg border">
           <Table>
             <TableHeader>
@@ -60,6 +99,7 @@ export function StructureView({ table }: { table: TableInfo }) {
                 <TableHead>Type</TableHead>
                 <TableHead>Null</TableHead>
                 <TableHead>Default</TableHead>
+                {!readOnly && <TableHead className="w-20" />}
               </TableRow>
             </TableHeader>
             <TableBody>
@@ -90,6 +130,28 @@ export function StructureView({ table }: { table: TableInfo }) {
                     <TableCell className="font-mono text-muted-foreground text-xs">
                       {c.default ?? "—"}
                     </TableCell>
+                    {!readOnly && (
+                      <TableCell>
+                        <div className="flex justify-end gap-1">
+                          <Button
+                            variant="ghost"
+                            size="icon-xs"
+                            aria-label={`Edit column ${c.name}`}
+                            onClick={() => setDialog({ kind: "alter_column", column: asInfo(c) })}
+                          >
+                            <PencilIcon />
+                          </Button>
+                          <Button
+                            variant="ghost"
+                            size="icon-xs"
+                            aria-label={`Drop column ${c.name}`}
+                            onClick={() => setDialog({ kind: "drop_column", column: asInfo(c) })}
+                          >
+                            <TrashIcon />
+                          </Button>
+                        </div>
+                      </TableCell>
+                    )}
                   </TableRow>
                 )
               })}
@@ -119,6 +181,21 @@ export function StructureView({ table }: { table: TableInfo }) {
           </div>
         )}
       </section>
+
+      {dialog && (
+        <DdlDialog
+          key={`${dialog.kind}:${"column" in dialog ? dialog.column.name : table.name}`}
+          kind={dialog.kind}
+          schema={table.schema}
+          table={table.name}
+          column={"column" in dialog ? dialog.column : undefined}
+          open
+          onOpenChange={(open) => {
+            if (!open) setDialog(null)
+          }}
+          onApplied={onChanged}
+        />
+      )}
     </div>
   )
 }

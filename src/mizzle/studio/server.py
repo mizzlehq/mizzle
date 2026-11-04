@@ -48,6 +48,8 @@ from mizzle.core.snapshot import ColumnSnap, Snapshot, TableSnap, key
 from mizzle.dialects.base import Connection, Dialect, Driver
 from mizzle.dialects.postgres.ddl import SERIAL_TYPES, qualified, quote
 from mizzle.kit.config import Config
+from mizzle.kit.migrate import apply_statements
+from mizzle.studio.ddl import build_steps, statement_rows
 
 STATIC_DIR = Path(__file__).parent / "static"
 MAX_SQL_ROWS = 1000
@@ -564,6 +566,40 @@ async def clear_history(studio: Studio, _request: Request) -> Response:
     return JSONResponse({"cleared": True})
 
 
+async def _current_table(studio: Studio, data: dict[str, object]) -> TableSnap | None:
+    """The table an operation changes, from the live snapshot (None if it does not exist)."""
+    schema = data.get("schema", "public")
+    name = data.get("table", data.get("name"))
+    if not isinstance(schema, str) or not isinstance(name, str):
+        return None
+    snapshot = await studio.load_snapshot()
+    current = snapshot["tables"].get(key(schema, name))
+    if current is None:
+        snapshot = await studio.load_snapshot(refresh=True)
+        current = snapshot["tables"].get(key(schema, name))
+    return current
+
+
+async def ddl_preview(studio: Studio, request: Request) -> Response:
+    """Generate the SQL for an operation without running it (the review screen)."""
+    data = await _body(request)
+    steps = build_steps(studio.dialect, data, await _current_table(studio, data))
+    return JSONResponse({"statements": statement_rows(studio.dialect, steps)})
+
+
+async def ddl_apply(studio: Studio, request: Request) -> Response:
+    _writable(studio)
+    data = await _body(request)
+    steps = build_steps(studio.dialect, data, await _current_table(studio, data))
+    statements = studio.dialect.render(steps)
+    async with studio.pool().acquire() as conn:
+        await apply_statements(conn, statements)
+    await studio.load_snapshot(refresh=True)
+    return JSONResponse(
+        {"applied": len(statements), "statements": statement_rows(studio.dialect, steps)}
+    )
+
+
 async def list_saved(studio: Studio, _request: Request) -> Response:
     return JSONResponse({"saved": [{"name": n, "sql": s} for n, s in studio.saved.items()]})
 
@@ -700,6 +736,8 @@ def create_app(
             methods=["GET"],
         ),
         Route("/api/sql", _api(studio, run_sql), methods=["POST"]),
+        Route("/api/ddl/preview", _api(studio, ddl_preview), methods=["POST"]),
+        Route("/api/ddl/apply", _api(studio, ddl_apply), methods=["POST"]),
         Route("/api/queries/history", _api(studio, get_history), methods=["GET"]),
         Route("/api/queries/history", _api(studio, clear_history), methods=["DELETE"]),
         Route("/api/queries/saved", _api(studio, list_saved), methods=["GET"]),

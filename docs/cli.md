@@ -107,3 +107,11 @@ mizzle studio --host 0.0.0.0 --auth admin:$(cat /run/secrets/studio-password)
 Binding a non-loopback host without `--auth` (or `--token` / `MIZZLE_STUDIO_TOKEN`) is
 refused. Basic auth is over HTTP, so put it behind TLS (a reverse proxy) when the network is
 not trusted.
+
+In the browser, a table's **Structure** tab can create and alter tables and columns: add a
+table, add or drop a column, change a column's type, nullability or default, and drop a
+table. Studio never runs free-form SQL for this — it builds a small allow-listed operation,
+generates the DDL with mizzle's own renderer, and shows it on a review screen before you
+apply it. Column types and default expressions are checked, and every name is quoted.
+`--read-only` still lets you review the generated SQL; it only blocks applying it.
+

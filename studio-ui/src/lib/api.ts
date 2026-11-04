@@ -66,6 +66,33 @@ export type DiagramEdge = {
   to_columns: string[]
 }
 
+export type DdlColumnInput = {
+  name: string
+  type: string
+  not_null?: boolean
+  primary_key?: boolean
+  default?: string | null
+}
+
+export type DdlOperation =
+  | { operation: "create_table"; schema: string; name: string; columns: DdlColumnInput[] }
+  | { operation: "drop_table"; schema: string; name: string }
+  | { operation: "add_column"; schema: string; table: string; name: string; column: DdlColumnInput }
+  | {
+      operation: "alter_column"
+      schema: string
+      table: string
+      name: string
+      type?: string
+      not_null?: boolean
+      default?: string | null
+    }
+  | { operation: "drop_column"; schema: string; table: string; name: string }
+
+export type DdlStatement = { sql: string; description: string; data_loss: boolean }
+export type DdlPreview = { statements: DdlStatement[] }
+export type DdlResult = { applied: number; statements: DdlStatement[] }
+
 const TOKEN_KEY = "mizzle-studio-token"
 
 // The token arrives in the URL fragment (never sent to servers or logged). Keep it for
@@ -180,6 +207,8 @@ export const api = {
   remove: (table: TableInfo, keys: Row[]) =>
     request<{ deleted: number }>("DELETE", rowsPath(table), { keys }),
   sql: (sql: string) => request<SqlBatch>("POST", "/api/sql", { sql }),
+  ddlPreview: (op: DdlOperation) => request<DdlPreview>("POST", "/api/ddl/preview", op),
+  ddlApply: (op: DdlOperation) => request<DdlResult>("POST", "/api/ddl/apply", op),
   history: () => request<{ history: HistoryEntry[] }>("GET", "/api/queries/history"),
   clearHistory: () => request<{ cleared: boolean }>("DELETE", "/api/queries/history"),
   saved: () => request<{ saved: SavedQuery[] }>("GET", "/api/queries/saved"),

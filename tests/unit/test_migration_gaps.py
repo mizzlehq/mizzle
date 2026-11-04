@@ -29,6 +29,7 @@ from mizzle.dialects.postgres.ddl import _without_defaults
 from mizzle.kit.diff import StrictRenames, diff, no_renames
 from mizzle.kit.snapshot import build_snapshot
 from mizzle.pg import integer, pg_composite, pg_domain, text
+from mizzle.studio.ddl import build_steps, statement_rows
 
 dialect = PostgresDialect()
 
@@ -629,3 +630,131 @@ def test_pg_composite_decodes_and_accepts_tuples() -> None:
     with pytest.raises(QueryError, match="expects tuple"):
         column.validate("nope")
     assert pg_composite("addr", schema="app").sql_type == "app.addr"
+
+
+# -- studio DDL (allow-listed) -------------------------------------------------------------
+
+
+def test_studio_ddl_renders_only_allow_listed_operations() -> None:
+    steps = build_steps(
+        dialect,
+        {
+            "operation": "create_table",
+            "schema": "public",
+            "name": "notes",
+            "columns": [
+                {"name": "id", "type": "integer", "primary_key": True},
+                {"name": "title", "type": "character varying(80)", "not_null": True},
+                {"name": "created_at", "type": "timestamp with time zone", "default": "now()"},
+            ],
+        },
+    )
+    assert statement_rows(dialect, steps) == [
+        {
+            "sql": (
+                'CREATE TABLE "notes" (\n'
+                '    "id" integer,\n'
+                '    "title" character varying(80) NOT NULL,\n'
+                '    "created_at" timestamp with time zone DEFAULT now(),\n'
+                '    CONSTRAINT "notes_pkey" PRIMARY KEY ("id")\n'
+                ")"
+            ),
+            "description": "create table notes",
+            "data_loss": False,
+        }
+    ]
+
+    for bad in (  # only these five operations, and only safe shapes
+        {"operation": "drop_database", "name": "x"},
+        {"operation": "create_table", "name": "x", "columns": []},
+        {
+            "operation": "create_table",
+            "name": "x",
+            "columns": [{"name": "c", "type": "text; drop"}],
+        },
+        {
+            "operation": "create_table",
+            "name": "x",
+            "columns": [{"name": "c", "type": "text", "default": "0; drop table users"}],
+        },
+        {"operation": "create_table", "name": "x", "columns": [{"name": "c; --", "type": "text"}]},
+        {
+            "operation": "create_table",
+            "name": "x",
+            "columns": [{"name": "c", "type": "int references users(id)"}],
+        },
+    ):
+        with pytest.raises(SchemaError):
+            build_steps(dialect, bad)
+
+
+def test_studio_ddl_changes_an_existing_table() -> None:
+    @final
+    class Notes(Table, name="notes"):
+        id = integer().primary_key()
+        title = text()
+
+    current = build_snapshot([Notes], dialect)["tables"]["public.notes"]
+    assert current is not None
+
+    add = build_steps(
+        dialect,
+        {
+            "operation": "add_column",
+            "schema": "public",
+            "table": "notes",
+            "name": "body",
+            "column": {"name": "body", "type": "text", "not_null": True},
+        },
+        current,
+    )
+    assert (
+        statement_rows(dialect, add)[0]["sql"]
+        == 'ALTER TABLE "notes" ADD COLUMN "body" text NOT NULL'
+    )
+
+    altered = build_steps(
+        dialect,
+        {
+            "operation": "alter_column",
+            "schema": "public",
+            "table": "notes",
+            "name": "title",
+            "type": "character varying(50)",
+            "default": "'x'::text",
+        },
+        current,
+    )
+    assert [s.describe() for s in altered] == [
+        "change type of notes.title from text to character varying(50)",
+        "change default of notes.title",
+    ]
+    assert statement_rows(dialect, altered)[1]["sql"] == (
+        'ALTER TABLE "notes" ALTER COLUMN "title" SET DEFAULT \'x\'::text'
+    )
+
+    drop = build_steps(
+        dialect,
+        {"operation": "drop_column", "schema": "public", "table": "notes", "name": "title"},
+        current,
+    )
+    assert [s.describe() for s in drop] == ["drop column notes.title"]
+
+    with pytest.raises(SchemaError, match="nothing to change"):
+        build_steps(
+            dialect,
+            {
+                "operation": "alter_column",
+                "schema": "public",
+                "table": "notes",
+                "name": "title",
+                "type": current["columns"]["title"]["type"],
+            },
+            current,
+        )
+    with pytest.raises(SchemaError, match="does not exist"):
+        build_steps(
+            dialect,
+            {"operation": "drop_column", "schema": "public", "table": "notes", "name": "nope"},
+            current,
+        )

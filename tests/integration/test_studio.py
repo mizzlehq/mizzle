@@ -304,3 +304,96 @@ def test_state_persists_between_runs(pg_url: str, driver: PostgresDriver, tmp_pa
         ]
         history = client.get("/api/queries/history", headers=AUTH).json()["history"]
         assert history[-1]["sql"] == "select 1"
+
+
+DDL_PREVIEW = "/api/ddl/preview"
+DDL_APPLY = "/api/ddl/apply"
+
+
+def test_ddl_preview_and_apply(client: TestClient) -> None:
+    client.post("/api/sql", json={"sql": "drop table if exists st_notes"}, headers=AUTH)
+    create = {
+        "operation": "create_table",
+        "schema": "public",
+        "name": "st_notes",
+        "columns": [
+            {"name": "id", "type": "integer", "primary_key": True},
+            {"name": "title", "type": "text", "not_null": True},
+        ],
+    }
+    preview = client.post(DDL_PREVIEW, json=create, headers=AUTH)
+    assert preview.status_code == 200, preview.text
+    assert preview.json()["statements"] == [
+        {
+            "sql": (
+                'CREATE TABLE "st_notes" (\n'
+                '    "id" integer,\n'
+                '    "title" text NOT NULL,\n'
+                '    CONSTRAINT "st_notes_pkey" PRIMARY KEY ("id")\n'
+                ")"
+            ),
+            "description": "create table st_notes",
+            "data_loss": False,
+        }
+    ]
+
+    applied = client.post(DDL_APPLY, json=create, headers=AUTH)
+    assert applied.status_code == 200 and applied.json()["applied"] == 1
+    tables = client.get("/api/tables", headers=AUTH).json()["tables"]
+    assert any(t["name"] == "st_notes" for t in tables)
+
+    add = {
+        "operation": "add_column",
+        "schema": "public",
+        "table": "st_notes",
+        "name": "body",
+        "column": {"name": "body", "type": "text"},
+    }
+    client.post(DDL_APPLY, json=add, headers=AUTH)
+    notes = next(
+        t
+        for t in client.get("/api/tables", headers=AUTH).json()["tables"]
+        if t["name"] == "st_notes"
+    )
+    assert "body" in notes["columns"]
+
+    # An existing table or column is refused, and bad operations never reach SQL.
+    assert client.post(DDL_APPLY, json=create, headers=AUTH).status_code == 400
+    bad = {
+        "operation": "add_column",
+        "schema": "public",
+        "table": "st_notes",
+        "name": "x",
+        "column": {"name": "x", "type": "text; drop table users"},
+    }
+    assert client.post(DDL_PREVIEW, json=bad, headers=AUTH).status_code == 400
+    assert (
+        client.post(
+            DDL_PREVIEW, json={"operation": "truncate", "name": "x"}, headers=AUTH
+        ).status_code
+        == 400
+    )
+
+    dropped = client.post(
+        DDL_APPLY,
+        json={"operation": "drop_table", "schema": "public", "name": "st_notes"},
+        headers=AUTH,
+    )
+    assert dropped.json()["applied"] == 1
+    assert not any(
+        t["name"] == "st_notes" for t in client.get("/api/tables", headers=AUTH).json()["tables"]
+    )
+
+
+def test_ddl_preview_works_but_apply_is_blocked_read_only(
+    pg_url: str, driver: PostgresDriver
+) -> None:
+    op = {
+        "operation": "create_table",
+        "schema": "public",
+        "name": "st_ro",
+        "columns": [{"name": "id", "type": "integer"}],
+    }
+    with make_client(pg_url, read_only=True) as client:
+        assert client.post(DDL_PREVIEW, json=op, headers=AUTH).status_code == 200
+        assert client.post(DDL_APPLY, json=op, headers=AUTH).status_code == 403

@@ -2,6 +2,7 @@ import { DatabaseIcon } from "lucide-react"
 import { useCallback, useEffect, useState } from "react"
 
 import { DataGrid } from "@/components/data-grid"
+import { DdlDialog } from "@/components/ddl-dialog"
 import { RelationshipDiagram } from "@/components/relationship-diagram"
 import { SqlConsole } from "@/components/sql-console"
 import { StructureView } from "@/components/structure-view"
@@ -16,6 +17,7 @@ export function App() {
   const [selected, setSelected] = useState<string | null>(null)
   const [view, setView] = useState<View>("table")
   const [error, setError] = useState<string | null>(null)
+  const [createOpen, setCreateOpen] = useState(false)
 
   const load = useCallback(async () => {
     try {
@@ -68,6 +70,7 @@ export function App() {
         onOpenSql={() => setView("sql")}
         onOpenDiagram={() => setView("diagram")}
         onRefresh={() => void load()}
+        onCreateTable={() => setCreateOpen(true)}
       />
       <main className="flex min-w-0 flex-1 flex-col">
         {view === "sql" ? (
@@ -104,7 +107,7 @@ export function App() {
               <DataGrid table={table} readOnly={readOnly} />
             </TabsContent>
             <TabsContent value="structure" className="min-h-0 flex-1 overflow-auto">
-              <StructureView table={table} />
+              <StructureView table={table} readOnly={readOnly} onChanged={() => void load()} />
             </TabsContent>
           </Tabs>
         ) : (
@@ -113,6 +116,16 @@ export function App() {
           </div>
         )}
       </main>
+      {createOpen && (
+        <DdlDialog
+          kind="create_table"
+          schema="public"
+          table=""
+          open
+          onOpenChange={(open) => setCreateOpen(open)}
+          onApplied={() => void load()}
+        />
+      )}
       <Toaster position="bottom-right" />
     </div>
   )
