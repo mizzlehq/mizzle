@@ -21,6 +21,7 @@ from mizzle import (
     View,
     check,
     exclusion,
+    extension,
     function,
     grant,
     index,
@@ -43,18 +44,35 @@ from mizzle.kit.migrate import apply_statements
 from mizzle.kit.snapshot import build_snapshot
 from mizzle.pg import (
     bigint,
+    bit,
+    box,
     char,
+    cidr,
+    circle,
+    citext,
     date,
     daterange,
+    hstore,
     int4multirange,
     int4range,
     integer,
+    line,
+    lseg,
+    ltree,
+    macaddr,
+    macaddr8,
+    money,
     numrange,
+    path,
     pg_enum,
+    point,
+    polygon,
     smallint,
     text,
     timestamp,
     tstzrange,
+    varbit,
+    xml,
 )
 from tests.integration.test_generated_columns import server_version
 
@@ -68,6 +86,7 @@ DROP SCHEMA IF EXISTS mg CASCADE;
 DROP SCHEMA IF EXISTS mg2 CASCADE;
 DROP ROLE IF EXISTS {READER};
 DROP ROLE IF EXISTS {OTHER};
+DROP EXTENSION IF EXISTS hstore, citext, ltree CASCADE;
 """
 
 
@@ -961,4 +980,79 @@ async def test_range_types_round_trip(driver: PostgresDriver, tmp_path: Path) ->
     multi = cast("list[Range[int]]", row["multi"])
     assert (ints.lower, ints.upper, ints.lower_inc, ints.upper_inc) == (1, 5, True, False)
     assert [r.lower for r in multi] == [1, 5]
+    await assert_pull_round_trip(driver, tmp_path)
+
+
+# -- more column types: network, bit, xml, money, geometric, extension types ----------------
+
+
+@final
+class Assorted(Table, name="assorted", schema="mg"):
+    id = integer().primary_key()
+    net = cidr()
+    mac = macaddr()
+    mac8 = macaddr8()
+    flags = bit(4)
+    variable = varbit(8)
+    doc = xml()
+    amount = money()
+    pt = point()
+    ln = line()
+    seg = lseg()
+    rect = box()
+    trace = path()
+    area = polygon()
+    disc = circle()
+    attrs = hstore()
+    label = citext()
+    tree = ltree()
+
+
+EXTENSIONS: list[SchemaObject] = [extension("hstore"), extension("citext"), extension("ltree")]
+
+
+async def test_more_column_types_round_trip(driver: PostgresDriver, tmp_path: Path) -> None:
+    await migrate(driver, empty_snapshot("postgresql"), snap([Assorted], EXTENSIONS))
+    columns = (await live(driver))["tables"]["mg.assorted"]["columns"]
+    expected = {
+        "net": "cidr",
+        "mac": "macaddr",
+        "mac8": "macaddr8",
+        "flags": "bit(4)",
+        "variable": "bit varying(8)",
+        "doc": "xml",
+        "amount": "money",
+        "pt": "point",
+        "ln": "line",
+        "seg": "lseg",
+        "rect": "box",
+        "trace": "path",
+        "area": "polygon",
+        "disc": "circle",
+        "attrs": "hstore",
+        "label": "citext",
+        "tree": "ltree",
+    }
+    assert {name: columns[name]["type"] for name in expected} == expected
+
+    await execute(
+        driver,
+        "INSERT INTO mg.assorted (id, net, mac, mac8, flags, variable, doc, amount, pt, ln, seg, "
+        "rect, trace, area, disc, attrs, label, tree) VALUES "
+        "(1, '10.0.0.0/8', '08:00:2b:01:02:03', '08:00:2b:01:02:03:04:05', B'1010', B'1010', "
+        "'<a/>', '12.34', '(1,2)', '{1,2,3}', '[(1,2),(3,4)]', '(1,2),(3,4)', '[(1,2),(3,4)]', "
+        "'((1,2),(3,4),(5,6))', '<(1,2),3>', 'a=>1', 'Hello', 'a.b')",
+    )
+    [row] = await execute(
+        driver, "SELECT net, mac, mac8, flags, variable, doc, attrs, label, tree FROM mg.assorted"
+    )
+    assert str(row["net"]) == "10.0.0.0/8"
+    assert row["mac"] == "08:00:2b:01:02:03"
+    assert row["mac8"] == "08:00:2b:01:02:03:04:05"
+    assert "1010" in str(row["flags"])
+    assert "1010" in str(row["variable"])
+    assert row["doc"] == "<a/>"
+    assert '"a"=>"1"' in cast(str, row["attrs"])
+    assert row["label"] == "Hello"
+    assert row["tree"] == "a.b"
     await assert_pull_round_trip(driver, tmp_path)

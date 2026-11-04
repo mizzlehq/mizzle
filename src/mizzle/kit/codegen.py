@@ -53,6 +53,23 @@ _SIMPLE_TYPES = {
     "character": "char",
     "tsvector": "tsvector",
     "tsquery": "tsquery",
+    "cidr": "cidr",
+    "macaddr": "macaddr",
+    "macaddr8": "macaddr8",
+    "bit": "bit",
+    "bit varying": "varbit",
+    "xml": "xml",
+    "money": "money",
+    "point": "point",
+    "line": "line",
+    "lseg": "lseg",
+    "box": "box",
+    "path": "path",
+    "polygon": "polygon",
+    "circle": "circle",
+    "hstore": "hstore",
+    "citext": "citext",
+    "ltree": "ltree",
     "int4range": "int4range",
     "int8range": "int8range",
     "numrange": "numrange",
@@ -184,7 +201,8 @@ class _SchemaWriter:
                 args.append(f"precision={match.group(2)}")
             return f"{fn}({', '.join([*args, kwargs] if kwargs else args)})"
         if match := re.fullmatch(
-            r"(character varying|character|numeric|vector|halfvec|sparsevec)\(([\d,]+)\)",
+            r"(character varying|character|numeric|vector|halfvec|sparsevec|bit|varbit|bit varying)"
+            r"\(([\d,]+)\)",
             sql_type,
         ):
             fn = _SIMPLE_TYPES[match.group(1)]

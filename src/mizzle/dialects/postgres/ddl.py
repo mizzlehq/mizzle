@@ -104,6 +104,7 @@ _TYPE_ALIASES = {
     "float8": "double precision",
     "float4": "real",
     "bool": "boolean",
+    "varbit": "bit varying",
 }
 _PLAIN_IDENT = re.compile(r"[a-z_][a-z0-9_$]*")
 _TRAILING_CAST = re.compile(

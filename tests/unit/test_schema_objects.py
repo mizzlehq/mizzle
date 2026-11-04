@@ -34,20 +34,38 @@ from mizzle.kit.codegen import render_schema_module, render_types_module
 from mizzle.kit.diff import diff
 from mizzle.kit.snapshot import build_snapshot
 from mizzle.pg import (
+    array,
     bigint,
+    bit,
     boolean,
+    box,
+    cidr,
+    circle,
+    citext,
     daterange,
+    hstore,
     int4multirange,
     int4range,
     int8range,
     integer,
+    line,
+    lseg,
+    ltree,
+    macaddr,
+    macaddr8,
+    money,
     numrange,
+    path,
+    point,
+    polygon,
     serial,
     text,
     timestamp,
     tstzmultirange,
     tstzrange,
+    varbit,
     vector,
+    xml,
 )
 
 dialect = PostgresDialect()
@@ -715,6 +733,78 @@ def test_exclusion_constraints_sql_snapshot_and_pull(tmp_path: Path) -> None:
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     sys.modules["pulled_exclusion"] = module
+    spec.loader.exec_module(module)
+    members = list(vars(module).values())
+    tables = [
+        v
+        for v in members
+        if isinstance(v, type) and issubclass(v, Table) and "__table__" in vars(v)
+    ]
+    assert diff(original, build_snapshot(tables, dialect)) == []
+
+
+@final
+class Assorted(Table, name="assorted"):
+    id = integer().primary_key()
+    net = cidr()
+    mac = macaddr()
+    mac8 = macaddr8()
+    flags = bit(4)
+    variable = varbit(8)
+    doc = xml()
+    amount = money()
+    pt = point()
+    ln = line()
+    seg = lseg()
+    rect = box()
+    trace = path()
+    area = polygon()
+    disc = circle()
+    attrs = hstore()
+    label = citext()
+    tree = ltree()
+    embeddings = array(vector(3))
+
+
+def test_more_column_types_sql_snapshot_and_pull(tmp_path: Path) -> None:
+    original = snap([Assorted], objects=[])
+    columns = original["tables"]["public.assorted"]["columns"]
+    assert columns["net"]["type"] == "cidr"
+    assert columns["mac"]["type"] == "macaddr"
+    assert columns["mac8"]["type"] == "macaddr8"
+    assert columns["flags"]["type"] == "bit(4)"
+    assert columns["variable"]["type"] == "bit varying(8)"
+    assert columns["doc"]["type"] == "xml"
+    assert columns["amount"]["type"] == "money"
+    assert columns["pt"]["type"] == "point"
+    assert columns["ln"]["type"] == "line"
+    assert columns["seg"]["type"] == "lseg"
+    assert columns["rect"]["type"] == "box"
+    assert columns["trace"]["type"] == "path"
+    assert columns["area"]["type"] == "polygon"
+    assert columns["disc"]["type"] == "circle"
+    assert columns["attrs"]["type"] == "hstore"
+    assert columns["label"]["type"] == "citext"
+    assert columns["tree"]["type"] == "ltree"
+    assert columns["embeddings"]["type"] == "vector(3)[]"
+    assert original.get("extensions") == {"vector": {"name": "vector"}}  # vector[] needs pgvector
+
+    create = next(s for s in sqls(empty_snapshot("postgresql"), original) if "CREATE TABLE" in s)
+    assert '"flags" bit(4)' in create
+    assert '"variable" bit varying(8)' in create
+    assert '"embeddings" vector(3)[]' in create
+
+    source = render_schema_module(original)
+    assert "bit(4)" in source
+    assert "varbit(8)" in source
+    assert "array(vector(3))" in source
+
+    path = tmp_path / "pulled_more_types.py"
+    path.write_text(source)
+    spec = importlib.util.spec_from_file_location("pulled_more_types", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["pulled_more_types"] = module
     spec.loader.exec_module(module)
     members = list(vars(module).values())
     tables = [

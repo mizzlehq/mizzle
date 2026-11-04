@@ -12,7 +12,17 @@ from collections.abc import Callable, Iterable, Mapping, Sequence
 from decimal import Decimal
 from typing import Protocol, cast, runtime_checkable
 
-from asyncpg import Range
+from asyncpg import (
+    BitString,
+    Box,
+    Circle,
+    Line,
+    LineSegment,
+    Path,
+    Point,
+    Polygon,
+    Range,
+)
 
 from mizzle.core.errors import QueryError
 from mizzle.core.naming import snake_case
@@ -128,6 +138,94 @@ def tstzmultirange(name: str | None = None) -> Column[list[Range[_dt.datetime]] 
 def datemultirange(name: str | None = None) -> Column[list[Range[_dt.date]] | None]:
     """A set of disjoint ``daterange`` values, read and written as a list of ``Range``."""
     return Column("datemultirange", (list,), name)
+
+
+def cidr(name: str | None = None) -> Column[IPAddress | None]:
+    """An IPv4/IPv6 network, read and written as an ``ipaddress`` network object."""
+    return Column("cidr", (ipaddress.IPv4Network, ipaddress.IPv6Network), name)
+
+
+def macaddr(name: str | None = None) -> Column[str | None]:
+    """A 6-byte MAC address (``08:00:2b:01:02:03``), read and written as text."""
+    return Column("macaddr", (str,), name)
+
+
+def macaddr8(name: str | None = None) -> Column[str | None]:
+    """An 8-byte MAC address (``08:00:2b:01:02:03:04:05``), read and written as text."""
+    return Column("macaddr8", (str,), name)
+
+
+def bit(length: int | None = None, name: str | None = None) -> Column[BitString | None]:
+    """A fixed-length bit string. ``bit()`` is ``bit(1)``; values read and write as
+    ``asyncpg.BitString``."""
+    return Column("bit" if length is None else f"bit({length})", (BitString,), name)
+
+
+def varbit(length: int | None = None, name: str | None = None) -> Column[BitString | None]:
+    """A variable-length bit string (``bit varying``). Values read and write as
+    ``asyncpg.BitString``."""
+    return Column("varbit" if length is None else f"varbit({length})", (BitString,), name)
+
+
+def xml(name: str | None = None) -> Column[str | None]:
+    """An XML document, read and written as text."""
+    return Column("xml", (str,), name)
+
+
+def money(name: str | None = None) -> Column[str | None]:
+    """A currency amount (locale-formatted, e.g. ``$12.34``), read and written as text."""
+    return Column("money", (str,), name)
+
+
+def point(name: str | None = None) -> Column[Point | None]:
+    """A geometric point. Values read and write as ``asyncpg.Point``."""
+    return Column("point", (Point,), name)
+
+
+def line(name: str | None = None) -> Column[Line | None]:
+    """An infinite geometric line. Values read and write as ``asyncpg.Line``."""
+    return Column("line", (Line,), name)
+
+
+def lseg(name: str | None = None) -> Column[LineSegment | None]:
+    """A finite line segment. Values read and write as ``asyncpg.LineSegment``."""
+    return Column("lseg", (LineSegment,), name)
+
+
+def box(name: str | None = None) -> Column[Box | None]:
+    """A rectangular box. Values read and write as ``asyncpg.Box``."""
+    return Column("box", (Box,), name)
+
+
+def path(name: str | None = None) -> Column[Path | None]:
+    """A geometric path. Values read and write as ``asyncpg.Path``."""
+    return Column("path", (Path,), name)
+
+
+def polygon(name: str | None = None) -> Column[Polygon | None]:
+    """A closed geometric polygon. Values read and write as ``asyncpg.Polygon``."""
+    return Column("polygon", (Polygon,), name)
+
+
+def circle(name: str | None = None) -> Column[Circle | None]:
+    """A geometric circle. Values read and write as ``asyncpg.Circle``."""
+    return Column("circle", (Circle,), name)
+
+
+def hstore(name: str | None = None) -> Column[str | None]:
+    """An ``hstore`` key/value map (needs the ``hstore`` extension), read and written as
+    text: ``'"a"=>"1"'``."""
+    return Column("hstore", (str,), name)
+
+
+def citext(name: str | None = None) -> Column[str | None]:
+    """A case-insensitive string (needs the ``citext`` extension), read and written as text."""
+    return Column("citext", (str,), name)
+
+
+def ltree(name: str | None = None) -> Column[str | None]:
+    """A label-tree path (needs the ``ltree`` extension), read and written as text."""
+    return Column("ltree", (str,), name)
 
 
 def inet(name: str | None = None) -> Column[IPAddress | None]:
