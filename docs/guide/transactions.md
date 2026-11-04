@@ -66,6 +66,26 @@ async with db.transaction() as tx:
         pass  # only the savepoint rolled back; the entry is still there
 ```
 
+### Side effects after commit
+
+`transaction(after_commit=..., after_rollback=...)` runs a callback outside the transaction,
+so a write that did not commit does not send an email or enqueue a job:
+
+```python
+async with db.transaction(after_commit=notify_warehouse) as tx:
+    await tx.insert(Orders).values(...)
+```
+
+Two rules keep hook errors from confusing the outcome:
+
+- In a **savepoint**, `after_commit` is queued, not run: releasing a savepoint is not a
+  commit, and the outer transaction can still roll back. Queued hooks run after the
+  outermost `COMMIT`, and are dropped if either level rolls back.
+- An `after_commit` hook that raises raises `AfterCommitError`. The data **is** committed:
+  the message says so, so a retry does not insert it twice. An `after_rollback` hook that
+  raises does not hide the error that caused the rollback; the hook's failure is logged and
+  attached as the context.
+
 ## Isolation levels and read-only
 
 ```python

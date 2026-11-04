@@ -31,8 +31,14 @@ from dataclasses import dataclass, field
 from typing import Literal, Self, final, overload
 
 from mizzle.core.compiler import CompiledQuery
+from mizzle.core.errors import (
+    AfterCommitError,
+    AfterRollbackError,
+    MizzleError,
+    QueryError,
+    SerializationFailure,
+)
 from mizzle.core.errors import ConnectionError as DbConnectionError
-from mizzle.core.errors import MizzleError, QueryError, SerializationFailure
 from mizzle.core.naming import Casing
 from mizzle.core.query.base import Row, evolve
 from mizzle.core.query.builder import QueryBuilder
@@ -81,6 +87,27 @@ type _CallKind = Literal["fetch", "execute", "dicts"]
 MAX_PARAMS = 32767
 
 
+async def _run_commit_hook(hook: Callable[[], Awaitable[None]]) -> None:
+    """Run an after-commit hook; a failure is reported without suggesting the write failed."""
+    try:
+        await hook()
+    except Exception as exc:
+        raise AfterCommitError(
+            "an after_commit hook failed after the transaction committed; the data is saved. "
+            "Do not retry the transaction."
+        ) from exc
+
+
+async def _run_rollback_hook(hook: Callable[[], Awaitable[None]], original: BaseException) -> None:
+    """Run an after-rollback hook without replacing the error that caused the rollback."""
+    try:
+        await hook()
+    except Exception as exc:
+        # Keep the hook's failure reachable, but let the original error be the one raised.
+        log.error("mizzle: an after_rollback hook failed: %r", exc)
+        original.__context__ = AfterRollbackError(f"an after_rollback hook failed: {exc}")
+
+
 class Session(QueryBuilder):
     """Query API. ``Database`` runs each statement on a pooled connection; inside
     ``transaction()`` a Session is bound to one connection.
@@ -102,6 +129,10 @@ class Session(QueryBuilder):
     _tags: Mapping[str, object]
     _conn: Connection | None
     _lock: asyncio.Lock
+    # Callbacks a savepoint registered, to run when the *outermost* transaction commits.
+    # A savepoint is released, not committed, so running them there fires a side effect for
+    # data the outer transaction can still roll back (R2).
+    _deferred: list[Callable[[], Awaitable[None]]]
 
     def __init__(
         self,
@@ -134,6 +165,7 @@ class Session(QueryBuilder):
         # One connection runs one statement at a time; the lock lets asyncio.gather()
         # inside a transaction queue up instead of failing.
         self._lock = asyncio.Lock()
+        self._deferred = []
 
     # -- Runner protocol --------------------------------------------------------------
 
@@ -446,7 +478,8 @@ class Session(QueryBuilder):
                 async for event in events:
                     handle(event.data)
 
-        A decoder that raises ends the iteration with that error."""
+        A decoder that raises propagates that error from the ``async for`` body; the
+        listener stays open, so the next notification is still delivered."""
         if self._conn is not None:
             raise QueryError("listen() needs its own connection; call it outside a transaction")
         if not channels:
@@ -559,7 +592,17 @@ class Session(QueryBuilder):
 
         ``after_commit`` runs only once the data is committed, and ``after_rollback`` after
         a rollback, both outside the transaction: use them for side effects (send an email,
-        enqueue a job) that must not happen when the transaction did not commit."""
+        enqueue a job) that must not happen when the transaction did not commit.
+
+        Hook errors do not change what happened to the data:
+
+        - an ``after_commit`` hook that raises is re-raised as
+          :class:`AfterCommitError` naming it, because the write *did* commit and a caller
+          must not treat the failure as "nothing was saved" and retry;
+        - an ``after_rollback`` hook that raises does not replace the original error: the
+          original is re-raised and the hook's error is attached as
+          ``AfterRollbackError.__context__``.
+        """
         if self._conn is not None:
             if isolation is not None or readonly:
                 raise QueryError("isolation and readonly apply to the outermost transaction only")
@@ -567,14 +610,19 @@ class Session(QueryBuilder):
                 try:
                     async with self._conn.transaction():
                         yield self
-                except BaseException:
+                except BaseException as original:
+                    # A rolled-back savepoint drops whatever it queued (and any queued by a
+                    # savepoint inside it).
+                    self._deferred.clear()
                     if after_rollback is not None:
-                        await after_rollback()
+                        await _run_rollback_hook(after_rollback, original)
                     raise
             if after_commit is not None:
-                await after_commit()
+                # Released, not committed: run it only when the outermost transaction commits.
+                self._deferred.append(after_commit)
             return
         driver = self._require_driver()
+        deferred: list[Callable[[], Awaitable[None]]] = []
         with self._transaction_span(isolation):
             try:
                 async with driver.acquire() as conn, conn.transaction(isolation, readonly):
@@ -590,13 +638,17 @@ class Session(QueryBuilder):
                         connection=conn,
                     )
                     tx._timeout = self._timeout
+                    deferred = tx._deferred
                     yield tx
-            except BaseException:
+            except BaseException as original:
+                deferred.clear()
                 if after_rollback is not None:
-                    await after_rollback()
+                    await _run_rollback_hook(after_rollback, original)
                 raise
+        for hook in deferred:
+            await _run_commit_hook(hook)
         if after_commit is not None:
-            await after_commit()
+            await _run_commit_hook(after_commit)
 
     @property
     def dialect(self) -> Dialect:
@@ -1038,11 +1090,11 @@ class Database(Session):
                                 server_settings=server_settings,
                             )
                         )
-                except DbConnectionError:
+                except DbConnectionError as exc:
                     for driver in drivers:
                         await driver.close()
                     drivers.clear()
-                    if attempt >= connect_retries:
+                    if attempt >= connect_retries or not exc.retryable:
                         raise
                     delay = connect_backoff * 2.0**attempt
                     log.warning("mizzle: could not connect; retrying in %.1fs", delay)

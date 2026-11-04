@@ -68,11 +68,29 @@ class SerializationFailure(DatabaseError):
 
 
 class ConnectionError(DatabaseError):
-    pass
+    """A connection could not be opened or was lost.
+
+    ``retryable`` is False when trying again cannot help (bad credentials, unknown database,
+    an unsupported feature), so a caller's retry loop can fail fast instead of waiting."""
+
+    retryable: bool = True
 
 
 class QueryTimeout(DatabaseError):
     """The statement ran longer than its timeout and was cancelled."""
+
+
+class AfterCommitError(MizzleError):
+    """An ``after_commit`` hook raised. The transaction **did** commit: the data is saved.
+
+    Raised instead of the hook's own error so a caller does not mistake it for a failed
+    write and run the transaction again. The hook's error is the cause."""
+
+
+class AfterRollbackError(MizzleError):
+    """An ``after_rollback`` hook raised while unwinding another error. The original error is
+    the cause, and is what the caller sees; this only exists so the hook's failure is not
+    lost (it is attached as the context of the original)."""
 
 
 class ListenerOverflow(MizzleError):

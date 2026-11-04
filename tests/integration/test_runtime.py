@@ -158,3 +158,86 @@ async def test_executemany_pipelines_many_sets(db: Database) -> None:
         await db.executemany(
             sql("INSERT INTO users (email) VALUES (", placeholder("email"), ")"), [("x",)]
         )
+
+
+async def test_on_connect_survives_a_reset(pg_url: str) -> None:
+    # R1: the reset after a dirty statement ran RESET ALL but not the hook again, so the
+    # setting was gone on the same connection (asyncpg only calls init on a new one).
+    async def hook(conn: Connection) -> None:
+        await conn.execute("SET application_name = 'hooked'", [])
+
+    async with await Database.connect(
+        pg_url, schema=[Users, Posts], pool_size=1, on_connect=hook
+    ) as db:
+        assert await setting(db, "application_name") == "hooked"
+        # A raw statement marks the connection dirty, so the next acquire resets it.
+        await db.execute(sql("SELECT 1"))
+        assert await setting(db, "application_name") == "hooked"
+        await db.execute(sql("SELECT 1"))
+        assert await setting(db, "application_name") == "hooked"
+
+
+async def test_nested_after_commit_waits_for_the_outermost_commit(pg_url: str) -> None:
+    # R2: releasing a savepoint is not a commit, so the hook must not fire there.
+    fired: list[str] = []
+
+    async def hook() -> None:
+        fired.append("nested")
+
+    async with await Database.connect(pg_url, schema=[Users, Posts], pool_size=1) as db:
+        async with db.transaction() as tx:
+            async with tx.transaction(after_commit=hook):
+                pass
+            assert fired == []  # still only released
+        assert fired == ["nested"]  # the outer transaction committed
+
+        fired.clear()
+        with pytest.raises(RuntimeError):
+            async with db.transaction() as tx:
+                async with tx.transaction(after_commit=hook):
+                    pass
+                raise RuntimeError("outer rolls back")
+        assert fired == []  # rolled back: the side effect must not have happened
+
+
+async def test_after_commit_error_says_the_data_is_saved(pg_url: str) -> None:
+    # R3: a hook that raises must not look like a failed write, or the caller retries.
+    from mizzle import AfterCommitError
+
+    async def hook() -> None:
+        raise RuntimeError("queue is down")
+
+    async with await Database.connect(pg_url, schema=[Users, Posts], pool_size=1) as db:
+        with pytest.raises(AfterCommitError, match="the data is saved"):
+            async with db.transaction(after_commit=hook) as tx:
+                await tx.insert(Users).values(email="committed")
+        # It really did commit, which is why retrying would insert a second row.
+        committed = await (
+            db.select(Users.email).from_(Users).where(eq(Users.email, "committed"))
+        )
+        assert committed == [("committed",)]
+
+
+async def test_after_rollback_error_keeps_the_original_error(pg_url: str) -> None:
+    # R3: the hook's failure used to replace the error that caused the rollback.
+    async def hook() -> None:
+        raise RuntimeError("hook is down")
+
+    async with await Database.connect(pg_url, schema=[Users, Posts], pool_size=1) as db:
+        with pytest.raises(ValueError, match="the real problem") as caught:
+            async with db.transaction(after_rollback=hook):
+                raise ValueError("the real problem")
+        assert "after_rollback" in str(caught.value.__context__)
+
+
+async def test_connect_retry_gives_up_on_a_wrong_password(pg_url: str) -> None:
+    # R4: a bad password does not fix itself; retrying only delays the error.
+    import time
+
+    from mizzle.core.errors import ConnectionError as DbConnectionError
+
+    bad = pg_url.replace("mizzle:mizzle@", "mizzle:wrong-password@")
+    started = time.monotonic()
+    with pytest.raises(DbConnectionError):
+        await Database.connect(bad, schema=[Users, Posts], connect_retries=3, connect_backoff=1.0)
+    assert time.monotonic() - started < 1.0  # no 1s + 2s + 4s of sleeping

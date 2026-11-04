@@ -625,6 +625,8 @@ class _PoolConnection(asyncpg.Connection):
     """
 
     _mizzle_dirty: bool = False  # no __slots__ here, so instances can set it
+    # The on_connect hook the pool was created with, so a reset can re-run it (R1).
+    _mizzle_on_connect: Callable[[PostgresConnection], Awaitable[None]] | None = None
 
     def mark_dirty(self) -> None:
         self._mizzle_dirty = True
@@ -633,10 +635,45 @@ class _PoolConnection(asyncpg.Connection):
         dirty, self._mizzle_dirty = self._mizzle_dirty, False
         return dirty
 
+    def set_on_connect(
+        self, hook: Callable[[PostgresConnection], Awaitable[None]] | None
+    ) -> None:
+        """Remember the pool's ``on_connect``, so a reset can run it again."""
+        self._mizzle_on_connect = hook
+
+    async def reset_session(self) -> None:
+        """Undo session state, then re-apply the ``on_connect`` hook.
+
+        ``RESET ALL`` undoes whatever the hook set (a ``search_path``, a role), and asyncpg
+        only runs ``init`` on a new connection, so the hook has to run again here. Otherwise
+        it works on the first query and is silently gone after any raw statement.
+        """
+        if self.take_dirty():
+            await self.execute(self.get_reset_query())
+        hook = self._mizzle_on_connect
+        if hook is not None:
+            await hook(PostgresConnection(self))
+
 
 async def _reset_connection(conn: asyncpg.Connection) -> None:
-    if isinstance(conn, _PoolConnection) and conn.take_dirty():
-        await conn.execute(conn.get_reset_query())
+    if isinstance(conn, _PoolConnection):
+        await conn.reset_session()
+
+
+# SQLSTATE classes and codes that a retry cannot fix: bad credentials, no such database, a
+# rejected connection. Sleeping and retrying these only delays the error.
+_PERMANENT_SQLSTATES = (
+    "28",  # invalid authorization specification (28P01 bad password, 28000 no auth)
+    "3D",  # invalid catalog name (3D000: database does not exist)
+    "0A",  # feature not supported
+)
+
+
+def _retryable(exc: BaseException) -> bool:
+    """Whether connecting again could succeed. A superuser/failed-auth/unknown-database
+    error is permanent; a refused or timed-out TCP connection is not."""
+    code = str(getattr(exc, "sqlstate", "") or "")
+    return not code.startswith(_PERMANENT_SQLSTATES)
 
 
 def _jsonb_encode(value: object) -> bytes:
@@ -747,6 +784,8 @@ class PostgresDriver:
 
         async def init(conn: asyncpg.Connection) -> None:
             await _init_connection(conn)
+            if isinstance(conn, _PoolConnection):
+                conn.set_on_connect(on_connect)
             if on_connect is not None:
                 await on_connect(PostgresConnection(conn))
 
@@ -759,14 +798,18 @@ class PostgresDriver:
                 command_timeout=query_timeout,
                 statement_cache_size=statement_cache_size,
                 server_settings=None if server_settings is None else dict(server_settings),
-                init=init if on_connect is not None else _init_connection,
+                init=init,
                 connection_class=_PoolConnection,
                 # None: asyncpg's own full reset on every release.
                 reset=_reset_connection if reset_connections == "auto" else None,
             )
         except (OSError, asyncpg.PostgresError) as exc:
             # The URL is left out on purpose: it may contain a password.
-            raise DbConnectionError(f"could not connect: {type(exc).__name__}: {exc}") from exc
+            error = DbConnectionError(f"could not connect: {type(exc).__name__}: {exc}")
+            # A wrong password or a missing database does not fix itself: the caller's
+            # retry loop must not sleep and try again (R4).
+            error.retryable = _retryable(exc)
+            raise error from exc
         return cls(pool, url)
 
     def acquire(self) -> _Acquire:

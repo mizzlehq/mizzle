@@ -1,6 +1,8 @@
 """mizzle: a fully typed async ORM for PostgreSQL."""
 
 from mizzle.core.errors import (
+    AfterCommitError,
+    AfterRollbackError,
     CheckViolation,
     ConnectionError,
     DatabaseError,
@@ -197,6 +199,8 @@ from mizzle.dialects.base import Notification, Reconnected
 __version__ = "0.2.4"
 
 __all__ = [
+    "AfterCommitError",
+    "AfterRollbackError",
     "CheckViolation",
     "Column",
     "Condition",
