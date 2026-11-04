@@ -1,7 +1,7 @@
 import { KeyRoundIcon, LinkIcon, PencilIcon, PlusIcon, TrashIcon } from "lucide-react"
 import { useState } from "react"
 
-import { DdlDialog, type ColumnInfo } from "@/components/ddl-dialog"
+import { type ColumnInfo, DdlDialog } from "@/components/ddl-dialog"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import {

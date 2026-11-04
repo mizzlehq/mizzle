@@ -14,19 +14,9 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog"
 import { Input } from "@/components/ui/input"
-import {
-  api,
-  type DdlColumnInput,
-  type DdlOperation,
-  type DdlStatement,
-} from "@/lib/api"
+import { api, type DdlColumnInput, type DdlOperation, type DdlStatement } from "@/lib/api"
 
-export type DdlKind =
-  | "create_table"
-  | "add_column"
-  | "alter_column"
-  | "drop_table"
-  | "drop_column"
+export type DdlKind = "create_table" | "add_column" | "alter_column" | "drop_table" | "drop_column"
 
 type ColumnDraft = {
   name: string
@@ -75,15 +65,7 @@ const TITLES: Record<DdlKind, string> = {
   drop_column: "Drop column",
 }
 
-export function DdlDialog({
-  kind,
-  schema,
-  table,
-  column,
-  open,
-  onOpenChange,
-  onApplied,
-}: Props) {
+export function DdlDialog({ kind, schema, table, column, open, onOpenChange, onApplied }: Props) {
   const [tableName, setTableName] = useState(table)
   const [columns, setColumns] = useState<ColumnDraft[]>([emptyColumn()])
   const [draft, setDraft] = useState<ColumnDraft>(
@@ -117,7 +99,8 @@ export function DdlDialog({
     if (kind === "alter_column") {
       const changes: { type?: string; not_null?: boolean; default?: string | null } = {}
       const wanted = draft.default.trim() === "" ? null : draft.default.trim()
-      if (column && draft.type.trim() && draft.type !== column.type) changes.type = draft.type.trim()
+      if (column && draft.type.trim() && draft.type !== column.type)
+        changes.type = draft.type.trim()
       if (column && draft.not_null !== column.not_null) changes.not_null = draft.not_null
       if (column && wanted !== column.default) changes.default = wanted
       if (Object.keys(changes).length === 0) return "Change a field first"
@@ -272,7 +255,11 @@ export function DdlDialog({
                   {columnFields(c, (patch) => edit(i, patch))}
                 </div>
               ))}
-              <Button variant="outline" size="sm" onClick={() => setColumns([...columns, emptyColumn()])}>
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => setColumns([...columns, emptyColumn()])}
+              >
                 <PlusIcon />
                 Add column
               </Button>
