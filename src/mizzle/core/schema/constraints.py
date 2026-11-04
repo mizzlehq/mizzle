@@ -194,6 +194,18 @@ class RowLevelSecurity:
     force: bool = False  # also for the table owner
 
 
+@dataclass(frozen=True)
+class Partition:
+    """One partition of a partitioned table, declared in ``config()``:
+    ``CREATE TABLE name PARTITION OF parent for_values``. ``for_values`` is the bound as
+    PostgreSQL prints it: ``"FOR VALUES FROM ('2026-01-01') TO ('2027-01-01')"``,
+    ``"FOR VALUES IN ('a', 'b')"``, ``"FOR VALUES WITH (modulus 4, remainder 0)"`` or
+    ``"DEFAULT"``."""
+
+    name: str
+    for_values: str
+
+
 type Constraint = (
     Index
     | UniqueConstraint
@@ -204,6 +216,7 @@ type Constraint = (
     | Policy
     | RowLevelSecurity
     | Grant
+    | Partition
 )
 
 
@@ -322,3 +335,12 @@ def grant(privileges: Privilege | Sequence[Privilege], *, to: Sequence[str | Rol
     managed = tuple(r for r in to if isinstance(r, Role) and not r.existing)
     privs = ("all",) if "all" in wanted else tuple(sorted(set(wanted)))
     return Grant(privs, tuple(names), managed)
+
+
+def partition(name: str, *, for_values: str) -> Partition:
+    """Declare a partition of the table, which must set ``partition_by=...``. ``for_values``
+    is the bound in PostgreSQL's spelling (see ``Partition``); the partition is created in
+    the table's schema."""
+    if not for_values.strip():
+        raise SchemaError(f"partition {name!r} needs for_values")
+    return Partition(name, for_values.strip())

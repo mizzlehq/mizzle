@@ -450,6 +450,8 @@ class _SchemaWriter:
                 options += f", where={_sql(where)}"
             options += flags(e, ("deferrable", "initially_deferred"))
             items.append(f"exclusion({', '.join(keys)}, name={e['name']!r}{options})")
+        for pname, bound in table.get("partitions", {}).items():
+            items.append(f"partition({pname!r}, for_values={bound!r})")
         items += [_index_item(i, attrs) for i in table["indexes"].values()]
         if rls := table.get("rls"):
             args = [] if rls["enabled"] else ["enabled=False"]
@@ -599,6 +601,8 @@ class _SchemaWriter:
                 kw += ", unlogged=True"
             if options := table.get("options"):
                 kw += f", storage={options!r}"
+            if partition_by := table.get("partition_by"):
+                kw += f", partition_by={partition_by!r}"
             lines = ["@final", f"class {self.table_classes[k]}(Table, {kw}):"]
             for cname, column in table["columns"].items():
                 lines.append(f"    {attrs[cname]} = {self.column(table, column, attrs[cname])}")
@@ -614,6 +618,7 @@ class _SchemaWriter:
                     "foreign_key",
                     "check",
                     "exclusion",
+                    "partition",
                     "unique_index",
                     "index",
                     "rls",

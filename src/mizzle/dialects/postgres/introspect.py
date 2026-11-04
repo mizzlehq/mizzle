@@ -58,11 +58,24 @@ _TABLES = """
 SELECT c.oid, n.nspname AS schema, c.relname AS name,
        c.relrowsecurity AS rls, c.relforcerowsecurity AS rls_force,
        obj_description(c.oid, 'pg_class') AS comment,
-       c.relpersistence::text AS persistence, coalesce(c.reloptions, '{}') AS options
+       c.relpersistence::text AS persistence, coalesce(c.reloptions, '{}') AS options,
+       pg_get_partkeydef(c.oid) AS partition_by
 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
 WHERE c.relkind IN ('r', 'p') AND n.nspname = ANY($1::text[]) AND c.relname <> $2
   AND NOT c.relispartition
 ORDER BY n.nspname, c.relname
+"""
+
+_PARTITIONS = """
+SELECT c.relname AS name, pn.nspname AS parent_schema, pc.relname AS parent_name,
+       pg_get_expr(c.relpartbound, c.oid) AS bound
+FROM pg_class c
+JOIN pg_namespace n ON n.oid = c.relnamespace
+JOIN pg_inherits i ON i.inhrelid = c.oid
+JOIN pg_class pc ON pc.oid = i.inhparent
+JOIN pg_namespace pn ON pn.oid = pc.relnamespace
+WHERE c.relispartition AND n.nspname = ANY($1::text[])
+ORDER BY pn.nspname, pc.relname, c.relname
 """
 
 _COLUMNS = """
@@ -487,9 +500,16 @@ async def introspect(
             snap["unlogged"] = True
         if options := _strs(t["options"]):
             snap["options"] = dict(o.split("=", 1) for o in options)
+        if (partkey := _opt_str(t["partition_by"])) is not None:
+            snap["partition_by"] = partkey
         by_oid[_int(t["oid"])] = snap
         snapshot["tables"][key(schema, name)] = snap
         _add_schema(snapshot, schema)
+
+    for row in await conn.fetch_dicts(_PARTITIONS, [schema_list]):
+        parent = snapshot["tables"].get(key(str(row["parent_schema"]), str(row["parent_name"])))
+        if parent is not None:  # a partition whose parent is outside the schemas read
+            parent.setdefault("partitions", {})[str(row["name"])] = str(row["bound"])
 
     oids = list(by_oid)
     for row in await conn.fetch_dicts(_COLUMNS, [oids]):

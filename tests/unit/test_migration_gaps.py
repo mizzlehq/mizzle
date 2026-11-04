@@ -16,6 +16,7 @@ from mizzle import (
     function,
     grant,
     index,
+    partition,
     sql,
 )
 from mizzle import trigger as make_trigger
@@ -495,3 +496,82 @@ def test_domain_in_another_schema_qualifies_the_column() -> None:
     snap = build_snapshot([T], dialect, objects=[domain("email", as_="text", schema="app")])
     assert set(snap.get("domains", {})) == {"app.email"}
     assert snap["tables"]["app.t"]["columns"]["d"]["type"] == "app.email"
+
+
+# -- partitions ----------------------------------------------------------------------------
+
+
+def _measurements(key: str, parts: list[tuple[str, str]]) -> type[Table]:
+    @final
+    class M(Table, name="measurements", partition_by=key):
+        id = integer()
+        logged_at = text()
+
+        @classmethod
+        @override
+        def config(cls) -> list[Constraint]:
+            return [partition(n, for_values=b) for n, b in parts]
+
+    return M
+
+
+P2026 = ("measurements_2026", "FOR VALUES FROM ('2026-01-01') TO ('2027-01-01')")
+P_DEF = ("measurements_def", "DEFAULT")
+
+
+def test_partitions_render_create_and_drop() -> None:
+    v1 = build_snapshot([_measurements("RANGE (logged_at)", [P2026, P_DEF])], dialect)
+    table = v1["tables"]["public.measurements"]
+    assert table.get("partition_by") == "RANGE (logged_at)"
+    assert table.get("partitions") == {P2026[0]: P2026[1], P_DEF[0]: P_DEF[1]}
+
+    sql = sqls(empty_snapshot("postgresql"), v1)
+    assert sql[0] == (
+        'CREATE TABLE "measurements" (\n    "id" integer,\n    "logged_at" text\n) '
+        "PARTITION BY RANGE (logged_at)"
+    )
+    assert sql[1] == (
+        'CREATE TABLE "measurements_2026" PARTITION OF "measurements" '
+        "FOR VALUES FROM ('2026-01-01') TO ('2027-01-01')"
+    )
+    assert sql[2] == 'CREATE TABLE "measurements_def" PARTITION OF "measurements" DEFAULT'
+    assert diff(v1, v1) == []
+
+    # Removing the table takes its partitions along: no separate drop.
+    steps = diff(v1, build_snapshot([], dialect))
+    assert [s.describe() for s in steps] == ["drop table measurements"]
+
+    # A partition added and one dropped on a table that stays.
+    p2027 = ("measurements_2027", "FOR VALUES FROM ('2027-01-01') TO ('2028-01-01')")
+    v2 = build_snapshot([_measurements("RANGE (logged_at)", [P2026, p2027])], dialect)
+    steps = diff(v1, v2)
+    assert [s.describe() for s in steps] == [
+        "create partition measurements_2027 of measurements",
+        "drop partition measurements_def",
+    ]
+    assert dialect.render(steps)[0].sql == (
+        'CREATE TABLE "measurements_2027" PARTITION OF "measurements" '
+        "FOR VALUES FROM ('2027-01-01') TO ('2028-01-01')"
+    )
+    assert dialect.render(steps)[1].sql == 'DROP TABLE "measurements_def"'
+
+    # A moved bound and a changed key are not expressible in place.
+    moved = ("measurements_2026", "FOR VALUES FROM ('2020-01-01') TO ('2021-01-01')")
+    with pytest.raises(MigrationError, match="bound of partition"):
+        diff(v1, build_snapshot([_measurements("RANGE (logged_at)", [moved, P_DEF])], dialect))
+    with pytest.raises(MigrationError, match="partition key"):
+        diff(v1, build_snapshot([_measurements("RANGE (id)", [P2026, P_DEF])], dialect))
+
+
+def test_partition_needs_partition_by() -> None:
+    @final
+    class Bad(Table, name="bad"):
+        id = integer()
+
+        @classmethod
+        @override
+        def config(cls) -> list[Constraint]:
+            return [partition("bad_1", for_values="DEFAULT")]
+
+    with pytest.raises(SchemaError, match="partition_by"):
+        build_snapshot([Bad], dialect)

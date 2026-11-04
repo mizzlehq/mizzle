@@ -157,6 +157,35 @@ class DropTable(Step):
 
 
 @dataclass(frozen=True)
+class CreatePartition(Step):
+    """``CREATE TABLE name PARTITION OF parent bound``."""
+
+    schema: str
+    parent: str
+    name: str
+    bound: str  # as PostgreSQL prints it: "FOR VALUES FROM (...) TO (...)" or "DEFAULT"
+
+    @override
+    def describe(self) -> str:
+        return f"create partition {self.name} of {self.parent}"
+
+
+@dataclass(frozen=True)
+class DropPartition(Step):
+    schema: str
+    name: str
+
+    @property
+    @override
+    def data_loss(self) -> bool:
+        return True
+
+    @override
+    def describe(self) -> str:
+        return f"drop partition {self.name}"
+
+
+@dataclass(frozen=True)
 class RenameTable(Step):
     schema: str
     old: str

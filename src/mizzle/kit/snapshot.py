@@ -16,6 +16,7 @@ from mizzle.core.schema.constraints import (
     ForeignKey,
     Grant,
     Index,
+    Partition,
     Policy,
     PrimaryKey,
     Role,
@@ -110,6 +111,8 @@ def build_snapshot(
             snap["unlogged"] = True
         if info.storage:
             snap["options"] = dict(info.storage)
+        if info.partition_by is not None:
+            snap["partition_by"] = info.partition_by
         for column in info.columns.values():
             cname = column.db_name(casing)
             if column.enum is not None:
@@ -271,6 +274,8 @@ def build_snapshot(
                     _add_grant(snap.setdefault("grants", {}), constraint)
                     for declared in constraint.declared_roles:
                         _add_role(snapshot, declared)
+                case Partition():
+                    snap.setdefault("partitions", {})[constraint.name] = constraint.for_values
 
         if pk := snap["primary_key"]:  # CREATE TABLE drops a UNIQUE that repeats the key
             snap["uniques"] = {

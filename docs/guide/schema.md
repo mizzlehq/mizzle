@@ -302,6 +302,44 @@ class Users(Table, name="users"):
 before the tables that use it and drop it after them. Changing a domain in place needs a
 hand-written migration: `mizzle generate` stops and says so.
 
+## Partitioned tables
+
+A table declares its partition key with `partition_by=` (PostgreSQL's spelling, as
+`pg_get_partkeydef()` prints it) and its partitions with `partition(...)` in `config()`.
+`for_values` is the bound as PostgreSQL prints it: `FOR VALUES FROM (...) TO (...)`,
+`FOR VALUES IN (...)`, `FOR VALUES WITH (...)`, or `DEFAULT`.
+
+```python
+from typing import final, override
+
+from mizzle import Constraint, Table, partition
+from mizzle.pg import date, integer, text
+
+
+@final
+class Measurements(Table, name="measurements", partition_by="RANGE (logged_at)"):
+    id = integer()
+    region = text()
+    logged_at = date()
+
+    @classmethod
+    @override
+    def config(cls) -> list[Constraint]:
+        return [
+            partition(
+                "measurements_2026",
+                for_values="FOR VALUES FROM ('2026-01-01') TO ('2027-01-01')",
+            ),
+            partition("measurements_default", for_values="DEFAULT"),
+        ]
+```
+
+Partitions are physical storage: query the parent. A migration creates each partition after
+its parent and drops it before its parent, and dropping the parent takes its partitions with
+it. Adding a partition to an existing table is a `CREATE TABLE ... PARTITION OF`. Changing
+the key, or a partition's bound, needs a hand-written migration: `mizzle generate` stops and
+says so.
+
 ## Identity and generated columns
 
 ```python
@@ -432,8 +470,8 @@ class Messages(Table, name="messages"):
 ## Table.config()
 
 `config()` returns everything that belongs to the table but not to one column:
-`primary_key`, `unique`, `check`, `foreign_key`, `index`, `unique_index`, and the
-security objects `rls()`, `policy(...)` and `grant(...)`. Declare it as a
+`primary_key`, `unique`, `check`, `foreign_key`, `index`, `unique_index`, `partition`, and
+the security objects `rls()`, `policy(...)` and `grant(...)`. Declare it as a
 `@classmethod` with `@override`, typed `list[Constraint]`, as in the examples above.
 
 Columns in `config()` must belong to the same table. mizzle checks the whole schema when

@@ -48,6 +48,7 @@ from mizzle.core.steps import (
     CreateExtension,
     CreateFunction,
     CreateIndex,
+    CreatePartition,
     CreatePolicy,
     CreateRole,
     CreateSchema,
@@ -61,6 +62,7 @@ from mizzle.core.steps import (
     DropExtension,
     DropFunction,
     DropIndex,
+    DropPartition,
     DropPolicy,
     DropRole,
     DropTable,
@@ -173,6 +175,7 @@ class _Plan:
     drop_rebuilt: list[Step] = field(default_factory=list[Step])  # columns added again
     drop_early: list[Step] = field(default_factory=list[Step])  # tables whose names are reused
     create_tables: list[Step] = field(default_factory=list[Step])
+    create_partitions: list[Step] = field(default_factory=list[Step])
     add_columns: list[Step] = field(default_factory=list[Step])
     alter_columns: list[Step] = field(default_factory=list[Step])
     table_options: list[Step] = field(default_factory=list[Step])
@@ -189,6 +192,7 @@ class _Plan:
     comments: list[Step] = field(default_factory=list[Step])
     revokes: list[Step] = field(default_factory=list[Step])
     grants: list[Step] = field(default_factory=list[Step])
+    drop_partitions: list[Step] = field(default_factory=list[Step])
     drop_tables: list[Step] = field(default_factory=list[Step])
     drop_domains: list[Step] = field(default_factory=list[Step])
     drop_enums: list[Step] = field(default_factory=list[Step])
@@ -218,6 +222,7 @@ class _Plan:
             *self.drop_rebuilt,
             *self.drop_early,
             *self.create_tables,
+            *self.create_partitions,
             *self.add_columns,
             *self.alter_columns,
             *self.table_options,
@@ -234,6 +239,7 @@ class _Plan:
             *self.comments,
             *self.revokes,
             *self.grants,
+            *self.drop_partitions,
             *self.drop_tables,
             *self.drop_domains,
             *self.drop_enums,
@@ -487,8 +493,28 @@ def _diff_named[T: Mapping[str, object]](
         on_add(new[name])
 
 
+def _diff_partitions(old: TableSnap, new: TableSnap, plan: _Plan) -> None:
+    """Partitions of an existing table: add the new ones, drop the gone ones. A change to
+    the key or to a partition's bound is not expressible (it needs a detach/attach)."""
+    schema, name = new["schema"], new["name"]
+    if old.get("partition_by") != new.get("partition_by"):
+        raise MigrationError(f"table {name}: changing the partition key needs a custom migration")
+    before, after = old.get("partitions", {}), new.get("partitions", {})
+    for pname, bound in after.items():
+        if pname not in before:
+            plan.create_partitions.append(CreatePartition(schema, name, pname, bound))
+        elif before[pname] != bound:
+            raise MigrationError(
+                f"table {name}: changing the bound of partition {pname} needs a custom migration"
+            )
+    for pname in before:
+        if pname not in after:
+            plan.drop_partitions.append(DropPartition(schema, pname))
+
+
 def _diff_table(old: TableSnap, new: TableSnap, plan: _Plan, compare_expressions: bool) -> None:
     schema, name = new["schema"], new["name"]
+    _diff_partitions(old, new, plan)
     if rebuilt := [
         c
         for c, col in new["columns"].items()
@@ -691,6 +717,10 @@ def diff(
         before = old_tables.get(k)
         if before is None:
             plan.create_tables.append(CreateTable(table))
+            plan.create_partitions += [
+                CreatePartition(table["schema"], table["name"], pname, bound)
+                for pname, bound in table.get("partitions", {}).items()
+            ]
             plan.create_indexes += [
                 CreateIndex(table["schema"], table["name"], i) for i in table["indexes"].values()
             ]

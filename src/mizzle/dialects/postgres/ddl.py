@@ -52,6 +52,7 @@ from mizzle.core.steps import (
     CreateExtension,
     CreateFunction,
     CreateIndex,
+    CreatePartition,
     CreatePolicy,
     CreateRole,
     CreateSchema,
@@ -65,6 +66,7 @@ from mizzle.core.steps import (
     DropExtension,
     DropFunction,
     DropIndex,
+    DropPartition,
     DropPolicy,
     DropRole,
     DropTable,
@@ -395,6 +397,8 @@ def _create_table(table: TableSnap) -> str:
     body = ",\n    ".join(lines)
     kind = "CREATE UNLOGGED TABLE" if table.get("unlogged") else "CREATE TABLE"
     text = f"{kind} {qualified(table['schema'], table['name'])} (\n    {body}\n)"
+    if partition_by := table.get("partition_by"):
+        text += f" PARTITION BY {partition_by}"
     if options := table.get("options"):
         text += " WITH (" + ", ".join(f"{k}={v}" for k, v in options.items()) + ")"
     return text
@@ -573,6 +577,13 @@ def render_step(step: Step) -> Statement:
             return Statement(f"DROP DOMAIN {qualified(schema, name)}")
         case CreateTable(table=table):
             return Statement(_create_table(table))
+        case CreatePartition(schema=schema, parent=parent, name=name, bound=bound):
+            return Statement(
+                f"CREATE TABLE {qualified(schema, name)} PARTITION OF "
+                f"{qualified(schema, parent)} {bound}"
+            )
+        case DropPartition(schema=schema, name=name):
+            return Statement(f"DROP TABLE {qualified(schema, name)}")
         case DropTable(schema=schema, name=name):
             return Statement(f"DROP TABLE {qualified(schema, name)}")
         case RenameTable(schema=schema, old=old, new=new):

@@ -26,6 +26,7 @@ from mizzle import (
     function,
     grant,
     index,
+    partition,
     primary_key,
     role,
     sql,
@@ -1111,3 +1112,84 @@ async def test_domains(driver: PostgresDriver, tmp_path: Path) -> None:
     v3 = snap([Subscribers], objects=[changed])
     with pytest.raises(MigrationError, match="domain mg_email"):
         diff(v1, v3, StrictRenames())
+
+
+# -- partitions --------------------------------------------------------------------------
+
+
+def _partitioned(name: str, key: str, parts: list[tuple[str, str]]) -> type[Table]:
+    @final
+    class P(Table, name=name, schema="mg", partition_by=key):
+        id = integer()
+        logged_at = date()
+        region = text()
+
+        @classmethod
+        @override
+        def config(cls) -> list[Constraint]:
+            return [partition(n, for_values=b) for n, b in parts]
+
+    return P
+
+
+async def test_partitions(driver: PostgresDriver, tmp_path: Path) -> None:
+    r2026 = ("measurements_2026", "FOR VALUES FROM ('2026-01-01') TO ('2027-01-01')")
+    r2027 = ("measurements_2027", "FOR VALUES FROM ('2027-01-01') TO ('2028-01-01')")
+    rdef = ("measurements_def", "DEFAULT")
+    v1 = snap([_partitioned("measurements", "RANGE (logged_at)", [r2026, rdef])])
+    assert v1["tables"]["mg.measurements"].get("partition_by") == "RANGE (logged_at)"
+    assert v1["tables"]["mg.measurements"].get("partitions") == {
+        r2026[0]: r2026[1],
+        rdef[0]: rdef[1],
+    }
+
+    await migrate(driver, empty_snapshot("postgresql"), v1)
+    # A row routes to the partition its key falls in; the rest lands in the default.
+    await execute(
+        driver,
+        "INSERT INTO mg.measurements (id, logged_at, region) VALUES "
+        "(1, DATE '2026-06-01', 'eu'), (2, DATE '2030-01-01', 'us')",
+    )
+    [row] = await execute(driver, "SELECT count(*) AS n FROM mg.measurements_2026")
+    assert row["n"] == 1
+    [row] = await execute(driver, "SELECT count(*) AS n FROM mg.measurements_def")
+    assert row["n"] == 1
+    await assert_pull_round_trip(driver, tmp_path)
+
+    # Swap the default partition for a new range one.
+    v2 = snap([_partitioned("measurements", "RANGE (logged_at)", [r2026, r2027])])
+    steps = [s.describe() for s in await migrate(driver, v1, v2)]
+    assert steps == [
+        "create partition measurements_2027 of measurements",
+        "drop partition measurements_def",
+    ]
+
+    # A list partition keeps its bound text through pull round trips (real PostgreSQL
+    # reformats the bound, and the snapshot matches it).
+    eu = ("regions_eu", "FOR VALUES IN ('eu', 'uk')")
+    other = ("regions_other", "FOR VALUES IN ('us')")
+    v3 = snap([_partitioned("regions", "LIST (region)", [eu, other])])
+    await migrate(driver, v2, snap([]))  # only drops: partitions go with the table
+    await migrate(driver, empty_snapshot("postgresql"), v3)
+    await execute(
+        driver, "INSERT INTO mg.regions (id, logged_at, region) VALUES (1, DATE '2020-01-01', 'uk')"
+    )
+    [row] = await execute(driver, "SELECT count(*) AS n FROM mg.regions_eu")
+    assert row["n"] == 1
+    with pytest.raises(DatabaseError, match="no partition"):
+        await execute(
+            driver,
+            "INSERT INTO mg.regions (id, logged_at, region) VALUES (2, DATE '2020-01-01', 'fr')",
+        )
+    source = await assert_pull_round_trip(driver, tmp_path)
+    assert "FOR VALUES IN ('eu', 'uk')" in source
+    assert "partition_by='LIST (region)'" in source
+
+    # Changing the key in place is not expressible: it needs a hand-written migration.
+    changed = snap([_partitioned("regions", "LIST (id)", [eu, other])])
+    with pytest.raises(MigrationError, match="partition key"):
+        diff(v3, changed, StrictRenames())
+
+    # Dropping the partitioned table takes its partitions with it.
+    steps = await migrate(driver, v3, snap([]))
+    assert [s.describe() for s in steps] == ["drop table regions"]

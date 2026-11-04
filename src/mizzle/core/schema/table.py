@@ -16,6 +16,7 @@ from mizzle.core.schema.constraints import (
     ForeignKey,
     Grant,
     Index,
+    Partition,
     Policy,
     PrimaryKey,
     RowLevelSecurity,
@@ -33,6 +34,7 @@ class TableInfo:
     comment: str | None = None
     unlogged: bool = False
     storage: dict[str, str] | None = None  # WITH (fillfactor=70, ...)
+    partition_by: str | None = None  # PARTITION BY key, as PostgreSQL prints it
 
 
 class Table:
@@ -46,6 +48,7 @@ class Table:
         comment: str | None = None,
         unlogged: bool = False,
         storage: Mapping[str, str | int] | None = None,
+        partition_by: str | None = None,
         abstract: bool = False,
         **kwargs: object,
     ) -> None:
@@ -66,7 +69,14 @@ class Table:
         relations = {attr: v for attr, v in members.items() if isinstance(v, Relation)}
         options = {k: str(v) for k, v in storage.items()} if storage is not None else None
         cls.__table__ = TableInfo(
-            name or snake_case(cls.__name__), schema, columns, relations, comment, unlogged, options
+            name or snake_case(cls.__name__),
+            schema,
+            columns,
+            relations,
+            comment,
+            unlogged,
+            options,
+            partition_by,
         )
 
     @classmethod
@@ -100,7 +110,7 @@ def _constraint_columns(constraint: Constraint) -> tuple[ColumnBase, ...]:
             return constraint.columns
         case Exclusion():
             return tuple(k for k, _ in constraint.elements if isinstance(k, ColumnBase))
-        case Check() | Policy() | RowLevelSecurity() | Grant():
+        case Check() | Policy() | RowLevelSecurity() | Grant() | Partition():
             return ()
 
 
@@ -179,3 +189,10 @@ def validate_tables(tables: Sequence[type[Table]], casing: Casing | None = None)
                     raise SchemaError(
                         f"{table.__name__}.config() uses {column.qualified_name} from another table"
                     )
+
+        if info.partition_by is None and any(isinstance(c, Partition) for c in constraints):
+            raise SchemaError(
+                f"{table.__name__}: partition(...) needs partition_by=... on the table"
+            )
+        if info.partition_by is not None and not info.partition_by.strip():
+            raise SchemaError(f"{table.__name__}: partition_by cannot be empty")

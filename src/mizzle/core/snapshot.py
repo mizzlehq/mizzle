@@ -171,6 +171,10 @@ class TableSnap(TypedDict):
     unlogged: NotRequired[bool]  # CREATE UNLOGGED TABLE
     options: NotRequired[dict[str, str]]  # storage parameters: WITH (fillfactor=70)
     exclusions: NotRequired[dict[str, ExclusionSnap]]
+    # A partitioned table's key (as pg_get_partkeydef() prints it: "RANGE (logged_at)") and
+    # its partitions: name -> bound (as pg_get_expr() prints it).
+    partition_by: NotRequired[str]
+    partitions: NotRequired[dict[str, str]]
 
 
 class EnumSnap(TypedDict):
