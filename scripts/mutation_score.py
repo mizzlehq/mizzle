@@ -33,8 +33,12 @@ def main() -> int:
     stats: dict[str, object] = json.loads(path.read_text(encoding="utf-8"))
     counts = {name: int(stats.get(name, 0) or 0) for name in DETECTED}
     detected = sum(counts.values())
-    score = 100.0 * counts["killed"] / detected if detected else 100.0
     detail = ", ".join(f"{name} {count}" for name, count in counts.items())
+    if not detected:
+        # A filter that matches nothing would otherwise report a perfect score.
+        print(f"no mutants ran ({detail}); the filter matched nothing", file=sys.stderr)
+        return 1
+    score = 100.0 * counts["killed"] / detected
     print(f"mutation score {score:.1f}% ({detail})")
     if score < args.min:
         print(f"below the {args.min:.1f}% threshold", file=sys.stderr)

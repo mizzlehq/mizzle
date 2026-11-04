@@ -7,7 +7,7 @@ of asyncpg. A relative gate needs no machine-specific baseline and is stable eno
 while still catching a gross regression (an accidental extra round trip or a lost cache).
 
     docker compose up -d
-    uv run python benchmarks/regression.py --min-ratio 0.25
+    uv run python benchmarks/regression.py
 
 Set ``MIZZLE_TEST_URL`` to point at another database. The table it creates is UNLOGGED and
 dropped at the end.
@@ -144,7 +144,19 @@ async def measure(
     return results
 
 
-async def run(min_ratio: float, rows: int, rounds: int) -> int:
+# Floors per scenario, as a fraction of asyncpg's ops/sec. Measured on a developer machine
+# at 1.39x (insert), 1.34x (get), 1.19x (update) and 0.75x (select many); each floor is about
+# 85% of that, which leaves room for CI noise but not for an extra round trip per statement
+# (which drops the single-row scenarios to 0.38-0.55x). --min-ratio overrides every floor.
+FLOORS = {
+    "insert 1 row": 1.18,
+    "get by primary key": 1.14,
+    "update by primary key": 1.01,
+    "select many rows": 0.64,
+}
+
+
+async def run(min_ratio: float | None, rows: int, rounds: int) -> int:
     pool = await asyncpg.create_pool(URL, min_size=1, max_size=4)
     db = await Database.connect(URL, schema=[RegUser], pool_size=4)
     try:
@@ -162,16 +174,23 @@ async def run(min_ratio: float, rows: int, rounds: int) -> int:
         await pool.close()
 
     print(f"\nRound trip: {rtt:.2f} ms per SELECT 1.")
-    worst = min(results, key=lambda name: results[name][1] / results[name][0])
-    ratio = results[worst][1] / results[worst][0]
-    if ratio < min_ratio:
+    failures: list[str] = []
+    for name, (apg, mz) in results.items():
+        measured = mz / apg
+        floor = min_ratio if min_ratio is not None else FLOORS[name]
+        verdict = "ok" if measured >= floor else "FAIL"
+        print(f"  {name:24}{measured:5.2f}x  (floor {floor:.2f}x)  {verdict}")
+        if measured < floor:
+            failures.append(f"{name!r} at {measured:.2f}x, below its floor {floor:.2f}x")
+    if failures:
         print(
-            f"\nFAIL: mizzle/asyncpg for {worst!r} is {ratio:.2f}x,"
-            f" below --min-ratio {min_ratio:.2f}",
+            "\nFAIL: " + "; ".join(failures) + ".\n"
+            "A per-scenario floor near the measured ratio is what catches a regression: the "
+            "old single 0.25x gate passed even with two extra round trips per statement.",
             file=sys.stderr,
         )
         return 1
-    print(f"OK: worst scenario is {worst!r} at {ratio:.2f}x asyncpg (>= {min_ratio:.2f}x).")
+    print("OK: every scenario is at or above its floor.")
     return 0
 
 
@@ -180,8 +199,9 @@ def main() -> int:
     parser.add_argument(
         "--min-ratio",
         type=float,
-        default=0.25,
-        help="fail when mizzle is below this fraction of asyncpg's ops/sec (default: 0.25)",
+        default=None,
+        help="fail when mizzle is below this fraction of asyncpg's ops/sec for every "
+        "scenario (default: a per-scenario floor, see FLOORS)",
     )
     parser.add_argument("--rows", type=int, default=300, help="rows per round (default: 300)")
     parser.add_argument("--rounds", type=int, default=5, help="timed rounds per scenario")

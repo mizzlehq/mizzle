@@ -49,6 +49,9 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - run: pnpm run ci  # Biome; bare `pnpm ci` is pnpm's own clean-install command
       - run: pnpm build
+      # pip-audit covers Python only; the UI's own dependencies need their own audit.
+      - name: Audit UI dependencies
+        run: pnpm audit --prod --audit-level high
 
   studio-assets:
     # The Studio UI zip is unpacked by mizzle on every OS: prove it on each one.
@@ -158,7 +161,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
       - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e  # v6
       - run: uv sync --python 3.12
-      - run: uv run python benchmarks/regression.py --min-ratio 0.25
+      - run: uv run python benchmarks/regression.py
 
   package:
     # The release workflow only builds at tag time. Build and install the wheel here so a
