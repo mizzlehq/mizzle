@@ -8,12 +8,17 @@ Run `mizzle <command> --help` for all options. Every command reads `mizzle.toml`
 | `mizzle init` | Set up mizzle in this project. |
 | `mizzle generate` | Write a migration from schema changes. |
 | `mizzle migrate` | Apply pending migrations. |
+| `mizzle reset` | Drop every mizzle-managed object and re-run all migrations. |
+| `mizzle squash` | Collapse the migration history into one migration. |
+| `mizzle seed` | Run the seed scripts (`seeds/*.sql`) in order. |
 | `mizzle push` | Sync the schema to the database directly (development). |
 | `mizzle pull` | Write a schema module from an existing database. |
 | `mizzle check` | Validate the migrations folder. |
 | `mizzle status` | Show which migrations are applied and which are pending. |
+| `mizzle info` | Environment, connectivity, pending count and schema drift. |
+| `mizzle doctor` | Like `info`, but exits 1 when something is wrong (use in CI). |
 | `mizzle drop` | Delete the latest (unapplied) migration. |
-| `mizzle typegen` | Write insert/update TypedDicts. |
+| `mizzle typegen` | Write row/insert/update TypedDicts. |
 | `mizzle studio` | Browse and edit data in the browser. |
 
 ## generate
@@ -25,7 +30,13 @@ mizzle generate --rename users.name=full_name     # a column rename
 mizzle generate --no-renames                      # treat changes as drop + create
 mizzle generate --allow-data-loss                 # allow drops and narrowing types
 mizzle generate --custom --name backfill          # empty migration for your own SQL
+mizzle generate --sql                             # print the SQL, write nothing
+mizzle generate --custom --name backfill --template header.sql
+mizzle generate --custom --name backfill --sql    # print the header only, write nothing
 ```
+
+`--template <file>` seeds the body of a `--custom` migration with that file's contents. With
+`--sql`, nothing is written to disk (not even a `--custom` folder) and the SQL is printed.
 
 When a column or table is gone and a new one appears, mizzle asks if it is a rename (on a
 terminal), or stops and tells you which `--rename` to pass (in CI).
@@ -37,7 +48,18 @@ In a `--custom` migration, separate statements with `-- mizzle:breakpoint`.
 ```bash
 mizzle migrate
 mizzle migrate --lock-timeout 5   # seconds to wait for another server's migration (default 60)
+mizzle migrate --dry-run          # run every check, print the SQL, apply nothing
+mizzle migrate --to 0003_add_posts
 ```
+
+`--dry-run` performs the same checks as a real run (an edited applied migration, migrations
+missing from disk after a squash, a pending migration older than an applied one) and exits
+non-zero on the same failures; it only skips sending the statements.
+
+`--to <name>` stops after that migration. The target is matched by exact folder name or by
+exact number, never by prefix: `--to 3` means migration 0003, not `0031_...`. When the
+target was already applied, `migrate --to` says so instead of claiming everything is
+up to date.
 
 Each migration runs in one transaction. Many app servers can run `migrate` at the same time:
 an advisory lock lets one apply and the others wait. A server that waits longer than
@@ -66,18 +88,34 @@ that runs nothing ([Following a schema another app owns](guide/migrations.md#fol
 
 ## check
 
+```bash
+mizzle check
+mizzle check --fix   # repair journal and prev_id inconsistencies
+```
+
 Fails when the journal and the migration folders disagree. Warns when a `migration.sql`
 was edited after `generate` (custom migrations are expected to be edited). Run it in CI.
+
+`--fix` rewrites the journal where it can: a missing `prev_id`, a duplicate number it can
+resolve unambiguously. It never touches an entry that may already be applied, refuses
+ambiguous branch cases instead of guessing, and prints every change it makes.
 
 ## status
 
 ```bash
 mizzle status
+mizzle status --json    # machine-readable
+mizzle status --check   # exit 1 when a migration is pending (for deploy gates)
 ```
 
 Lists every migration with its state: `applied`, `pending`, `applied (changed after it was
 applied)`, or a name the database has but the folder does not. Set the database URL to
-compare with the database; without it, the state is `unknown`.
+compare with the database; without it, the state is `unknown`, and the counts only include
+migrations whose state is known.
+
+`--check` exits 1 when anything is pending, and also when an applied migration was edited
+after it was applied. `--json` prints
+`{"migrations": [...], "applied": n, "pending": n, "missing": n}`.
 
 ```text
   0001_create_users   applied
@@ -85,6 +123,57 @@ compare with the database; without it, the state is `unknown`.
 
 1 applied, 1 pending.
 ```
+
+## reset
+
+```bash
+mizzle reset --database shop --force
+```
+
+Drops every object mizzle manages (from the latest snapshot) and re-runs all migrations.
+Only mizzle-managed objects are dropped: unmanaged tables in the same schema, installed
+extensions and `public`'s owner and grants survive. The migrations table is always cleared,
+so every migration runs again even when its schema is outside `schema_filter`.
+
+`reset` is destructive, so it asks first and shows the host and database. `--force` skips
+the prompt but still requires `--database <name>` matching the database in the URL, so
+`DATABASE_URL=<production> mizzle reset --force` cannot wipe production by accident. It
+takes the same advisory lock as `migrate`, so a concurrent `migrate` waits instead of
+failing.
+
+## squash
+
+```bash
+mizzle squash --name initial
+```
+
+Replaces the applied history with one migration holding the latest snapshot. It refuses to
+run when the range contains custom (hand-written) migrations, because their SQL would be
+lost; move that SQL into the squashed migration by hand first.
+
+Databases that already applied the old migrations are not broken: the squashed migration
+records the names it `supersedes`, and `migrate` treats it as applied for them.
+
+## seed
+
+```bash
+mizzle seed
+```
+
+Runs `seeds/*.sql` in filename order. Each file commits on its own, so a failure in the
+second file keeps the first file's rows; re-running is not idempotent. This is a script
+runner, not a data generator — write the SQL you want.
+
+## info and doctor
+
+```bash
+mizzle info
+mizzle doctor   # exit 1 when something is wrong
+```
+
+Both print the environment, whether the database is reachable, how many migrations are
+pending and whether the schema has drifted. `doctor` exits non-zero when a migration is
+pending, an applied migration was edited, or the schema drifts; use it as a CI gate.
 
 ## studio
 

@@ -33,8 +33,8 @@ def varchar(length: int | None = None, name: str | None = None) -> Column[str | 
 
 def char(length: int = 1, name: str | None = None) -> Column[str | None]:
     """A blank-padded fixed-length string: ``char()`` is ``character(1)``, ``char(4)`` is
-    ``character(4)``. PostgreSQL strips trailing spaces when comparing and reading, so it
-    behaves like a length-limited ``text``."""
+    ``character(4)``. PostgreSQL pads on write and compares with the padding ignored, but
+    reading returns the padding: ``'ab'`` stored in ``char(3)`` reads back as ``'ab '``."""
     return Column(f"char({length})", (str,), name)
 
 

@@ -192,8 +192,10 @@ uses the same `mizzle.toml` and database URL as the other commands.
 
 ## typegen
 
-`mizzle typegen` writes a `TypedDict` for inserts and one for updates of each table, next
-to your schema module (`db/schema_types.py`):
+`mizzle typegen` writes three `TypedDict`s per table, next to your schema module
+(`db/schema_types.py`): `<Table>Row` for a full selected row (including generated
+columns), `<Table>Insert` for the values of a new row, and `<Table>Update` for a partial
+update.
 
 ```python
 class NotesInsert(TypedDict):
@@ -210,6 +212,17 @@ inserting:
 rows: list[NotesInsert] = [{"body": "one"}, {"body": "two"}]
 async with as_user(db, ANN) as tx:
     await tx.insert(Notes).values(rows)  # a misspelled key is a type error
+```
+
+`<Table>Row` names the shape a projection returns; `as_rows()` checks the field names and
+re-types the result:
+
+```python
+rows = (
+    await db.select({"id": Notes.id, "body": Notes.body})
+    .from_(Notes)
+    .as_rows(NotesRow)  # list[NotesRow]
+)
 ```
 
 Once the file exists, `mizzle generate` rewrites it each time it writes a migration.
