@@ -46,7 +46,7 @@ from mizzle.core.schema.objects import (
     Trigger,
 )
 from mizzle.core.snapshot import Snapshot, empty_snapshot
-from mizzle.core.steps import Statement, Step
+from mizzle.core.steps import DropExtension, Statement, Step
 from mizzle.dialects.postgres import PostgresDialect
 from mizzle.dialects.postgres.driver import PostgresDriver
 from mizzle.kit.codegen import render_schema_module
@@ -83,6 +83,7 @@ from mizzle.pg import (
     smallint,
     text,
     timestamp,
+    tsrange,
     tstzrange,
     varbit,
     xml,
@@ -770,6 +771,55 @@ async def test_char_types_round_trip(driver: PostgresDriver, tmp_path: Path) -> 
     await execute(driver, "INSERT INTO mg.chars (fixed, single) VALUES ('abcd', 'x')")
     [row] = await execute(driver, "SELECT fixed, single FROM mg.chars")
     assert (row["fixed"], row["single"]) == ("abcd", "x")
+    await assert_pull_round_trip(driver, tmp_path)
+
+
+# -- hand-written CHECK and exclusion predicates (T10) -------------------------------------
+
+
+@final
+class Bookings(Table, name="bookings", schema="mg"):
+    during = tsrange().not_null()
+    status = text().not_null()
+
+    @classmethod
+    @override
+    def config(cls) -> list[Constraint]:
+        # A range key needs no extra operator class, so the test needs no btree_gist.
+        return [
+            # Written the way a person writes it: no outer parens, no ::text casts.
+            check("bookings_status_valid", sql("status <> ''"), not_valid=True),
+            exclusion(
+                (cls.during, "&&"),
+                name="bookings_no_overlap",
+                using="gist",
+                where=sql("status = 'active'"),
+            ),
+        ]
+
+
+async def test_hand_written_constraint_text_does_not_drift(
+    driver: PostgresDriver, tmp_path: Path
+) -> None:
+    # T10: PostgreSQL prints ``(status <> ''::text)``; a hand-written ``status <> ''`` must
+    # compare equal instead of being dropped and re-added on every generate.
+    await migrate(driver, empty_snapshot("postgresql"), snap([Bookings]))
+    live_left = await live(driver)
+    async with driver.acquire() as conn:
+        desired = await dialect.normalize_snapshot(conn, snap([Bookings]))
+    live_table, wanted = live_left["tables"]["mg.bookings"], desired["tables"]["mg.bookings"]
+    assert live_table["checks"]["bookings_status_valid"]["expression"].endswith("::text)")
+    assert (
+        wanted["checks"]["bookings_status_valid"]["expression"]
+        == live_table["checks"]["bookings_status_valid"]["expression"]
+    )
+    live_exclusions = live_table.get("exclusions", {})
+    wanted_exclusions = wanted.get("exclusions", {})
+    assert wanted_exclusions["bookings_no_overlap"].get("where") == (
+        live_exclusions["bookings_no_overlap"].get("where")
+    )
+    remaining = diff(live_left, desired, compare_expressions=True)
+    assert [s for s in remaining if not isinstance(s, DropExtension)] == []
     await assert_pull_round_trip(driver, tmp_path)
 
 

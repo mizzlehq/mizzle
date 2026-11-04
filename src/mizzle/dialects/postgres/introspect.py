@@ -929,6 +929,58 @@ async def normalize_snapshot(conn: Connection, snapshot: Snapshot) -> Snapshot:
     return out
 
 
+async def _normalize_constraint_expressions(
+    table: TableSnap, like: str, norm: str, rel: str, read_back: _ReadBack
+) -> None:
+    """CHECK and exclusion expressions as PostgreSQL prints them.
+
+    A CHECK written by hand (``status <> ''``) reads back as ``(status <> ''::text)``, and
+    a hand-written exclusion predicate gains its outer parentheses and casts. Without this
+    ``generate`` after ``pull`` (or a hand-written constraint) drops and re-adds it forever.
+    All the table's constraints are created in one savepoint, then read back together.
+    """
+    checks = {n: c for n, c in table.get("checks", {}).items() if "expression" in c}
+    exclusions = {n: x for n, x in table.get("exclusions", {}).items() if "where" in x}
+    if not checks and not exclusions:
+        return
+    statements = [like]
+    for name, check in checks.items():
+        add = f"ALTER TABLE {norm} ADD CONSTRAINT {quote(name)} CHECK ({check['expression']})"
+        statements.append(add + (" NOT VALID" if check.get("not_valid") else ""))
+    for name, exclusion in exclusions.items():
+        keys: list[str] = []
+        for element in exclusion["elements"]:
+            column = element.get("column")
+            key = quote(column) if column is not None else f"({element.get('expression', '')})"
+            keys.append(f"{key} WITH {element['operator']}")
+        elements = ", ".join(keys)
+        statements.append(
+            f"ALTER TABLE {norm} ADD CONSTRAINT {quote(name)} "
+            f"EXCLUDE USING {exclusion['method']} ({elements}) WHERE ({exclusion['where']})"
+        )
+    row = await read_back(
+        statements,
+        "SELECT "
+        "ARRAY(SELECT c.conname FROM pg_constraint c "
+        f"WHERE c.conrelid = {rel} AND c.contype = 'c' ORDER BY c.conname) AS check_names, "
+        "ARRAY(SELECT pg_get_constraintdef(c.oid) FROM pg_constraint c "
+        f"WHERE c.conrelid = {rel} AND c.contype = 'c' ORDER BY c.conname) AS check_defs, "
+        "ARRAY(SELECT c.conname FROM pg_constraint c "
+        f"WHERE c.conrelid = {rel} AND c.contype = 'x' ORDER BY c.conname) AS excl_names, "
+        "ARRAY(SELECT pg_get_expr(i.indpred, i.indrelid) FROM pg_constraint c "
+        "JOIN pg_index i ON i.indexrelid = c.conindid "
+        f"WHERE c.conrelid = {rel} AND c.contype = 'x' ORDER BY c.conname) AS excl_wheres",
+    )
+    if row is None:
+        return
+    for name, definition in zip(_strs(row["check_names"]), _strs(row["check_defs"]), strict=True):
+        if name in checks:
+            checks[name]["expression"] = _check_expression(definition)
+    for name, predicate in zip(_strs(row["excl_names"]), _strs(row["excl_wheres"]), strict=True):
+        if name in exclusions:
+            exclusions[name]["where"] = predicate
+
+
 async def _normalize(snapshot: Snapshot, read_back: _ReadBack, version: int) -> None:
     norm = f"pg_temp.{quote(_NORM)}"
     # Looked up when each query runs (a missing object reads as NULL, never as text).
@@ -1045,3 +1097,4 @@ async def _normalize(snapshot: Snapshot, read_back: _ReadBack, version: int) -> 
             )
             if row is not None and row["d"] is not None:
                 trigger["when"] = _trigger_when(str(row["d"]))
+        await _normalize_constraint_expressions(table, like, norm, rel, read_back)
