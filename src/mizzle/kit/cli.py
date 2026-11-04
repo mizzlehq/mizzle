@@ -15,15 +15,15 @@ from pathlib import Path
 from typing import Protocol, cast
 
 from mizzle.core.errors import DatabaseError, DataLossBlocked, MigrationError, MizzleError
-from mizzle.core.snapshot import Snapshot
+from mizzle.core.snapshot import Snapshot, empty_snapshot
 from mizzle.core.steps import Step
 from mizzle.dialects.base import Dialect, Driver
 from mizzle.kit.codegen import render_schema_module, render_types_module
 from mizzle.kit.config import Config, load_config
 from mizzle.kit.diff import RenameKind, RenameResolver, StrictRenames, diff, no_renames
 from mizzle.kit.init import init_project
-from mizzle.kit.journal import Migration, MigrationsDir, format_sql
-from mizzle.kit.migrate import apply_statements, run_migrations
+from mizzle.kit.journal import Migration, MigrationsDir, format_sql, parse_sql
+from mizzle.kit.migrate import apply_statements, resolve_target, run_migrations
 from mizzle.kit.snapshot import build_snapshot
 
 
@@ -47,6 +47,7 @@ class Args(Protocol):
     check: bool
     fix: bool
     template: str | None
+    to: str | None
     out: str | None
     port: int
     read_only: bool
@@ -194,6 +195,7 @@ def cmd_migrate(config: Config, args: Args) -> int:
             directory,
             schema=config.migrations_schema,
             lock_timeout=args.lock_timeout,
+            target=args.to,
             on_apply=lambda m: print(f"Applying {m.name}"),
         )
 
@@ -202,7 +204,7 @@ def cmd_migrate(config: Config, args: Args) -> int:
     return 0
 
 
-def _migrate_dry_run(config: Config, _args: Args, directory: MigrationsDir) -> int:
+def _migrate_dry_run(config: Config, args: Args, directory: MigrationsDir) -> int:
     """Print the SQL ``migrate`` would run, without touching the database."""
 
     async def plan(driver: Driver, dialect: Dialect) -> list[Migration]:
@@ -214,7 +216,13 @@ def _migrate_dry_run(config: Config, _args: Args, directory: MigrationsDir) -> i
                     applied = {}
                 else:
                     raise
-        return [m for m in directory.migrations() if m.name not in applied]
+        migrations = directory.migrations()
+        target_index = resolve_target(migrations, args.to) if args.to is not None else None
+        return [
+            m
+            for m in migrations
+            if m.name not in applied and (target_index is None or m.index <= target_index)
+        ]
 
     pending = asyncio.run(_with_driver(config, plan))
     if not pending:
@@ -259,6 +267,45 @@ def cmd_reset(config: Config, args: Args) -> int:
     asyncio.run(_with_driver(config, wipe))
     applied = asyncio.run(_with_driver(config, run))
     print(f"Reset: applied {len(applied)} migration(s).")
+    return 0
+
+
+def cmd_squash(config: Config, args: Args) -> int:
+    """Collapse the migration history into one migration that builds the latest schema."""
+    dialect = config.dialect()
+    directory = MigrationsDir(config.out, config.dialect_name)
+    migrations = directory.migrations()
+    if not migrations:
+        print("No migrations to squash.")
+        return 0
+    latest = directory.latest_snapshot()
+    steps = diff(empty_snapshot(config.dialect_name), latest, no_renames, compare_expressions=False)
+    statements = dialect.render(steps)
+    latest["prev_id"] = None
+    directory.clear()
+    migration = directory.write(args.name or "squash", statements, latest)
+    print(f"Squashed {len(migrations)} migration(s) into {migration.name}.")
+    print("The database was left as it is: run `mizzle reset`, or migrate a fresh database.")
+    return 0
+
+
+def cmd_seed(config: Config, _args: Args) -> int:
+    """Run every ``*.sql`` file in the seed directory, in name order."""
+    folder = config.seed if config.seed.is_absolute() else config.root / config.seed
+    scripts = sorted(folder.glob("*.sql")) if folder.is_dir() else []
+    if not scripts:
+        print(f"No seed scripts in {folder}.")
+        return 0
+
+    async def run(driver: Driver, _dialect: Dialect) -> int:
+        async with driver.acquire() as conn:
+            for script in scripts:
+                print(f"Seeding {script.name}")
+                await apply_statements(conn, parse_sql(script.read_text(encoding="utf-8")))
+        return len(scripts)
+
+    count = asyncio.run(_with_driver(config, run))
+    print(f"Ran {count} seed script(s).")
     return 0
 
 
@@ -625,12 +672,20 @@ def _parser() -> argparse.ArgumentParser:
     p = sub.add_parser("migrate", help="apply pending migrations")
     p.add_argument("--lock-timeout", type=float, default=60.0)
     p.add_argument("--dry-run", action="store_true", help="print the SQL, apply nothing")
+    p.add_argument("--to", help="apply only up to this migration (name, prefix or number)")
     p.set_defaults(func=cmd_migrate)
 
     p = sub.add_parser("reset", help="drop the schema and re-run every migration")
     p.add_argument("--force", action="store_true", help="do not ask before dropping")
     p.add_argument("--lock-timeout", type=float, default=60.0)
     p.set_defaults(func=cmd_reset)
+
+    p = sub.add_parser("squash", help="collapse the history into one migration")
+    p.add_argument("--name", help="name for the squashed migration")
+    p.set_defaults(func=cmd_squash)
+
+    p = sub.add_parser("seed", help="run the seed scripts (seeds/*.sql)")
+    p.set_defaults(func=cmd_seed)
 
     p = sub.add_parser("push", help="sync the schema to the database directly (development)")
     p.add_argument("--force", action="store_true", help="do not ask before applying")

@@ -250,6 +250,68 @@ async def test_reset_reruns_every_migration(
     await conn.close()
 
 
+async def test_migrate_to_stops_early(
+    project: Path, kit_url: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    assert await cli("generate") == 0
+    rewrite_schema(
+        project,
+        V1.replace("    name = text()", "    name = text()\n    age = integer()"),
+        monkeypatch,
+    )
+    assert await cli("generate") == 0  # 0002 adds the age column
+
+    assert await cli("migrate", "--to", "0001") == 0
+    assert "age" not in await columns(kit_url, "users")
+    assert await cli("migrate", "--to", "9999") == 1  # no such migration
+    assert await cli("migrate", "--to", "0002") == 0
+    assert "age" in await columns(kit_url, "users")
+
+
+async def test_squash_collapses_history(project: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    assert await cli("generate") == 0
+    assert await cli("generate", "--custom", "--name", "extra") == 0
+    assert len(list(project.glob("migrations/0[0-9][0-9][0-9]_*"))) == 2
+    capsys.readouterr()
+
+    assert await cli("squash", "--name", "baseline") == 0
+    assert "Squashed 2 migration(s)" in capsys.readouterr().out
+    assert (project / "migrations" / "0001_baseline").exists()
+    assert len(list(project.glob("migrations/0[0-9][0-9][0-9]_*"))) == 1
+    assert await cli("check") == 0
+    assert await cli("generate", "--sql") == 0
+    assert "No schema changes." in capsys.readouterr().out
+    assert (
+        "CREATE TABLE" in (project / "migrations" / "0001_baseline" / "migration.sql").read_text()
+    )
+
+
+async def test_seed_runs_sql_scripts(
+    project: Path, kit_url: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert await cli("generate") == 0
+    assert await cli("migrate") == 0
+    seeds = project / "seeds"
+    seeds.mkdir()
+    (seeds / "001_users.sql").write_text("INSERT INTO users (email, name) VALUES ('a@b.c', 'A');\n")
+    (seeds / "002_more.sql").write_text("INSERT INTO users (email, name) VALUES ('c@d.e', 'C');\n")
+    capsys.readouterr()
+
+    assert await cli("seed") == 0
+    out = capsys.readouterr().out
+    assert "001_users.sql" in out and "002_more.sql" in out and "Ran 2 seed script(s)." in out
+    conn = await asyncpg.connect(kit_url)
+    assert await conn.fetchval("SELECT count(*) FROM users") == 2
+    await conn.close()
+
+    (seeds / "001_users.sql").unlink()
+    (seeds / "002_more.sql").unlink()
+    seeds.rmdir()
+    capsys.readouterr()
+    assert await cli("seed") == 0
+    assert "No seed scripts" in capsys.readouterr().out
+
+
 async def test_status(project: Path, kit_url: str, capsys: pytest.CaptureFixture[str]) -> None:
     assert await cli("status") == 0
     assert "No migrations." in capsys.readouterr().out

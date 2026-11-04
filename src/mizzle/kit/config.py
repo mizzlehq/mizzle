@@ -33,6 +33,7 @@ _KEYS = {
     "casing",
     "schema_filter",
     "migrations_schema",
+    "seed",
 }
 
 
@@ -46,6 +47,7 @@ class Config:
     casing: Casing | None = None
     schema_filter: list[str] = field(default_factory=lambda: ["public"])
     migrations_schema: str = "public"
+    seed: Path = field(default_factory=lambda: Path("seeds"))
 
     def dialect(self) -> Dialect:
         if self.dialect_name == "postgresql":
@@ -168,6 +170,7 @@ def _from_mapping(root: Path, data: dict[str, object], source: Path) -> Config:
         casing=None if casing is None else "snake_case",
         schema_filter=_str_list(data, "schema_filter", ["public"], source),
         migrations_schema=_str(data, "migrations_schema", "public", source),
+        seed=root / _str(data, "seed", "seeds", source),
     )
 
 

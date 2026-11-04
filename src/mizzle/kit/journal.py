@@ -197,6 +197,14 @@ class MigrationsDir:
         self._save_journal(journal)
         return migration
 
+    def clear(self) -> None:
+        """Remove every migration folder (keeping ``meta/``) and empty the journal."""
+        if self.root.exists():
+            for child in self.root.iterdir():
+                if child.is_dir() and child.name != "meta":
+                    shutil.rmtree(child, ignore_errors=True)
+        self._save_journal(Journal(version=JOURNAL_VERSION, dialect=self.dialect, entries=[]))
+
     def repair(self) -> list[str]:
         """Reconcile the journal with the folders on disk: add folders it is missing, drop
         entries whose folder is gone, refresh hashes and re-link the ``prev_id`` chain.

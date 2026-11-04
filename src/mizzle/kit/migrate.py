@@ -48,6 +48,18 @@ async def apply_statements(
         await conn.execute(*after)
 
 
+def resolve_target(migrations: list[Migration], target: str) -> int:
+    """The index of the migration named by ``target`` (a full name, a leading prefix, or a
+    number). Raises when nothing matches."""
+    digits = target.split("_", 1)[0]
+    for migration in migrations:
+        if migration.name == target or migration.name.startswith(target):
+            return migration.index
+        if digits.isdigit() and migration.index == int(digits):
+            return migration.index
+    raise MigrationError(f"no migration matches --to {target!r}")
+
+
 async def run_migrations(
     driver: Driver,
     dialect: Dialect,
@@ -55,10 +67,13 @@ async def run_migrations(
     *,
     schema: str = "public",
     lock_timeout: float = 60.0,
+    target: str | None = None,
     on_apply: Callable[[Migration], None] | None = None,
 ) -> list[str]:
-    """Apply every pending migration in order. Returns the names that were applied."""
+    """Apply every pending migration in order, or only those up to ``target``. Returns the
+    names that were applied."""
     migrations = directory.migrations()
+    target_index = resolve_target(migrations, target) if target is not None else None
     async with driver.acquire() as conn:
         await dialect.acquire_migration_lock(conn, lock_timeout)
         try:
@@ -83,6 +98,8 @@ async def run_migrations(
                         f"{migration.name} is not applied but a later migration is; "
                         "this usually comes from merging branches. Run `mizzle check`."
                     )
+                if target_index is not None and migration.index > target_index:
+                    continue
                 if on_apply is not None:
                     on_apply(migration)
                 record = dialect.record_migration(schema, migration.name, hash)
