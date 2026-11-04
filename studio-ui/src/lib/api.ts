@@ -50,6 +50,12 @@ export type SqlResult = {
   count: number
 }
 
+/** One statement's result inside a multi-statement run. */
+export type SqlStatementResult = SqlResult & { statement: string }
+export type SqlBatch = { results: SqlStatementResult[] }
+export type HistoryEntry = { sql: string; at: string; ok: boolean }
+export type SavedQuery = { name: string; sql: string }
+
 const TOKEN_KEY = "mizzle-studio-token"
 
 // The token arrives in the URL fragment (never sent to servers or logged). Keep it for
@@ -98,8 +104,24 @@ async function request<T>(method: string, path: string, body?: unknown): Promise
   return data as T
 }
 
+async function requestBlob(path: string): Promise<Blob> {
+  const response = await fetch(path, { headers: { Authorization: `Bearer ${token}` } })
+  if (!response.ok) {
+    const data: unknown = await response.json().catch(() => ({}))
+    const message =
+      typeof data === "object" && data !== null && "error" in data
+        ? String((data as { error: unknown }).error)
+        : response.statusText
+    throw new ApiError(message, response.status)
+  }
+  return response.blob()
+}
+
 const rowsPath = (t: TableInfo) =>
   `/api/tables/${encodeURIComponent(t.schema)}/${encodeURIComponent(t.name)}/rows`
+
+const exportPath = (t: TableInfo) =>
+  `/api/tables/${encodeURIComponent(t.schema)}/${encodeURIComponent(t.name)}/export`
 
 export type RowsQuery = {
   limit: number
@@ -109,20 +131,32 @@ export type RowsQuery = {
   filters: Filter[]
 }
 
+function filterParams(q: Pick<RowsQuery, "order" | "dir" | "filters">): URLSearchParams {
+  const params = new URLSearchParams({ filters: JSON.stringify(q.filters) })
+  if (q.order) {
+    params.set("order", q.order)
+    params.set("dir", q.dir ?? "asc")
+  }
+  return params
+}
+
 export const api = {
   meta: () => request<Meta>("GET", "/api/meta"),
   tables: () => request<{ tables: TableInfo[] }>("GET", "/api/tables"),
   rows: (table: TableInfo, q: RowsQuery) => {
-    const params = new URLSearchParams({
-      limit: String(q.limit),
-      offset: String(q.offset),
-      filters: JSON.stringify(q.filters),
-    })
-    if (q.order) {
-      params.set("order", q.order)
-      params.set("dir", q.dir ?? "asc")
-    }
+    const params = filterParams(q)
+    params.set("limit", String(q.limit))
+    params.set("offset", String(q.offset))
     return request<{ total: number; rows: Row[] }>("GET", `${rowsPath(table)}?${params}`)
+  },
+  export: (
+    table: TableInfo,
+    q: Pick<RowsQuery, "order" | "dir" | "filters">,
+    format: "csv" | "json"
+  ) => {
+    const params = filterParams(q)
+    params.set("format", format)
+    return requestBlob(`${exportPath(table)}?${params}`)
   },
   insert: (table: TableInfo, values: Row) =>
     request<{ row: Row }>("POST", rowsPath(table), { values }),
@@ -130,7 +164,14 @@ export const api = {
     request<{ row: Row }>("PATCH", rowsPath(table), { key, values }),
   remove: (table: TableInfo, keys: Row[]) =>
     request<{ deleted: number }>("DELETE", rowsPath(table), { keys }),
-  sql: (sql: string) => request<SqlResult>("POST", "/api/sql", { sql }),
+  sql: (sql: string) => request<SqlBatch>("POST", "/api/sql", { sql }),
+  history: () => request<{ history: HistoryEntry[] }>("GET", "/api/queries/history"),
+  clearHistory: () => request<{ cleared: boolean }>("DELETE", "/api/queries/history"),
+  saved: () => request<{ saved: SavedQuery[] }>("GET", "/api/queries/saved"),
+  saveQuery: (name: string, sql: string) =>
+    request<{ name: string }>("PUT", `/api/queries/saved/${encodeURIComponent(name)}`, { sql }),
+  deleteQuery: (name: string) =>
+    request<{ deleted: string }>("DELETE", `/api/queries/saved/${encodeURIComponent(name)}`),
 }
 
 export const tableKey = (t: TableInfo) => `${t.schema}.${t.name}`

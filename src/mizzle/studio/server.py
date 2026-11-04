@@ -12,13 +12,17 @@ Security model (Studio can read and change data):
 
 from __future__ import annotations
 
+import csv
 import datetime
 import enum
 import hmac
+import io
 import json
+import logging
+import re
 import secrets
 import webbrowser
-from collections.abc import AsyncGenerator, Awaitable, Callable
+from collections.abc import AsyncGenerator, Awaitable, Callable, Mapping, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -42,7 +46,12 @@ from mizzle.kit.config import Config
 STATIC_DIR = Path(__file__).parent / "static"
 MAX_SQL_ROWS = 1000
 MAX_PAGE = 500
+MAX_EXPORT_ROWS = 100_000
+MAX_HISTORY = 100
 _COMPARE = {"eq": "=", "ne": "<>", "lt": "<", "lte": "<=", "gt": ">", "gte": ">="}
+_DOLLAR = re.compile(r"\$[A-Za-z_][A-Za-z0-9_]*\$|\$\$")
+
+log = logging.getLogger("mizzle")
 
 _NOT_BUILT = """<!doctype html><meta charset="utf-8"><title>mizzle studio</title>
 <p>The Studio UI is not built.
@@ -80,6 +89,9 @@ class Studio:
     read_only: bool
     driver: Driver | None = None
     snapshot: Snapshot | None = field(default=None)
+    history: list[dict[str, object]] = field(default_factory=list)
+    saved: dict[str, str] = field(default_factory=dict)
+    state_path: Path | None = None
 
     def pool(self) -> Driver:
         if self.driver is None:
@@ -101,6 +113,60 @@ class Studio:
         if table is None:
             raise StudioError(f"unknown table {schema}.{name}", 404)
         return table
+
+    # -- query history and saved queries ----------------------------------------------
+
+    def load_state(self) -> None:
+        if self.state_path is None or not self.state_path.is_file():
+            return
+        try:
+            data = cast(object, json.loads(self.state_path.read_text(encoding="utf-8")))
+        except (OSError, ValueError):
+            log.warning("ignoring unreadable Studio state %s", self.state_path)
+            return
+        if not isinstance(data, dict):
+            return
+        state = cast(dict[str, object], data)
+        history = state.get("history")
+        if isinstance(history, list):
+            self.history = [h for h in cast(list[object], history) if isinstance(h, dict)]
+            del self.history[:-MAX_HISTORY]
+        saved = state.get("saved")
+        if isinstance(saved, dict):
+            self.saved = {
+                k: v for k, v in cast(dict[str, object], saved).items() if isinstance(v, str)
+            }
+
+    def save_state(self) -> None:
+        if self.state_path is None:
+            return
+        try:
+            self.state_path.parent.mkdir(parents=True, exist_ok=True)
+            payload = {"history": self.history, "saved": self.saved}
+            self.state_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+        except OSError:
+            log.warning("could not write Studio state %s", self.state_path)
+
+    def record_history(self, sql: str, *, ok: bool) -> None:
+        self.history.append(
+            {
+                "sql": sql,
+                "at": datetime.datetime.now(datetime.UTC).isoformat(timespec="seconds"),
+                "ok": ok,
+            }
+        )
+        del self.history[:-MAX_HISTORY]
+        self.save_state()
+
+    def save_query(self, name: str, sql: str) -> None:
+        self.saved[name] = sql
+        self.save_state()
+
+    def delete_query(self, name: str) -> bool:
+        existed = self.saved.pop(name, None) is not None
+        if existed:
+            self.save_state()
+        return existed
 
 
 # -- SQL helpers ----------------------------------------------------------------------
@@ -178,6 +244,85 @@ def _key_match(table: TableSnap, key_values: object, params: list[object]) -> st
     )
 
 
+def _order_sql(table: TableSnap, q: Mapping[str, str]) -> str:
+    order = q.get("order")
+    if order:
+        column = _column(table, order)
+        direction = "DESC" if q.get("dir") == "desc" else "ASC"
+        return f" ORDER BY t.{quote(column['name'])} {direction}"
+    if table["primary_key"]:
+        return " ORDER BY " + ", ".join(f"t.{quote(c)}" for c in table["primary_key"]["columns"])
+    return ""
+
+
+def _skip_quoted(text: str, i: int, quote: str) -> int:
+    i += 1
+    while i < len(text):
+        if text[i] == quote:
+            if i + 1 < len(text) and text[i + 1] == quote:  # doubled: an escaped quote
+                i += 2
+                continue
+            return i + 1
+        i += 1
+    return len(text)
+
+
+def split_statements(text: str) -> list[str]:
+    """Split SQL on top-level semicolons, honouring single/double quotes, dollar-quoted
+    bodies and comments, so the console can run several statements in one go."""
+    parts: list[str] = []
+    start, i, n = 0, 0, len(text)
+    while i < n:
+        ch = text[i]
+        if ch in "'\"":
+            i = _skip_quoted(text, i, ch)
+        elif ch == "$":
+            tag = _DOLLAR.match(text, i)
+            if tag is None:
+                i += 1
+            else:
+                close = text.find(tag.group(0), i + len(tag.group(0)))
+                i = n if close == -1 else close + len(tag.group(0))
+        elif text.startswith("--", i):
+            newline = text.find("\n", i)
+            i = n if newline == -1 else newline + 1
+        elif text.startswith("/*", i):
+            close = text.find("*/", i + 2)
+            i = n if close == -1 else close + 2
+        elif ch == ";":
+            parts.append(text[start:i])
+            start = i = i + 1
+        else:
+            i += 1
+    parts.append(text[start:])
+    return [p.strip() for p in parts if _has_sql(p)]
+
+
+def _has_sql(chunk: str) -> bool:
+    return any(line.strip() and not line.strip().startswith("--") for line in chunk.splitlines())
+
+
+def _cell(value: object) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, dict | list):
+        return json.dumps(value)
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    return str(value)
+
+
+def _to_csv(table: TableSnap, rows: Sequence[object]) -> str:
+    columns = list(table["columns"])
+    out = io.StringIO()
+    writer = csv.writer(out)
+    writer.writerow(columns)
+    for row in rows:
+        values: dict[str, object] = cast(dict[str, object], row) if isinstance(row, dict) else {}
+        writer.writerow([_cell(values.get(c)) for c in columns])
+    return out.getvalue()
+
+
 def jsonable(value: object) -> JSON:
     match value:
         case None | bool() | int() | str():
@@ -241,17 +386,7 @@ async def list_rows(studio: Studio, request: Request) -> Response:
         raise StudioError("limit and offset must be >= 0")
     params: list[object] = []
     where = _where(table, filters, params)
-    order = q.get("order")
-    if order:
-        column = _column(table, order)
-        direction = "DESC" if q.get("dir") == "desc" else "ASC"
-        order_sql = f" ORDER BY t.{quote(column['name'])} {direction}"
-    elif table["primary_key"]:
-        order_sql = " ORDER BY " + ", ".join(
-            f"t.{quote(c)}" for c in table["primary_key"]["columns"]
-        )
-    else:
-        order_sql = ""
+    order_sql = _order_sql(table, q)
     source = f"{qualified(table['schema'], table['name'])} AS t"
     async with studio.pool().acquire() as conn:
         [total] = await conn.fetch(f"SELECT count(*) FROM {source}{where}", params)
@@ -260,6 +395,33 @@ async def list_rows(studio: Studio, request: Request) -> Response:
             params,
         )
     return JSONResponse({"total": total[0], "rows": [jsonable(r[0]) for r in rows]})
+
+
+async def export_rows(studio: Studio, request: Request) -> Response:
+    """Download every matching row as CSV or JSON (not just the current page)."""
+    table = await _table(studio, request)
+    q = request.query_params
+    fmt = q.get("format", "csv").lower()
+    if fmt not in ("csv", "json"):
+        raise StudioError("format must be 'csv' or 'json'")
+    try:
+        filters = _array(cast(object, json.loads(q.get("filters", "[]"))), "filters")
+    except ValueError as exc:
+        raise StudioError(f"bad query parameters: {exc}") from exc
+    params: list[object] = []
+    where = _where(table, filters, params)
+    order_sql = _order_sql(table, q)
+    source = f"{qualified(table['schema'], table['name'])} AS t"
+    async with studio.pool().acquire() as conn:
+        rows = await conn.fetch(
+            f"SELECT to_jsonb(t) FROM {source}{where}{order_sql} LIMIT {MAX_EXPORT_ROWS}", params
+        )
+    data = [jsonable(r[0]) for r in rows]
+    filename = f"{table['schema']}.{table['name']}.{fmt}"
+    disposition = {"Content-Disposition": f'attachment; filename="{filename}"'}
+    if fmt == "json":
+        return JSONResponse(data, headers=disposition)
+    return Response(_to_csv(table, data), media_type="text/csv", headers=disposition)
 
 
 async def insert_row(studio: Studio, request: Request) -> Response:
@@ -324,25 +486,73 @@ async def run_sql(studio: Studio, request: Request) -> Response:
     text = (await _body(request)).get("sql")
     if not isinstance(text, str) or not text.strip():
         raise StudioError("sql must be a non-empty string")
+    statements = split_statements(text)
+    if not statements:
+        raise StudioError("sql must be a non-empty string")
 
-    async def fetch(conn: Connection) -> list[dict[str, object]]:
-        return await conn.fetch_dicts(text, [])
+    async def run(conn: Connection) -> list[dict[str, object]]:
+        results: list[dict[str, object]] = []
+        for statement in statements:
+            rows = await conn.fetch_dicts(statement, [])
+            columns = list(rows[0].keys()) if rows else []
+            results.append(
+                {
+                    "statement": statement,
+                    "columns": columns,
+                    "rows": [[jsonable(r[c]) for c in columns] for r in rows[:MAX_SQL_ROWS]],
+                    "truncated": len(rows) > MAX_SQL_ROWS,
+                    "count": len(rows),
+                }
+            )
+        return results
 
-    async with studio.pool().acquire() as conn:
-        if studio.read_only:
-            async with conn.transaction(readonly=True):
-                rows = await fetch(conn)
-        else:
-            rows = await fetch(conn)
-    columns = list(rows[0].keys()) if rows else []
-    return JSONResponse(
-        {
-            "columns": columns,
-            "rows": [[jsonable(r[c]) for c in columns] for r in rows[:MAX_SQL_ROWS]],
-            "truncated": len(rows) > MAX_SQL_ROWS,
-            "count": len(rows),
-        }
-    )
+    try:
+        async with studio.pool().acquire() as conn:
+            if studio.read_only:
+                async with conn.transaction(readonly=True):
+                    results = await run(conn)
+            else:
+                results = await run(conn)
+    except MizzleError:
+        studio.record_history(text, ok=False)
+        raise
+    studio.record_history(text, ok=True)
+    payload: dict[str, object] = {"results": results}
+    if len(results) == 1:  # keep the single-statement shape clients already use
+        payload.update(results[0])
+    return JSONResponse(payload)
+
+
+async def get_history(studio: Studio, _request: Request) -> Response:
+    return JSONResponse({"history": studio.history})
+
+
+async def clear_history(studio: Studio, _request: Request) -> Response:
+    studio.history = []
+    studio.save_state()
+    return JSONResponse({"cleared": True})
+
+
+async def list_saved(studio: Studio, _request: Request) -> Response:
+    return JSONResponse({"saved": [{"name": n, "sql": s} for n, s in studio.saved.items()]})
+
+
+async def put_saved(studio: Studio, request: Request) -> Response:
+    path: dict[str, object] = request.path_params
+    name = str(path["name"])
+    sql = (await _body(request)).get("sql")
+    if not isinstance(sql, str) or not sql.strip():
+        raise StudioError("sql must be a non-empty string")
+    studio.save_query(name, sql)
+    return JSONResponse({"name": name}, status_code=201)
+
+
+async def delete_saved(studio: Studio, request: Request) -> Response:
+    path: dict[str, object] = request.path_params
+    name = str(path["name"])
+    if not studio.delete_query(name):
+        raise StudioError(f"no saved query {name!r}", 404)
+    return JSONResponse({"deleted": name})
 
 
 def _api(
@@ -395,12 +605,14 @@ def create_app(
     allowed_hosts: set[str],
     read_only: bool = False,
     static_dir: Path = STATIC_DIR,
+    state_path: Path | None = None,
 ) -> Starlette:
-    studio = Studio(dialect, url, schemas, read_only)
+    studio = Studio(dialect, url, schemas, read_only, state_path=state_path)
 
     @asynccontextmanager
     async def lifespan(_app: Starlette) -> AsyncGenerator[None]:
         studio.driver = await dialect.connect(url, pool_size=4, statement_cache_size=100)
+        studio.load_state()
         try:
             yield
         finally:
@@ -414,7 +626,17 @@ def create_app(
         Route(tables_path, _api(studio, insert_row), methods=["POST"]),
         Route(tables_path, _api(studio, update_row), methods=["PATCH"]),
         Route(tables_path, _api(studio, delete_rows), methods=["DELETE"]),
+        Route(
+            "/api/tables/{schema}/{table}/export",
+            _api(studio, export_rows),
+            methods=["GET"],
+        ),
         Route("/api/sql", _api(studio, run_sql), methods=["POST"]),
+        Route("/api/queries/history", _api(studio, get_history), methods=["GET"]),
+        Route("/api/queries/history", _api(studio, clear_history), methods=["DELETE"]),
+        Route("/api/queries/saved", _api(studio, list_saved), methods=["GET"]),
+        Route("/api/queries/saved/{name}", _api(studio, put_saved), methods=["PUT"]),
+        Route("/api/queries/saved/{name}", _api(studio, delete_saved), methods=["DELETE"]),
     ]
     if (static_dir / "index.html").exists():
         routes.append(Mount("/", StaticFiles(directory=static_dir, html=True)))
@@ -449,6 +671,7 @@ def serve(
         allowed_hosts={f"127.0.0.1:{port}", f"localhost:{port}"},
         read_only=read_only,
         static_dir=static_dir,
+        state_path=config.root / ".mizzle" / "studio.json",
     )
     link = f"http://127.0.0.1:{port}/#token={token}"
     mode = " (read-only)" if read_only else ""

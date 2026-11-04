@@ -4,6 +4,7 @@ import {
   ArrowUpIcon,
   ChevronLeftIcon,
   ChevronRightIcon,
+  DownloadIcon,
   FilterIcon,
   PlusIcon,
   RefreshCwIcon,
@@ -239,6 +240,24 @@ export function DataGrid({ table, readOnly }: { table: TableInfo; readOnly: bool
     }
   }
 
+  const download = async (format: "csv" | "json") => {
+    try {
+      const blob = await api.export(
+        table,
+        { order: order?.column, dir: order?.dir, filters },
+        format
+      )
+      const url = URL.createObjectURL(blob)
+      const link = document.createElement("a")
+      link.href = url
+      link.download = `${table.schema}.${table.name}.${format}`
+      link.click()
+      URL.revokeObjectURL(url)
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : String(e))
+    }
+  }
+
   const allSelected = rows.length > 0 && selected.size === rows.length
 
   return (
@@ -265,6 +284,14 @@ export function DataGrid({ table, readOnly }: { table: TableInfo; readOnly: bool
               Add row
             </Button>
           )}
+          <Button size="sm" variant="outline" onClick={() => void download("csv")}>
+            <DownloadIcon />
+            CSV
+          </Button>
+          <Button size="sm" variant="outline" onClick={() => void download("json")}>
+            <DownloadIcon />
+            JSON
+          </Button>
           <Button
             size="icon-sm"
             variant="ghost"

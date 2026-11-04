@@ -7,15 +7,25 @@ from starlette.testclient import TestClient
 
 from mizzle.dialects.postgres import PostgresDialect
 from mizzle.dialects.postgres.driver import PostgresDriver
-from mizzle.studio.server import create_app
+from mizzle.studio.server import create_app, split_statements
 
 TOKEN = "test-token"
 AUTH = {"Authorization": f"Bearer {TOKEN}"}
 ROWS = "/api/tables/public/users/rows"
+EXPORT = "/api/tables/public/users/export"
 
 
-def make_client(pg_url: str, read_only: bool = False, static: Path | None = None) -> TestClient:
-    kwargs: dict[str, Any] = {} if static is None else {"static_dir": static}
+def make_client(
+    pg_url: str,
+    read_only: bool = False,
+    static: Path | None = None,
+    state_path: Path | None = None,
+) -> TestClient:
+    kwargs: dict[str, Any] = {}
+    if static is not None:
+        kwargs["static_dir"] = static
+    if state_path is not None:
+        kwargs["state_path"] = state_path
     app = create_app(
         dialect=PostgresDialect(),
         url=pg_url,
@@ -26,6 +36,18 @@ def make_client(pg_url: str, read_only: bool = False, static: Path | None = None
         **kwargs,
     )
     return TestClient(app)
+
+
+def test_split_statements_handles_quotes_and_comments() -> None:
+    assert split_statements("select 1; select 2") == ["select 1", "select 2"]
+    assert split_statements("select 'a;b'") == ["select 'a;b'"]
+    assert split_statements('select "we;ird"') == ['select "we;ird"']
+    assert split_statements("select $$a;b$$") == ["select $$a;b$$"]
+    assert split_statements("select $tag$x;y$tag$") == ["select $tag$x;y$tag$"]
+    assert split_statements("-- note;\nselect 1;") == ["-- note;\nselect 1"]
+    assert split_statements("/* a;b */ select 1;") == ["/* a;b */ select 1"]
+    assert split_statements("  ") == []
+    assert split_statements("-- only a comment") == []
 
 
 @pytest.fixture
@@ -126,3 +148,77 @@ def test_serves_ui_without_token(pg_url: str, driver: PostgresDriver, tmp_path: 
         page = client.get("/")
         assert page.status_code == 200 and "studio" in page.text
         assert "default-src 'self'" in page.headers["content-security-policy"]
+
+
+def test_export_csv_and_json(client: TestClient) -> None:
+    client.post(ROWS, json={"values": {"email": "ann"}}, headers=AUTH)
+    client.post(ROWS, json={"values": {"email": "bob"}}, headers=AUTH)
+
+    csv_resp = client.get(EXPORT, params={"format": "csv", "order": "email"}, headers=AUTH)
+    assert csv_resp.status_code == 200
+    assert csv_resp.headers["content-type"].startswith("text/csv")
+    assert csv_resp.headers["content-disposition"] == 'attachment; filename="public.users.csv"'
+    lines = csv_resp.text.strip().splitlines()
+    assert lines[0].split(",") == ["id", "email", "bio", "role", "created_at"]
+    assert "ann" in lines[1] and "bob" in lines[2]
+
+    filters = '[{"column": "email", "op": "eq", "value": "ann"}]'
+    js = client.get(EXPORT, params={"format": "json", "filters": filters}, headers=AUTH).json()
+    assert [r["email"] for r in js] == ["ann"]
+    assert client.get(EXPORT, params={"format": "xml"}, headers=AUTH).status_code == 400
+
+
+def test_sql_console_runs_multiple_statements(client: TestClient) -> None:
+    client.post(ROWS, json={"values": {"email": "ann"}}, headers=AUTH)
+    result = client.post(
+        "/api/sql",
+        json={"sql": "select email from users; select count(*) as n from users"},
+        headers=AUTH,
+    ).json()
+    assert [r["columns"] for r in result["results"]] == [["email"], ["n"]]
+    assert result["results"][0]["rows"][0][0] == "ann"
+    assert result["results"][1]["rows"][0][0] == 1
+    assert "columns" not in result  # the flat shape is only for a single statement
+
+    literal = client.post("/api/sql", json={"sql": "select 'a;b' as s"}, headers=AUTH).json()
+    assert literal["rows"] == [["a;b"]] and len(literal["results"]) == 1
+    assert literal["columns"] == ["s"]  # a single statement still mirrors the flat shape
+
+
+def test_query_history_records_success_and_failure(client: TestClient) -> None:
+    client.post("/api/sql", json={"sql": "select 1"}, headers=AUTH)
+    client.post("/api/sql", json={"sql": "select nope"}, headers=AUTH)
+    history = client.get("/api/queries/history", headers=AUTH).json()["history"]
+    assert [h["sql"] for h in history] == ["select 1", "select nope"]
+    assert [h["ok"] for h in history] == [True, False]
+    cleared = client.request("DELETE", "/api/queries/history", headers=AUTH)
+    assert cleared.json() == {"cleared": True}
+    assert client.get("/api/queries/history", headers=AUTH).json()["history"] == []
+
+
+def test_saved_queries_round_trip(client: TestClient) -> None:
+    assert client.get("/api/queries/saved", headers=AUTH).json() == {"saved": []}
+    created = client.put("/api/queries/saved/top", json={"sql": "select 1"}, headers=AUTH)
+    assert created.status_code == 201
+    assert client.get("/api/queries/saved", headers=AUTH).json()["saved"] == [
+        {"name": "top", "sql": "select 1"}
+    ]
+    assert client.request("DELETE", "/api/queries/saved/nope", headers=AUTH).status_code == 404
+    assert client.request("DELETE", "/api/queries/saved/top", headers=AUTH).json() == {
+        "deleted": "top"
+    }
+    assert client.get("/api/queries/saved", headers=AUTH).json()["saved"] == []
+
+
+def test_state_persists_between_runs(pg_url: str, driver: PostgresDriver, tmp_path: Path) -> None:
+    state = tmp_path / "studio.json"
+    with make_client(pg_url, state_path=state) as client:
+        client.put("/api/queries/saved/top", json={"sql": "select 42"}, headers=AUTH)
+        client.post("/api/sql", json={"sql": "select 1"}, headers=AUTH)
+    assert state.exists()
+    with make_client(pg_url, state_path=state) as client:
+        assert client.get("/api/queries/saved", headers=AUTH).json()["saved"] == [
+            {"name": "top", "sql": "select 42"}
+        ]
+        history = client.get("/api/queries/history", headers=AUTH).json()["history"]
+        assert history[-1]["sql"] == "select 1"
