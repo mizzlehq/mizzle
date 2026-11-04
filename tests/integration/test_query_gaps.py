@@ -282,3 +282,28 @@ async def test_auto_reset_after_a_user_named_function(db: Database, pg_url: str)
             .limit(1)
         )
         assert name != "leaked"
+
+
+async def test_a_select_with_a_data_modifying_cte_runs_on_the_primary(db: Database) -> None:
+    # Q1: the DELETE inside the WITH actually runs, and the outer SELECT returns its rows.
+    await seed(db)
+    moved = db.delete(Posts).where(eq(Posts.author_id, 1)).returning(Posts.id).cte("moved")
+    # The main query reads the pre-delete snapshot (PostgreSQL semantics); selecting from
+    # the CTE returns the rows the DELETE removed.
+    deleted = db.with_(moved).select(moved.c("id", int)).from_(moved)
+    assert sorted(await deleted) == [(1,), (2,)]
+    assert await db.select(count(Posts.id)).from_(Posts) == [(1,)]  # one post (author 3) left
+
+
+async def test_ctes_run_on_insert_update_and_delete(db: Database) -> None:
+    # Q2: with_() is emitted before every write, not only SELECT.
+    await seed(db)
+    keep = db.select(Users.id).from_(Users).cte("keep")
+    updated = db.with_(keep).update(Posts).set({"title": "renamed"}).where(eq(Posts.author_id, 1))
+    assert await updated == 2
+    assert await db.select(Posts.title).from_(Posts).where(eq(Posts.title, "renamed")) == [
+        ("renamed",),
+        ("renamed",),
+    ]
+    deleted = db.with_(keep).delete(Posts).where(eq(Posts.author_id, 3))
+    assert await deleted == 1

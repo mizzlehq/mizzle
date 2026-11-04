@@ -9,7 +9,7 @@ import datetime
 import enum
 import json
 import uuid
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from decimal import Decimal
 from typing import TYPE_CHECKING, cast
@@ -55,7 +55,7 @@ from mizzle.core.sql.nodes import (
 if TYPE_CHECKING:
     from mizzle.core.query.insert import Insert, OnConflict
     from mizzle.core.query.returning import Returning
-    from mizzle.core.query.select import CompoundBase, SelectBase, Slot, Source
+    from mizzle.core.query.select import CompoundBase, Cte, SelectBase, Slot, Source
     from mizzle.core.query.update import Delete, Update
     from mizzle.core.schema.table import Table
 
@@ -78,6 +78,10 @@ class CompiledQuery:
     # session alone (set_config, pg_advisory_lock...), so the connection is reset after it.
     # Unlike raw, a read using one may still be retried after a lost connection.
     opaque: bool = False
+    # True when the statement writes at any level, including a data-modifying CTE inside a
+    # SELECT. Such a SELECT is a write: it must run on the primary, must never be retried,
+    # and explain(analyze=True) must refuse it.
+    writes: bool = False
 
     @property
     def session_safe(self) -> bool:
@@ -108,6 +112,7 @@ class CompiledQuery:
             self.locking,
             self.dynamic,
             self.opaque,
+            self.writes,
         )
 
 
@@ -140,6 +145,7 @@ class Compiler:
     _locking: bool
     _dynamic: bool
     _opaque: bool
+    _writes: bool
     # (id(Param), SQL type it is compared with) -> its marker: a reused node reuses its
     # parameter, unless raw SQL holding it sits next to values of different types.
     _bound: dict[tuple[int, str | None], str]
@@ -166,6 +172,7 @@ class Compiler:
         self._locking = False
         self._dynamic = False
         self._opaque = False
+        self._writes = False
         self._bound = {}
         self._context = None
         self._scopes = []
@@ -175,6 +182,7 @@ class Compiler:
         self._params, self._placeholders, self._raw, self._locking = [], [], False, False
         self._dynamic = False
         self._opaque = False
+        self._writes = False
         self._bound = {}
         self._context = None
         text = self.visit(node)
@@ -186,6 +194,7 @@ class Compiler:
             self._locking,
             self._dynamic,
             self._opaque,
+            self._writes,
         )
 
     def visit(self, node: Node) -> str:
@@ -512,15 +521,26 @@ class Compiler:
         finally:
             self.qualify_columns = qualify
 
+    def _note_write(self) -> None:
+        """Mark the statement as a write; a subclass visitor (MERGE) calls this."""
+        self._writes = True
+
+    def _with_ctes(self, ctes: Sequence[Cte]) -> str:
+        """The ``WITH`` prefix for a select or a write that carries CTEs (a data-modifying
+        CTE inside a write). Empty when there are none."""
+        if not ctes:
+            return ""
+        keyword = "WITH RECURSIVE" if any(c.recursive for c in ctes) else "WITH"
+        rendered = ", ".join(f"{self.quote(c.name)} AS ({self.visit(c.query)})" for c in ctes)
+        return f"{keyword} {rendered} "
+
     def _select_body(self, node: SelectBase) -> str:
         if node.lock is not None:
             self._locking = True
         # Clauses are emitted strictly left to right so $n numbering follows the text.
         parts: list[str] = []
         if node.ctes:
-            keyword = "WITH RECURSIVE" if any(c.recursive for c in node.ctes) else "WITH"
-            ctes = ", ".join(f"{self.quote(c.name)} AS ({self.visit(c.query)})" for c in node.ctes)
-            parts.append(f"{keyword} {ctes}")
+            parts.append(self._with_ctes(node.ctes).rstrip())
         if node.distinct_ and node.distinct_on_:
             raise QueryError("distinct() and distinct_on() cannot be combined")
         if node.distinct_on_:
@@ -601,8 +621,10 @@ class Compiler:
         return ", ".join(items)
 
     def visit_Insert(self, node: Insert[Table]) -> str:
+        self._writes = True
+        prefix = self._with_ctes(node.ctes)
         if node.source is not None:
-            return self._insert_select_text(node, node.source)
+            return prefix + self._insert_select_text(node, node.source)
         if not node.rows:
             raise QueryError(f"insert into {node.table.__name__} has no values()")
         if node.identity is not None and node.overriding is None:
@@ -613,7 +635,12 @@ class Compiler:
         # Fast path for the most common write: one row of plain values, no ON CONFLICT.
         # Its SQL depends only on which columns are set, so the text is cached and only
         # the values are bound (in column order, as the full path below binds them).
-        if node.conflict is None and len(node.rows) == 1 and not self.inline_literals:
+        if (
+            node.conflict is None
+            and len(node.rows) == 1
+            and not self.inline_literals
+            and not node.ctes
+        ):
             row = node.rows[0]
             if row and not any(isinstance(v, Node) for v in row.values()):
                 key = (
@@ -636,7 +663,7 @@ class Compiler:
                     )
                     self._placeholders.append(None)
                 return text
-        return self._insert_text(node)
+        return prefix + self._insert_text(node)
 
     def _insert_select_text(self, node: Insert[Table], source: SelectBase | CompoundBase) -> str:
         if node.identity is not None and node.overriding is None:
@@ -695,24 +722,28 @@ class Compiler:
             )
 
     def visit_Update(self, node: Update[Table]) -> str:
+        self._writes = True
         if not node.values_:
             raise QueryError(f"update({node.table.__name__}) needs .set(...)")
         self._require_filter(node, "update")
+        prefix = self._with_ctes(node.ctes)
         text = f"UPDATE {self.table_name(node.table)} SET {self.set_list(node.table, node.values_)}"
         if node.from_sources:
             text += " FROM " + ", ".join(self.source(t) for t in node.from_sources)
         if node.where_ is not None:
             text += f" WHERE {self.visit(node.where_)}"
-        return text
+        return prefix + text
 
     def visit_Delete(self, node: Delete[Table]) -> str:
+        self._writes = True
         self._require_filter(node, "delete")
+        prefix = self._with_ctes(node.ctes)
         text = f"DELETE FROM {self.table_name(node.table)}"
         if node.using_:
             text += " USING " + ", ".join(self.source(t) for t in node.using_)
         if node.where_ is not None:
             text += f" WHERE {self.visit(node.where_)}"
-        return text
+        return prefix + text
 
     def visit_Returning(self, node: Returning[object]) -> str:
         return f"{self.visit(node.query)} {self.returning_clause(node)}"

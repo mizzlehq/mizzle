@@ -48,17 +48,19 @@ class PostgresCompiler(Compiler):
         return "RETURNING " + ", ".join(self.visit(expr) for expr in exprs)
 
     def visit_Merge(self, node: Merge[Table]) -> str:
+        self._note_write()
         if node.source_ is None:
             raise QueryError(f"merge({node.table.__name__}) needs .using(...)")
         if node.on_ is None:
             raise QueryError(f"merge({node.table.__name__}) needs .on(...)")
         if not node.when_:
             raise QueryError(f"merge({node.table.__name__}) needs at least one when_* clause")
+        prefix = self._with_ctes(node.ctes)
         text = (
             f"MERGE INTO {self.table_name(node.table)} USING {self.source(node.source_)}"
             f" ON {self.visit(node.on_)}"
         )
-        return text + "".join(f" {self._merge_when(node.table, w)}" for w in node.when_)
+        return prefix + text + "".join(f" {self._merge_when(node.table, w)}" for w in node.when_)
 
     def _merge_when(self, table: type[Table], clause: MergeWhen) -> str:
         if clause.matched:

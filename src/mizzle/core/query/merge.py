@@ -14,7 +14,7 @@ from mizzle.core.compiler import CompiledQuery
 from mizzle.core.errors import QueryError
 from mizzle.core.query.base import evolve
 from mizzle.core.query.returning import ReturningMixin
-from mizzle.core.query.select import Source
+from mizzle.core.query.select import Cte, Source
 from mizzle.core.schema.table import Table
 from mizzle.core.sql.nodes import Condition
 
@@ -42,6 +42,8 @@ class Merge[T: Table](ReturningMixin[T]):
     source_: Source | None = None
     on_: Condition | None = None
     when_: tuple[MergeWhen, ...] = ()
+    # A WITH clause passed with db.with_(...): emitted before the MERGE.
+    ctes: tuple[Cte, ...] = ()
 
     def using(self, source: Source) -> Self:
         """The table or subquery to merge from: ``MERGE ... USING source ON ...``."""

@@ -10,7 +10,7 @@ from mizzle.core.compiler import CompiledQuery
 from mizzle.core.errors import QueryError
 from mizzle.core.query.base import evolve
 from mizzle.core.query.returning import ReturningMixin
-from mizzle.core.query.select import CompoundBase, SelectBase
+from mizzle.core.query.select import CompoundBase, Cte, SelectBase
 from mizzle.core.schema.column import ColumnBase
 from mizzle.core.schema.table import Table
 from mizzle.core.sql.nodes import Expr
@@ -138,6 +138,8 @@ class Insert[T: Table](ReturningMixin[T]):
     # INSERT ... SELECT (see from_select): a query as the source of rows, and its target columns.
     source: SelectBase | CompoundBase | None = None
     source_columns: tuple[ColumnBase, ...] = ()
+    # A WITH clause passed with db.with_(...): emitted before the INSERT.
+    ctes: tuple[Cte, ...] = ()
 
     def values(self, rows: RowLike | Sequence[RowLike] | None = None, /, **fields: object) -> Self:
         """``values(email="a")``, ``values({"email": "a"})`` or ``values([{...}, {...}])``."""

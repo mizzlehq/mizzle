@@ -276,3 +276,40 @@ def test_generated_row_decoder() -> None:
     user = decode(("x", "y", 7, None, "admin"))
     assert (user.id, user.bio, user.role) == (7, None, Role.ADMIN)
     assert not hasattr(user, "email")  # not selected: absent, not None
+
+
+def test_a_select_with_a_data_modifying_cte_is_a_write(qb: QueryBuilder) -> None:
+    # Q1: a data-modifying CTE writes, so the SELECT runs on the primary, is never retried
+    # and explain(analyze=True) refuses it.
+    moved = qb.delete(Posts).where(eq(Posts.author_id, 1)).returning().cte("moved")
+    compiled = PostgresCompiler().compile(qb.with_(moved).select(Users.id).from_(Users))
+    assert compiled.writes is True
+    assert compiled.locking is False
+    assert PostgresCompiler().compile(qb.select(Users.id).from_(Users)).writes is False
+
+
+def test_ctes_reach_insert_update_delete_and_merge(qb: QueryBuilder) -> None:
+    # Q2/Q6: with_() used to be silently dropped on every write but SELECT.
+    keep = qb.select(Users.id).from_(Users).cte("keep")
+    with_ = qb.with_(keep)
+    head = 'WITH "keep" AS (SELECT "users"."id" FROM "users") '
+
+    insert_sql = with_.insert(Posts).values({"author_id": 1, "title": "x"}).to_sql()[0]
+    assert insert_sql.startswith(head + 'INSERT INTO "posts"')
+
+    update_sql = with_.update(Posts).set({"title": "y"}).where(eq(Posts.id, 1)).to_sql()[0]
+    assert update_sql.startswith(head + 'UPDATE "posts"')
+
+    delete_sql = with_.delete(Posts).where(eq(Posts.id, 1)).to_sql()[0]
+    assert delete_sql.startswith(head + 'DELETE FROM "posts"')
+
+    source = qb.select(Users.id, Users.email).from_(Users).subquery("src")
+    sid, email = source.c("id", int), source.c("email", str)
+    merge_sql = (
+        with_.merge(Posts)
+        .using(source)
+        .on(eq(Posts.author_id, sid))
+        .when_matched_then_update({"title": email})
+        .to_sql()[0]
+    )
+    assert merge_sql.startswith(head + 'MERGE INTO "posts"')

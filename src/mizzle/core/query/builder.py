@@ -71,17 +71,17 @@ class QueryBuilder:
         return RelationalQuery(self.runner, table)
 
     def insert[T: Table](self, table: type[T]) -> Insert[T]:
-        return Insert(self.runner, table)
+        return Insert(self.runner, table, ctes=self.ctes)
 
     def update[T: Table](self, table: type[T]) -> Update[T]:
-        return Update(self.runner, table)
+        return Update(self.runner, table, ctes=self.ctes)
 
     def delete[T: Table](self, table: type[T]) -> Delete[T]:
-        return Delete(self.runner, table)
+        return Delete(self.runner, table, ctes=self.ctes)
 
     def merge[T: Table](self, table: type[T]) -> Merge[T]:
         """``MERGE INTO table USING source ON ... WHEN ...`` (PostgreSQL 15+)."""
-        return Merge(self.runner, table)
+        return Merge(self.runner, table, ctes=self.ctes)
 
     @overload
     def select(self) -> SelectAll: ...

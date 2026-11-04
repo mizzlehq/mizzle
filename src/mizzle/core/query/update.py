@@ -7,7 +7,7 @@ filter cannot rewrite or wipe a whole table.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Self, override
+from typing import TYPE_CHECKING, Self, override
 
 from mizzle.core.compiler import CompiledQuery
 from mizzle.core.errors import QueryError
@@ -17,6 +17,9 @@ from mizzle.core.query.returning import ReturningMixin
 from mizzle.core.schema.table import Table
 from mizzle.core.sql.nodes import Condition
 from mizzle.core.sql.operators import and_
+
+if TYPE_CHECKING:
+    from mizzle.core.query.select import Cte
 
 
 @dataclass(frozen=True, eq=False)
@@ -28,6 +31,8 @@ class Update[T: Table](ReturningMixin[T]):
     all_rows_: bool = False
     # UPDATE ... FROM: other tables to join into the update.
     from_sources: tuple[type[Table], ...] = ()
+    # A WITH clause passed with db.with_(...): emitted before the UPDATE.
+    ctes: tuple[Cte, ...] = ()
 
     def set(self, values: RowLike | None = None, /, **fields: object) -> Self:
         """``set(bio="x")``, ``set({"bio": "x"})`` or ``set(pydantic_model)``."""
@@ -66,6 +71,8 @@ class Delete[T: Table](ReturningMixin[T]):
     all_rows_: bool = False
     # DELETE ... USING: other tables to join into the delete.
     using_: tuple[type[Table], ...] = ()
+    # A WITH clause passed with db.with_(...): emitted before the DELETE.
+    ctes: tuple[Cte, ...] = ()
 
     def where(self, condition: Condition) -> Self:
         """Add a filter. Calling ``where`` again ANDs the conditions."""

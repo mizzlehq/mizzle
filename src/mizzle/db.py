@@ -141,8 +141,9 @@ class Session(QueryBuilder):
         return self._dialect.compiler(self._casing).compile(node)
 
     def fetch(self, query: CompiledQuery, *, read_only: bool = False) -> Awaitable[list[Row]]:
-        # FOR UPDATE anywhere in the query (CTE, subquery) needs the primary.
-        return self._call(query, "fetch", read_only and not query.locking)
+        # A write anywhere in the query (FOR UPDATE, or a data-modifying CTE) needs the
+        # primary and must never be retried.
+        return self._call(query, "fetch", read_only and not query.locking and not query.writes)
 
     def run(self, query: CompiledQuery) -> Awaitable[int]:
         return self._call(query, "execute")
@@ -171,7 +172,7 @@ class Session(QueryBuilder):
                 # Cursors only live inside a transaction; it ends (and closes the cursor)
                 # when the loop ends, breaks or is cancelled.
                 async with (
-                    self._connection(read_only and not query.locking) as conn,
+                    self._connection(read_only and not query.locking and not query.writes) as conn,
                     conn.transaction(),
                 ):
                     cursor = conn.cursor(
@@ -219,7 +220,8 @@ class Session(QueryBuilder):
         if compiled.has_placeholders:
             raise QueryError("explain() does not take placeholders; inline the values instead")
         is_read = isinstance(statement, SelectBase | RelationalStatement)
-        if analyze and not is_read:
+        if analyze and (not is_read or compiled.writes):
+            # Plain selects only: analyze runs the statement, and a data-modifying CTE writes.
             raise QueryError("explain(analyze=True) runs the statement; only selects are allowed")
         options = "ANALYZE, " if analyze else ""
         explained = CompiledQuery(
@@ -230,8 +232,11 @@ class Session(QueryBuilder):
             compiled.locking,
             compiled.dynamic,
             compiled.opaque,
+            compiled.writes,
         )
-        return await self._call(explained, "dicts", is_read and not compiled.locking)
+        return await self._call(
+            explained, "dicts", is_read and not compiled.locking and not compiled.writes
+        )
 
     async def refresh(self, view: type[View], *, concurrently: bool = False) -> None:
         """``REFRESH MATERIALIZED VIEW``. ``concurrently=True`` keeps the view readable
@@ -298,7 +303,11 @@ class Session(QueryBuilder):
         compiled = self.compile(query)
         if compiled.has_placeholders:
             raise QueryError("copy_from() does not take placeholders")
-        read_only = isinstance(query, SelectBase | RelationalStatement) and not compiled.locking
+        read_only = (
+            isinstance(query, SelectBase | RelationalStatement)
+            and not compiled.locking
+            and not compiled.writes
+        )
         with self._logged(compiled):
             try:
                 async with self._connection(read_only) as conn:
