@@ -38,7 +38,7 @@ from mizzle.kit.codegen import render_schema_module
 from mizzle.kit.diff import StrictRenames, diff
 from mizzle.kit.migrate import apply_statements
 from mizzle.kit.snapshot import build_snapshot
-from mizzle.pg import bigint, date, integer, pg_enum, smallint, text, timestamp
+from mizzle.pg import bigint, char, date, integer, pg_enum, smallint, text, timestamp
 from tests.integration.test_generated_columns import server_version
 
 dialect = PostgresDialect()
@@ -691,4 +691,86 @@ async def test_deferrable_and_not_valid_round_trip(driver: PostgresDriver, tmp_p
     assert remaining_pk is not None
     assert not remaining_pk.get("deferrable")
     assert not remaining["uniques"]["def_column_code_key"].get("deferrable")
+    await assert_pull_round_trip(driver, tmp_path)
+
+
+# -- fixed-length strings (character / bpchar) ---------------------------------------------
+
+
+@final
+class Chars(Table, name="chars", schema="mg"):
+    fixed = char(4)
+    single = char()
+
+
+async def test_char_types_round_trip(driver: PostgresDriver, tmp_path: Path) -> None:
+    await migrate(driver, empty_snapshot("postgresql"), snap([Chars]))
+    columns = (await live(driver))["tables"]["mg.chars"]["columns"]
+    assert columns["fixed"]["type"] == "character(4)"
+    assert columns["single"]["type"] == "character(1)"
+    await execute(driver, "INSERT INTO mg.chars (fixed, single) VALUES ('abcd', 'x')")
+    [row] = await execute(driver, "SELECT fixed, single FROM mg.chars")
+    assert (row["fixed"], row["single"]) == ("abcd", "x")
+    await assert_pull_round_trip(driver, tmp_path)
+
+
+# -- column collation ----------------------------------------------------------------------
+
+
+@final
+class CollatedText(Table, name="collated_text", schema="mg"):
+    label = text().collate("C")
+
+
+@final
+class PlainText(Table, name="collated_text", schema="mg"):
+    label = text()
+
+
+async def test_column_collation_round_trip(driver: PostgresDriver, tmp_path: Path) -> None:
+    collated = snap([CollatedText])
+    await migrate(driver, empty_snapshot("postgresql"), collated)
+    columns = (await live(driver))["tables"]["mg.collated_text"]["columns"]
+    assert columns["label"].get("collation") == "C"
+    await assert_pull_round_trip(driver, tmp_path)
+
+    plain = snap([PlainText])
+    steps = await migrate(driver, collated, plain)
+    assert any(s.describe().startswith("change collation") for s in steps)
+    columns = (await live(driver))["tables"]["mg.collated_text"]["columns"]
+    assert "collation" not in columns["label"]
+    await assert_pull_round_trip(driver, tmp_path)
+
+
+# -- comments ------------------------------------------------------------------------------
+
+
+@final
+class Documented(Table, name="documented", schema="mg", comment="a table"):
+    id = integer().comment("the id")
+    note = text().comment("a note")
+
+
+@final
+class DocumentedLater(Table, name="documented", schema="mg", comment="a renamed table"):
+    id = integer()  # its comment is removed
+    note = text().comment("a note")
+
+
+async def test_table_and_column_comments(driver: PostgresDriver, tmp_path: Path) -> None:
+    v1 = snap([Documented])
+    await migrate(driver, empty_snapshot("postgresql"), v1)
+    table = (await live(driver))["tables"]["mg.documented"]
+    assert table.get("comment") == "a table"
+    assert table["columns"]["id"].get("comment") == "the id"
+    assert table["columns"]["note"].get("comment") == "a note"
+    await assert_pull_round_trip(driver, tmp_path)
+
+    v2 = snap([DocumentedLater])
+    steps = await migrate(driver, v1, v2)
+    assert any(s.describe().endswith("on table documented") for s in steps)
+    assert any(s.describe().endswith("on documented.id") for s in steps)
+    table = (await live(driver))["tables"]["mg.documented"]
+    assert table.get("comment") == "a renamed table"
+    assert "comment" not in table["columns"]["id"]
     await assert_pull_round_trip(driver, tmp_path)

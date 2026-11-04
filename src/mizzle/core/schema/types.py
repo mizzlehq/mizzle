@@ -31,6 +31,13 @@ def varchar(length: int | None = None, name: str | None = None) -> Column[str | 
     return Column("varchar" if length is None else f"varchar({length})", (str,), name)
 
 
+def char(length: int = 1, name: str | None = None) -> Column[str | None]:
+    """A blank-padded fixed-length string: ``char()`` is ``character(1)``, ``char(4)`` is
+    ``character(4)``. PostgreSQL strips trailing spaces when comparing and reading, so it
+    behaves like a length-limited ``text``."""
+    return Column(f"char({length})", (str,), name)
+
+
 def boolean(name: str | None = None) -> Column[bool | None]:
     return Column("boolean", (bool,), name)
 

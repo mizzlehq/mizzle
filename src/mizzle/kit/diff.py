@@ -29,6 +29,7 @@ from mizzle.core.steps import (
     AddForeignKey,
     AddPrimaryKey,
     AddUnique,
+    AlterColumnCollation,
     AlterColumnDefault,
     AlterColumnGenerated,
     AlterColumnIdentity,
@@ -66,7 +67,9 @@ from mizzle.core.steps import (
     RenameTable,
     RestoreGrants,
     SaveGrants,
+    SetColumnComment,
     SetRowLevelSecurity,
+    SetTableComment,
     SetTableSchema,
     Step,
 )
@@ -174,6 +177,7 @@ class _Plan:
     rls: list[Step] = field(default_factory=list[Step])
     create_policies: list[Step] = field(default_factory=list[Step])
     create_triggers: list[Step] = field(default_factory=list[Step])
+    comments: list[Step] = field(default_factory=list[Step])
     revokes: list[Step] = field(default_factory=list[Step])
     grants: list[Step] = field(default_factory=list[Step])
     drop_tables: list[Step] = field(default_factory=list[Step])
@@ -215,6 +219,7 @@ class _Plan:
             *self.rls,
             *self.create_policies,
             *self.create_triggers,
+            *self.comments,
             *self.revokes,
             *self.grants,
             *self.drop_tables,
@@ -499,6 +504,10 @@ def _diff_table(old: TableSnap, new: TableSnap, plan: _Plan, compare_expressions
             )
         if _default(old_default) != _default(column["default"]):
             plan.alter_columns.append(AlterColumnDefault(schema, name, cname, column["default"]))
+        if before.get("collation") != column.get("collation"):
+            plan.alter_columns.append(
+                AlterColumnCollation(schema, name, cname, column["type"], column.get("collation"))
+            )
         if new_identity is not None and old_identity != new_identity:  # after SET NOT NULL
             plan.alter_columns.append(
                 AlterColumnIdentity(schema, name, cname, old_identity, new_identity, column["type"])
@@ -613,6 +622,7 @@ def diff(
         else:
             _diff_table(before, table, plan, compare_expressions)
         _diff_grants(table, before.get("grants", {}) if before else {}, plan, compare_expressions)
+        _diff_comments(before if before is not None else _empty_like(table), table, plan)
 
     def new_in(schema: str) -> list[TableSnap]:
         return [t for t in new["tables"].values() if t["schema"] == schema]
@@ -673,6 +683,19 @@ def _empty_like(table: TableSnap) -> TableSnap:
         foreign_keys={},
         indexes={},
     )
+
+
+def _diff_comments(before: TableSnap, after: TableSnap, plan: _Plan) -> None:
+    """``COMMENT ON`` for the table and every column whose comment changed (a new column has
+    no old comment, so its comment is set too). Comments on dropped objects go with them."""
+    schema, name = after["schema"], after["name"]
+    if before.get("comment") != after.get("comment"):
+        plan.comments.append(SetTableComment(schema, name, after.get("comment")))
+    for cname, column in after["columns"].items():
+        old = before["columns"].get(cname)
+        old_comment = old.get("comment") if old is not None else None
+        if old_comment != column.get("comment"):
+            plan.comments.append(SetColumnComment(schema, name, cname, column.get("comment")))
 
 
 def _diff_roles(old: Snapshot, new: Snapshot, plan: _Plan, drop_unlisted: bool) -> None:

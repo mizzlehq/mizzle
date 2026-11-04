@@ -48,6 +48,10 @@ def test_normalize_default(raw: str | None, expected: str | None) -> None:
         ("timestamptz", "timestamp with time zone"),
         ("text[]", "text[]"),
         ("varchar(5)[]", "character varying(5)[]"),
+        ("char(4)", "character(4)"),
+        ("char(1)", "character(1)"),
+        ("char", "character"),
+        ("bpchar(2)", "character(2)"),
     ],
 )
 def test_normalize_type(raw: str, expected: str) -> None:

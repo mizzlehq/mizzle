@@ -48,6 +48,8 @@ class ColumnSnap(TypedDict):
     # Absent unless set, so snapshots written before these fields existed compare equal.
     identity: NotRequired[IdentitySnap]
     generated: NotRequired[GeneratedSnap]
+    collation: NotRequired[str]  # COLLATE name, when not the database default
+    comment: NotRequired[str]  # COMMENT ON COLUMN
 
 
 class PrimaryKeySnap(TypedDict):
@@ -147,6 +149,7 @@ class TableSnap(TypedDict):
     policies: NotRequired[dict[str, PolicySnap]]
     triggers: NotRequired[dict[str, TriggerSnap]]
     grants: NotRequired[GrantsSnap]
+    comment: NotRequired[str]  # COMMENT ON TABLE
 
 
 class EnumSnap(TypedDict):

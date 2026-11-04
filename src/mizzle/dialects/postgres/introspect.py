@@ -53,7 +53,8 @@ _NEXTVAL = re.compile(r"nextval\('.*'::regclass\)")
 
 _TABLES = """
 SELECT c.oid, n.nspname AS schema, c.relname AS name,
-       c.relrowsecurity AS rls, c.relforcerowsecurity AS rls_force
+       c.relrowsecurity AS rls, c.relforcerowsecurity AS rls_force,
+       obj_description(c.oid, 'pg_class') AS comment
 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
 WHERE c.relkind IN ('r', 'p') AND n.nspname = ANY($1::text[]) AND c.relname <> $2
   AND NOT c.relispartition
@@ -65,11 +66,15 @@ SELECT a.attrelid AS table_oid, a.attname AS name,
        format_type(a.atttypid, a.atttypmod) AS type, a.attnotnull AS not_null,
        pg_get_expr(d.adbin, d.adrelid) AS default,
        a.attidentity::text AS identity, a.attgenerated::text AS generated,
+       col.collname AS collation, coln.nspname AS collation_schema,
+       col_description(a.attrelid, a.attnum) AS comment,
        s.seqstart AS identity_start, s.seqincrement AS identity_increment,
        s.seqmin AS identity_min, s.seqmax AS identity_max, s.seqcache AS identity_cache,
        s.seqcycle AS identity_cycle
 FROM pg_attribute a
 LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum
+LEFT JOIN pg_collation col ON col.oid = a.attcollation
+LEFT JOIN pg_namespace coln ON coln.oid = col.collnamespace
 -- An identity column's sequence depends on it internally (deptype 'i').
 LEFT JOIN pg_depend dep ON a.attidentity <> '' AND dep.refclassid = 'pg_class'::regclass
   AND dep.refobjid = a.attrelid AND dep.refobjsubid = a.attnum AND dep.deptype = 'i'
@@ -247,16 +252,32 @@ def _strs(value: object) -> list[str]:
     return [str(v) for v in cast(list[object], value)]
 
 
+def _collation(row: _Row) -> str | None:
+    """The ``COLLATE`` name, or None for the type's default (PostgreSQL stores that as the
+    ``default`` collation). Type and collation mutate independently, so this is separate."""
+    name = row.get("collation")
+    if name is None or str(name) == "default":
+        return None
+    return str(name)
+
+
 def _column(row: _Row) -> ColumnSnap:
     name, sql_type, not_null = str(row["name"]), str(row["type"]), bool(row["not_null"])
     default = _opt_str(row["default"])
     serial = next((s for s, base in SERIAL_TYPES.items() if base == sql_type), None)
     if serial is not None and default is not None and _NEXTVAL.fullmatch(default):
-        return ColumnSnap(name=name, type=serial, not_null=not_null, default=None)
+        column = ColumnSnap(name=name, type=serial, not_null=not_null, default=None)
+        if (comment := _opt_str(row["comment"])) is not None:
+            column["comment"] = comment
+        return column
     if row["generated"] in ("s", "v"):  # pg_attrdef holds the expression, not a default
         assert default is not None
         column = ColumnSnap(name=name, type=sql_type, not_null=not_null, default=None)
         column["generated"] = GeneratedSnap(expression=default, stored=row["generated"] == "s")
+        if (collation := _collation(row)) is not None:
+            column["collation"] = collation
+        if (comment := _opt_str(row["comment"])) is not None:
+            column["comment"] = comment
         return column
     column = ColumnSnap(
         name=name,
@@ -264,6 +285,10 @@ def _column(row: _Row) -> ColumnSnap:
         not_null=not_null,
         default=normalize_default(default),
     )
+    if (collation := _collation(row)) is not None:
+        column["collation"] = collation
+    if (comment := _opt_str(row["comment"])) is not None:
+        column["comment"] = comment
     if row["identity"] in ("a", "d"):
         increment = _int(row["identity_increment"])
         identity = column["identity"] = IdentitySnap(
@@ -411,6 +436,8 @@ async def introspect(
         )
         if t["rls"] or t["rls_force"]:
             snap["rls"] = RlsSnap(enabled=bool(t["rls"]), force=bool(t["rls_force"]))
+        if (comment := _opt_str(t["comment"])) is not None:
+            snap["comment"] = comment
         by_oid[_int(t["oid"])] = snap
         snapshot["tables"][key(schema, name)] = snap
         _add_schema(snapshot, schema)

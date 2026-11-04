@@ -220,6 +220,51 @@ class AlterColumnType(Step):
 
 
 @dataclass(frozen=True)
+class AlterColumnCollation(Step):
+    """Change (or drop) a column's ``COLLATE``. ``sql_type`` is part of the ALTER: PostgreSQL
+    spells a collation change as ``ALTER COLUMN c TYPE <type> COLLATE <name>``."""
+
+    schema: str
+    table: str
+    column: str
+    sql_type: str
+    collation: str | None  # None: the collation the type uses by default
+
+    @override
+    def describe(self) -> str:
+        return f"change collation of {self.table}.{self.column} to {self.collation or 'default'}"
+
+
+@dataclass(frozen=True)
+class SetTableComment(Step):
+    """``COMMENT ON TABLE``; ``None`` removes the comment."""
+
+    schema: str
+    table: str
+    comment: str | None
+
+    @override
+    def describe(self) -> str:
+        what = "comment" if self.comment is not None else "remove comment"
+        return f"{what} on table {self.table}"
+
+
+@dataclass(frozen=True)
+class SetColumnComment(Step):
+    """``COMMENT ON COLUMN``; ``None`` removes the comment."""
+
+    schema: str
+    table: str
+    column: str
+    comment: str | None
+
+    @override
+    def describe(self) -> str:
+        what = "comment" if self.comment is not None else "remove comment"
+        return f"{what} on {self.table}.{self.column}"
+
+
+@dataclass(frozen=True)
 class AlterColumnNullability(Step):
     schema: str
     table: str

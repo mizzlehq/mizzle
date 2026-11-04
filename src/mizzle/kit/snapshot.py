@@ -100,6 +100,8 @@ def build_snapshot(
             foreign_keys={},
             indexes={},
         )
+        if info.comment is not None:
+            snap["comment"] = info.comment
         for column in info.columns.values():
             cname = column.db_name(casing)
             if column.enum is not None:
@@ -118,6 +120,10 @@ def build_snapshot(
                     expression=dialect.expression(computed.expression, casing),
                     stored=computed.stored,
                 )
+            if column.collation is not None:
+                col["collation"] = column.collation
+            if column.comment_text is not None:
+                col["comment"] = column.comment_text
             if column.is_primary_key:
                 col_pk = PrimaryKeySnap(name=trunc(f"{tname}_pkey"), columns=[cname])
                 if column.pk_deferrable:

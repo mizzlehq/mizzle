@@ -50,6 +50,7 @@ _SIMPLE_TYPES = {
     "smallserial": "smallserial",
     "numeric": "numeric",
     "character varying": "varchar",
+    "character": "char",
     "tsvector": "tsvector",
     "tsquery": "tsquery",
     "vector": "vector",
@@ -171,7 +172,8 @@ class _SchemaWriter:
                 args.append(f"precision={match.group(2)}")
             return f"{fn}({', '.join([*args, kwargs] if kwargs else args)})"
         if match := re.fullmatch(
-            r"(character varying|numeric|vector|halfvec|sparsevec)\(([\d,]+)\)", sql_type
+            r"(character varying|character|numeric|vector|halfvec|sparsevec)\(([\d,]+)\)",
+            sql_type,
         ):
             fn = _SIMPLE_TYPES[match.group(1)]
             self.pg_imports.add(fn)
@@ -189,6 +191,10 @@ class _SchemaWriter:
     def column(self, table: TableSnap, column: ColumnSnap, attr: str) -> str:
         kwargs = f"name={column['name']!r}" if attr != column["name"] else ""
         code = self.factory(column["type"], kwargs)
+        if collation := column.get("collation"):
+            code += f".collate({collation!r})"
+        if comment := column.get("comment"):
+            code += f".comment({comment!r})"
         tname, cname = table["name"], column["name"]
         pk = table["primary_key"]
         is_pk = pk is not None and pk["columns"] == [cname] and pk["name"] == f"{tname}_pkey"
@@ -511,6 +517,8 @@ class _SchemaWriter:
             kw = f"name={table['name']!r}"
             if table["schema"] != "public":
                 kw += f", schema={table['schema']!r}"
+            if comment := table.get("comment"):
+                kw += f", comment={comment!r}"
             lines = ["@final", f"class {self.table_classes[k]}(Table, {kw}):"]
             for cname, column in table["columns"].items():
                 lines.append(f"    {attrs[cname]} = {self.column(table, column, attrs[cname])}")

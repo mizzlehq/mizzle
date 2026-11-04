@@ -3,6 +3,7 @@
 from mizzle.core.schema.types import (
     bigint,
     boolean,
+    char,
     date,
     double_precision,
     integer,
@@ -44,6 +45,7 @@ __all__ = [
     "bigserial",
     "boolean",
     "bytea",
+    "char",
     "cosine_distance",
     "date",
     "double_precision",

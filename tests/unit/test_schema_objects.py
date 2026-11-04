@@ -474,3 +474,79 @@ def test_constraint_modifiers_snapshot_and_pull(tmp_path: Path) -> None:
         if isinstance(v, type) and issubclass(v, Table) and "__table__" in vars(v)
     ]
     assert diff(original, build_snapshot(tables, dialect)) == []
+
+
+@final
+class Annotated(Table, name="annotated", comment="a well-documented table"):
+    id = integer().not_null().comment("the primary id")
+    note = text().comment("free text notes")
+
+
+def test_comments_sql_and_pull(tmp_path: Path) -> None:
+    original = snap([Annotated], objects=[])
+    table = original["tables"]["public.annotated"]
+    assert table.get("comment") == "a well-documented table"
+    assert table["columns"]["id"].get("comment") == "the primary id"
+    assert table["columns"]["note"].get("comment") == "free text notes"
+
+    statements = sqls(empty_snapshot("postgresql"), original)
+    assert "COMMENT ON TABLE \"annotated\" IS 'a well-documented table'" in statements
+    assert 'COMMENT ON COLUMN "annotated"."id" IS \'the primary id\'' in statements
+    assert 'COMMENT ON COLUMN "annotated"."note" IS \'free text notes\'' in statements
+
+    source = render_schema_module(original)
+    assert "comment='a well-documented table'" in source
+    assert ".comment('the primary id')" in source
+
+    path = tmp_path / "pulled_comments.py"
+    path.write_text(source)
+    spec = importlib.util.spec_from_file_location("pulled_comments", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["pulled_comments"] = module
+    spec.loader.exec_module(module)
+    members = list(vars(module).values())
+    tables = [
+        v
+        for v in members
+        if isinstance(v, type) and issubclass(v, Table) and "__table__" in vars(v)
+    ]
+    assert diff(original, build_snapshot(tables, dialect)) == []
+
+
+@final
+class Collated(Table, name="collated"):
+    label = text().collate("C")
+    plain = text()
+
+
+def test_column_collation_sql_and_pull(tmp_path: Path) -> None:
+    original = snap([Collated], objects=[])
+    columns = original["tables"]["public.collated"]["columns"]
+    assert columns["label"].get("collation") == "C"
+    assert "collation" not in columns["plain"]
+
+    create = next(
+        s
+        for s in sqls(empty_snapshot("postgresql"), original)
+        if s.startswith('CREATE TABLE "collated"')
+    )
+    assert '"label" text COLLATE "C"' in create
+
+    source = render_schema_module(original)
+    assert ".collate('C')" in source
+
+    path = tmp_path / "pulled_collation.py"
+    path.write_text(source)
+    spec = importlib.util.spec_from_file_location("pulled_collation", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["pulled_collation"] = module
+    spec.loader.exec_module(module)
+    members = list(vars(module).values())
+    tables = [
+        v
+        for v in members
+        if isinstance(v, type) and issubclass(v, Table) and "__table__" in vars(v)
+    ]
+    assert diff(original, build_snapshot(tables, dialect)) == []

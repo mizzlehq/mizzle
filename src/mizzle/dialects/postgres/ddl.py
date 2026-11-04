@@ -33,6 +33,7 @@ from mizzle.core.steps import (
     AddForeignKey,
     AddPrimaryKey,
     AddUnique,
+    AlterColumnCollation,
     AlterColumnDefault,
     AlterColumnGenerated,
     AlterColumnIdentity,
@@ -69,7 +70,9 @@ from mizzle.core.steps import (
     RenameTable,
     RestoreGrants,
     SaveGrants,
+    SetColumnComment,
     SetRowLevelSecurity,
+    SetTableComment,
     SetTableSchema,
     Statement,
     Step,
@@ -84,6 +87,7 @@ SERIAL_TYPES = {"serial": "integer", "bigserial": "bigint", "smallserial": "smal
 _TYPE_ALIASES = {
     "varchar": "character varying",
     "char": "character",
+    "bpchar": "character",
     "timestamptz": "timestamp with time zone",
     "timestamp": "timestamp without time zone",
     "timetz": "time with time zone",
@@ -307,6 +311,8 @@ def _sequence_options(new: IdentitySnap, old: IdentitySnap | None, sql_type: str
 
 def column_definition(column: ColumnSnap) -> str:
     parts = [quote(column["name"]), column["type"]]
+    if collation := column.get("collation"):
+        parts.append(f"COLLATE {quote(collation)}")
     if generated := column.get("generated"):
         kind = "STORED" if generated["stored"] else "VIRTUAL"
         parts.append(f"GENERATED ALWAYS AS ({generated['expression']}) {kind}")
@@ -536,6 +542,11 @@ def render_step(step: Step) -> Statement:
         case AlterColumnNullability(schema=schema, table=table, column=column, not_null=not_null):
             action = "SET NOT NULL" if not_null else "DROP NOT NULL"
             return alter(schema, table, f"ALTER COLUMN {quote(column)} {action}")
+        case AlterColumnCollation(
+            schema=schema, table=table, column=column, sql_type=sql_type, collation=collation
+        ):
+            collate = f" COLLATE {quote(collation)}" if collation else ""
+            return alter(schema, table, f"ALTER COLUMN {quote(column)} TYPE {sql_type}{collate}")
         case AlterColumnIdentity():
             return Statement(_alter_identity(step, step.sql_type))
         case AlterColumnGenerated():
@@ -621,6 +632,13 @@ def render_step(step: Step) -> Statement:
                 f"{'ENABLE' if enabled else 'DISABLE'} ROW LEVEL SECURITY, "
                 f"{'FORCE' if force else 'NO FORCE'} ROW LEVEL SECURITY",
             )
+        case SetTableComment(schema=schema, table=table, comment=comment):
+            value = "NULL" if comment is None else _literal(comment)
+            return Statement(f"COMMENT ON TABLE {qualified(schema, table)} IS {value}")
+        case SetColumnComment(schema=schema, table=table, column=column, comment=comment):
+            value = "NULL" if comment is None else _literal(comment)
+            target = f"{qualified(schema, table)}.{quote(column)}"
+            return Statement(f"COMMENT ON COLUMN {target} IS {value}")
         case CreatePolicy(schema=schema, table=table, policy=policy):
             kind = "PERMISSIVE" if policy["permissive"] else "RESTRICTIVE"
             text = (

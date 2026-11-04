@@ -29,6 +29,7 @@ class TableInfo:
     schema: str | None
     columns: dict[str, ColumnBase]  # attribute name -> column, in declaration order
     relations: dict[str, Relation] = field(default_factory=dict[str, Relation])
+    comment: str | None = None
 
 
 class Table:
@@ -39,6 +40,7 @@ class Table:
         *,
         name: str | None = None,
         schema: str | None = None,
+        comment: str | None = None,
         abstract: bool = False,
         **kwargs: object,
     ) -> None:
@@ -57,7 +59,9 @@ class Table:
         if not columns:
             raise SchemaError(f"table class {cls.__name__} declares no columns")
         relations = {attr: v for attr, v in members.items() if isinstance(v, Relation)}
-        cls.__table__ = TableInfo(name or snake_case(cls.__name__), schema, columns, relations)
+        cls.__table__ = TableInfo(
+            name or snake_case(cls.__name__), schema, columns, relations, comment
+        )
 
     @classmethod
     def config(cls) -> Sequence[Constraint]:

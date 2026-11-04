@@ -87,6 +87,8 @@ class ColumnBase(ExprBase):
     pk_initially_deferred: bool
     unique_deferrable: bool
     unique_initially_deferred: bool
+    collation: str | None
+    comment_text: str | None
     default_value: object
     default_factory: Callable[[], object] | None
     reference: Reference | None
@@ -127,6 +129,8 @@ class ColumnBase(ExprBase):
         self.pk_initially_deferred = False
         self.unique_deferrable = False
         self.unique_initially_deferred = False
+        self.collation = None
+        self.comment_text = None
         self.default_value = MISSING  # a value, an SQL expression, or MISSING
         self.default_factory = None
         self.reference = None
@@ -218,6 +222,8 @@ class ColumnBase(ExprBase):
         pk_initially_deferred: bool | None = None,
         unique_deferrable: bool | None = None,
         unique_initially_deferred: bool | None = None,
+        collate: str | None = None,
+        comment: str | None = None,
         default: object = MISSING,
         default_factory: Callable[[], object] | None = None,
         reference: Reference | None = None,
@@ -251,6 +257,10 @@ class ColumnBase(ExprBase):
             self.unique_deferrable = unique_deferrable
         if unique_initially_deferred is not None:
             self.unique_initially_deferred = unique_initially_deferred
+        if collate is not None:
+            self.collation = collate
+        if comment is not None:
+            self.comment_text = comment
         if default is not MISSING:
             self.default_value = default
         if default_factory is not None:
@@ -284,6 +294,17 @@ class Column[T](ColumnBase, Expr[T]):
     def not_null(self) -> Self: ...
     def not_null(self) -> ColumnBase:
         self._set(nullable=False)
+        return self
+
+    def collate(self, name: str) -> Self:
+        """``COLLATE "name"``: the collation used for comparisons and sorting of this column's
+        values (PostgreSQL). Built-in examples: ``C``, ``POSIX``, ``en_US.utf8``."""
+        self._set(collate=name)
+        return self
+
+    def comment(self, text: str) -> Self:
+        """``COMMENT ON COLUMN ...``: a note stored in the database and shown by ``\\d+``."""
+        self._set(comment=text)
         return self
 
     @overload
