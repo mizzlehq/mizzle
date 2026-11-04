@@ -9,7 +9,10 @@ import re
 import struct
 import uuid as _uuid
 from collections.abc import Callable, Iterable, Mapping, Sequence
+from decimal import Decimal
 from typing import Protocol, cast, runtime_checkable
+
+from asyncpg import Range
 
 from mizzle.core.errors import QueryError
 from mizzle.core.naming import snake_case
@@ -65,6 +68,66 @@ def time(
     """``precision``: digits of fractional seconds kept, 0-6 (default 6)."""
     digits = f"({precision})" if precision is not None else ""
     return Column(f"time{'tz' if tz else ''}{digits}", (_dt.time,), name)
+
+
+def int4range(name: str | None = None) -> Column[Range[int] | None]:
+    """A discrete ``integer`` range, ``[1,5)``. Values read and write as ``asyncpg.Range``."""
+    return Column("int4range", (Range,), name)
+
+
+def int8range(name: str | None = None) -> Column[Range[int] | None]:
+    """A discrete ``bigint`` range. Values read and write as ``asyncpg.Range``."""
+    return Column("int8range", (Range,), name)
+
+
+def numrange(name: str | None = None) -> Column[Range[Decimal] | None]:
+    """A continuous ``numeric`` range. Values read and write as ``asyncpg.Range``."""
+    return Column("numrange", (Range,), name)
+
+
+def tsrange(name: str | None = None) -> Column[Range[_dt.datetime] | None]:
+    """A ``timestamp without time zone`` range. Values read and write as ``asyncpg.Range``."""
+    return Column("tsrange", (Range,), name)
+
+
+def tstzrange(name: str | None = None) -> Column[Range[_dt.datetime] | None]:
+    """A ``timestamp with time zone`` range. Values read and write as ``asyncpg.Range``."""
+    return Column("tstzrange", (Range,), name)
+
+
+def daterange(name: str | None = None) -> Column[Range[_dt.date] | None]:
+    """A ``date`` range. Values read and write as ``asyncpg.Range``."""
+    return Column("daterange", (Range,), name)
+
+
+def int4multirange(name: str | None = None) -> Column[list[Range[int]] | None]:
+    """A set of disjoint ``int4range`` values, read and written as a list of ``Range``."""
+    return Column("int4multirange", (list,), name)
+
+
+def int8multirange(name: str | None = None) -> Column[list[Range[int]] | None]:
+    """A set of disjoint ``int8range`` values, read and written as a list of ``Range``."""
+    return Column("int8multirange", (list,), name)
+
+
+def nummultirange(name: str | None = None) -> Column[list[Range[Decimal]] | None]:
+    """A set of disjoint ``numrange`` values, read and written as a list of ``Range``."""
+    return Column("nummultirange", (list,), name)
+
+
+def tsmultirange(name: str | None = None) -> Column[list[Range[_dt.datetime]] | None]:
+    """A set of disjoint ``tsrange`` values, read and written as a list of ``Range``."""
+    return Column("tsmultirange", (list,), name)
+
+
+def tstzmultirange(name: str | None = None) -> Column[list[Range[_dt.datetime]] | None]:
+    """A set of disjoint ``tstzrange`` values, read and written as a list of ``Range``."""
+    return Column("tstzmultirange", (list,), name)
+
+
+def datemultirange(name: str | None = None) -> Column[list[Range[_dt.date]] | None]:
+    """A set of disjoint ``daterange`` values, read and written as a list of ``Range``."""
+    return Column("datemultirange", (list,), name)
 
 
 def inet(name: str | None = None) -> Column[IPAddress | None]:

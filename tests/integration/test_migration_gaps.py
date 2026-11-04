@@ -8,9 +8,10 @@ import sys
 import uuid
 from collections.abc import AsyncGenerator, Sequence
 from pathlib import Path
-from typing import final, override
+from typing import cast, final, override
 
 import pytest
+from asyncpg import Range
 
 from mizzle import (
     Constraint,
@@ -40,7 +41,21 @@ from mizzle.kit.codegen import render_schema_module
 from mizzle.kit.diff import StrictRenames, diff
 from mizzle.kit.migrate import apply_statements
 from mizzle.kit.snapshot import build_snapshot
-from mizzle.pg import bigint, char, date, integer, pg_enum, smallint, text, timestamp
+from mizzle.pg import (
+    bigint,
+    char,
+    date,
+    daterange,
+    int4multirange,
+    int4range,
+    integer,
+    numrange,
+    pg_enum,
+    smallint,
+    text,
+    timestamp,
+    tstzrange,
+)
 from tests.integration.test_generated_columns import server_version
 
 dialect = PostgresDialect()
@@ -910,4 +925,40 @@ async def test_exclusion_constraints_round_trip(driver: PostgresDriver, tmp_path
     steps = await migrate(driver, v2, v3)
     assert any(d.startswith("drop exclusion") for d in [s.describe() for s in steps])
     assert "exclusions" not in (await live(driver))["tables"]["mg.reservation"]
+    await assert_pull_round_trip(driver, tmp_path)
+
+
+# -- range and multirange types ------------------------------------------------------------
+
+
+@final
+class Spans(Table, name="spans", schema="mg"):
+    id = integer().primary_key()
+    ints = int4range()
+    nums = numrange()
+    stamps = tstzrange()
+    days = daterange()
+    multi = int4multirange()
+
+
+async def test_range_types_round_trip(driver: PostgresDriver, tmp_path: Path) -> None:
+    await migrate(driver, empty_snapshot("postgresql"), snap([Spans]))
+    columns = (await live(driver))["tables"]["mg.spans"]["columns"]
+    assert columns["ints"]["type"] == "int4range"
+    assert columns["nums"]["type"] == "numrange"
+    assert columns["stamps"]["type"] == "tstzrange"
+    assert columns["days"]["type"] == "daterange"
+    assert columns["multi"]["type"] == "int4multirange"
+
+    await execute(
+        driver,
+        "INSERT INTO mg.spans (id, ints, nums, stamps, days, multi) VALUES "
+        "(1, '[1,5)', '(1.5,2.5)', '[2020-01-01,2020-02-01)', "
+        "'[2020-01-01,2020-02-01)', '{[1,3),[5,9)}')",
+    )
+    [row] = await execute(driver, "SELECT ints, multi FROM mg.spans")
+    ints = cast("Range[int]", row["ints"])
+    multi = cast("list[Range[int]]", row["multi"])
+    assert (ints.lower, ints.upper, ints.lower_inc, ints.upper_inc) == (1, 5, True, False)
+    assert [r.lower for r in multi] == [1, 5]
     await assert_pull_round_trip(driver, tmp_path)
