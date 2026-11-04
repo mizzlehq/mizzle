@@ -469,3 +469,19 @@ def pg_domain[T](
         sql_type, (py_type,) if py_type is not None else None, name, decoder=py_type
     )
     return column
+
+
+def pg_composite[T](
+    type_name: str,
+    py_type: type[T] | None = None,
+    name: str | None = None,
+    *,
+    schema: str | None = None,
+) -> Column[T | None]:
+    """A column of a PostgreSQL composite type; declare the type with ``mizzle.composite``.
+    asyncpg reads a composite as an ``asyncpg.Record`` (fields by name) and writes a tuple of
+    field values in order; pass ``py_type`` (``tuple`` or ``dict``, say) to decode to that
+    instead. Give ``schema`` when the type lives outside the database's default schema."""
+    sql_type = type_name if schema in (None, "public") else f"{schema}.{type_name}"
+    column: Column[T | None] = Column(sql_type, (tuple,), name, decoder=py_type)
+    return column

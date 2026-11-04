@@ -194,6 +194,17 @@ class DomainSnap(TypedDict):
     collation: NotRequired[str]
 
 
+class CompositeFieldSnap(TypedDict):
+    name: str
+    type: str  # as format_type() prints it
+
+
+class CompositeSnap(TypedDict):
+    schema: str
+    name: str
+    fields: list[CompositeFieldSnap]  # in declaration order
+
+
 class RoleSnap(TypedDict):
     name: str
     login: bool
@@ -252,6 +263,7 @@ class Snapshot(TypedDict):
     functions: NotRequired[dict[str, FunctionSnap]]  # function_key() -> function
     views: NotRequired[dict[str, ViewSnap]]  # "schema.name" -> view
     domains: NotRequired[dict[str, DomainSnap]]  # "schema.name" -> domain
+    composites: NotRequired[dict[str, CompositeSnap]]  # "schema.name" -> composite type
 
 
 def key(schema: str, name: str) -> str:

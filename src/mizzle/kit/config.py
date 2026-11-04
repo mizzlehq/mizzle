@@ -20,7 +20,14 @@ from typing import cast
 from mizzle.core.errors import MigrationError
 from mizzle.core.naming import Casing
 from mizzle.core.schema.constraints import Role
-from mizzle.core.schema.objects import Domain, Extension, Function, SchemaObject, Trigger
+from mizzle.core.schema.objects import (
+    Composite,
+    Domain,
+    Extension,
+    Function,
+    SchemaObject,
+    Trigger,
+)
 from mizzle.core.schema.table import Table
 from mizzle.dialects.base import Dialect
 from mizzle.dialects.postgres import PostgresDialect
@@ -107,7 +114,7 @@ class Config:
         objects: list[SchemaObject] = []
         for value in self._members():
             if (
-                isinstance(value, Extension | Function | Trigger | Role | Domain)
+                isinstance(value, Extension | Function | Trigger | Role | Domain | Composite)
                 and value not in objects
             ):
                 objects.append(value)

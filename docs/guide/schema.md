@@ -302,6 +302,35 @@ class Users(Table, name="users"):
 before the tables that use it and drop it after them. Changing a domain in place needs a
 hand-written migration: `mizzle generate` stops and says so.
 
+## Composite types
+
+A composite type is a named row type, declared once and reused, like a domain.
+
+```python
+from mizzle import Table, composite
+from mizzle.pg import integer, pg_composite, varchar
+
+
+caddr = composite(
+    "caddr",
+    [("street", "varchar(40)"), ("city", "text"), ("zip", "integer")],
+)
+
+
+@final
+class Homes(Table, name="homes"):
+    id = integer().primary_key()
+    at = pg_composite("caddr", dict)   # dict is the Python type values decode to
+```
+
+Field types use PostgreSQL's spelling and their order is kept. `pg_composite` reads a value
+as an `asyncpg.Record` (fields by name) and writes a tuple of field values in order; pass
+`py_type` (`tuple` or `dict`, say) to decode to that instead. Migrations create a composite
+before the tables that use it and drop it after them. Changing its fields needs a
+hand-written migration: `mizzle generate` stops and says so. A composite lives in the
+default schema unless both `composite(..., schema="app")` and
+`pg_composite(..., schema="app")` are given.
+
 ## Partitioned tables
 
 A table declares its partition key with `partition_by=` (PostgreSQL's spelling, as

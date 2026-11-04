@@ -23,12 +23,21 @@ from mizzle.core.schema.constraints import (
     RowLevelSecurity,
     UniqueConstraint,
 )
-from mizzle.core.schema.objects import Domain, Extension, Function, SchemaObject, Trigger
+from mizzle.core.schema.objects import (
+    Composite,
+    Domain,
+    Extension,
+    Function,
+    SchemaObject,
+    Trigger,
+)
 from mizzle.core.schema.table import Table, validate_tables
 from mizzle.core.schema.view import View
 from mizzle.core.snapshot import (
     CheckSnap,
     ColumnSnap,
+    CompositeFieldSnap,
+    CompositeSnap,
     DomainSnap,
     EnumSnap,
     ExclusionElementSnap,
@@ -308,6 +317,8 @@ def build_snapshot(
                 add_schema(fn["schema"])
             case Domain():
                 _add_domain(snapshot, obj, default_schema, dialect)
+            case Composite():
+                _add_composite(snapshot, obj, default_schema, dialect)
             case Trigger():
                 k = key(schema_of(obj.on), obj.on.__table__.name)
                 on = snapshot["tables"].get(k) or snapshot.get("views", {}).get(k)
@@ -517,6 +528,27 @@ def _add_domain(snapshot: Snapshot, obj: Domain, default_schema: str, dialect: D
     if existing is not None and existing != snap:
         raise SchemaError(f"domain {obj.name!r} is declared twice")
     domains[key(schema, obj.name)] = snap
+    if schema != default_schema and schema not in snapshot["schemas"]:
+        snapshot["schemas"].append(schema)
+
+
+def _add_composite(
+    snapshot: Snapshot, obj: Composite, default_schema: str, dialect: Dialect
+) -> None:
+    schema = obj.schema or default_schema
+    snap = CompositeSnap(
+        schema=schema,
+        name=obj.name,
+        fields=[
+            CompositeFieldSnap(name=name, type=dialect.normalize_type(sql_type))
+            for name, sql_type in obj.fields
+        ],
+    )
+    composites = snapshot.setdefault("composites", {})
+    existing = composites.get(key(schema, obj.name))
+    if existing is not None and existing != snap:
+        raise SchemaError(f"composite {obj.name!r} is declared twice")
+    composites[key(schema, obj.name)] = snap
     if schema != default_schema and schema not in snapshot["schemas"]:
         snapshot["schemas"].append(schema)
 

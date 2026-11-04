@@ -6,7 +6,7 @@ import enum
 import importlib.util
 import sys
 import uuid
-from collections.abc import AsyncGenerator, Sequence
+from collections.abc import AsyncGenerator, Mapping, Sequence
 from pathlib import Path
 from typing import cast, final, override
 
@@ -20,6 +20,7 @@ from mizzle import (
     Table,
     View,
     check,
+    composite,
     domain,
     exclusion,
     extension,
@@ -36,7 +37,14 @@ from mizzle import (
 )
 from mizzle.core.errors import MigrationError
 from mizzle.core.schema.column import Computed
-from mizzle.core.schema.objects import Domain, Extension, Function, SchemaObject, Trigger
+from mizzle.core.schema.objects import (
+    Composite,
+    Domain,
+    Extension,
+    Function,
+    SchemaObject,
+    Trigger,
+)
 from mizzle.core.snapshot import Snapshot, empty_snapshot
 from mizzle.core.steps import Statement, Step
 from mizzle.dialects.postgres import PostgresDialect
@@ -67,6 +75,7 @@ from mizzle.pg import (
     money,
     numrange,
     path,
+    pg_composite,
     pg_domain,
     pg_enum,
     point,
@@ -162,7 +171,9 @@ async def assert_pull_round_trip(driver: PostgresDriver, tmp_path: Path) -> str:
         for m in members
         if isinstance(m, type) and issubclass(m, Table) and "__table__" in vars(m)
     ]
-    objects = [m for m in members if isinstance(m, Domain | Extension | Function | Trigger)]
+    objects = [
+        m for m in members if isinstance(m, Composite | Domain | Extension | Function | Trigger)
+    ]
     pulled = build_snapshot(tables, dialect, objects=objects)
     remaining = diff(current, pulled)
     assert remaining == [], (source, [s.describe() for s in remaining])
@@ -1193,3 +1204,51 @@ async def test_partitions(driver: PostgresDriver, tmp_path: Path) -> None:
     # Dropping the partitioned table takes its partitions with it.
     steps = await migrate(driver, v3, snap([]))
     assert [s.describe() for s in steps] == ["drop table regions"]
+
+
+# -- composite types ---------------------------------------------------------------------
+
+caddr = composite(
+    "caddr",
+    [("street", "varchar(40)"), ("city", "text"), ("zip", "integer")],
+    schema="mg",
+)
+
+
+@final
+class Homes(Table, name="homes", schema="mg"):
+    id = integer().primary_key()
+    at = pg_composite("caddr", dict, schema="mg")
+
+
+async def test_composites(driver: PostgresDriver, tmp_path: Path) -> None:
+    v1 = snap([Homes], objects=[caddr])
+    assert v1.get("composites") == {
+        "mg.caddr": {
+            "schema": "mg",
+            "name": "caddr",
+            "fields": [
+                {"name": "street", "type": "character varying(40)"},
+                {"name": "city", "type": "text"},
+                {"name": "zip", "type": "integer"},
+            ],
+        }
+    }
+    assert v1["tables"]["mg.homes"]["columns"]["at"]["type"] == "mg.caddr"
+
+    await migrate(driver, empty_snapshot("postgresql"), v1)
+    await execute(
+        driver,
+        "INSERT INTO mg.homes (id, at) VALUES (1, ROW('1 Main', 'Springfield', 12345))",
+    )
+    [row] = await execute(driver, "SELECT at, (at).city AS city FROM mg.homes")
+    assert row["city"] == "Springfield"
+    # asyncpg reads a composite as a Record (field values by name).
+    assert cast(Mapping[str, object], row["at"])["zip"] == 12345
+    source = await assert_pull_round_trip(driver, tmp_path)
+    assert "composite('caddr'" in source
+    assert "pg_composite('mg.caddr'" in source
+
+    # A composite drops after the table that uses it.
+    steps = await migrate(driver, v1, snap([]))
+    assert [s.describe() for s in steps] == ["drop table homes", "drop type caddr"]

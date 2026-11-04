@@ -164,6 +164,7 @@ class _SchemaWriter:
         self.enum_values: dict[str, list[str]] = {}  # db type name -> values
         self.enum_names: dict[str, tuple[str, str]] = {}  # db type name -> (schema, name)
         self.domains: dict[str, str] = {}  # column type -> Python type for pg_domain()
+        self.composites: set[str] = set()  # column types that are composite types
         self.other_imports: set[str] = set()  # e.g. "import decimal" for a domain's type
         self.table_classes: dict[str, str] = {}  # "schema.table" -> class name
         self.attrs: dict[str, dict[str, str]] = {}  # "schema.table" -> column -> attribute
@@ -193,6 +194,9 @@ class _SchemaWriter:
             self.pg_imports.add("pg_domain")
             py = self.domains[sql_type]
             return f"pg_domain({sql_type!r}, {py}{', ' + kwargs if kwargs else ''})"
+        if sql_type in self.composites:
+            self.pg_imports.add("pg_composite")
+            return f"pg_composite({sql_type!r}{', ' + kwargs if kwargs else ''})"
         if sql_type in ("jsonb", "json"):
             self.pg_imports.add(sql_type)
             self.uses_any = True
@@ -532,6 +536,19 @@ class _SchemaWriter:
                 args.append(f"collation={collation!r}")
             domains_code.append(f"d_{_identifier(name)} = domain({', '.join(args)})")
 
+        composites_code: list[str] = []
+        for comp in self.snapshot.get("composites", {}).values():
+            schema, name = comp["schema"], comp["name"]
+            sql_type = _type_ident(name)
+            if schema != "public":
+                sql_type = f"{_type_ident(schema)}.{sql_type}"
+            self.composites.add(sql_type)
+            fields = ", ".join(f"({f['name']!r}, {f['type']!r})" for f in comp["fields"])
+            extra = f", schema={schema!r}" if schema != "public" else ""
+            composites_code.append(
+                f"c_{_identifier(name)} = composite({name!r}, [{fields}]{extra})"
+            )
+
         for k, table in self.snapshot["tables"].items():
             name = _class_name(table["name"])
             if name in self.table_classes.values() or name in self.enum_classes.values():
@@ -586,6 +603,8 @@ class _SchemaWriter:
         }
         if domains_code:
             uses_objects.add("domain")
+        if composites_code:
+            uses_objects.add("composite")
 
         tables_code: list[str] = []
         uses_config: set[str] = set()
@@ -687,7 +706,14 @@ class _SchemaWriter:
             typing_names.add("override")
         header.append(f"from typing import {', '.join(sorted(typing_names))}")
         header.append("")
-        blocks = [*enums_code, *domains_code, *objects_code, *tables_code, *triggers_code]
+        blocks = [
+            *enums_code,
+            *domains_code,
+            *composites_code,
+            *objects_code,
+            *tables_code,
+            *triggers_code,
+        ]
         body = "\n\n\n".join(blocks)
         mizzle_names: set[str] = {
             "Table",

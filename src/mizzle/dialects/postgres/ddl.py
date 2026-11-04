@@ -12,6 +12,7 @@ from mizzle.core.naming import Casing
 from mizzle.core.schema.column import MISSING, ColumnBase
 from mizzle.core.snapshot import (
     ColumnSnap,
+    CompositeSnap,
     DomainSnap,
     ExclusionElementSnap,
     ExclusionSnap,
@@ -47,6 +48,7 @@ from mizzle.core.steps import (
     AlterPolicy,
     AlterRole,
     AlterTableStorage,
+    CreateComposite,
     CreateDomain,
     CreateEnum,
     CreateExtension,
@@ -60,6 +62,7 @@ from mizzle.core.steps import (
     CreateTrigger,
     CreateView,
     DropColumn,
+    DropComposite,
     DropConstraint,
     DropDomain,
     DropEnum,
@@ -549,6 +552,11 @@ def _create_domain(domain: DomainSnap) -> str:
     return " ".join(parts)
 
 
+def _create_composite(composite: CompositeSnap) -> str:
+    fields = ", ".join(f"{quote(f['name'])} {f['type']}" for f in composite["fields"])
+    return f"CREATE TYPE {qualified(composite['schema'], composite['name'])} AS ({fields})"
+
+
 def render_step(step: Step) -> Statement:
     def alter(schema: str, table: str, action: str) -> Statement:
         return Statement(f"ALTER TABLE {qualified(schema, table)} {action}")
@@ -575,6 +583,10 @@ def render_step(step: Step) -> Statement:
             return Statement(_create_domain(domain))
         case DropDomain(schema=schema, name=name):
             return Statement(f"DROP DOMAIN {qualified(schema, name)}")
+        case CreateComposite(composite=composite):
+            return Statement(_create_composite(composite))
+        case DropComposite(schema=schema, name=name):
+            return Statement(f"DROP TYPE {qualified(schema, name)}")
         case CreateTable(table=table):
             return Statement(_create_table(table))
         case CreatePartition(schema=schema, parent=parent, name=name, bound=bound):

@@ -9,9 +9,11 @@ import pytest
 from mizzle import (
     Constraint,
     QueryBuilder,
+    QueryError,
     SchemaError,
     Table,
     View,
+    composite,
     domain,
     function,
     grant,
@@ -26,7 +28,7 @@ from mizzle.dialects.postgres import PostgresDialect
 from mizzle.dialects.postgres.ddl import _without_defaults
 from mizzle.kit.diff import StrictRenames, diff, no_renames
 from mizzle.kit.snapshot import build_snapshot
-from mizzle.pg import integer, pg_domain, text
+from mizzle.pg import integer, pg_composite, pg_domain, text
 
 dialect = PostgresDialect()
 
@@ -575,3 +577,55 @@ def test_partition_needs_partition_by() -> None:
 
     with pytest.raises(SchemaError, match="partition_by"):
         build_snapshot([Bad], dialect)
+
+
+# -- composite types -----------------------------------------------------------------------
+
+
+def test_composites_render_create_drop_and_reject_changes() -> None:
+    caddr = composite("caddr", [("street", "varchar(40)"), ("city", "text"), ("zip", "integer")])
+
+    @final
+    class Users(Table, name="users"):
+        id = integer().primary_key()
+        home = pg_composite("caddr", dict)
+
+    v1 = build_snapshot([Users], dialect, objects=[caddr])
+    assert v1.get("composites") == {
+        "public.caddr": {
+            "schema": "public",
+            "name": "caddr",
+            "fields": [
+                {"name": "street", "type": "character varying(40)"},
+                {"name": "city", "type": "text"},
+                {"name": "zip", "type": "integer"},
+            ],
+        }
+    }
+    assert v1["tables"]["public.users"]["columns"]["home"]["type"] == "caddr"
+
+    statements = dialect.render(diff(empty_snapshot("postgresql"), v1))
+    assert statements[0].sql == (
+        'CREATE TYPE "caddr" AS ("street" character varying(40), "city" text, "zip" integer)'
+    )
+    assert diff(v1, v1) == []
+
+    # A composite is dropped after the table that uses it.
+    steps = diff(v1, build_snapshot([], dialect))
+    assert [s.describe() for s in steps] == ["drop table users", "drop type caddr"]
+
+    # Changing its fields needs a custom migration.
+    changed = composite("caddr", [("street", "varchar(40)"), ("city", "text")])
+    v2 = build_snapshot([Users], dialect, objects=[changed])
+    with pytest.raises(MigrationError, match="composite type caddr"):
+        diff(v1, v2)
+
+
+def test_pg_composite_decodes_and_accepts_tuples() -> None:
+    column = pg_composite("caddr", dict, name="home")
+    assert column.sql_type == "caddr"
+    assert column.decode({"city": "x"}) == {"city": "x"}
+    column.validate(("street", "city", 1))
+    with pytest.raises(QueryError, match="expects tuple"):
+        column.validate("nope")
+    assert pg_composite("addr", schema="app").sql_type == "app.addr"

@@ -43,6 +43,7 @@ from mizzle.core.steps import (
     AlterRole,
     AlterTableStorage,
     ConstraintKind,
+    CreateComposite,
     CreateDomain,
     CreateEnum,
     CreateExtension,
@@ -56,6 +57,7 @@ from mizzle.core.steps import (
     CreateTrigger,
     CreateView,
     DropColumn,
+    DropComposite,
     DropConstraint,
     DropDomain,
     DropEnum,
@@ -164,6 +166,7 @@ class _Plan:
     extensions: list[Step] = field(default_factory=list[Step])
     enums: list[Step] = field(default_factory=list[Step])
     domains: list[Step] = field(default_factory=list[Step])
+    composites: list[Step] = field(default_factory=list[Step])
     renames: list[Step] = field(default_factory=list[Step])
     drop_triggers: list[Step] = field(default_factory=list[Step])
     drop_policies: list[Step] = field(default_factory=list[Step])
@@ -194,6 +197,7 @@ class _Plan:
     grants: list[Step] = field(default_factory=list[Step])
     drop_partitions: list[Step] = field(default_factory=list[Step])
     drop_tables: list[Step] = field(default_factory=list[Step])
+    drop_composites: list[Step] = field(default_factory=list[Step])
     drop_domains: list[Step] = field(default_factory=list[Step])
     drop_enums: list[Step] = field(default_factory=list[Step])
     drop_extensions: list[Step] = field(default_factory=list[Step])
@@ -211,6 +215,7 @@ class _Plan:
             *self.extensions,
             *self.enums,
             *self.domains,  # a domain's base type can be an enum
+            *self.composites,  # a composite's fields can be enums or domains
             *self.renames,
             *self.drop_triggers,
             *self.drop_policies,
@@ -241,6 +246,7 @@ class _Plan:
             *self.grants,
             *self.drop_partitions,
             *self.drop_tables,
+            *self.drop_composites,
             *self.drop_domains,
             *self.drop_enums,
             *self.drop_extensions,
@@ -308,6 +314,25 @@ def _diff_domains(old: Snapshot, new: Snapshot, plan: _Plan, compare_expressions
     for k, domain in old_domains.items():
         if k not in new_domains:
             plan.drop_domains.append(DropDomain(domain["schema"], domain["name"]))
+
+
+def _diff_composites(old: Snapshot, new: Snapshot, plan: _Plan) -> None:
+    """A composite type is created or dropped whole; changing its fields needs a custom
+    migration (PostgreSQL can ALTER TYPE ADD/DROP/ALTER ATTRIBUTE, but not atomically from a
+    snapshot)."""
+    old_types = old.get("composites", {})
+    new_types = new.get("composites", {})
+    for k, composite in new_types.items():
+        before = old_types.get(k)
+        if before is None:
+            plan.composites.append(CreateComposite(composite))
+        elif before["fields"] != composite["fields"]:
+            raise MigrationError(
+                f"composite type {composite['name']}: changing its fields needs a custom migration"
+            )
+    for k, composite in old_types.items():
+        if k not in new_types:
+            plan.drop_composites.append(DropComposite(composite["schema"], composite["name"]))
 
 
 def _rename_columns_in(table: TableSnap, mapping: Mapping[str, str]) -> None:
@@ -711,6 +736,7 @@ def diff(
     plan.schemas = [CreateSchema(s) for s in new["schemas"] if s not in old["schemas"]]
     _diff_enums(old, new, plan)
     _diff_domains(old, new, plan, compare_expressions)
+    _diff_composites(old, new, plan)
     old_tables = _apply_renames(old, new, resolve, plan)
 
     for k, table in new["tables"].items():

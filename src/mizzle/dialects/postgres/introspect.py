@@ -11,6 +11,8 @@ from mizzle.core.errors import DatabaseError, SchemaError
 from mizzle.core.snapshot import (
     CheckSnap,
     ColumnSnap,
+    CompositeFieldSnap,
+    CompositeSnap,
     DomainSnap,
     EnumSnap,
     ExclusionElementSnap,
@@ -192,6 +194,19 @@ JOIN pg_type t ON t.oid = c.contypid
 JOIN pg_namespace n ON n.oid = t.typnamespace
 WHERE c.contype = 'c' AND n.nspname = ANY($1::text[])
 ORDER BY n.nspname, t.typname
+"""
+
+# Standalone composite types; a table's row type is a composite too, so keep only the
+# pg_class rows of relkind 'c' (the ones CREATE TYPE ... AS makes).
+_COMPOSITES = """
+SELECT n.nspname AS schema, t.typname AS name,
+       a.attname AS field, format_type(a.atttypid, a.atttypmod) AS type
+FROM pg_type t
+JOIN pg_namespace n ON n.oid = t.typnamespace
+JOIN pg_class c ON c.oid = t.typrelid
+JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped
+WHERE t.typtype = 'c' AND c.relkind = 'c' AND n.nspname = ANY($1::text[])
+ORDER BY n.nspname, t.typname, a.attnum
 """
 
 
@@ -630,6 +645,17 @@ async def introspect(
         if checks := domain_checks.get(key(schema, name)):
             domain["checks"] = sorted(checks)
         snapshot.setdefault("domains", {})[key(schema, name)] = domain
+        _add_schema(snapshot, schema)
+
+    for row in await conn.fetch_dicts(_COMPOSITES, [schema_list]):
+        schema, name = str(row["schema"]), str(row["name"])
+        composites = snapshot.setdefault("composites", {})
+        composite = composites.setdefault(
+            key(schema, name), CompositeSnap(schema=schema, name=name, fields=[])
+        )
+        composite["fields"].append(
+            CompositeFieldSnap(name=str(row["field"]), type=str(row["type"]))
+        )
         _add_schema(snapshot, schema)
     return snapshot
 

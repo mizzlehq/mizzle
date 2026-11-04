@@ -77,7 +77,16 @@ class Domain:
     collation: str | None = None
 
 
-type SchemaObject = Extension | Function | Trigger | Role | Domain
+@dataclass(frozen=True)
+class Composite:
+    """``CREATE TYPE name AS (field type, ...)``: a named row type."""
+
+    name: str
+    fields: tuple[tuple[str, str], ...]  # (field name, SQL type in PostgreSQL's spelling)
+    schema: str | None = None
+
+
+type SchemaObject = Extension | Function | Trigger | Role | Domain | Composite
 
 
 def extension(name: str, *, schema: str | None = None, version: str | None = None) -> Extension:
@@ -181,3 +190,14 @@ def domain(
         (*checks, *([check] if check is not None else [])),
         collation,
     )
+
+
+def composite(
+    name: str, fields: Sequence[tuple[str, str]], *, schema: str | None = None
+) -> Composite:
+    """``CREATE TYPE name AS (field type, ...)``. Field types use PostgreSQL's spelling
+    (``character varying(255)``, not ``varchar``) and their order is kept. A column uses the
+    type by name (see ``mizzle.pg.pg_composite``)."""
+    if not fields:
+        raise SchemaError(f"composite {name!r} needs at least one field")
+    return Composite(name, tuple((f, t) for f, t in fields), schema)
