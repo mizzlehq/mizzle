@@ -425,6 +425,32 @@ def test_read_only_refuses_transaction_control(pg_url: str, driver: PostgresDriv
         assert emails == [["victim"]]
 
 
+def test_read_only_checks_each_split_statement(pg_url: str, driver: PostgresDriver) -> None:
+    # The check runs on the statements split_statements produced, so a COPY after a
+    # harmless SELECT is caught; smoke-testing the raw text would miss it.
+    from mizzle.studio.server import _reject_read_only, split_statements
+
+    statements = split_statements("select 1; copy (select 1) to program 'true'")
+    assert len(statements) == 2
+    with pytest.raises(Exception, match="COPY"):
+        _reject_read_only(statements)
+
+
+def test_read_only_allows_queries_that_mention_blocked_words(
+    pg_url: str, driver: PostgresDriver
+) -> None:
+    # The blocklist is anchored at the statement start, so data and identifiers are fine.
+    from mizzle.studio.server import _reject_read_only
+
+    for sql in (
+        "select 'set up' as note",
+        "select * from settings",
+        "select name from t where name = 'commit'",
+        "select notify_at from jobs",
+    ):
+        _reject_read_only([sql])
+
+
 def test_read_only_refuses_server_side_calls(pg_url: str, driver: PostgresDriver) -> None:
     # SS2: READ ONLY does not stop a superuser from acting outside the transaction.
     with make_client(pg_url, read_only=True) as client:
