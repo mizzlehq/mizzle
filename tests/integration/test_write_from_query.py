@@ -141,3 +141,30 @@ async def test_on_conflict_on_constraint(db: Database) -> None:
     )
     assert skipped == 0
     assert await db.select(Users.bio).from_(Users).where(eq(Users.email, "ann@x")) == [("updated",)]
+
+
+async def test_returning_expressions(db: Database) -> None:
+    await seed(db)
+    inserted = await db.insert(Users).values(email="dan@z").returning(Users.id, Users.email)
+    assert inserted == [(4, "dan@z")]
+    updated = (
+        await db.update(Users)
+        .set(bio="well")
+        .where(eq(Users.id, 1))
+        .returning({"id": Users.id, "email": Users.email})
+    )
+    assert updated == [{"id": 1, "email": "ann@x"}]
+
+
+async def test_returning_projection_in_cte(db: Database) -> None:
+    await seed(db)
+    moved = (
+        db.delete(Posts).where(eq(Posts.author_id, 1)).returning(Posts.id, Posts.title).cte("moved")
+    )
+    rows = (
+        await db.with_(moved)
+        .select(moved.c("id", int), moved.c("title", str))
+        .from_(moved)
+        .order_by(moved.c("id", int))
+    )
+    assert rows == [(1, "cat"), (2, "dog")]

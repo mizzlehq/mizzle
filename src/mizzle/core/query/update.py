@@ -11,19 +11,18 @@ from typing import Self, override
 
 from mizzle.core.compiler import CompiledQuery
 from mizzle.core.errors import QueryError
-from mizzle.core.query.base import Executable, evolve
+from mizzle.core.query.base import evolve
 from mizzle.core.query.insert import RowLike, as_mapping, check_values
-from mizzle.core.query.returning import Returning
+from mizzle.core.query.returning import ReturningMixin
 from mizzle.core.schema.table import Table
 from mizzle.core.sql.nodes import Condition
 from mizzle.core.sql.operators import and_
 
 
 @dataclass(frozen=True, eq=False)
-class Update[T: Table](Executable[int]):
+class Update[T: Table](ReturningMixin[T]):
     """Awaiting returns the number of updated rows; ``.returning()`` returns the rows."""
 
-    table: type[T]
     values_: dict[str, object] = field(default_factory=dict[str, object])
     where_: Condition | None = None
     all_rows_: bool = False
@@ -54,19 +53,15 @@ class Update[T: Table](Executable[int]):
         """Allow running without ``.where()``."""
         return evolve(self, all_rows_=True)
 
-    def returning(self) -> Returning[T]:
-        return Returning(self.runner, self, self.table)
-
     @override
     async def run_compiled(self, compiled: CompiledQuery) -> int:
         return await self.runner.run(compiled)
 
 
 @dataclass(frozen=True, eq=False)
-class Delete[T: Table](Executable[int]):
+class Delete[T: Table](ReturningMixin[T]):
     """Awaiting returns the number of deleted rows; ``.returning()`` returns the rows."""
 
-    table: type[T]
     where_: Condition | None = None
     all_rows_: bool = False
     # DELETE ... USING: other tables to join into the delete.
@@ -87,9 +82,6 @@ class Delete[T: Table](Executable[int]):
     def all_rows(self) -> Self:
         """Allow running without ``.where()``."""
         return evolve(self, all_rows_=True)
-
-    def returning(self) -> Returning[T]:
-        return Returning(self.runner, self, self.table)
 
     @override
     async def run_compiled(self, compiled: CompiledQuery) -> int:

@@ -575,7 +575,7 @@ class Compiler:
 
     # -- INSERT / UPDATE / DELETE -----------------------------------------------------
 
-    def returning_clause(self, _table: type[Table], /) -> str:
+    def returning_clause(self, _node: Returning[object], /) -> str:
         raise QueryError(f"{type(self).__name__} does not support RETURNING")
 
     def on_conflict_clause(self, _table: type[Table], _conflict: OnConflict, /) -> str:
@@ -714,5 +714,5 @@ class Compiler:
             text += f" WHERE {self.visit(node.where_)}"
         return text
 
-    def visit_Returning(self, node: Returning[Table]) -> str:
-        return f"{self.visit(node.query)} {self.returning_clause(node.table)}"
+    def visit_Returning(self, node: Returning[object]) -> str:
+        return f"{self.visit(node.query)} {self.returning_clause(node)}"

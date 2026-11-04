@@ -1,10 +1,13 @@
+from typing import cast
+
 import pytest
 
 from mizzle.core.errors import QueryError
 from mizzle.core.query.builder import QueryBuilder
 from mizzle.core.schema.table import Table
 from mizzle.core.schema.types import integer, text
-from mizzle.core.sql.operators import eq, excluded, gt
+from mizzle.core.sql.nodes import ExprBase
+from mizzle.core.sql.operators import count, eq, excluded, gt
 from mizzle.core.sql.raw import sql
 from mizzle.dialects.postgres.types import serial
 from tests.models import Posts, Role, Users
@@ -192,6 +195,50 @@ async def test_insert_returning(qb: QueryBuilder, runner: FakeRunner) -> None:
 async def test_insert_returns_rowcount(qb: QueryBuilder, runner: FakeRunner) -> None:
     runner.rowcount = 2
     assert await qb.insert(Users).values([{"email": "a"}, {"email": "b"}]) == 2
+
+
+def test_returning_expressions_sql(qb: QueryBuilder) -> None:
+    q = qb.insert(Users).values(email="a").returning(Users.id, Users.email)
+    assert q.to_sql() == (
+        'INSERT INTO "users" ("email") VALUES ($1) RETURNING "users"."id", "users"."email"',
+        ("a",),
+    )
+    mapped = (
+        qb.update(Users)
+        .set(bio="x")
+        .where(eq(Users.id, 1))
+        .returning({"id": Users.id, "n": count()})
+    )
+    assert mapped.to_sql() == (
+        'UPDATE "users" SET "bio" = $1 WHERE "users"."id" = $2 RETURNING "users"."id", count(*)',
+        ("x", 1),
+    )
+
+
+async def test_returning_expressions_decode(qb: QueryBuilder, runner: FakeRunner) -> None:
+    q = qb.delete(Users).where(eq(Users.id, 1)).returning(Users.id, Users.email)
+    runner.rows = [(1, "a@b.c"), (2, "c@d.e")]
+    assert await q == [(1, "a@b.c"), (2, "c@d.e")]
+
+
+async def test_returning_mapping_decodes(qb: QueryBuilder, runner: FakeRunner) -> None:
+    q = qb.update(Users).set(bio="x").where(eq(Users.id, 1)).returning({"id": Users.id})
+    runner.rows = [(1,)]
+    assert await q == [{"id": 1}]
+
+
+async def test_returning_projection_decodes_enum(qb: QueryBuilder, runner: FakeRunner) -> None:
+    # A projected column is decoded through its own decoder, so an enum comes back as enum.
+    q = qb.delete(Users).where(eq(Users.id, 1)).returning(Users.role)
+    runner.rows = [("admin",)]
+    assert await q == [(Role.ADMIN,)]
+
+
+def test_returning_validation(qb: QueryBuilder) -> None:
+    with pytest.raises(QueryError, match="takes expressions"):
+        qb.delete(Users).where(eq(Users.id, 1)).returning(cast("ExprBase", cast(object, Users)))
+    with pytest.raises(QueryError, match="at least one field"):
+        qb.delete(Users).where(eq(Users.id, 1)).returning({})
 
 
 # -- update / delete ------------------------------------------------------------------

@@ -1,17 +1,19 @@
 from __future__ import annotations
 
 import datetime
+from collections.abc import Iterable
 from decimal import Decimal
 from typing import TYPE_CHECKING, override
 
 from mizzle.core.compiler import CompiledQuery, Compiler
 from mizzle.core.errors import QueryError
 from mizzle.core.sql.alias import real_table
-from mizzle.core.sql.nodes import Node
+from mizzle.core.sql.nodes import ExprBase, Node
 
 if TYPE_CHECKING:
     from mizzle.core.query.insert import OnConflict
     from mizzle.core.query.relational import LoadPlan, RelationalStatement
+    from mizzle.core.query.returning import Returning
     from mizzle.core.schema.column import ColumnBase
     from mizzle.core.schema.relations import Link
     from mizzle.core.schema.table import Table
@@ -35,8 +37,14 @@ class PostgresCompiler(Compiler):
         return compiled
 
     @override
-    def returning_clause(self, table: type[Table], /) -> str:
-        return "RETURNING " + ", ".join(self.visit(c) for c in table.__table__.columns.values())
+    def returning_clause(self, node: Returning[object], /) -> str:
+        projection = node.projection
+        exprs: Iterable[ExprBase]
+        if projection is None:
+            exprs = node.table.__table__.columns.values()
+        else:
+            exprs = projection.values() if isinstance(projection, dict) else projection
+        return "RETURNING " + ", ".join(self.visit(expr) for expr in exprs)
 
     @override
     def on_conflict_clause(self, table: type[Table], conflict: OnConflict, /) -> str:

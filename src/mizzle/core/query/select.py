@@ -97,6 +97,16 @@ class Cte(Node):
         while isinstance(query, CompoundBase):
             query = query.left  # output columns are named by the first query
         if isinstance(query, Returning):
+            if query.projection is not None:
+                projection = query.projection
+                if isinstance(projection, dict):
+                    node = projection.get(name)
+                    return None if node is None else column_of(node)
+                for expr_node in projection:
+                    column = column_of(expr_node)
+                    if column is not None and name in (column.attr, column.db_name()):
+                        return column
+                return None
             for attr, column in query.table.__table__.columns.items():
                 if name in (attr, column.db_name()):
                     return column

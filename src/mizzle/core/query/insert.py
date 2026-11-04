@@ -8,8 +8,8 @@ from typing import Literal, Protocol, Self, override
 
 from mizzle.core.compiler import CompiledQuery
 from mizzle.core.errors import QueryError
-from mizzle.core.query.base import Executable, evolve
-from mizzle.core.query.returning import Returning
+from mizzle.core.query.base import evolve
+from mizzle.core.query.returning import ReturningMixin
 from mizzle.core.query.select import CompoundBase, SelectBase
 from mizzle.core.schema.column import ColumnBase
 from mizzle.core.schema.table import Table
@@ -127,10 +127,9 @@ def _conflict(
 
 
 @dataclass(frozen=True, eq=False)
-class Insert[T: Table](Executable[int]):
+class Insert[T: Table](ReturningMixin[T]):
     """Awaiting returns the number of inserted rows; ``.returning()`` returns the rows."""
 
-    table: type[T]
     rows: tuple[dict[str, object], ...] = ()
     conflict: OnConflict | None = None
     overriding: Literal["SYSTEM", "USER"] | None = None
@@ -231,9 +230,6 @@ class Insert[T: Table](Executable[int]):
             raise QueryError("on_conflict_do_update() needs a non-empty set_")
         check_values(self.table, set_)
         return evolve(self, conflict=OnConflict(targets, "update", dict(set_), where, constraint))
-
-    def returning(self) -> Returning[T]:
-        return Returning(self.runner, self, self.table)
 
     @override
     async def run_compiled(self, compiled: CompiledQuery) -> int:
