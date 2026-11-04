@@ -635,9 +635,7 @@ class _PoolConnection(asyncpg.Connection):
         dirty, self._mizzle_dirty = self._mizzle_dirty, False
         return dirty
 
-    def set_on_connect(
-        self, hook: Callable[[PostgresConnection], Awaitable[None]] | None
-    ) -> None:
+    def set_on_connect(self, hook: Callable[[PostgresConnection], Awaitable[None]] | None) -> None:
         """Remember the pool's ``on_connect``, so a reset can run it again."""
         self._mizzle_on_connect = hook
 

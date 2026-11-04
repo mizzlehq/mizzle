@@ -212,9 +212,7 @@ async def test_after_commit_error_says_the_data_is_saved(pg_url: str) -> None:
             async with db.transaction(after_commit=hook) as tx:
                 await tx.insert(Users).values(email="committed")
         # It really did commit, which is why retrying would insert a second row.
-        committed = await (
-            db.select(Users.email).from_(Users).where(eq(Users.email, "committed"))
-        )
+        committed = await db.select(Users.email).from_(Users).where(eq(Users.email, "committed"))
         assert committed == [("committed",)]
 
 

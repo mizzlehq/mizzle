@@ -327,8 +327,8 @@ def split_statements(text: str) -> list[str]:
         ch = text[i]
         if ch in "'\"":
             # E'...' (also e'...') has backslash escapes; a bare '...' does not.
-            escapes = ch == "'" and i > 0 and text[i - 1] in "Ee" and not _is_ident_char(
-                text, i - 2
+            escapes = (
+                ch == "'" and i > 0 and text[i - 1] in "Ee" and not _is_ident_char(text, i - 2)
             )
             i = _skip_quoted(text, i, ch, escapes=escapes)
         elif ch == "$":
@@ -970,9 +970,7 @@ def create_app(
         # ``:path`` so a saved-query name may contain "/" (it is a user-chosen label, not a
         # path segment); the default converter stopped at the slash and answered 405.
         Route("/api/queries/saved/{name:path}", _api(studio, put_saved), methods=["PUT"]),
-        Route(
-            "/api/queries/saved/{name:path}", _api(studio, delete_saved), methods=["DELETE"]
-        ),
+        Route("/api/queries/saved/{name:path}", _api(studio, delete_saved), methods=["DELETE"]),
     ]
     if (static_dir / "index.html").exists():
         routes.append(Mount("/", StaticFiles(directory=static_dir, html=True)))
