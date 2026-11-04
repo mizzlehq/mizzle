@@ -26,3 +26,6 @@ docs/superpowers/
 # scripts/ci-local.sh
 .ci-local/
 site/
+
+# mutmut's working directory (mutation testing)
+mutants/

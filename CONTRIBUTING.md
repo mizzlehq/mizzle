@@ -17,6 +17,22 @@ uv run mypy
 uv run ruff check && uv run ruff format --check
 ```
 
+### Mutation testing
+
+The suite can pass while asserting the wrong thing. Mutation testing mutates the source and
+checks that a test fails for each change. It is slow, so CI runs it weekly
+(`.github/workflows/mutation.yml`), not on every pull request:
+
+```bash
+uv run --group mutation mutmut run "mizzle.core.compiler*"  # limit to one module while iterating
+uv run --group mutation mutmut export-cicd-stats
+uv run python scripts/mutation_score.py --min 70
+```
+
+`tool.mutmut` in `pyproject.toml` mutates `src/mizzle` against `tests/unit` (no Postgres
+needed). CI runs a curated set of core modules and fails below a 70% score. A surviving mutant
+is a test worth writing, not necessarily a bug: browse them with `mutmut browse`.
+
 ## Studio UI (`studio-ui/`)
 
 React + Tailwind + Base UI/shadcn, managed with pnpm and Biome.
