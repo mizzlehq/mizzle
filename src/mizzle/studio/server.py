@@ -27,6 +27,7 @@ import logging
 import os
 import re
 import secrets
+import sys
 import webbrowser
 from collections.abc import AsyncGenerator, Awaitable, Callable, Mapping, Sequence
 from contextlib import asynccontextmanager
@@ -34,6 +35,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import cast, override
 
+import asyncpg
 from starlette.applications import Starlette
 from starlette.middleware import Middleware
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
@@ -58,6 +60,24 @@ MAX_EXPORT_ROWS = 100_000
 MAX_HISTORY = 100
 _COMPARE = {"eq": "=", "ne": "<>", "lt": "<", "lte": "<=", "gt": ">", "gte": ">="}
 _DOLLAR = re.compile(r"\$[A-Za-z_][A-Za-z0-9_]*\$|\$\$")
+
+# Statements that change the transaction, the session or the process rather than the data.
+# In read-only mode a batch must not be able to leave the READ ONLY transaction it runs in
+# (``commit; insert ...`` was a working write), so these are refused outright.
+_READ_ONLY_DENIED = re.compile(
+    r"(?:BEGIN|START\s+TRANSACTION|COMMIT|END|ROLLBACK|ABORT|SAVEPOINT|RELEASE"
+    r"|SET|RESET|DISCARD|LOCK|PREPARE\s+TRANSACTION|NOTIFY|LISTEN|UNLISTEN"
+    r"|COPY|DO)\b",
+    re.IGNORECASE,
+)
+# Server-side functions that read or change things outside the transaction, which READ ONLY
+# does not (and cannot) stop.
+_READ_ONLY_DENIED_CALLS = re.compile(
+    r"\b(?:pg_read_file|pg_read_binary_file|pg_ls_dir|pg_stat_file|pg_terminate_backend"
+    r"|pg_cancel_backend|pg_reload_conf|pg_rotate_logfile|pg_switch_wal|pg_promote"
+    r"|lo_import|lo_export|dblink|dblink_exec|pg_file_write|pg_file_rename|pg_file_unlink)\b",
+    re.IGNORECASE,
+)
 
 log = logging.getLogger("mizzle")
 
@@ -310,14 +330,24 @@ def _has_sql(chunk: str) -> bool:
     return any(line.strip() and not line.strip().startswith("--") for line in chunk.splitlines())
 
 
+# A cell a spreadsheet would evaluate as a formula. CSV has no types, so the only defence is
+# to make the text unambiguous: a leading apostrophe is the conventional "this is text" mark
+# (Excel, LibreOffice and Sheets all show the rest of the cell and keep it inert).
+_FORMULA_LEAD = ("=", "+", "-", "@", "\t", "\r")
+
+
+def _csv_safe(text: str) -> str:
+    return f"'{text}" if text.startswith(_FORMULA_LEAD) else text
+
+
 def _cell(value: object) -> str:
     if value is None:
         return ""
     if isinstance(value, dict | list):
-        return json.dumps(value)
+        return _csv_safe(json.dumps(value))
     if isinstance(value, bool):
         return "true" if value else "false"
-    return str(value)
+    return _csv_safe(str(value))
 
 
 def _to_csv(table: TableSnap, rows: Sequence[object]) -> str:
@@ -515,6 +545,40 @@ async def delete_rows(studio: Studio, request: Request) -> Response:
     return JSONResponse({"deleted": deleted})
 
 
+def _reject_read_only(statements: Sequence[str]) -> None:
+    """Refuse a read-only batch that could leave the READ ONLY transaction or act on the server.
+
+    The transaction is one per request, so a ``COMMIT``/``ROLLBACK`` in the middle ended it
+    and the rest of the batch ran read-write. ``SET transaction_read_only = off`` did the
+    same. Rejecting the statement class is cheaper to reason about than tracking whether the
+    transaction is still the one we opened.
+    """
+    for statement in statements:
+        body = _strip_leading_comments(statement)
+        if (match := _READ_ONLY_DENIED.match(body)) is not None:
+            raise StudioError(
+                f"{match.group(0).upper()} is not allowed in read-only mode", 403
+            )
+        if (call := _READ_ONLY_DENIED_CALLS.search(body)) is not None:
+            raise StudioError(
+                f"{call.group(0)} is not allowed in read-only mode", 403
+            )
+
+
+def _strip_leading_comments(statement: str) -> str:
+    """The statement without leading ``--``/``/* */`` comments, so the first keyword is found."""
+    rest = statement.lstrip()
+    while True:
+        if rest.startswith("--"):
+            newline = rest.find("\n")
+            rest = "" if newline == -1 else rest[newline + 1 :].lstrip()
+        elif rest.startswith("/*"):
+            close = rest.find("*/", 2)
+            rest = "" if close == -1 else rest[close + 2 :].lstrip()
+        else:
+            return rest
+
+
 async def run_sql(studio: Studio, request: Request) -> Response:
     text = (await _body(request)).get("sql")
     if not isinstance(text, str) or not text.strip():
@@ -522,6 +586,9 @@ async def run_sql(studio: Studio, request: Request) -> Response:
     statements = split_statements(text)
     if not statements:
         raise StudioError("sql must be a non-empty string")
+
+    if studio.read_only:
+        _reject_read_only(statements)
 
     async def run(conn: Connection) -> list[dict[str, object]]:
         results: list[dict[str, object]] = []
@@ -580,9 +647,25 @@ async def _current_table(studio: Studio, data: dict[str, object]) -> TableSnap |
     return current
 
 
+def _configured_schema(studio: Studio, data: Mapping[str, object]) -> None:
+    """DDL may only touch the schemas Studio was told to manage.
+
+    ``_schema`` checks the name is a plain identifier, not that it is one of ours, so
+    ``information_schema`` used to be created in.
+    """
+    schema = data.get("schema", "public")
+    if not isinstance(schema, str) or schema not in studio.schemas:
+        raise StudioError(
+            f"schema {schema!r} is outside this Studio's schema filter "
+            f"({', '.join(studio.schemas)})",
+            403,
+        )
+
+
 async def ddl_preview(studio: Studio, request: Request) -> Response:
     """Generate the SQL for an operation without running it (the review screen)."""
     data = await _body(request)
+    _configured_schema(studio, data)
     steps = build_steps(studio.dialect, data, await _current_table(studio, data))
     return JSONResponse({"statements": statement_rows(studio.dialect, steps)})
 
@@ -590,6 +673,7 @@ async def ddl_preview(studio: Studio, request: Request) -> Response:
 async def ddl_apply(studio: Studio, request: Request) -> Response:
     _writable(studio)
     data = await _body(request)
+    _configured_schema(studio, data)
     steps = build_steps(studio.dialect, data, await _current_table(studio, data))
     statements = studio.dialect.render(steps)
     async with studio.pool().acquire() as conn:
@@ -649,15 +733,56 @@ def parse_auth(value: str) -> tuple[str, str]:
     return user, password
 
 
+MIN_TOKEN_LENGTH = 32
+
+
 def resolve_token(explicit: str | None = None) -> str:
     """The bearer token: ``--token``, then ``MIZZLE_STUDIO_TOKEN``, then a random one."""
     return explicit or os.environ.get("MIZZLE_STUDIO_TOKEN") or secrets.token_urlsafe(32)
+
+
+def resolve_auth(explicit: str | None = None) -> str | None:
+    """``--auth``, then ``MIZZLE_STUDIO_AUTH``.
+
+    The environment form exists so the password need not be in argv, where ``ps`` shows it.
+    """
+    return explicit or os.environ.get("MIZZLE_STUDIO_AUTH") or None
+
+
+def check_token_length(token: str) -> None:
+    """Refuse a remote bind with a guessable token. A loopback bind is fine: it is reachable
+    only from this machine, and a short token there is just a session marker."""
+    if len(token) < MIN_TOKEN_LENGTH:
+        raise MigrationError(
+            f"a bearer token for a remote bind needs at least {MIN_TOKEN_LENGTH} characters "
+            f"(got {len(token)}); omit --token to have one generated"
+        )
+
+
+_SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
+
+
+def _writes_json(request: Request) -> bool:
+    """A body must be sent as JSON. Form encodings (``text/plain``, urlencoded, multipart) are
+    what a cross-site form can produce, so refusing them removes that surface entirely.
+
+    A request with no body (``DELETE /api/...`` with the name in the path) needs no type.
+    """
+    if request.method in _SAFE_METHODS:
+        return True
+    length = request.headers.get("content-length", "")
+    has_body = (length.isdigit() and int(length) > 0) or "transfer-encoding" in request.headers
+    if not has_body:
+        return True
+    content_type = request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+    return content_type == "application/json"
 
 
 class _Guard(BaseHTTPMiddleware):
     expected: bytes
     allowed_hosts: set[str] | None
     basic: bytes | None
+    origins: set[str] | None
 
     def __init__(
         self,
@@ -665,11 +790,15 @@ class _Guard(BaseHTTPMiddleware):
         token: str,
         allowed_hosts: set[str] | None,
         basic_auth: tuple[str, str] | None = None,
+        origins: set[str] | None = None,
     ) -> None:
         super().__init__(app)
         self.expected = f"Bearer {token}".encode()
         self.allowed_hosts = allowed_hosts
         self.basic = None if basic_auth is None else _basic_credentials(*basic_auth)
+        # The origins a browser request may come from. Loopback serves the UI itself; a
+        # remote bind is behind a reverse proxy, whose public origin is passed in.
+        self.origins = origins
 
     def _authorized(self, request: Request) -> bool:
         given = request.headers.get("authorization", "").encode()
@@ -677,19 +806,47 @@ class _Guard(BaseHTTPMiddleware):
             return True
         return self.basic is not None and hmac.compare_digest(given, self.basic)
 
+    def _cross_site(self, request: Request) -> bool:
+        """Whether this looks like another site driving the browser's cached credentials.
+
+        Browsers attach cached Basic credentials to a cross-site form post, and a
+        ``text/plain`` form body parses as JSON, so neither the credentials nor
+        ``request.json()`` is proof that our own UI sent the request. ``Origin`` and
+        ``Sec-Fetch-Site`` are the signals a page cannot forge.
+        """
+        if request.method in _SAFE_METHODS:
+            return False
+        fetch_site = request.headers.get("sec-fetch-site", "")
+        if fetch_site in ("cross-site", "same-site"):
+            return True
+        raw = request.headers.get("origin")
+        if raw is None:  # not a browser request (curl, a test client): no CSRF surface
+            return False
+        return raw not in (self.origins or set())
+
     @override
     async def dispatch(self, request: Request, call_next: RequestResponseEndpoint) -> Response:
         if (
             self.allowed_hosts is not None
             and request.headers.get("host", "") not in self.allowed_hosts
         ):
-            return JSONResponse({"error": "forbidden host"}, status_code=403)
+            return self._error("forbidden host", 403)
         if request.url.path.startswith("/api/") and not self._authorized(request):
             headers = {"WWW-Authenticate": 'Basic realm="mizzle studio"'} if self.basic else None
-            return JSONResponse(
-                {"error": "missing or wrong credentials"}, status_code=401, headers=headers
-            )
+            return self._error("missing or wrong credentials", 401, headers)
+        if request.url.path.startswith("/api/") and self._cross_site(request):
+            return self._error("cross-site request refused", 403)
+        if request.url.path.startswith("/api/") and not _writes_json(request):
+            return self._error("Content-Type must be application/json", 415)
         response = await call_next(request)
+        response.headers.update(_SECURITY_HEADERS)
+        return response
+
+    @staticmethod
+    def _error(message: str, status: int, headers: dict[str, str] | None = None) -> Response:
+        # Error responses go through the same header set: a 401 without them is a hole a
+        # browser will happily render.
+        response = JSONResponse({"error": message}, status_code=status, headers=headers)
         response.headers.update(_SECURITY_HEADERS)
         return response
 
@@ -709,6 +866,7 @@ def create_app(
     static_dir: Path = STATIC_DIR,
     state_path: Path | None = None,
     basic_auth: tuple[str, str] | None = None,
+    origins: set[str] | None = None,
 ) -> Starlette:
     studio = Studio(dialect, url, schemas, read_only, state_path=state_path)
 
@@ -752,9 +910,54 @@ def create_app(
         routes=routes,
         lifespan=lifespan,
         middleware=[
-            Middleware(_Guard, token=token, allowed_hosts=allowed_hosts, basic_auth=basic_auth)
+            Middleware(
+                _Guard,
+                token=token,
+                allowed_hosts=allowed_hosts,
+                basic_auth=basic_auth,
+                origins=origins,
+            )
         ],
     )
+
+
+def _is_superuser(url: str) -> bool:
+    """Whether the configured URL connects as a superuser. Best effort: it opens one
+    connection, and a failure (unreachable, no permission) just means no warning."""
+    import asyncio
+
+    async def check() -> bool:
+        try:
+            conn = await asyncpg.connect(url)
+        except Exception:
+            return False
+        try:
+            rows = await conn.fetch(
+                "SELECT rolsuper FROM pg_roles WHERE rolname = current_user"
+            )
+            [row] = cast("Sequence[Sequence[object]]", rows)
+            return bool(row[0])
+        finally:
+            await conn.close()
+
+    try:
+        return asyncio.run(check())
+    except Exception:
+        return False
+
+
+def _server_origins(host: str, port: int) -> set[str]:
+    """The origins a same-site browser request can carry.
+
+    Loopback is unambiguous: the UI is served from one of these three. A remote bind sits
+    behind a TLS reverse proxy whose public origin the server cannot derive, so
+    ``MIZZLE_STUDIO_ORIGIN`` (comma-separated) supplies it; without it a browser request
+    carrying an ``Origin`` header is refused, which fails closed."""
+    if host in {"127.0.0.1", "localhost", "::1"}:
+        return {f"http://127.0.0.1:{port}", f"http://localhost:{port}", f"http://[::1]:{port}"}
+    extra = os.environ.get("MIZZLE_STUDIO_ORIGIN", "")
+    origins = {o.strip().rstrip("/") for o in extra.split(",") if o.strip()}
+    return origins or {f"http://{host}:{port}", f"https://{host}:{port}"}
 
 
 def serve(
@@ -772,6 +975,7 @@ def serve(
 
     from mizzle.studio.assets import ui_path
 
+    auth = resolve_auth(auth)
     basic_auth = parse_auth(auth) if auth else None
     token_value = resolve_token(token)
     loopback = host in {"127.0.0.1", "localhost", "::1"}
@@ -783,8 +987,10 @@ def serve(
     ):
         raise MigrationError(
             f"refusing to listen on {host} without credentials; pass --auth USER:PASSWORD "
-            "or --token (or set MIZZLE_STUDIO_TOKEN)"
+            "or --token (or set MIZZLE_STUDIO_TOKEN / MIZZLE_STUDIO_AUTH)"
         )
+    if not loopback and basic_auth is None:
+        check_token_length(token_value)
     static_dir = ui_path(ui_dir)  # downloads and verifies the UI on first run
     app = create_app(
         dialect=config.dialect(),
@@ -796,12 +1002,23 @@ def serve(
         allowed_hosts=(
             {f"127.0.0.1:{port}", f"localhost:{port}", f"[::1]:{port}"} if loopback else None
         ),
+        # The UI is served from the same origin, so the loopback URLs are the only origins a
+        # browser request can legitimately carry. A remote bind is behind a proxy: its
+        # origin is unknown here, so it is passed in (see MIZZLE_STUDIO_ORIGIN).
+        origins=_server_origins(host, port),
         read_only=read_only,
         static_dir=static_dir,
         state_path=config.root / ".mizzle" / "studio.json",
         basic_auth=basic_auth,
     )
     mode = " (read-only)" if read_only else ""
+    if read_only and _is_superuser(config.url()):
+        print(
+            "warning: Studio is read-only, but this connection is a superuser. Read-only "
+            "blocks writes, not server-side abilities (COPY ... PROGRAM, pg_read_file, "
+            "pg_terminate_backend are refused, nothing else is). Use a non-superuser role.",
+            file=sys.stderr,
+        )
     if loopback:
         link = f"http://127.0.0.1:{port}/#token={token_value}"
         print(f"mizzle studio{mode} running at {link}\nPress Ctrl+C to stop.")

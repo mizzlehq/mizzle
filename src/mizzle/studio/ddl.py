@@ -42,18 +42,43 @@ _IDENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,62}\Z")
 # A PostgreSQL type: a (possibly dotted, possibly multi-word) name, optional (p) / (p,s)
 # modifier and [] arrays. This rejects anything with quotes, semicolons or trailing text such
 # as "integer REFERENCES users(id)".
+# A type name: an optionally schema-qualified name, or one of the multi-word spellings
+# PostgreSQL uses (``double precision``, ``character varying``, ``timestamp with time zone``,
+# ``bit varying``). Only those, never arbitrary trailing words: ``int references victim on
+# delete cascade`` used to match, which let the editor create constraints it does not model.
+_MULTIWORD = (
+    "double precision",
+    "character varying",
+    "char varying",
+    "bit varying",
+    "timestamp with time zone",
+    "timestamp without time zone",
+    "time with time zone",
+    "time without time zone",
+)
 _TYPE = re.compile(
-    r"[A-Za-z_][A-Za-z0-9_]*(?:[ .][A-Za-z_][A-Za-z0-9_]*)*"
-    r"(?:\(\s*[0-9]+\s*(?:,\s*[0-9]+\s*)?\))?"
-    r"(?:\[\])*\Z"
+    r"(?:"
+    + "|".join(re.escape(word) for word in sorted(_MULTIWORD, key=len, reverse=True))
+    + r"|[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)?)"
+    r"(?:\s*\(\s*[0-9]+\s*(?:,\s*[0-9]+\s*)?\))?"
+    r"(?:\[\])*\Z",
+    re.IGNORECASE,
+)
+# The type a default may be cast to: the same shapes, with nothing after the cast.
+_CAST_TYPE = (
+    r"(?:"
+    + "|".join(re.escape(word) for word in sorted(_MULTIWORD, key=len, reverse=True))
+    + r"|[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)?)"
+    r"(?:\s*\([0-9]+(?:,[0-9]+)?\))?(?:\[\])*"
 )
 # A default expression: a literal, a known zero-argument function or keyword, each with an
-# optional cast to an allowed type.
+# optional cast to an allowed type and nothing after it.
 _DEFAULT = re.compile(
     r"(?:NULL|TRUE|FALSE|-?[0-9]+(?:\.[0-9]+)?|'(?:[^']|'')*'"
     r"|CURRENT_TIMESTAMP|CURRENT_DATE|CURRENT_TIME|CURRENT_USER|SESSION_USER"
     r"|(?:now|gen_random_uuid|uuid_generate_v4)\(\))"
-    r"(?:::[A-Za-z_][A-Za-z0-9_ .]*(?:\([0-9]+(?:,[0-9]+)?\))?(?:\[\])*)?\Z"
+    rf"(?:::{_CAST_TYPE})?\Z",
+    re.IGNORECASE,
 )
 
 
