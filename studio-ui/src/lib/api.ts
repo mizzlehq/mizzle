@@ -55,6 +55,16 @@ export type SqlStatementResult = SqlResult & { statement: string }
 export type SqlBatch = { results: SqlStatementResult[] }
 export type HistoryEntry = { sql: string; at: string; ok: boolean }
 export type SavedQuery = { name: string; sql: string }
+export type DiagramNode = { schema: string; name: string; columns: string[] }
+export type DiagramEdge = {
+  name: string
+  from_schema: string
+  from_table: string
+  from_columns: string[]
+  to_schema: string
+  to_table: string
+  to_columns: string[]
+}
 
 const TOKEN_KEY = "mizzle-studio-token"
 
@@ -143,6 +153,11 @@ function filterParams(q: Pick<RowsQuery, "order" | "dir" | "filters">): URLSearc
 export const api = {
   meta: () => request<Meta>("GET", "/api/meta"),
   tables: () => request<{ tables: TableInfo[] }>("GET", "/api/tables"),
+  relationships: () =>
+    request<{ tables: DiagramNode[]; relationships: DiagramEdge[] }>(
+      "GET",
+      "/api/schema/relationships"
+    ),
   rows: (table: TableInfo, q: RowsQuery) => {
     const params = filterParams(q)
     params.set("limit", String(q.limit))

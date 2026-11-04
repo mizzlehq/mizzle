@@ -1,5 +1,12 @@
 import { cn } from "cn"
-import { DatabaseIcon, RefreshCwIcon, SearchIcon, TableIcon, TerminalIcon } from "lucide-react"
+import {
+  DatabaseIcon,
+  GitForkIcon,
+  RefreshCwIcon,
+  SearchIcon,
+  TableIcon,
+  TerminalIcon,
+} from "lucide-react"
 import { useMemo, useState } from "react"
 
 import { Badge } from "@/components/ui/badge"
@@ -8,23 +15,27 @@ import { Input } from "@/components/ui/input"
 import { ScrollArea } from "@/components/ui/scroll-area"
 import { type TableInfo, tableKey } from "@/lib/api"
 
+export type View = "table" | "sql" | "diagram"
+
 type Props = {
   tables: TableInfo[]
   selected: string | null
-  sqlOpen: boolean
+  view: View
   readOnly: boolean
   onSelect: (key: string) => void
   onOpenSql: () => void
+  onOpenDiagram: () => void
   onRefresh: () => void
 }
 
 export function TableSidebar({
   tables,
   selected,
-  sqlOpen,
+  view,
   readOnly,
   onSelect,
   onOpenSql,
+  onOpenDiagram,
   onRefresh,
 }: Props) {
   const [search, setSearch] = useState("")
@@ -73,7 +84,7 @@ export function TableSidebar({
               </div>
               {items.map((table) => {
                 const key = tableKey(table)
-                const active = !sqlOpen && key === selected
+                const active = view === "table" && key === selected
                 return (
                   <button
                     key={key}
@@ -99,7 +110,15 @@ export function TableSidebar({
       </ScrollArea>
       <div className="border-t p-2">
         <Button
-          variant={sqlOpen ? "secondary" : "ghost"}
+          variant={view === "diagram" ? "secondary" : "ghost"}
+          className="w-full justify-start"
+          onClick={onOpenDiagram}
+        >
+          <GitForkIcon />
+          Schema diagram
+        </Button>
+        <Button
+          variant={view === "sql" ? "secondary" : "ghost"}
           className="w-full justify-start"
           onClick={onOpenSql}
         >

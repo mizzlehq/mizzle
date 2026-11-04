@@ -373,6 +373,31 @@ async def tables(studio: Studio, _request: Request) -> Response:
     return JSONResponse({"tables": list(snapshot["tables"].values()), "enums": snapshot["enums"]})
 
 
+async def relationships(studio: Studio, _request: Request) -> Response:
+    """Nodes and foreign-key edges for the ER diagram: enough to draw the schema without
+    shipping the full snapshots."""
+    snapshot = await studio.load_snapshot(refresh=True)
+    nodes = [
+        {"schema": t["schema"], "name": t["name"], "columns": list(t["columns"])}
+        for t in snapshot["tables"].values()
+    ]
+    edges: list[dict[str, object]] = []
+    for table in snapshot["tables"].values():
+        for fk in table["foreign_keys"].values():
+            edges.append(
+                {
+                    "name": fk["name"],
+                    "from_schema": table["schema"],
+                    "from_table": table["name"],
+                    "from_columns": fk["columns"],
+                    "to_schema": fk["ref_schema"],
+                    "to_table": fk["ref_table"],
+                    "to_columns": fk["ref_columns"],
+                }
+            )
+    return JSONResponse({"tables": nodes, "relationships": edges})
+
+
 async def list_rows(studio: Studio, request: Request) -> Response:
     table = await _table(studio, request)
     q = request.query_params
@@ -622,6 +647,7 @@ def create_app(
     routes: list[BaseRoute] = [
         Route("/api/meta", _api(studio, meta)),
         Route("/api/tables", _api(studio, tables)),
+        Route("/api/schema/relationships", _api(studio, relationships)),
         Route(tables_path, _api(studio, list_rows), methods=["GET"]),
         Route(tables_path, _api(studio, insert_row), methods=["POST"]),
         Route(tables_path, _api(studio, update_row), methods=["PATCH"]),

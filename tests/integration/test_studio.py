@@ -73,6 +73,18 @@ def test_tables_lists_schema(client: TestClient) -> None:
     assert users["primary_key"]["columns"] == ["id"]
 
 
+def test_relationships_endpoint(client: TestClient) -> None:
+    data = client.get("/api/schema/relationships", headers=AUTH).json()
+    nodes = {f"{t['schema']}.{t['name']}": t for t in data["tables"]}
+    assert {"public.users", "public.posts"} <= set(nodes)
+    assert "id" in nodes["public.users"]["columns"]
+
+    edge = next(e for e in data["relationships"] if e["from_table"] == "posts")
+    assert edge["from_schema"] == "public"
+    assert edge["from_columns"] == ["author_id"]
+    assert edge["to_table"] == "users" and edge["to_columns"] == ["id"]
+
+
 def test_crud_flow(client: TestClient) -> None:
     created = client.post(ROWS, json={"values": {"email": "ann", "role": "admin"}}, headers=AUTH)
     assert created.status_code == 201, created.text
