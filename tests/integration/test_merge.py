@@ -3,7 +3,7 @@
 import pytest
 
 from mizzle import Database, eq, is_not_null, lt
-from mizzle.core.errors import QueryError
+from mizzle.core.errors import DatabaseError
 from mizzle.dialects.postgres.driver import PostgresDriver
 from tests.models import Posts, Role, Users
 
@@ -104,8 +104,11 @@ async def test_merge_17_syntax_on_an_older_server_names_the_version(
 ) -> None:
     # Q3: where the syntax is unavailable the error says which version is needed, rather
     # than a bare "syntax error at or near ...".
-    if await _version(driver) >= 170000:
+    version = await _version(driver)
+    if version >= 170000:
         pytest.skip("this server supports MERGE ... RETURNING")
+    # On 14 the statement stops at MERGE itself; on 15/16 it stops at RETURNING.
+    expected = "needs PostgreSQL 17" if version >= 150000 else "needs PostgreSQL 15"
     await seed(db)
     source = db.select(Users.id).from_(Users).subquery("src")
     query = (
@@ -115,5 +118,5 @@ async def test_merge_17_syntax_on_an_older_server_names_the_version(
         .when_matched_then_update({"title": "x"})
         .returning(Posts.id)
     )
-    with pytest.raises(QueryError, match=r"needs PostgreSQL 17"):
+    with pytest.raises(DatabaseError, match=expected):
         await query
