@@ -29,7 +29,7 @@ def test_opentelemetry_tracer_sets_attributes() -> None:
     otel = FakeOtelTracer()
     tracer = OpenTelemetryTracer(otel)
 
-    with tracer.statement("SELECT 1", ("a",)):
+    with tracer.statement("SELECT 1", ("a",), {"request_id": "r1"}):
         pass
     with tracer.transaction("serializable"):
         pass
@@ -39,6 +39,7 @@ def test_opentelemetry_tracer_sets_attributes() -> None:
         "db.system": "postgresql",
         "db.statement": "SELECT 1",
         "db.statement.parameters": "('a',)",
+        "mizzle.tag.request_id": "r1",
     }
     assert otel.spans[1] == ("db.transaction", otel.spans[1][1])
     assert otel.spans[1][1].attributes == {"db.transaction.isolation": "serializable"}

@@ -30,12 +30,14 @@ class DatabaseError(MizzleError):
         original: BaseException | None = None,
         constraint: str | None = None,
         column: str | None = None,
+        table: str | None = None,
     ) -> None:
         super().__init__(message if sql is None else f"{message}\nSQL: {sql}")
         self.sql: str | None = sql
         self.original: BaseException | None = original
         self.constraint: str | None = constraint
         self.column: str | None = column
+        self.table: str | None = table
 
     @property
     def sqlstate(self) -> str | None:

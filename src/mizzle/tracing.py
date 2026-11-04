@@ -15,7 +15,7 @@ context managers yielding your span object.
 
 from __future__ import annotations
 
-from collections.abc import Generator
+from collections.abc import Generator, Mapping
 from contextlib import AbstractContextManager, contextmanager
 from typing import Protocol
 
@@ -26,7 +26,10 @@ class Tracer(Protocol):
     """A span source. See :class:`OpenTelemetryTracer`."""
 
     def statement(
-        self, sql: str, params: tuple[object, ...] | None
+        self,
+        sql: str,
+        params: tuple[object, ...] | None,
+        tags: Mapping[str, object],
     ) -> AbstractContextManager[object]: ...
     def transaction(
         self, isolation: IsolationLevel | None = None
@@ -60,12 +63,16 @@ class OpenTelemetryTracer:
         self._tracer = tracer
 
     @contextmanager
-    def statement(self, sql: str, params: tuple[object, ...] | None) -> Generator[object]:
+    def statement(
+        self, sql: str, params: tuple[object, ...] | None, tags: Mapping[str, object]
+    ) -> Generator[object]:
         with self._tracer.start_as_current_span("db.statement") as span:
             span.set_attribute("db.system", "postgresql")
             span.set_attribute("db.statement", sql)
             if params is not None:
                 span.set_attribute("db.statement.parameters", str(params))
+            for key, value in tags.items():
+                span.set_attribute(f"mizzle.tag.{key}", value)
             yield span
 
     @contextmanager

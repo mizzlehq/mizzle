@@ -286,6 +286,13 @@ def test_typegen_leaves_out_read_only_columns() -> None:
     assert "    embedding: NotRequired[list[float] | None]" in insert
 
 
+def test_typegen_emits_a_row_dict_with_every_column() -> None:
+    source = render_types_module([Docs])
+    row = source.split("class DocsRow(TypedDict):")[1].split("class")[0]
+    assert "    id:" in row and "    search:" in row and "    shout:" in row
+    assert "NotRequired" not in row  # a selected row always has every key
+
+
 def test_pydantic_models() -> None:
     insert = insert_model(Docs)
     assert set(insert.model_fields) == {"body", "embedding", "touched", "changed"}

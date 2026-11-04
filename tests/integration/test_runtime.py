@@ -2,7 +2,7 @@
 
 import json
 import logging
-from collections.abc import Generator
+from collections.abc import Generator, Mapping
 from contextlib import contextmanager
 from typing import Any
 
@@ -123,7 +123,9 @@ class RecordingTracer:
         self.transactions = 0
 
     @contextmanager
-    def statement(self, sql: str, params: tuple[object, ...] | None) -> Generator[_Span]:
+    def statement(
+        self, sql: str, params: tuple[object, ...] | None, tags: Mapping[str, object]
+    ) -> Generator[_Span]:
         self.statements.append(sql)
         yield _Span()
 

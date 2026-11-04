@@ -12,7 +12,7 @@ from pathlib import Path
 import asyncpg
 import pytest
 
-from mizzle.core.errors import MigrationTampered
+from mizzle.core.errors import MigrationError, MigrationTampered
 from mizzle.dialects.postgres import PostgresDialect
 from mizzle.dialects.postgres.driver import PostgresDriver
 from mizzle.kit.cli import main
@@ -163,6 +163,71 @@ async def test_tamper_and_concurrency(project: Path, kit_url: str) -> None:
     finally:
         for d in drivers:
             await d.close()
+
+
+async def test_migrate_reports_missing_on_disk(
+    project: Path, kit_url: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    assert await cli("generate") == 0
+    rewrite_schema(
+        project,
+        V1.replace("    name = text()", "    name = text()\n    age = integer()"),
+        monkeypatch,
+    )
+    assert await cli("generate") == 0
+    assert await cli("migrate") == 0
+    directory = MigrationsDir(project / "migrations", "postgresql")
+    directory.drop_latest()  # 0002 leaves disk and the journal, but stays applied in the DB
+    driver = await PostgresDriver.connect(kit_url, pool_size=1)
+    try:
+        with pytest.raises(MigrationError, match="missing on disk"):
+            await run_migrations(driver, PostgresDialect(), directory)
+    finally:
+        await driver.close()
+
+
+async def test_migrate_reports_a_forked_history(
+    project: Path, kit_url: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    assert await cli("generate") == 0
+    rewrite_schema(
+        project,
+        V1.replace("    name = text()", "    name = text()\n    age = integer()"),
+        monkeypatch,
+    )
+    assert await cli("generate") == 0
+    assert await cli("migrate") == 0
+    directory = MigrationsDir(project / "migrations", "postgresql")
+    driver = await PostgresDriver.connect(kit_url, pool_size=1)
+    try:
+        async with driver.acquire() as conn:  # forget 0001 while 0002 stays applied
+            await conn.execute(
+                "DELETE FROM public.__mizzle_migrations WHERE name = $1",
+                [directory.migrations()[0].name],
+            )
+        with pytest.raises(MigrationError, match="not applied but a later"):
+            await run_migrations(driver, PostgresDialect(), directory)
+    finally:
+        await driver.close()
+
+
+async def test_migrate_survives_a_failed_lock_release(
+    project: Path, kit_url: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    assert await cli("generate") == 0
+    directory = MigrationsDir(project / "migrations", "postgresql")
+    dialect = PostgresDialect()
+
+    async def boom(_conn: object) -> None:
+        raise RuntimeError("the connection is already broken")
+
+    monkeypatch.setattr(dialect, "release_migration_lock", boom)
+    driver = await PostgresDriver.connect(kit_url, pool_size=1)
+    try:
+        applied = await run_migrations(driver, dialect, directory)
+        assert applied == [directory.migrations()[0].name]
+    finally:
+        await driver.close()
 
 
 async def test_drop(project: Path, monkeypatch: pytest.MonkeyPatch) -> None:

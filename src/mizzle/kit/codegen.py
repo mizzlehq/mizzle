@@ -791,24 +791,30 @@ def _py_type(column: ColumnBase, imports: set[str]) -> str:
 
 
 def render_types_module(tables: Sequence[type[Table]]) -> str:
-    """TypedDicts for insert/update values: ``db.insert(Users).values(UsersInsert(...))``."""
+    """TypedDicts for a table's values: ``<Name>Row`` for a full selected row (including
+    generated columns), and ``<Name>Insert`` / ``<Name>Update`` for writes. Use them with
+    ``db.insert(Users).values(UsersInsert(...))`` and to name the shape a select returns.
+
+    Views are left out: read them through queries, never write them."""
     imports: set[str] = set()
     blocks: list[str] = []
     for table in tables:
         if issubclass(table, View):  # read through queries, never written
             continue
         columns = table.__table__.columns
+        row = [f"class {table.__name__}Row(TypedDict):"]
         insert = [f"class {table.__name__}Insert(TypedDict):"]
         update = [f"class {table.__name__}Update(TypedDict, total=False):"]
         for attr, column in columns.items():
+            py = _py_type(column, imports)
+            row.append(f"    {attr}: {py}")
             if column.read_only:  # generated columns: the database writes them
                 continue
-            py = _py_type(column, imports)
             insert.append(
                 f"    {attr}: {py if column.required_on_insert else f'NotRequired[{py}]'}"
             )
             update.append(f"    {attr}: {py}")
-        blocks += ["\n".join(insert), "\n".join(update)]
+        blocks += ["\n".join(row), "\n".join(insert), "\n".join(update)]
     body = "\n\n\n".join(blocks)
     # Only what the body uses: strict checkers flag unused imports.
     typing = [n for n in ("Any", "NotRequired") if re.search(rf"\b{n}\b", body)]

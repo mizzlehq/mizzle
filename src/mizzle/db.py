@@ -27,7 +27,7 @@ from contextlib import (
     contextmanager,
     nullcontext,
 )
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Literal, Self, final, overload
 
 from mizzle.core.compiler import CompiledQuery
@@ -65,12 +65,14 @@ log = logging.getLogger("mizzle")
 @dataclass(frozen=True)
 class QueryEvent:
     """Passed to the ``logger`` hook after every statement. ``params`` is None unless
-    ``log_params=True``: parameter values may hold passwords or personal data."""
+    ``log_params=True``: parameter values may hold passwords or personal data. ``tags``
+    are the key/values set with ``Session.tag()``."""
 
     sql: str
     params: tuple[object, ...] | None
     duration_ms: float
     error: BaseException | None
+    tags: Mapping[str, object] = field(default_factory=lambda: {})
 
 
 type QueryLogger = Callable[[QueryEvent], None]
@@ -97,6 +99,7 @@ class Session(QueryBuilder):
     _log_params: bool
     _slow_query_ms: float | None
     _tracer: Tracer | None
+    _tags: Mapping[str, object]
     _conn: Connection | None
     _lock: asyncio.Lock
 
@@ -110,6 +113,7 @@ class Session(QueryBuilder):
         log_params: bool = False,
         slow_query_ms: float | None = None,
         tracer: Tracer | None = None,
+        tags: Mapping[str, object] | None = None,
         connection: Connection | None = None,
         replicas: Sequence[Driver] = (),
     ) -> None:
@@ -125,6 +129,7 @@ class Session(QueryBuilder):
         self._log_params = log_params
         self._slow_query_ms = slow_query_ms
         self._tracer = tracer
+        self._tags = dict(tags) if tags else {}
         self._conn = connection
         # One connection runs one statement at a time; the lock lets asyncio.gather()
         # inside a transaction queue up instead of failing.
@@ -495,6 +500,17 @@ class Session(QueryBuilder):
         view._timeout = seconds
         return view
 
+    def tag(self, **tags: object) -> Session:
+        """This session with key/values attached to every statement it runs (a request id,
+        a route, a user): they arrive on the ``logger`` QueryEvent and on tracer spans. The
+        original session is unchanged, and tags merge with any already set::
+
+            db.tag(request_id=rid).insert(Users).values(...)
+        """
+        view = self._view()
+        view._tags = {**self._tags, **tags}
+        return view
+
     async def retry[R](
         self, fn: Callable[[], Awaitable[R]], *, attempts: int = 3, backoff: float = 0.05
     ) -> R:
@@ -561,6 +577,7 @@ class Session(QueryBuilder):
                         log_params=self._log_params,
                         slow_query_ms=self._slow_query_ms,
                         tracer=self._tracer,
+                        tags=self._tags,
                         connection=conn,
                     )
                     tx._timeout = self._timeout
@@ -597,6 +614,7 @@ class Session(QueryBuilder):
             log_params=self._log_params,
             slow_query_ms=self._slow_query_ms,
             tracer=self._tracer,
+            tags=self._tags,
             connection=self._conn,
             replicas=self._replicas,
         )
@@ -672,7 +690,9 @@ class Session(QueryBuilder):
     def _span(self, query: CompiledQuery) -> AbstractContextManager[object]:
         if self._tracer is None:
             return nullcontext()
-        return self._tracer.statement(query.sql, query.params if self._log_params else None)
+        return self._tracer.statement(
+            query.sql, query.params if self._log_params else None, self._tags
+        )
 
     @contextmanager
     def _transaction_span(self, isolation: IsolationLevel | None) -> Generator[None]:
@@ -708,6 +728,7 @@ class Session(QueryBuilder):
                         query.params if self._log_params else None,
                         duration_ms,
                         error,
+                        self._tags,
                     )
                     try:
                         self._logger(event)

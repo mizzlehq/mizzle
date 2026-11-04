@@ -71,17 +71,31 @@ def map_error(exc: BaseException, sql: str) -> MizzleError | None:
     match exc:
         case pg.UniqueViolationError():
             return UniqueViolation(
-                exc.message, sql=sql, original=exc, constraint=exc.constraint_name
+                exc.message,
+                sql=sql,
+                original=exc,
+                constraint=exc.constraint_name,
+                table=exc.table_name,
             )
         case pg.ForeignKeyViolationError() | pg.RestrictViolationError():
             return ForeignKeyViolation(
-                exc.message, sql=sql, original=exc, constraint=exc.constraint_name
+                exc.message,
+                sql=sql,
+                original=exc,
+                constraint=exc.constraint_name,
+                table=exc.table_name,
             )
         case pg.NotNullViolationError():
-            return NotNullViolation(exc.message, sql=sql, original=exc, column=exc.column_name)
+            return NotNullViolation(
+                exc.message, sql=sql, original=exc, column=exc.column_name, table=exc.table_name
+            )
         case pg.CheckViolationError():
             return CheckViolation(
-                exc.message, sql=sql, original=exc, constraint=exc.constraint_name
+                exc.message,
+                sql=sql,
+                original=exc,
+                constraint=exc.constraint_name,
+                table=exc.table_name,
             )
         case pg.SerializationError() | pg.DeadlockDetectedError():
             return SerializationFailure(exc.message, sql=sql, original=exc)
