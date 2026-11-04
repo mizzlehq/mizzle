@@ -7,6 +7,7 @@ import argparse
 import asyncio
 import hashlib
 import importlib
+import json
 import sys
 import uuid
 from collections.abc import Awaitable, Callable, Sequence
@@ -21,7 +22,7 @@ from mizzle.kit.codegen import render_schema_module, render_types_module
 from mizzle.kit.config import Config, load_config
 from mizzle.kit.diff import RenameKind, RenameResolver, StrictRenames, diff, no_renames
 from mizzle.kit.init import init_project
-from mizzle.kit.journal import MigrationsDir, format_sql
+from mizzle.kit.journal import Migration, MigrationsDir, format_sql
 from mizzle.kit.migrate import apply_statements, run_migrations
 from mizzle.kit.snapshot import build_snapshot
 
@@ -41,6 +42,9 @@ class Args(Protocol):
     force: bool
     update: bool
     dry_run: bool
+    sql: bool
+    json: bool
+    check: bool
     out: str | None
     port: int
     read_only: bool
@@ -150,6 +154,13 @@ def cmd_generate(config: Config, args: Args) -> int:
         print(f"Created {migration.sql_path}")
         return 0
     steps = diff(previous, current, _resolver(args, dialect))
+    if args.sql:
+        if not steps:
+            print("No schema changes.")
+            return 0
+        for statement in dialect.render(steps):
+            print(statement.sql + ";")
+        return 0
     if not steps:
         print("No schema changes.")
         return 0
@@ -168,6 +179,9 @@ def cmd_generate(config: Config, args: Args) -> int:
 def cmd_migrate(config: Config, args: Args) -> int:
     directory = MigrationsDir(config.out, config.dialect_name)
 
+    if args.dry_run:
+        return _migrate_dry_run(config, args, directory)
+
     async def run(driver: Driver, dialect: Dialect) -> list[str]:
         return await run_migrations(
             driver,
@@ -180,6 +194,31 @@ def cmd_migrate(config: Config, args: Args) -> int:
 
     applied = asyncio.run(_with_driver(config, run))
     print(f"Applied {len(applied)} migration(s)." if applied else "Database is up to date.")
+    return 0
+
+
+def _migrate_dry_run(config: Config, _args: Args, directory: MigrationsDir) -> int:
+    """Print the SQL ``migrate`` would run, without touching the database."""
+
+    async def plan(driver: Driver, dialect: Dialect) -> list[Migration]:
+        async with driver.acquire() as conn:
+            try:
+                applied = await dialect.applied_migrations(conn, config.migrations_schema)
+            except DatabaseError as exc:
+                if exc.sqlstate in ("42P01", "3F000"):  # undefined table / schema
+                    applied = {}
+                else:
+                    raise
+        return [m for m in directory.migrations() if m.name not in applied]
+
+    pending = asyncio.run(_with_driver(config, plan))
+    if not pending:
+        print("Database is up to date.")
+        return 0
+    for migration in pending:
+        print(f"-- {migration.name}")
+        print(migration.sql().rstrip())
+    print(f"\n{len(pending)} pending migration(s); nothing was applied (--dry-run).")
     return 0
 
 
@@ -304,54 +343,122 @@ def cmd_check(config: Config, _args: Args) -> int:
     return 0
 
 
-def cmd_status(config: Config, _args: Args) -> int:
-    directory = MigrationsDir(config.out, config.dialect_name)
-    migrations = directory.migrations()
-    if not migrations:
-        print("No migrations.")
-        return 0
-    applied: dict[str, str] | None = None
+def _applied_now(config: Config) -> dict[str, str] | None:
+    """The applied migrations, or ``None`` when there is no database URL to ask."""
     try:
         config.url()
     except MigrationError:
-        pass  # no database URL: still list what is on disk
-    else:
+        return None
 
-        async def load(driver: Driver, dialect: Dialect) -> dict[str, str]:
-            # Read only: no migrations table (or schema) yet means nothing is applied.
-            async with driver.acquire() as conn:
-                try:
-                    return await dialect.applied_migrations(conn, config.migrations_schema)
-                except DatabaseError as exc:
-                    if exc.sqlstate in ("42P01", "3F000"):  # undefined table / schema
-                        return {}
-                    raise
+    async def load(driver: Driver, dialect: Dialect) -> dict[str, str]:
+        # Read only: no migrations table (or schema) yet means nothing is applied.
+        async with driver.acquire() as conn:
+            try:
+                return await dialect.applied_migrations(conn, config.migrations_schema)
+            except DatabaseError as exc:
+                if exc.sqlstate in ("42P01", "3F000"):  # undefined table / schema
+                    return {}
+                raise
 
-        applied = asyncio.run(_with_driver(config, load))
+    return asyncio.run(_with_driver(config, load))
 
-    width = max(len(m.name) for m in migrations)
+
+def cmd_status(config: Config, args: Args) -> int:
+    directory = MigrationsDir(config.out, config.dialect_name)
+    migrations = directory.migrations()
+    applied = _applied_now(config)
+
+    rows: list[dict[str, object]] = []
     pending = 0
     for migration in migrations:
         if applied is None:
-            state = "unknown (set the database URL to compare)"
+            state = "unknown"
         elif migration.name not in applied:
-            state = "pending"
-            pending += 1
+            state, pending = "pending", pending + 1
         elif applied[migration.name] != migration.hash():
-            state = "applied (changed after it was applied)"
+            state = "changed"
         else:
             state = "applied"
-        print(f"  {migration.name:<{width}}  {state}")
-    if applied is None:
+        rows.append({"name": migration.name, "state": state})
+    missing = [name for name in (applied or {}) if name not in {m.name for m in migrations}]
+
+    if args.json:
         print(
-            f"\n{len(migrations)} migration(s). Set ${config.url_env} to compare with the database."
+            json.dumps(
+                {
+                    "migrations": rows,
+                    "applied": len(migrations) - pending,
+                    "pending": pending,
+                    "missing": missing,
+                }
+            )
         )
-        return 0
-    on_disk = {m.name for m in migrations}
-    for name in applied:
-        if name not in on_disk:
-            print(f"  {name:<{width}}  applied but missing on disk")
-    print(f"\n{len(migrations) - pending} applied, {pending} pending.")
+    elif not migrations:
+        print("No migrations.")
+    else:
+        width = max(len(m.name) for m in migrations)
+        labels = {
+            "unknown": "unknown (set the database URL to compare)",
+            "pending": "pending",
+            "changed": "applied (changed after it was applied)",
+            "applied": "applied",
+        }
+        for row in rows:
+            print(f"  {row['name']:<{width}}  {labels[cast(str, row['state'])]}")
+        if applied is None:
+            print(f"\n{len(migrations)} migration(s). Set ${config.url_env} to compare.")
+        else:
+            for name in missing:
+                print(f"  {name:<{width}}  applied but missing on disk")
+            print(f"\n{len(migrations) - pending} applied, {pending} pending.")
+    if args.check:
+        return 1 if applied is None or pending or missing else 0
+    return 0
+
+
+def cmd_info(config: Config, args: Args) -> int:
+    directory = MigrationsDir(config.out, config.dialect_name)
+    migrations = directory.migrations()
+    print("mizzle")
+    print(f"  dialect:     {config.dialect_name}")
+    print(f"  config:      {config.root}")
+    print(f"  schema:      {', '.join(config.schema)} ({config.schema_file()})")
+    print(f"  migrations:  {config.out} ({len(migrations)} on disk)")
+    try:
+        config.url()
+    except MigrationError as exc:
+        print(f"  database:    {exc}")
+        print(f"  applied:     unknown (set ${config.url_env})")
+        return 1 if args.command == "doctor" else 0
+
+    async def inspect(driver: Driver, dialect: Dialect) -> tuple[str, dict[str, str], list[Step]]:
+        async with driver.acquire() as conn:
+            [row] = await conn.fetch_dicts("SELECT current_setting('server_version') AS v", [])
+            latest = directory.latest_snapshot()
+            try:
+                applied = await dialect.applied_migrations(conn, config.migrations_schema)
+            except DatabaseError as exc:
+                if exc.sqlstate in ("42P01", "3F000"):  # undefined table / schema
+                    applied = {}
+                else:
+                    raise
+            live = await dialect.introspect(conn, _schemas(config, latest))
+            desired = await dialect.normalize_snapshot(conn, latest)
+            drift = diff(live, desired, no_renames, compare_expressions=False)
+            return str(row["v"]), applied, drift
+
+    version, applied, drift = asyncio.run(_with_driver(config, inspect))
+    pending = sum(1 for m in migrations if m.name not in applied)
+    print(f"  database:    PostgreSQL {version}")
+    print(f"  applied:     {len(migrations) - pending} applied, {pending} pending")
+    if drift:
+        print(f"  drift:       {len(drift)} change(s) between the database and the migrations")
+        for step in drift[:10]:
+            print(f"    - {step.describe()}")
+    else:
+        print("  drift:       none")
+    if args.command == "doctor":
+        return 1 if pending or drift else 0
     return 0
 
 
@@ -458,11 +565,15 @@ def _parser() -> argparse.ArgumentParser:
     p = sub.add_parser("generate", help="write a migration from schema changes")
     p.add_argument("--name")
     p.add_argument("--custom", action="store_true", help="empty migration for hand-written SQL")
+    p.add_argument(
+        "--sql", action="store_true", help="print the SQL instead of writing a migration"
+    )
     renames(p)
     p.set_defaults(func=cmd_generate)
 
     p = sub.add_parser("migrate", help="apply pending migrations")
     p.add_argument("--lock-timeout", type=float, default=60.0)
+    p.add_argument("--dry-run", action="store_true", help="print the SQL, apply nothing")
     p.set_defaults(func=cmd_migrate)
 
     p = sub.add_parser("push", help="sync the schema to the database directly (development)")
@@ -491,7 +602,15 @@ def _parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_check)
 
     p = sub.add_parser("status", help="show which migrations are applied and which are pending")
+    p.add_argument("--json", action="store_true", help="machine-readable output")
+    p.add_argument("--check", action="store_true", help="exit 1 when migrations are pending")
     p.set_defaults(func=cmd_status)
+
+    p = sub.add_parser("info", help="environment, connectivity, pending count and drift")
+    p.set_defaults(func=cmd_info)
+
+    p = sub.add_parser("doctor", help="like info, but exit 1 when something is wrong")
+    p.set_defaults(func=cmd_info)
 
     p = sub.add_parser("drop", help="delete the latest (unapplied) migration")
     p.add_argument("--force", action="store_true", help="drop without checking the database")

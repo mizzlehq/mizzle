@@ -2,6 +2,7 @@
 
 import asyncio
 import importlib
+import json
 import subprocess
 import sys
 import uuid
@@ -226,6 +227,84 @@ async def test_status(project: Path, kit_url: str, capsys: pytest.CaptureFixture
     sql.write_text(sql.read_text() + "\n-- edited\n")
     assert await cli("status") == 0
     assert "changed after it was applied" in capsys.readouterr().out
+
+
+async def test_generate_sql_prints_without_writing(
+    project: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert await cli("generate", "--sql") == 0
+    out = capsys.readouterr().out
+    assert "CREATE TYPE" in out and "CREATE TABLE" in out and out.rstrip().endswith(";")
+    assert not (project / "migrations").exists()  # nothing written
+
+
+async def test_migrate_dry_run(
+    project: Path, kit_url: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert await cli("generate") == 0
+    capsys.readouterr()
+    assert await cli("migrate", "--dry-run") == 0
+    out = capsys.readouterr().out
+    assert "0001_" in out and "CREATE TABLE" in out and "nothing was applied" in out
+    conn = await asyncpg.connect(kit_url)
+    users = await conn.fetchval("SELECT to_regclass('public.users')")
+    history = await conn.fetchval("SELECT to_regclass('public.__mizzle_migrations')")
+    await conn.close()
+    assert users is None and history is None  # dry-run touched nothing
+
+    assert await cli("migrate") == 0
+    assert await cli("migrate", "--dry-run") == 0
+    assert "Database is up to date." in capsys.readouterr().out
+
+
+async def test_status_json_and_check(project: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    assert await cli("status", "--json") == 0
+    assert json.loads(capsys.readouterr().out) == {
+        "migrations": [],
+        "applied": 0,
+        "pending": 0,
+        "missing": [],
+    }
+    assert await cli("status", "--check") == 0
+
+    assert await cli("generate") == 0
+    capsys.readouterr()
+    assert await cli("status", "--json") == 0
+    data = json.loads(capsys.readouterr().out)
+    assert data["pending"] == 1
+    assert data["migrations"][0]["state"] == "pending"
+    assert await cli("status", "--check") == 1  # pending -> nonzero
+
+    assert await cli("migrate") == 0
+    capsys.readouterr()
+    assert await cli("status", "--check") == 0
+    capsys.readouterr()
+    assert await cli("status", "--json") == 0
+    data = json.loads(capsys.readouterr().out)
+    assert data["applied"] == 1 and data["pending"] == 0
+
+
+async def test_info_and_doctor(
+    project: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert await cli("generate") == 0
+    capsys.readouterr()
+    assert await cli("doctor") == 1  # not applied yet
+    out = capsys.readouterr().out
+    assert "pending" in out and "PostgreSQL" in out and "drift:" in out
+
+    assert await cli("migrate") == 0
+    capsys.readouterr()
+    assert await cli("info") == 0
+    out = capsys.readouterr().out
+    assert "0 pending" in out and "drift:       none" in out
+    assert await cli("doctor") == 0
+
+    # Without a URL it still describes the project, but doctor fails.
+    monkeypatch.delenv("DATABASE_URL")
+    assert await cli("info") == 0
+    assert "set the DATABASE_URL" in capsys.readouterr().out
+    assert await cli("doctor") == 1
 
 
 async def test_push_then_pull_roundtrip(
