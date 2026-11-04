@@ -10,7 +10,7 @@ from mizzle.core.errors import QueryError
 from mizzle.core.query.base import Executable, Row, table_decoder
 from mizzle.core.schema.table import Table
 from mizzle.core.sql.functions import column_of
-from mizzle.core.sql.nodes import ExprBase
+from mizzle.core.sql.nodes import Expr, ExprBase
 
 if TYPE_CHECKING:
     from mizzle.core.query.select import Cte
@@ -38,30 +38,30 @@ class ReturningMixin[T: Table](Executable[int], ABC):
     @overload
     def returning(self, fields: Mapping[str, ExprBase], /) -> Returning[dict[str, object]]: ...
     @overload
-    def returning[A](self, c1: ExprBase, /) -> Returning[tuple[A]]: ...
+    def returning[A](self, c1: Expr[A], /) -> Returning[tuple[A]]: ...
     @overload
-    def returning[A, B](self, c1: ExprBase, c2: ExprBase, /) -> Returning[tuple[A, B]]: ...
+    def returning[A, B](self, c1: Expr[A], c2: Expr[B], /) -> Returning[tuple[A, B]]: ...
     @overload
     def returning[A, B, C](
-        self, c1: ExprBase, c2: ExprBase, c3: ExprBase, /
+        self, c1: Expr[A], c2: Expr[B], c3: Expr[C], /
     ) -> Returning[tuple[A, B, C]]: ...
     @overload
     def returning[A, B, C, D](
-        self, c1: ExprBase, c2: ExprBase, c3: ExprBase, c4: ExprBase, /
+        self, c1: Expr[A], c2: Expr[B], c3: Expr[C], c4: Expr[D], /
     ) -> Returning[tuple[A, B, C, D]]: ...
     @overload
     def returning[A, B, C, D, E](
-        self, c1: ExprBase, c2: ExprBase, c3: ExprBase, c4: ExprBase, c5: ExprBase, /
+        self, c1: Expr[A], c2: Expr[B], c3: Expr[C], c4: Expr[D], c5: Expr[E], /
     ) -> Returning[tuple[A, B, C, D, E]]: ...
     @overload
     def returning[A, B, C, D, E, F](
         self,
-        c1: ExprBase,
-        c2: ExprBase,
-        c3: ExprBase,
-        c4: ExprBase,
-        c5: ExprBase,
-        c6: ExprBase,
+        c1: Expr[A],
+        c2: Expr[B],
+        c3: Expr[C],
+        c4: Expr[D],
+        c5: Expr[E],
+        c6: Expr[F],
         /,
     ) -> Returning[tuple[A, B, C, D, E, F]]: ...
     @overload

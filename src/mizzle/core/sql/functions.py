@@ -737,65 +737,73 @@ def substring[S: (str, str | None)](
     return TypedFunc[S]("substr", args)
 
 
-def replace(expr: Expr[str], old: str, new: str) -> Expr[str]:
+def replace[S: (str, str | None)](expr: Expr[S], old: str, new: str) -> Expr[S]:
     """Replace every occurrence of ``old`` with ``new``."""
-    return TypedFunc[str]("replace", (expr, bind(old), bind(new)))
+    return TypedFunc[S]("replace", (expr, bind(old), bind(new)))
 
 
-def strpos(expr: Expr[str], needle: str | Expr[str]) -> Expr[int]:
+@overload
+def strpos(expr: Expr[str], needle: str | Expr[str]) -> Expr[int]: ...
+@overload
+def strpos(expr: Expr[str | None], needle: str | Expr[str]) -> Expr[int | None]: ...
+def strpos(expr: Expr[str] | Expr[str | None], needle: str | Expr[str]) -> ExprBase:
     """1-based position of ``needle`` in ``expr``, or 0 when absent."""
-    return TypedFunc[int]("strpos", (expr, bind(needle)))
+    return TypedFunc[object]("strpos", (expr, bind(needle)))
 
 
-def left(expr: Expr[str], n: int) -> Expr[str]:
+def left[S: (str, str | None)](expr: Expr[S], n: int) -> Expr[S]:
     """The first ``n`` characters."""
-    return TypedFunc[str]("left", (expr, Fragment((str(_whole("n", n)),))))
+    return TypedFunc[S]("left", (expr, Fragment((str(_whole("n", n)),))))
 
 
-def right(expr: Expr[str], n: int) -> Expr[str]:
+def right[S: (str, str | None)](expr: Expr[S], n: int) -> Expr[S]:
     """The last ``n`` characters."""
-    return TypedFunc[str]("right", (expr, Fragment((str(_whole("n", n)),))))
+    return TypedFunc[S]("right", (expr, Fragment((str(_whole("n", n)),))))
 
 
-def lpad(expr: Expr[str], length: int, fill: str = " ") -> Expr[str]:
+def lpad[S: (str, str | None)](expr: Expr[S], length: int, fill: str = " ") -> Expr[S]:
     """Pad on the left with ``fill`` until ``length`` characters."""
-    return TypedFunc[str]("lpad", (expr, Fragment((str(_whole("length", length)),)), bind(fill)))
+    return TypedFunc[S]("lpad", (expr, Fragment((str(_whole("length", length)),)), bind(fill)))
 
 
-def rpad(expr: Expr[str], length: int, fill: str = " ") -> Expr[str]:
+def rpad[S: (str, str | None)](expr: Expr[S], length: int, fill: str = " ") -> Expr[S]:
     """Pad on the right with ``fill`` until ``length`` characters."""
-    return TypedFunc[str]("rpad", (expr, Fragment((str(_whole("length", length)),)), bind(fill)))
+    return TypedFunc[S]("rpad", (expr, Fragment((str(_whole("length", length)),)), bind(fill)))
 
 
-def repeat(expr: Expr[str], n: int) -> Expr[str]:
+def repeat[S: (str, str | None)](expr: Expr[S], n: int) -> Expr[S]:
     """``expr`` repeated ``n`` times."""
-    return TypedFunc[str]("repeat", (expr, Fragment((str(_whole("n", n)),))))
+    return TypedFunc[S]("repeat", (expr, Fragment((str(_whole("n", n)),))))
 
 
-def reverse(expr: Expr[str]) -> Expr[str]:
+def reverse[S: (str, str | None)](expr: Expr[S]) -> Expr[S]:
     """The string with its characters in reverse order."""
-    return TypedFunc[str]("reverse", (expr,))
+    return TypedFunc[S]("reverse", (expr,))
 
 
-def split_part(expr: Expr[str], delimiter: str | Expr[str], n: int) -> Expr[str]:
+def split_part[S: (str, str | None)](expr: Expr[S], delimiter: str | Expr[str], n: int) -> Expr[S]:
     """The ``n``-th field of ``expr`` split on ``delimiter`` (1-based)."""
-    return TypedFunc[str]("split_part", (expr, bind(delimiter), Fragment((str(_whole("n", n)),))))
+    return TypedFunc[S]("split_part", (expr, bind(delimiter), Fragment((str(_whole("n", n)),))))
 
 
-def starts_with(expr: Expr[str], prefix: str | Expr[str]) -> Expr[bool]:
+@overload
+def starts_with(expr: Expr[str], prefix: str | Expr[str]) -> Expr[bool]: ...
+@overload
+def starts_with(expr: Expr[str | None], prefix: str | Expr[str]) -> Expr[bool | None]: ...
+def starts_with(expr: Expr[str] | Expr[str | None], prefix: str | Expr[str]) -> ExprBase:
     """Whether ``expr`` begins with ``prefix``."""
-    return TypedFunc[bool]("starts_with", (expr, bind(prefix)))
+    return TypedFunc[object]("starts_with", (expr, bind(prefix)))
 
 
-def regexp_replace(
-    expr: Expr[str], pattern: str | Expr[str], replacement: str | Expr[str], *, flags: str = ""
-) -> Expr[str]:
+def regexp_replace[S: (str, str | None)](
+    expr: Expr[S], pattern: str | Expr[str], replacement: str | Expr[str], *, flags: str = ""
+) -> Expr[S]:
     """Replace the first match of ``pattern`` (all with the ``g`` flag). ``flags`` combines
     ``g``, ``i``, ``m``, ``n``, ``p``, ``s``, ``x`` and ``w``."""
     args: tuple[Node, ...] = (expr, bind(pattern), bind(replacement))
     if flags:
         args += (bind(flags),)
-    return TypedFunc[str]("regexp_replace", args)
+    return TypedFunc[S]("regexp_replace", args)
 
 
 def regexp_match(
@@ -808,9 +816,9 @@ def regexp_match(
     return TypedFunc[list[str] | None]("regexp_match", args)
 
 
-def md5(expr: Expr[str]) -> Expr[str]:
+def md5[S: (str, str | None)](expr: Expr[S]) -> Expr[S]:
     """The MD5 hash of the string, as 32 hex digits."""
-    return TypedFunc[str]("md5", (expr,))
+    return TypedFunc[S]("md5", (expr,))
 
 
 # -- more numbers (EX6) ---------------------------------------------------------------
@@ -831,9 +839,17 @@ def sqrt[N: (float, float | None, Decimal, Decimal | None)](expr: Expr[N]) -> Ex
     return TypedFunc[N]("sqrt", (expr,))
 
 
-def power[N: (float, Decimal)](base: Expr[N], exponent: N | Expr[N]) -> Expr[N]:
-    """``base`` raised to ``exponent``."""
-    return TypedFunc[N]("power", (base, bind(exponent, (base,))))
+@overload
+def power(base: Expr[int], exponent: int | Expr[int]) -> Expr[float]: ...
+@overload
+def power(base: Expr[int | None], exponent: int | Expr[int]) -> Expr[float | None]: ...
+@overload
+def power[N: (float, float | None, Decimal, Decimal | None)](
+    base: Expr[N], exponent: N | Expr[N]
+) -> Expr[N]: ...
+def power(base: ExprBase, exponent: object) -> ExprBase:
+    """``base`` raised to ``exponent`` (``double precision``; PostgreSQL widens integers)."""
+    return TypedFunc[object]("power", (base, bind(exponent, (base,))))
 
 
 def ln[N: (float, float | None, Decimal, Decimal | None)](expr: Expr[N]) -> Expr[N]:
@@ -846,12 +862,22 @@ def exp[N: (float, float | None, Decimal, Decimal | None)](expr: Expr[N]) -> Exp
     return TypedFunc[N]("exp", (expr,))
 
 
-def log[N: (float, Decimal)](base: Expr[N], value: N | Expr[N]) -> Expr[N]:
-    """Logarithm of ``value`` to ``base``."""
-    return TypedFunc[N]("log", (base, bind(value, (base,))))
+@overload
+def log(base: Expr[int], value: int | Expr[int]) -> Expr[float]: ...
+@overload
+def log(base: Expr[int | None], value: int | Expr[int]) -> Expr[float | None]: ...
+@overload
+def log[N: (float, float | None, Decimal, Decimal | None)](
+    base: Expr[N], value: N | Expr[N]
+) -> Expr[N]: ...
+def log(base: ExprBase, value: object) -> ExprBase:
+    """Logarithm of ``value`` to ``base`` (``double precision``; PostgreSQL widens integers)."""
+    return TypedFunc[object]("log", (base, bind(value, (base,))))
 
 
-def mod[N: (int, Decimal)](value: Expr[N], divisor: N | Expr[N]) -> Expr[N]:
+def mod[N: (int, int | None, float, float | None, Decimal, Decimal | None)](
+    value: Expr[N], divisor: N | Expr[N]
+) -> Expr[N]:
     """``value`` modulo ``divisor``."""
     return TypedFunc[N]("mod", (value, bind(divisor, (value,))))
 
@@ -960,23 +986,17 @@ def jsonb_build_array(*values: object) -> Expr[list[object]]:
 # -- dates and times, extras (EX10) ---------------------------------------------------
 
 
-@overload
-def age(
-    value: Expr[datetime.datetime] | Expr[datetime.date],
-    start: Expr[datetime.datetime] | Expr[datetime.date],
-) -> Expr[datetime.timedelta]: ...
-@overload
-def age(value: Expr[datetime.datetime] | Expr[datetime.date]) -> Expr[datetime.timedelta]: ...
-def age(value: ExprBase, start: ExprBase | None = None) -> Expr[datetime.timedelta]:
-    """The interval between two timestamps, or from ``value`` to today (at midnight)."""
-    if start is None:
-        return TypedFunc[datetime.timedelta]("age", (value,))
-    return TypedFunc[datetime.timedelta]("age", (value, start))
+def age(value: ExprBase, start: ExprBase | None = None) -> Expr[datetime.timedelta | None]:
+    """The interval between two timestamps, or from ``value`` to today (at midnight).
+    NULL when either timestamp is NULL."""
+    args: tuple[Node, ...] = (value,) if start is None else (value, start)
+    return TypedFunc[datetime.timedelta | None]("age", args)
 
 
-def to_char(value: ExprBase, template: str) -> Expr[str]:
-    """Format a value as text with a template: ``to_char(Users.created_at, "YYYY-MM")``."""
-    return TypedFunc[str]("to_char", (value, bind(template)))
+def to_char(value: ExprBase, template: str) -> Expr[str | None]:
+    """Format a value as text with a template: ``to_char(Users.created_at, "YYYY-MM")``.
+    NULL when the value is NULL."""
+    return TypedFunc[str | None]("to_char", (value, bind(template)))
 
 
 def to_date(text: str | Expr[str], format: str) -> Expr[datetime.date]:

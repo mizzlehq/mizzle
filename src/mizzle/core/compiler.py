@@ -594,6 +594,8 @@ class Compiler:
         for join in node.joins:
             on = "" if join.on is None else f" ON {self.visit(join.on)}"
             lateral = " LATERAL" if join.lateral else ""
+            if join.on is None and join.kind != "CROSS":  # LATERAL without a condition
+                on = " ON true"
             parts.append(f"{join.kind} JOIN{lateral} {self.source(join.source)}{on}")
         if node.where_ is not None:
             parts.append(f"WHERE {self.visit(node.where_)}")

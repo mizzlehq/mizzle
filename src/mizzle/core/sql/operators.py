@@ -492,9 +492,10 @@ def mode[T](expr: Expr[T]) -> Aggregate[T | None]:
     )
 
 
-def percentile_cont(fraction: float, expr: _Number) -> Aggregate[float | Decimal | None]:
-    """Continuous percentile: interpolates between values."""
-    return Aggregate[float | Decimal | None](
+def percentile_cont(fraction: float, expr: _Number) -> Aggregate[float]:
+    """Continuous percentile: interpolates between values. PostgreSQL returns ``double
+    precision`` (or an interval), never NULL for a non-empty group."""
+    return Aggregate[float](
         "percentile_cont", (_fraction(fraction),), within_group_=(OrderBy(expr, False, None),)
     )
 

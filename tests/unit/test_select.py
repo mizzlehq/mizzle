@@ -140,6 +140,16 @@ async def test_first_one_scalar(qb: QueryBuilder, runner: FakeRunner) -> None:
         await query.one()
 
 
+async def test_one_keeps_a_tighter_user_limit(qb: QueryBuilder, runner: FakeRunner) -> None:
+    # T4: one() must not widen the caller's limit; limit(1) stays LIMIT 1.
+    runner.rows = [(1,)]
+    assert await qb.select(Users.id).from_(Users).limit(1).one() == (1,)
+    assert runner.executed[-1].params == (1,)
+    runner.rows = []
+    with pytest.raises(QueryError, match="no rows"):
+        await qb.select(Users.id).from_(Users).limit(0).one()
+
+
 async def test_scalar_shape_validation(qb: QueryBuilder) -> None:
     with pytest.raises(QueryError, match="exactly one selected column"):
         await qb.select(Users.id, Users.email).from_(Users).scalar()
@@ -272,6 +282,15 @@ def test_join_lateral(qb: QueryBuilder) -> None:
     )
 
 
+def test_join_lateral_without_a_condition(qb: QueryBuilder) -> None:
+    # T6: ON true needs no sql("true"), so the query stays session-safe (no raw SQL).
+    sub = qb.select(Posts.id).from_(Posts).subquery("p")
+    q = qb.select(Users.id, sub.c("id", int)).from_(Users).join_lateral(sub)
+    sql, params = q.to_sql()
+    assert 'INNER JOIN LATERAL (SELECT "posts"."id" FROM "posts") AS "p" ON true' in sql
+    assert params == ()
+
+
 def test_rollup_cube_grouping_sets(qb: QueryBuilder) -> None:
     base = qb.select(Users.role, count()).from_(Users)
     assert base.rollup(Users.role).to_sql()[0].endswith('GROUP BY ROLLUP ("users"."role")')
@@ -355,4 +374,22 @@ def test_dict_returning_inside_a_cte_is_aliased(qb: QueryBuilder) -> None:
         'WITH "m" AS (DELETE FROM "posts" WHERE "posts"."id" = $1 '
         'RETURNING "posts"."id" AS "c") SELECT "m"."c" FROM "m"',
         (1,),
+    )
+
+
+def test_recursive_helper(qb: QueryBuilder) -> None:
+    # T7: the self-reference is built for you; the name is written once.
+    tree = qb.recursive(
+        "walk", qb.select({"n": Users.id}).from_(Users).where(eq(Users.id, 3))
+    ).step(
+        lambda walk: (
+            qb.select({"n": walk.c("n", int) - 1}).from_(walk).where(gt(walk.c("n", int), 1))
+        )
+    )
+    q = qb.with_(tree).select(tree.c("n", int)).from_(tree).order_by(desc(tree.c("n", int)))
+    assert q.to_sql() == (
+        'WITH RECURSIVE "walk" AS ((SELECT "users"."id" AS "n" FROM "users" '
+        'WHERE "users"."id" = $1) UNION ALL (SELECT ("walk"."n" - $2) AS "n" FROM "walk" '
+        'WHERE "walk"."n" > $3)) SELECT "walk"."n" FROM "walk" ORDER BY "walk"."n" DESC',
+        (3, 1, 1),
     )

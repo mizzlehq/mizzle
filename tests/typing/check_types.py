@@ -7,11 +7,11 @@ unused ignores, so if an expected error disappears, CI fails.
 from __future__ import annotations
 
 import datetime
-from typing import Any, assert_type
+from typing import Any, TypedDict, assert_type
 
 from mizzle.core.query.builder import QueryBuilder
 from mizzle.core.schema.column import Column
-from mizzle.core.sql.nodes import Expr
+from mizzle.core.sql.nodes import Aggregate, Expr
 from mizzle.core.sql.operators import count, eq, lt, nullable
 from tests.models import Posts, Role, Users
 
@@ -72,6 +72,7 @@ async def expressions(qb: QueryBuilder) -> None:
 
     from mizzle import (
         abs_,
+        age,
         alias,
         case_,
         cast,
@@ -85,15 +86,25 @@ async def expressions(qb: QueryBuilder) -> None:
         greatest,
         lag,
         least,
+        left,
         length,
+        log,
         lower,
         matches,
+        md5,
+        mod,
         now,
         nullif,
+        percentile_cont,
+        power,
         rank,
+        replace,
         round_,
         row_number,
+        starts_with,
+        strpos,
         sum_,
+        to_char,
         to_tsquery,
         to_tsvector,
         ts_rank,
@@ -130,6 +141,24 @@ async def expressions(qb: QueryBuilder) -> None:
     assert_type(lower(Users.email), Expr[str])
     assert_type(lower(Users.bio), Expr[str | None])
     assert_type(length(Users.bio), Expr[int | None])
+    # T2: the newer string/date functions accept nullable columns and stay nullable.
+    assert_type(replace(Users.bio, "a", "b"), Expr[str | None])
+    assert_type(md5(Users.bio), Expr[str | None])
+    assert_type(starts_with(Users.bio, "a"), Expr[bool | None])
+    assert_type(strpos(Users.bio, "a"), Expr[int | None])
+    assert_type(left(Users.bio, 2), Expr[str | None])
+    assert_type(age(Users.created_at), Expr[datetime.timedelta | None])
+    assert_type(to_char(Users.created_at, "YYYY"), Expr[str | None])
+    assert_type(power(Users.id, 2), Expr[float])
+    assert_type(log(Users.id, 10), Expr[float])
+    assert_type(mod(Users.id, 2), Expr[int])
+    assert_type(percentile_cont(0.5, Users.id), Aggregate[float])
+    # Nullable inputs stay nullable; non-null inputs do not gain None.
+    assert_type(power(nullable(Users.id), 2), Expr[float | None])
+    assert_type(mod(nullable(Users.id), 2), Expr[int | None])
+    assert_type(to_char(nullable(Users.created_at), "YYYY"), Expr[str | None])
+    assert_type(age(nullable(Users.created_at)), Expr[datetime.timedelta | None])
+    assert_type(percentile_cont(0.5, nullable(Users.id)), Aggregate[float])
     assert_type(concat(Users.email, "-", Users.id), Expr[str])
     assert_type(abs_(Users.id), Expr[int])
     round_(cast(Users.id, text()))  # type: ignore[type-var]  # pyright: ignore[reportArgumentType]
@@ -205,3 +234,30 @@ def nullable_comparisons(user: Users) -> None:
     assert_type(eq(Users.email, Users.bio), Expr[bool])
     assert_type(lt(Users.bio, "m"), Expr[bool])
     eq(Users.bio, 1)  # type: ignore[misc]  # pyright: ignore[reportCallIssue, reportArgumentType]
+
+
+async def returning_and_scalar(qb: QueryBuilder) -> None:
+    # T1: a projection is typed from the expressions, not Unknown.
+    assert_type(await qb.insert(Users).values({}).returning(Users.id), list[tuple[int]])
+    assert_type(
+        await qb.insert(Users).values({}).returning(Users.id, Users.email), list[tuple[int, str]]
+    )
+    assert_type(
+        await qb.update(Users).set({"bio": "x"}).returning(Users.bio),
+        list[tuple[str | None]],
+    )
+    # T3: scalar() follows the selected column.
+    assert_type(await qb.select(Users.id).from_(Users).scalar(), int | None)
+    assert_type(await qb.select(Users.bio).from_(Users).scalar(), str | None)
+    assert_type(await qb.select({"n": count()}).from_(Users).scalar(), object)
+
+
+class UsersRow(TypedDict):
+    id: int
+    email: str
+
+
+async def typed_rows(qb: QueryBuilder) -> None:
+    # T8: the generated <Table>Row TypedDict names the shape a select returns.
+    rows = await qb.select({"id": Users.id, "email": Users.email}).from_(Users).as_rows(UsersRow)
+    assert_type(rows, list[UsersRow])

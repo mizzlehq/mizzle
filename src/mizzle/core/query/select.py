@@ -176,13 +176,13 @@ class SelectBase(Node):
     def join(self, source: Source, on: Condition) -> Self:
         return self._join("INNER", source, on)
 
-    def join_lateral(self, source: Source, on: Condition) -> Self:
+    def join_lateral(self, source: Source, on: Condition | None = None) -> Self:
         """``JOIN LATERAL``: ``source`` (a subquery) may reference columns of the tables
-        before it."""
+        before it. Without ``on`` the join is ``ON true`` (keep the subquery's own filter)."""
         return self._join("INNER", source, on, lateral=True)
 
-    def left_join_lateral(self, source: Source, on: Condition) -> Self:
-        """``LEFT JOIN LATERAL``."""
+    def left_join_lateral(self, source: Source, on: Condition | None = None) -> Self:
+        """``LEFT JOIN LATERAL``; without ``on`` the join is ``ON true``."""
         return self._join("LEFT", source, on, lateral=True)
 
     def cross_join(self, source: Source) -> Self:
@@ -416,6 +416,26 @@ class SetOps[R]:
 
 
 @dataclass(frozen=True, eq=False)
+class Recursive[R]:
+    """A ``WITH RECURSIVE`` CTE being built: the seed query plus a step that refers to it.
+
+    Built by ``qb.recursive(name, seed)``; ``.step(lambda self_ref: ...)`` returns the CTE
+    to hand to ``qb.with_(...)``. The self-reference is created for you, so the name is
+    written once instead of twice.
+    """
+
+    name: str
+    seed: Select[R] | Compound[R]
+
+    def step(self, build: Callable[[Cte], Select[R] | Compound[R]]) -> Cte:
+        """``build`` receives the CTE and returns the recursive term (usually the seed
+        ``.union_all(...)``-ed with it)."""
+        reference = Cte(self.name, self.seed)
+        term = build(reference)
+        return Cte(self.name, self.seed.union_all(term), recursive=True)
+
+
+@dataclass(frozen=True, eq=False)
 class CompoundBase(Node):
     """Queries combined with UNION / INTERSECT / EXCEPT (see ``Compound[R]``)."""
 
@@ -516,6 +536,35 @@ class Select[R](SelectBase, Executable[list[R]], SetOps[R]):
         decode = self.decoder()
         return cast(list[R], [decode(row) for row in rows])
 
+    def as_rows[RowT](self, shape: type[RowT], /) -> Select[RowT]:
+        """Re-type a named projection as a ``typegen`` ``<Table>Row`` TypedDict::
+
+            class UsersRow(TypedDict):
+                id: int
+                email: str
+
+            rows = await (
+                db.select({"id": Users.id, "email": Users.email})
+                .from_(Users)
+                .as_rows(UsersRow)
+            )  # list[UsersRow]
+
+        Nothing changes at runtime: the rows are already dicts keyed by the projection
+        names. A TypedDict whose fields do not match the projection is a ``QueryError``.
+        """
+        if not isinstance(self.projection, dict):
+            raise QueryError("as_rows() needs select({...}) with named fields")
+        required = cast("frozenset[str] | None", getattr(shape, "__required_keys__", None))
+        if required is not None:  # a TypedDict: the names must line up
+            optional: frozenset[str] = getattr(shape, "__optional_keys__", frozenset())
+            declared = set(required) | optional
+            if declared != set(self.projection):
+                raise QueryError(
+                    f"as_rows({getattr(shape, '__name__', shape)}): the projection has "
+                    f"{sorted(self.projection)} but the TypedDict has {sorted(declared)}"
+                )
+        return cast("Select[RowT]", self)
+
     async def first(self) -> R | None:
         """The first row, or ``None`` when the query returns none. Adds ``LIMIT 1`` when the
         query has no limit of its own."""
@@ -524,13 +573,19 @@ class Select[R](SelectBase, Executable[list[R]], SetOps[R]):
 
     async def one(self) -> R:
         """Exactly one row. Raises ``QueryError`` when there are none or more than one."""
-        rows = await self.limit(2)
+        # Keep a stricter limit the caller set (limit(0) or limit(1) is already exact).
+        limit = self.limit_
+        rows = await (self if isinstance(limit, int) and limit <= 2 else self.limit(2))
         if not rows:
             raise QueryError("one() found no rows; use first() for an optional row")
         if len(rows) > 1:
             raise QueryError("one() found more than one row")
         return rows[0]
 
+    @overload
+    async def scalar[A](self: Select[tuple[A]]) -> A | None: ...
+    @overload
+    async def scalar(self) -> object: ...
     async def scalar(self) -> object:
         """The single selected value of the first row, or ``None``. The query must select
         exactly one column."""

@@ -10,7 +10,7 @@ from mizzle.core.query.base import Runner
 from mizzle.core.query.insert import Insert
 from mizzle.core.query.merge import Merge
 from mizzle.core.query.relational import RelationalQuery
-from mizzle.core.query.select import Cte, Projection, Select, Slot
+from mizzle.core.query.select import Compound, Cte, Projection, Recursive, Select, Slot
 from mizzle.core.query.update import Delete, Update
 from mizzle.core.schema.table import Table
 from mizzle.core.sql.nodes import Expr, ExprBase
@@ -65,6 +65,17 @@ class QueryBuilder:
     def with_(self, *ctes: Cte) -> QueryBuilder:
         """``WITH`` clause: ``db.with_(cte).select(...).from_(cte)``."""
         return QueryBuilder(self.runner, (*self.ctes, *ctes))
+
+    def recursive[R](self, name: str, seed: Select[R] | Compound[R]) -> Recursive[R]:
+        """Build a ``WITH RECURSIVE`` CTE without naming it twice::
+
+        tree = (
+            db.recursive("walk", db.select({"n": 3}))
+            .step(lambda walk: db.select({"n": walk.c("n", int) - 1}).from_(walk))
+        )
+        await db.with_(tree).select(tree.c("n", int)).from_(tree)
+        """
+        return Recursive(name, seed)
 
     def query[T: Table](self, table: type[T]) -> RelationalQuery[T]:
         """Relational queries: ``db.query(Users).find_many(with_={"posts": True})``."""

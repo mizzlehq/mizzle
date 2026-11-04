@@ -32,7 +32,7 @@ type ConstraintKind = Literal["primary_key", "unique", "check", "foreign_key", "
 
 _TEXT = ("text", "character varying")
 _INTS = ("smallint", "integer", "bigint")
-_SIZED = re.compile(r"(character varying|numeric)(?:\((\d+)(?:,(\d+))?\))?")
+_SIZED = re.compile(r"(character varying|character|numeric)(?:\((\d+)(?:,(\d+))?\))?")
 
 
 def widens(old: str, new: str) -> bool:
@@ -42,7 +42,7 @@ def widens(old: str, new: str) -> bool:
         return widens(old[:-2], new[:-2])
     if new == "text":  # every value as its exact text
         return old in (*_TEXT, *_INTS, "boolean", "uuid") or old.startswith(
-            ("character varying(", "numeric")
+            ("character varying(", "character(", "numeric")
         )
     if old in _INTS and new in _INTS:
         return _INTS.index(old) <= _INTS.index(new)
@@ -51,6 +51,10 @@ def widens(old: str, new: str) -> bool:
     a, b = _SIZED.fullmatch(old), _SIZED.fullmatch(new)
     if a is None or b is None or a.group(1) != b.group(1):
         return False
+    # ``character`` without a length is ``character(1)``; only ``character varying`` and
+    # ``numeric`` are unbounded when no length is written.
+    if a.group(1) == "character":
+        return int(b.group(2) or 1) >= int(a.group(2) or 1)
     if b.group(2) is None:  # unbounded
         return True
     if a.group(2) is None:
