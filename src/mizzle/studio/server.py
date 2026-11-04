@@ -24,11 +24,14 @@ import hmac
 import io
 import json
 import logging
+import math
 import os
 import re
 import secrets
 import sys
+import time
 import webbrowser
+from collections import deque
 from collections.abc import AsyncGenerator, Awaitable, Callable, Mapping, Sequence
 from contextlib import aclosing, asynccontextmanager
 from dataclasses import dataclass, field
@@ -60,6 +63,13 @@ MAX_PAGE = 500
 MAX_HISTORY = 100
 _COMPARE = {"eq": "=", "ne": "<>", "lt": "<", "lte": "<=", "gt": ">", "gte": ">="}
 _DOLLAR = re.compile(r"\$[A-Za-z_][A-Za-z0-9_]*\$|\$\$")
+
+# Failed-login throttle (SS4): after this many wrong credentials within the window, even a
+# correct one is refused for the lockout period. A remote bind is reachable from anywhere, so
+# a short token must not be guessable at network speed.
+LOGIN_MAX_FAILURES = 10
+LOGIN_WINDOW_SECONDS = 60.0
+LOGIN_LOCKOUT_SECONDS = 30.0
 
 # Statements that change the transaction, the session or the process rather than the data.
 # In read-only mode a batch must not be able to leave the READ ONLY transaction it runs in
@@ -851,6 +861,10 @@ class _Guard(BaseHTTPMiddleware):
     allowed_hosts: set[str] | None
     basic: bytes | None
     origins: set[str] | None
+    # Failed-attempt throttle (SS4). Shared by every request: an attacker guessing a token
+    # hits the same budget whichever connection they use.
+    _failures: deque[float]
+    _locked_until: float
 
     def __init__(
         self,
@@ -867,6 +881,32 @@ class _Guard(BaseHTTPMiddleware):
         # The origins a browser request may come from. Loopback serves the UI itself; a
         # remote bind is behind a reverse proxy, whose public origin is passed in.
         self.origins = origins
+        self._failures = deque()
+        self._locked_until = 0.0
+
+    def _too_many_failures(self) -> int | None:
+        """Seconds to wait, or None when this request may be tried.
+
+        After ``LOGIN_MAX_FAILURES`` wrong credentials in a row the server refuses even a
+        correct one for a while, so a guessed token cannot be brute-forced at full speed.
+        """
+        now = time.monotonic()
+        while self._failures and now - self._failures[0] > LOGIN_WINDOW_SECONDS:
+            self._failures.popleft()
+        if self._locked_until > now:
+            return max(1, math.ceil(self._locked_until - now))
+        return None
+
+    def _record_failure(self) -> None:
+        now = time.monotonic()
+        self._failures.append(now)
+        if len(self._failures) >= LOGIN_MAX_FAILURES:
+            self._locked_until = now + LOGIN_LOCKOUT_SECONDS
+            self._failures.clear()
+
+    def _record_success(self) -> None:
+        self._failures.clear()
+        self._locked_until = 0.0
 
     def _authorized(self, request: Request) -> bool:
         given = request.headers.get("authorization", "").encode()
@@ -899,9 +939,18 @@ class _Guard(BaseHTTPMiddleware):
             and request.headers.get("host", "") not in self.allowed_hosts
         ):
             return self._error("forbidden host", 403)
-        if request.url.path.startswith("/api/") and not self._authorized(request):
-            headers = {"WWW-Authenticate": 'Basic realm="mizzle studio"'} if self.basic else None
-            return self._error("missing or wrong credentials", 401, headers)
+        if request.url.path.startswith("/api/"):
+            if (wait := self._too_many_failures()) is not None:
+                return self._error(
+                    "too many failed attempts; try again shortly", 429, {"Retry-After": str(wait)}
+                )
+            if not self._authorized(request):
+                headers = (
+                    {"WWW-Authenticate": 'Basic realm="mizzle studio"'} if self.basic else None
+                )
+                self._record_failure()
+                return self._error("missing or wrong credentials", 401, headers)
+            self._record_success()
         if request.url.path.startswith("/api/") and self._cross_site(request):
             return self._error("cross-site request refused", 403)
         if request.url.path.startswith("/api/") and not _writes_json(request):

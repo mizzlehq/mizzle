@@ -29,3 +29,7 @@ site/
 
 # mutmut's working directory (mutation testing)
 mutants/
+
+# Local review notes: not part of the project, never published.
+ISSUES.md
+ISSUES-STUDIO-RUNTIME.md

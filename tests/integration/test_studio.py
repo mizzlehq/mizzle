@@ -615,3 +615,36 @@ def test_splitter_handles_escapes_and_nested_comments() -> None:
     ]
     # A plain '...' has no backslash escape, so a backslash stays literal.
     assert split_statements("select 'a\\\\'; select 2") == ["select 'a\\\\'", "select 2"]
+
+
+def test_repeated_failed_logins_are_throttled(pg_url: str, driver: PostgresDriver) -> None:
+    # SS4: a remote bind is reachable from anywhere, so a guessed token must not be
+    # brute-forceable at network speed.
+    import mizzle.studio.server as studio_server
+
+    original = studio_server.LOGIN_MAX_FAILURES
+    studio_server.LOGIN_MAX_FAILURES = 3
+    try:
+        with make_client(pg_url) as client:
+            for _ in range(3):
+                assert (
+                    client.get("/api/meta", headers={"Authorization": "Bearer no"}).status_code
+                    == 401
+                )
+            blocked = client.get("/api/meta", headers={"Authorization": "Bearer no"})
+            assert blocked.status_code == 429
+            assert int(blocked.headers["retry-after"]) >= 1
+            # Even the correct token is refused while locked out: the budget is global.
+            assert client.get("/api/meta", headers=AUTH).status_code == 429
+    finally:
+        studio_server.LOGIN_MAX_FAILURES = original
+
+
+def test_a_successful_login_clears_the_failure_budget(pg_url: str, driver: PostgresDriver) -> None:
+    with make_client(pg_url) as client:
+        for _ in range(5):
+            client.get("/api/meta", headers={"Authorization": "Bearer no"})
+        assert client.get("/api/meta", headers=AUTH).status_code == 200
+        # The counter is reset, so the next few failures are not an immediate lockout.
+        assert client.get("/api/meta", headers={"Authorization": "Bearer no"}).status_code == 401
+        assert client.get("/api/meta", headers=AUTH).status_code == 200

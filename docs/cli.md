@@ -197,7 +197,11 @@ mizzle studio --host 0.0.0.0
 
 Binding a non-loopback host without `--auth` / `MIZZLE_STUDIO_AUTH` (or
 `--token` / `MIZZLE_STUDIO_TOKEN`) is refused. A token used for a remote bind must be at
-least 32 characters; omit `--token` to have one generated. Basic auth is over HTTP, so put
+least 32 characters; omit `--token` to have one generated.
+
+Failed logins are throttled: after 10 wrong credentials within a minute the server answers
+`429` with `Retry-After` and refuses every attempt for 30 seconds, including a correct one.
+A successful login clears the count. Basic auth is over HTTP, so put
 it behind TLS (a reverse proxy) when the network is not trusted.
 
 Behind that proxy, set `MIZZLE_STUDIO_ORIGIN` to the public origin (comma-separated for
