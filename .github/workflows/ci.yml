@@ -138,6 +138,28 @@ jobs:
       - if: failure()
         run: docker compose -f tests/infra/compose.yml logs
 
+  benchmark:
+    # A relative gate (mizzle vs asyncpg, same machine) so there is no absolute baseline to
+    # rot. See benchmarks/regression.py and benchmarks/bench.py for the full comparison table.
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_USER: mizzle
+          POSTGRES_PASSWORD: mizzle
+          POSTGRES_DB: mizzle
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd pg_isready --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      MIZZLE_TEST_URL: postgresql://mizzle:mizzle@localhost:5432/mizzle
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e  # v6
+      - run: uv sync --python 3.12
+      - run: uv run python benchmarks/regression.py --min-ratio 0.25
+
   package:
     # The release workflow only builds at tag time. Build and install the wheel here so a
     # broken build system, a missing file or a bad entry point fails on the PR, not on tag.

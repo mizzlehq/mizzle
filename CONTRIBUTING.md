@@ -15,7 +15,11 @@ uv run pytest                             # integration tests skip when MIZZLE_T
 uv run basedpyright                       # strict; also run with --pythonversion 3.14
 uv run mypy
 uv run ruff check && uv run ruff format --check
+uv run python benchmarks/regression.py    # mizzle-vs-asyncpg gate (needs Postgres)
 ```
+
+`benchmarks/bench.py` is the full comparison table across libraries; `benchmarks/regression.py`
+is the fast, relative gate CI runs (fails when mizzle drops below a fraction of asyncpg).
 
 ### Mutation testing
 
