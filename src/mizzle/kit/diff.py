@@ -12,6 +12,7 @@ from mizzle.core.errors import MigrationError
 from mizzle.core.snapshot import (
     CheckSnap,
     ColumnSnap,
+    DomainSnap,
     ExclusionSnap,
     GrantsSnap,
     IndexSnap,
@@ -42,6 +43,7 @@ from mizzle.core.steps import (
     AlterRole,
     AlterTableStorage,
     ConstraintKind,
+    CreateDomain,
     CreateEnum,
     CreateExtension,
     CreateFunction,
@@ -54,6 +56,7 @@ from mizzle.core.steps import (
     CreateView,
     DropColumn,
     DropConstraint,
+    DropDomain,
     DropEnum,
     DropExtension,
     DropFunction,
@@ -158,6 +161,7 @@ class _Plan:
     schemas: list[Step] = field(default_factory=list[Step])
     extensions: list[Step] = field(default_factory=list[Step])
     enums: list[Step] = field(default_factory=list[Step])
+    domains: list[Step] = field(default_factory=list[Step])
     renames: list[Step] = field(default_factory=list[Step])
     drop_triggers: list[Step] = field(default_factory=list[Step])
     drop_policies: list[Step] = field(default_factory=list[Step])
@@ -186,6 +190,7 @@ class _Plan:
     revokes: list[Step] = field(default_factory=list[Step])
     grants: list[Step] = field(default_factory=list[Step])
     drop_tables: list[Step] = field(default_factory=list[Step])
+    drop_domains: list[Step] = field(default_factory=list[Step])
     drop_enums: list[Step] = field(default_factory=list[Step])
     drop_extensions: list[Step] = field(default_factory=list[Step])
     roles: list[Step] = field(default_factory=list[Step])
@@ -201,6 +206,7 @@ class _Plan:
             *self.schemas,
             *self.extensions,
             *self.enums,
+            *self.domains,  # a domain's base type can be an enum
             *self.renames,
             *self.drop_triggers,
             *self.drop_policies,
@@ -229,6 +235,7 @@ class _Plan:
             *self.revokes,
             *self.grants,
             *self.drop_tables,
+            *self.drop_domains,
             *self.drop_enums,
             *self.drop_extensions,
             *self.drop_roles,  # after the policies that named them are gone
@@ -268,6 +275,33 @@ def _diff_enums(old: Snapshot, new: Snapshot, plan: _Plan) -> None:
     for k, enum in old["enums"].items():
         if k not in new["enums"]:
             plan.drop_enums.append(DropEnum(enum["schema"], enum["name"]))
+
+
+def _domain_changed(old: DomainSnap, new: DomainSnap, compare_expressions: bool) -> bool:
+    if any(
+        old.get(field) != new.get(field)
+        for field in ("base_type", "not_null", "default", "collation")
+    ):
+        return True
+    if compare_expressions:
+        return sorted(old.get("checks", [])) != sorted(new.get("checks", []))
+    return len(old.get("checks", [])) != len(new.get("checks", []))
+
+
+def _diff_domains(old: Snapshot, new: Snapshot, plan: _Plan, compare_expressions: bool) -> None:
+    old_domains = old.get("domains", {})
+    new_domains = new.get("domains", {})
+    for k, domain in new_domains.items():
+        before = old_domains.get(k)
+        if before is None:
+            plan.domains.append(CreateDomain(domain))
+        elif _domain_changed(before, domain, compare_expressions):
+            raise MigrationError(
+                f"domain {domain['name']}: changing its definition needs a custom migration"
+            )
+    for k, domain in old_domains.items():
+        if k not in new_domains:
+            plan.drop_domains.append(DropDomain(domain["schema"], domain["name"]))
 
 
 def _rename_columns_in(table: TableSnap, mapping: Mapping[str, str]) -> None:
@@ -650,6 +684,7 @@ def diff(
     plan = _Plan()
     plan.schemas = [CreateSchema(s) for s in new["schemas"] if s not in old["schemas"]]
     _diff_enums(old, new, plan)
+    _diff_domains(old, new, plan, compare_expressions)
     old_tables = _apply_renames(old, new, resolve, plan)
 
     for k, table in new["tables"].items():

@@ -6,7 +6,18 @@ from typing import final, override
 
 import pytest
 
-from mizzle import Constraint, QueryBuilder, SchemaError, Table, View, function, grant, index, sql
+from mizzle import (
+    Constraint,
+    QueryBuilder,
+    SchemaError,
+    Table,
+    View,
+    domain,
+    function,
+    grant,
+    index,
+    sql,
+)
 from mizzle import trigger as make_trigger
 from mizzle.core.errors import MigrationError
 from mizzle.core.snapshot import Snapshot, empty_snapshot
@@ -14,7 +25,7 @@ from mizzle.dialects.postgres import PostgresDialect
 from mizzle.dialects.postgres.ddl import _without_defaults
 from mizzle.kit.diff import StrictRenames, diff, no_renames
 from mizzle.kit.snapshot import build_snapshot
-from mizzle.pg import integer, text
+from mizzle.pg import integer, pg_domain, text
 
 dialect = PostgresDialect()
 
@@ -412,3 +423,75 @@ def test_keyword_default_in_an_older_snapshot_is_not_a_change() -> None:
     assert diff(new, old) == []
     old_columns["actor"]["default"] = "session_user"  # a real change still is one
     assert [s.describe() for s in diff(old, new)] == ["change default of audit_log.actor"]
+
+
+# -- domains -------------------------------------------------------------------------------
+
+
+def test_domains_render_create_drop_and_reject_changes() -> None:
+    email = domain(
+        "email",
+        as_="text",
+        not_null=True,
+        default="'x'::text",
+        check="VALUE ~ '@'",
+        collation="C",
+    )
+
+    @final
+    class Users(Table, name="users"):
+        id = integer().primary_key()
+        email = pg_domain("email", str)
+
+    v1 = build_snapshot([Users], dialect, objects=[email])
+    assert v1.get("domains") == {
+        "public.email": {
+            "schema": "public",
+            "name": "email",
+            "base_type": "text",
+            "not_null": True,
+            "default": "'x'",
+            "checks": ["VALUE ~ '@'"],
+            "collation": "C",
+        }
+    }
+    assert v1["tables"]["public.users"]["columns"]["email"]["type"] == "email"
+
+    statements = dialect.render(diff(empty_snapshot("postgresql"), v1))
+    assert statements[0].sql == (
+        "CREATE DOMAIN \"email\" AS text COLLATE \"C\" DEFAULT 'x' NOT NULL CHECK (VALUE ~ '@')"
+    )
+    assert diff(v1, v1) == []
+
+    steps = diff(v1, build_snapshot([], dialect))
+    assert [s.describe() for s in steps] == ["drop table users", "drop domain email"]
+
+    # A definition change is not expressible: it needs a hand-written migration.
+    changed = domain("email", as_="integer")
+    v2 = build_snapshot([], dialect, objects=[changed])
+    with pytest.raises(MigrationError, match="domain email"):
+        diff(v1, v2)
+
+    # push (compare_expressions=False) tolerates reformatted CHECK text, but not a change.
+    retexted = domain(
+        "email",
+        as_="text",
+        not_null=True,
+        default="'x'::text",
+        check="VALUE <> ''",
+        collation="C",
+    )
+    v3 = build_snapshot([Users], dialect, objects=[retexted])
+    assert diff(v1, v3, compare_expressions=False) == []
+    with pytest.raises(MigrationError, match="domain email"):
+        diff(v1, v3)
+
+
+def test_domain_in_another_schema_qualifies_the_column() -> None:
+    @final
+    class T(Table, name="t", schema="app"):
+        d = pg_domain("email", str, schema="app")
+
+    snap = build_snapshot([T], dialect, objects=[domain("email", as_="text", schema="app")])
+    assert set(snap.get("domains", {})) == {"app.email"}
+    assert snap["tables"]["app.t"]["columns"]["d"]["type"] == "app.email"

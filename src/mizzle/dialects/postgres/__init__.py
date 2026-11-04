@@ -58,6 +58,12 @@ class PostgresDialect:
     def column_default(self, column: ColumnBase, casing: Casing | None) -> str | None:
         return ddl.column_default(column, casing)
 
+    def normalize_default(self, text: str | None) -> str | None:
+        return ddl.normalize_default(text)
+
+    def normalize_type(self, sql_type: str) -> str:
+        return ddl.normalize_type(sql_type)
+
     def expression(self, node: Node, casing: Casing | None) -> str:
         return ddl.expression(node, casing)
 

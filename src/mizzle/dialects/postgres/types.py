@@ -452,3 +452,20 @@ def pg_enum[E: enum.Enum](
     column.enum = enum_cls
     column.enum_schema = schema
     return column
+
+
+def pg_domain[T](
+    type_name: str,
+    py_type: type[T] | None = None,
+    name: str | None = None,
+    *,
+    schema: str | None = None,
+) -> Column[T | None]:
+    """A column of a PostgreSQL domain. ``py_type`` is the Python type values decode to
+    (``str`` for a text domain); declare the domain itself with ``mizzle.domain``. Give
+    ``schema`` when the domain lives outside the database's default schema."""
+    sql_type = type_name if schema in (None, "public") else f"{schema}.{type_name}"
+    column: Column[T | None] = Column(
+        sql_type, (py_type,) if py_type is not None else None, name, decoder=py_type
+    )
+    return column

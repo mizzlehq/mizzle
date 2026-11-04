@@ -36,7 +36,7 @@ from mizzle.core.schema.constraints import (
     unique,
     unique_index,
 )
-from mizzle.core.schema.objects import extension, function, trigger
+from mizzle.core.schema.objects import domain, extension, function, trigger
 from mizzle.core.schema.relations import many, one
 from mizzle.core.schema.table import Table
 from mizzle.core.schema.view import View
@@ -259,6 +259,7 @@ __all__ = [
     "date_trunc",
     "dense_rank",
     "desc",
+    "domain",
     "eq",
     "every",
     "excluded",

@@ -12,6 +12,7 @@ from mizzle.core.naming import Casing
 from mizzle.core.schema.column import MISSING, ColumnBase
 from mizzle.core.snapshot import (
     ColumnSnap,
+    DomainSnap,
     ExclusionElementSnap,
     ExclusionSnap,
     ForeignKeySnap,
@@ -46,6 +47,7 @@ from mizzle.core.steps import (
     AlterPolicy,
     AlterRole,
     AlterTableStorage,
+    CreateDomain,
     CreateEnum,
     CreateExtension,
     CreateFunction,
@@ -58,6 +60,7 @@ from mizzle.core.steps import (
     CreateView,
     DropColumn,
     DropConstraint,
+    DropDomain,
     DropEnum,
     DropExtension,
     DropFunction,
@@ -528,6 +531,20 @@ def _alter_type(step: AlterColumnType) -> str:
     return text if step.generated else f"{text} USING {col}::{step.new_type}"
 
 
+def _create_domain(domain: DomainSnap) -> str:
+    parts = [
+        f"CREATE DOMAIN {qualified(domain['schema'], domain['name'])} AS {domain['base_type']}"
+    ]
+    if collation := domain.get("collation"):
+        parts.append(f"COLLATE {type_ident(collation)}")
+    if default := domain.get("default"):
+        parts.append(f"DEFAULT {default}")
+    if domain.get("not_null"):
+        parts.append("NOT NULL")
+    parts.extend(f"CHECK ({check})" for check in domain.get("checks", []))
+    return " ".join(parts)
+
+
 def render_step(step: Step) -> Statement:
     def alter(schema: str, table: str, action: str) -> Statement:
         return Statement(f"ALTER TABLE {qualified(schema, table)} {action}")
@@ -550,6 +567,10 @@ def render_step(step: Step) -> Statement:
             return Statement(text, transactional=False)
         case DropEnum(schema=schema, name=name):
             return Statement(f"DROP TYPE {qualified(schema, name)}")
+        case CreateDomain(domain=domain):
+            return Statement(_create_domain(domain))
+        case DropDomain(schema=schema, name=name):
+            return Statement(f"DROP DOMAIN {qualified(schema, name)}")
         case CreateTable(table=table):
             return Statement(_create_table(table))
         case DropTable(schema=schema, name=name):

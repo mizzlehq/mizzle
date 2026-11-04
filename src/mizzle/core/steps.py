@@ -9,6 +9,7 @@ from typing import Literal, override
 from mizzle.core.snapshot import (
     CheckSnap,
     ColumnSnap,
+    DomainSnap,
     EnumSnap,
     ExclusionSnap,
     ExtensionSnap,
@@ -108,6 +109,25 @@ class DropEnum(Step):
     @override
     def describe(self) -> str:
         return f"drop enum {self.name}"
+
+
+@dataclass(frozen=True)
+class CreateDomain(Step):
+    domain: DomainSnap
+
+    @override
+    def describe(self) -> str:
+        return f"create domain {self.domain['name']}"
+
+
+@dataclass(frozen=True)
+class DropDomain(Step):
+    schema: str
+    name: str
+
+    @override
+    def describe(self) -> str:
+        return f"drop domain {self.name}"
 
 
 @dataclass(frozen=True)

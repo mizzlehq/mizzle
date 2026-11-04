@@ -273,6 +273,35 @@ The type name is the class name in snake_case (`Status` is `status`); `type_name
 changes it, and `schema=` puts the type in another schema. Rows hold enum members:
 `page.status is Status.DRAFT`. Migrations create the type and add new members.
 
+## Domains
+
+A domain is a base type with constraints and a default, declared once and reused. Declare it
+as a module-level object (like an extension or function); the migration kit collects it.
+
+```python
+from mizzle import Table, domain
+from mizzle.pg import pg_domain, serial
+
+
+email = domain("email", as_="text", not_null=True, check="VALUE ~ '@'")
+
+# use `schema="app"` on both to keep the domain outside the default schema
+price = domain("price", as_="numeric(10,2)", check="VALUE >= 0", collation="C")
+
+
+@final
+class Users(Table, name="users"):
+    id = serial().primary_key()
+    email = pg_domain("email", str)          # type "email"; str is the Python type
+    price = pg_domain("price", decimal.Decimal).default(0)
+```
+
+`as_` is the base SQL type (PostgreSQL spelling: `character varying(255)`, not `varchar`).
+`check` (or `checks=[...]`) adds CHECK constraints where `VALUE` is the domain's value;
+`default=` is an SQL expression, `collation=` a collation name. Migrations create the domain
+before the tables that use it and drop it after them. Changing a domain in place needs a
+hand-written migration: `mizzle generate` stops and says so.
+
 ## Identity and generated columns
 
 ```python

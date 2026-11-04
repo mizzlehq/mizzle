@@ -20,6 +20,7 @@ from mizzle import (
     Table,
     View,
     check,
+    domain,
     exclusion,
     extension,
     function,
@@ -32,8 +33,9 @@ from mizzle import (
     unique,
     unique_index,
 )
+from mizzle.core.errors import MigrationError
 from mizzle.core.schema.column import Computed
-from mizzle.core.schema.objects import Extension, Function, SchemaObject, Trigger
+from mizzle.core.schema.objects import Domain, Extension, Function, SchemaObject, Trigger
 from mizzle.core.snapshot import Snapshot, empty_snapshot
 from mizzle.core.steps import Statement, Step
 from mizzle.dialects.postgres import PostgresDialect
@@ -64,6 +66,7 @@ from mizzle.pg import (
     money,
     numrange,
     path,
+    pg_domain,
     pg_enum,
     point,
     polygon,
@@ -158,7 +161,7 @@ async def assert_pull_round_trip(driver: PostgresDriver, tmp_path: Path) -> str:
         for m in members
         if isinstance(m, type) and issubclass(m, Table) and "__table__" in vars(m)
     ]
-    objects = [m for m in members if isinstance(m, Extension | Function | Trigger)]
+    objects = [m for m in members if isinstance(m, Domain | Extension | Function | Trigger)]
     pulled = build_snapshot(tables, dialect, objects=objects)
     remaining = diff(current, pulled)
     assert remaining == [], (source, [s.describe() for s in remaining])
@@ -1056,3 +1059,55 @@ async def test_more_column_types_round_trip(driver: PostgresDriver, tmp_path: Pa
     assert row["label"] == "Hello"
     assert row["tree"] == "a.b"
     await assert_pull_round_trip(driver, tmp_path)
+
+
+# -- domains -------------------------------------------------------------------------------
+
+email_domain = domain(
+    "mg_email",
+    schema="mg",
+    as_="text",
+    not_null=True,
+    default="'none'::text",
+    check="VALUE ~ '@'",
+)
+
+
+@final
+class Subscribers(Table, name="subscribers", schema="mg"):
+    id = integer().primary_key()
+    email = pg_domain("mg_email", str, schema="mg")
+
+
+async def test_domains(driver: PostgresDriver, tmp_path: Path) -> None:
+    v1 = snap([Subscribers], objects=[email_domain])
+    assert v1.get("domains") == {
+        "mg.mg_email": {
+            "schema": "mg",
+            "name": "mg_email",
+            "base_type": "text",
+            "not_null": True,
+            "default": "'none'",
+            "checks": ["VALUE ~ '@'"],
+        }
+    }
+    assert v1["tables"]["mg.subscribers"]["columns"]["email"]["type"] == "mg.mg_email"
+
+    await migrate(driver, empty_snapshot("postgresql"), v1)
+    [row] = await execute(
+        driver, "INSERT INTO mg.subscribers (id, email) VALUES (1, 'a@b') RETURNING email"
+    )
+    assert row["email"] == "a@b"  # asyncpg decodes the domain as its base type
+    with pytest.raises(DatabaseError, match="mg_email"):
+        await execute(driver, "INSERT INTO mg.subscribers (id, email) VALUES (2, 'nope')")
+    await assert_pull_round_trip(driver, tmp_path)
+
+    # The domain goes after the table that uses it, on the way out.
+    v2 = snap([])
+    steps = await migrate(driver, v1, v2)
+    assert [s.describe() for s in steps] == ["drop table subscribers", "drop domain mg_email"]
+
+    changed = domain("mg_email", schema="mg", as_="text", not_null=False, check="VALUE ~ '@'")
+    v3 = snap([Subscribers], objects=[changed])
+    with pytest.raises(MigrationError, match="domain mg_email"):
+        diff(v1, v3, StrictRenames())

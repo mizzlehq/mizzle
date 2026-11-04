@@ -22,12 +22,13 @@ from mizzle.core.schema.constraints import (
     RowLevelSecurity,
     UniqueConstraint,
 )
-from mizzle.core.schema.objects import Extension, Function, SchemaObject, Trigger
+from mizzle.core.schema.objects import Domain, Extension, Function, SchemaObject, Trigger
 from mizzle.core.schema.table import Table, validate_tables
 from mizzle.core.schema.view import View
 from mizzle.core.snapshot import (
     CheckSnap,
     ColumnSnap,
+    DomainSnap,
     EnumSnap,
     ExclusionElementSnap,
     ExclusionSnap,
@@ -300,6 +301,8 @@ def build_snapshot(
                     raise SchemaError(f"function {fn['name']!r} is declared twice")
                 functions[function_key(fn)] = fn
                 add_schema(fn["schema"])
+            case Domain():
+                _add_domain(snapshot, obj, default_schema, dialect)
             case Trigger():
                 k = key(schema_of(obj.on), obj.on.__table__.name)
                 on = snapshot["tables"].get(k) or snapshot.get("views", {}).get(k)
@@ -486,6 +489,31 @@ def _add_enum(snapshot: Snapshot, schema: str, column: ColumnBase) -> None:
     if existing is not None and existing["values"] != values:
         raise SchemaError(f"enum type {name!r} is declared twice with different values")
     snapshot["enums"][key(schema, name)] = EnumSnap(schema=schema, name=name, values=values)
+
+
+def _add_domain(snapshot: Snapshot, obj: Domain, default_schema: str, dialect: Dialect) -> None:
+    schema = obj.schema or default_schema
+    snap = DomainSnap(
+        schema=schema,
+        name=obj.name,
+        base_type=dialect.normalize_type(obj.base_type),
+    )
+    if obj.not_null:
+        snap["not_null"] = True
+    if obj.default is not None:
+        normalized = dialect.normalize_default(obj.default)
+        snap["default"] = normalized if normalized is not None else obj.default
+    if obj.checks:
+        snap["checks"] = list(obj.checks)
+    if obj.collation is not None:
+        snap["collation"] = obj.collation
+    domains = snapshot.setdefault("domains", {})
+    existing = domains.get(key(schema, obj.name))
+    if existing is not None and existing != snap:
+        raise SchemaError(f"domain {obj.name!r} is declared twice")
+    domains[key(schema, obj.name)] = snap
+    if schema != default_schema and schema not in snapshot["schemas"]:
+        snapshot["schemas"].append(schema)
 
 
 def _add_role(snapshot: Snapshot, role: Role) -> None:

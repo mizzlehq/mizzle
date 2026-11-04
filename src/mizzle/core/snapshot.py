@@ -179,6 +179,17 @@ class EnumSnap(TypedDict):
     values: list[str]
 
 
+class DomainSnap(TypedDict):
+    schema: str
+    name: str
+    base_type: str  # as format_type() prints it
+    # Absent when the default, so snapshots written before these fields existed compare equal.
+    not_null: NotRequired[bool]
+    default: NotRequired[str]
+    checks: NotRequired[list[str]]  # CHECK expressions, sorted
+    collation: NotRequired[str]
+
+
 class RoleSnap(TypedDict):
     name: str
     login: bool
@@ -236,6 +247,7 @@ class Snapshot(TypedDict):
     roles: NotRequired[dict[str, RoleSnap]]  # name -> role (managed ones only)
     functions: NotRequired[dict[str, FunctionSnap]]  # function_key() -> function
     views: NotRequired[dict[str, ViewSnap]]  # "schema.name" -> view
+    domains: NotRequired[dict[str, DomainSnap]]  # "schema.name" -> domain
 
 
 def key(schema: str, name: str) -> str:

@@ -11,6 +11,7 @@ from mizzle.core.errors import DatabaseError, SchemaError
 from mizzle.core.snapshot import (
     CheckSnap,
     ColumnSnap,
+    DomainSnap,
     EnumSnap,
     ExclusionElementSnap,
     ExclusionSnap,
@@ -156,6 +157,27 @@ JOIN pg_enum e ON e.enumtypid = t.oid
 JOIN pg_namespace n ON n.oid = t.typnamespace
 WHERE n.nspname = ANY($1::text[])
 GROUP BY n.nspname, t.typname
+ORDER BY n.nspname, t.typname
+"""
+
+_DOMAINS = """
+SELECT n.nspname AS schema, t.typname AS name,
+       format_type(t.typbasetype, t.typtypmod) AS base_type,
+       t.typnotnull AS not_null,
+       pg_get_expr(t.typdefaultbin, 0) AS default,
+       (SELECT c.collname FROM pg_collation c WHERE c.oid = t.typcollation) AS collation
+FROM pg_type t
+JOIN pg_namespace n ON n.oid = t.typnamespace
+WHERE t.typtype = 'd' AND n.nspname = ANY($1::text[])
+ORDER BY n.nspname, t.typname
+"""
+
+_DOMAIN_CHECKS = """
+SELECT n.nspname AS schema, t.typname AS domain, pg_get_constraintdef(c.oid) AS definition
+FROM pg_constraint c
+JOIN pg_type t ON t.oid = c.contypid
+JOIN pg_namespace n ON n.oid = t.typnamespace
+WHERE c.contype = 'c' AND n.nspname = ANY($1::text[])
 ORDER BY n.nspname, t.typname
 """
 
@@ -569,6 +591,25 @@ async def introspect(
         schema, name = str(row["schema"]), str(row["name"])
         enum = EnumSnap(schema=schema, name=name, values=_strs(row["values"]))
         snapshot["enums"][key(schema, name)] = enum
+        _add_schema(snapshot, schema)
+
+    domain_checks: dict[str, list[str]] = {}
+    for row in await conn.fetch_dicts(_DOMAIN_CHECKS, [schema_list]):
+        domain_checks.setdefault(key(str(row["schema"]), str(row["domain"])), []).append(
+            _check_expression(str(row["definition"]))
+        )
+    for row in await conn.fetch_dicts(_DOMAINS, [schema_list]):
+        schema, name = str(row["schema"]), str(row["name"])
+        domain = DomainSnap(schema=schema, name=name, base_type=str(row["base_type"]))
+        if row["not_null"]:
+            domain["not_null"] = True
+        if (default := normalize_default(_opt_str(row["default"]))) is not None:
+            domain["default"] = default
+        if (collation := _opt_str(row["collation"])) not in (None, "default"):
+            domain["collation"] = collation
+        if checks := domain_checks.get(key(schema, name)):
+            domain["checks"] = sorted(checks)
+        snapshot.setdefault("domains", {})[key(schema, name)] = domain
         _add_schema(snapshot, schema)
     return snapshot
 

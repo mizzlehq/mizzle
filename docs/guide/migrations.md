@@ -270,6 +270,13 @@ before anything else. `schema=` and `version=` pin where and which version. Colu
 need an extension (pgvector's `vector`) add it on their own; see
 [Extensions](extensions.md).
 
+### Domains
+
+`domain("email", as_="text", check="VALUE ~ '@'")` is `CREATE DOMAIN`. Declare it at module
+level and use it with `pg_domain("email", str)`; migrations create it before the tables that
+use it. `as_` is the base type, `default=`, `not_null=`, `check=`/`checks=` and `collation=`
+map to the same clauses. See [Schema](schema.md#domains).
+
 ### Views
 
 A `View` declares its columns like a table, and a `query()`: a select built with `db`, or
