@@ -359,6 +359,21 @@ top_posts = await (
 )
 ```
 
+### Recursive CTEs
+
+`db.recursive(name, seed)` builds the self-reference for you, so the name is written once:
+
+```python
+tree = (
+    db.recursive("walk", db.select({"n": 3}))
+    .step(lambda walk: db.select({"n": walk.c("n", int) - 1}).from_(walk))
+)
+rows = await db.with_(tree).select(tree.c("n", int)).from_(tree)  # 3, 2, 1
+```
+
+`query.cte(name, recursive=True)` still works when you already have the step query built
+against a CTE of the same name.
+
 ## Window functions
 
 ```python
@@ -445,7 +460,8 @@ many_rows = await db.insert(Users).values(
 ```
 
 `values()` takes keyword arguments, a dict, a list of dicts or a Pydantic model. Awaiting
-the insert returns the row count; `.returning()` returns the inserted rows. mizzle checks
+the insert returns the row count; `.returning()` returns the inserted rows (whole rows, or
+`.returning(Users.id, Users.email)` for `list[tuple[int, str]]`). mizzle checks
 the values before it sends anything: an unknown column, a wrong type or a missing required
 column raises `QueryError`.
 
