@@ -848,7 +848,8 @@ def power[N: (float, float | None, Decimal, Decimal | None)](
     base: Expr[N], exponent: N | Expr[N]
 ) -> Expr[N]: ...
 def power(base: ExprBase, exponent: object) -> ExprBase:
-    """``base`` raised to ``exponent`` (``double precision``; PostgreSQL widens integers)."""
+    """``base`` raised to ``exponent``. Integers and floats give ``double precision``;
+    ``numeric`` stays ``numeric``."""
     return TypedFunc[object]("power", (base, bind(exponent, (base,))))
 
 
@@ -863,22 +864,23 @@ def exp[N: (float, float | None, Decimal, Decimal | None)](expr: Expr[N]) -> Exp
 
 
 @overload
-def log(base: Expr[int], value: int | Expr[int]) -> Expr[float]: ...
+def log(base: Expr[int], value: int | Expr[int]) -> Expr[Decimal]: ...
 @overload
-def log(base: Expr[int | None], value: int | Expr[int]) -> Expr[float | None]: ...
+def log(base: Expr[int | None], value: int | Expr[int]) -> Expr[Decimal | None]: ...
 @overload
 def log[N: (float, float | None, Decimal, Decimal | None)](
     base: Expr[N], value: N | Expr[N]
 ) -> Expr[N]: ...
 def log(base: ExprBase, value: object) -> ExprBase:
-    """Logarithm of ``value`` to ``base`` (``double precision``; PostgreSQL widens integers)."""
+    """Logarithm of ``value`` to ``base``. Two-argument ``log`` always returns ``numeric``,
+    whatever the arguments' type."""
     return TypedFunc[object]("log", (base, bind(value, (base,))))
 
 
-def mod[N: (int, int | None, float, float | None, Decimal, Decimal | None)](
+def mod[N: (int, int | None, Decimal, Decimal | None)](
     value: Expr[N], divisor: N | Expr[N]
 ) -> Expr[N]:
-    """``value`` modulo ``divisor``."""
+    """``value`` modulo ``divisor`` (integers and ``numeric``; no float overload)."""
     return TypedFunc[N]("mod", (value, bind(divisor, (value,))))
 
 

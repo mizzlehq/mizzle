@@ -150,15 +150,15 @@ async def expressions(qb: QueryBuilder) -> None:
     assert_type(age(Users.created_at), Expr[datetime.timedelta | None])
     assert_type(to_char(Users.created_at, "YYYY"), Expr[str | None])
     assert_type(power(Users.id, 2), Expr[float])
-    assert_type(log(Users.id, 10), Expr[float])
+    assert_type(log(Users.id, 10), Expr[Decimal])
     assert_type(mod(Users.id, 2), Expr[int])
-    assert_type(percentile_cont(0.5, Users.id), Aggregate[float])
+    assert_type(percentile_cont(0.5, Users.id), Aggregate[float | None])
     # Nullable inputs stay nullable; non-null inputs do not gain None.
     assert_type(power(nullable(Users.id), 2), Expr[float | None])
     assert_type(mod(nullable(Users.id), 2), Expr[int | None])
     assert_type(to_char(nullable(Users.created_at), "YYYY"), Expr[str | None])
     assert_type(age(nullable(Users.created_at)), Expr[datetime.timedelta | None])
-    assert_type(percentile_cont(0.5, nullable(Users.id)), Aggregate[float])
+    assert_type(percentile_cont(0.5, nullable(Users.id)), Aggregate[float | None])
     assert_type(concat(Users.email, "-", Users.id), Expr[str])
     assert_type(abs_(Users.id), Expr[int])
     round_(cast(Users.id, text()))  # type: ignore[type-var]  # pyright: ignore[reportArgumentType]
