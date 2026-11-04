@@ -1,3 +1,5 @@
+from typing import Literal, cast
+
 import pytest
 
 from mizzle.core.errors import QueryError
@@ -235,3 +237,99 @@ async def test_placeholder_requires_prepare(qb: QueryBuilder, runner: FakeRunner
     assert runner.executed[-1].params == ("admin", 5)
     await prepared.execute(role=Role.USER, n=1)
     assert runner.executed[-1].params == ("user", 1)
+
+
+def test_join_lateral(qb: QueryBuilder) -> None:
+    top = (
+        qb.select({"author": Posts.author_id, "n": count()})
+        .from_(Posts)
+        .group_by(Posts.author_id)
+        .subquery("top")
+    )
+    author, n = top.c("author", int), top.c("n", int)
+    q = qb.select(Users.email, n).from_(Users).left_join_lateral(top, eq(author, Users.id))
+    assert q.to_sql() == (
+        'SELECT "users"."email", "top"."n" FROM "users" LEFT JOIN LATERAL '
+        '(SELECT "posts"."author_id" AS "author", count(*) AS "n" FROM "posts" '
+        'GROUP BY "posts"."author_id") AS "top" ON "top"."author" = "users"."id"',
+        (),
+    )
+    cross = (
+        qb.select(Users.id)
+        .from_(Users)
+        .cross_join_lateral(qb.select(Posts.id).from_(Posts).subquery("p"))
+    )
+    assert cross.to_sql()[0].startswith(
+        'SELECT "users"."id" FROM "users" CROSS JOIN LATERAL (SELECT "posts"."id"'
+    )
+    inner = qb.select(Posts.id).from_(Posts).subquery("p")
+    assert (
+        qb.select(Users.id)
+        .from_(Users)
+        .join_lateral(inner, eq(Posts.author_id, Users.id))
+        .to_sql()[0]
+        .startswith('SELECT "users"."id" FROM "users" INNER JOIN LATERAL (')
+    )
+
+
+def test_rollup_cube_grouping_sets(qb: QueryBuilder) -> None:
+    base = qb.select(Users.role, count()).from_(Users)
+    assert base.rollup(Users.role).to_sql()[0].endswith('GROUP BY ROLLUP ("users"."role")')
+    assert base.cube(Users.role).to_sql()[0].endswith('GROUP BY CUBE ("users"."role")')
+    assert (
+        base.grouping_sets([Users.role], [])
+        .to_sql()[0]
+        .endswith('GROUP BY GROUPING SETS (("users"."role"), ())')
+    )
+    with pytest.raises(QueryError, match="at least one expression"):
+        base.rollup()
+    with pytest.raises(QueryError, match="at least one expression"):
+        base.cube()
+    with pytest.raises(QueryError, match="at least one set"):
+        base.grouping_sets()
+
+
+def test_tablesample(qb: QueryBuilder) -> None:
+    q = qb.select(Users.id).from_(Users).tablesample("SYSTEM", 10, seed=42)
+    assert q.to_sql() == (
+        'SELECT "users"."id" FROM "users" TABLESAMPLE SYSTEM (10) REPEATABLE (42)',
+        (),
+    )
+    plain = qb.select(Users.id).from_(Users).tablesample("BERNOULLI", 2.5)
+    assert plain.to_sql()[0].endswith("TABLESAMPLE BERNOULLI (2.5)")
+    with pytest.raises(QueryError, match="between 0 and 100"):
+        qb.select().from_(Users).tablesample("SYSTEM", 101)
+    with pytest.raises(QueryError, match="SYSTEM or BERNOULLI"):
+        bad = cast("Literal['SYSTEM', 'BERNOULLI']", cast(object, "NOPE"))
+        qb.select().from_(Users).tablesample(bad, 10)
+
+
+def test_recursive_cte(qb: QueryBuilder) -> None:
+    seed = qb.select({"n": Users.id}).from_(Users).where(eq(Users.id, 3)).cte("walk")
+    n = seed.c("n", int)
+    step = qb.select({"n": n - 1}).from_(seed).where(gt(n, 1))
+    tree = (
+        qb.select({"n": Users.id})
+        .from_(Users)
+        .where(eq(Users.id, 3))
+        .union_all(step)
+        .cte("walk", recursive=True)
+    )
+    q = qb.with_(tree).select(tree.c("n", int)).from_(tree).order_by(desc(tree.c("n", int)))
+    assert q.to_sql() == (
+        'WITH RECURSIVE "walk" AS ((SELECT "users"."id" AS "n" FROM "users" '
+        'WHERE "users"."id" = $1) UNION ALL (SELECT ("walk"."n" - $2) AS "n" FROM "walk" '
+        'WHERE "walk"."n" > $3)) SELECT "walk"."n" FROM "walk" ORDER BY "walk"."n" DESC',
+        (3, 1, 1),
+    )
+
+
+def test_data_modifying_cte(qb: QueryBuilder) -> None:
+    moved = qb.delete(Posts).where(eq(Posts.title, "x")).returning().cte("moved")
+    q = qb.with_(moved).select(count()).from_(moved)
+    assert q.to_sql() == (
+        'WITH "moved" AS (DELETE FROM "posts" WHERE "posts"."title" = $1 RETURNING '
+        '"posts"."id", "posts"."author_id", "posts"."title", "posts"."meta") '
+        'SELECT count(*) FROM "moved"',
+        ("x",),
+    )

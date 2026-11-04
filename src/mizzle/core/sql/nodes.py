@@ -372,6 +372,27 @@ class Star(Node):
 
 
 @dataclass(frozen=True)
+class Rollup(Node):
+    """``GROUP BY ROLLUP (...)```."""
+
+    items: tuple[Node, ...]
+
+
+@dataclass(frozen=True)
+class Cube(Node):
+    """``GROUP BY CUBE (...)```."""
+
+    items: tuple[Node, ...]
+
+
+@dataclass(frozen=True)
+class GroupingSets(Node):
+    """``GROUP BY GROUPING SETS (...)``: one entry per set, an empty tuple for ``()``."""
+
+    sets: tuple[tuple[Node, ...], ...]
+
+
+@dataclass(frozen=True)
 class Func(ExprBase):
     name: str
     args: tuple[Node, ...]

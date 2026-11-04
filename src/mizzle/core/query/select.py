@@ -18,6 +18,7 @@ from mizzle.core.query.base import (
     table_columns,
     table_decoder,
 )
+from mizzle.core.query.returning import Returning
 from mizzle.core.schema.column import ColumnBase
 from mizzle.core.schema.table import Table
 from mizzle.core.sql.alias import alias_table, real_table
@@ -25,12 +26,15 @@ from mizzle.core.sql.functions import column_of
 from mizzle.core.sql.nodes import (
     Condition,
     CteColumn,
+    Cube,
     Expr,
     ExprBase,
     Frame,
+    GroupingSets,
     Node,
     OrderBy,
     Placeholder,
+    Rollup,
     TypedCteColumn,
     Window,
     window,
@@ -51,6 +55,7 @@ class Join:
     kind: JoinKind
     source: Source
     on: Condition | None  # None: CROSS JOIN
+    lateral: bool = False
 
 
 @dataclass(frozen=True)
@@ -61,15 +66,25 @@ class Lock:
     strength: LockStrength = "UPDATE"
 
 
+@dataclass(frozen=True)
+class Tablesample:
+    """``TABLESAMPLE``: read a random sample of a table's pages/rows."""
+
+    method: Literal["SYSTEM", "BERNOULLI"]
+    percent: float
+    seed: float | None = None
+
+
 @dataclass(frozen=True, eq=False)
 class Cte(Node):
     """A named subquery: a ``WITH`` query (``query.cte(name)``), or with ``inline`` a
     subquery in FROM (``query.subquery(name)``). Reference its columns with ``c()``."""
 
     name: str
-    query: SelectBase | CompoundBase
+    query: SelectBase | CompoundBase | Returning[Table]
     alias: str | None = None  # see alias(cte, name)
     inline: bool = False
+    recursive: bool = False  # WITH RECURSIVE
 
     def c[T](self, column: str, type_: type[T]) -> TypedCteColumn[T]:
         """A column of this query, e.g. ``cte.c("id", int)``. The type is not checked;
@@ -81,6 +96,11 @@ class Cte(Node):
         query = self.query
         while isinstance(query, CompoundBase):
             query = query.left  # output columns are named by the first query
+        if isinstance(query, Returning):
+            for attr, column in query.table.__table__.columns.items():
+                if name in (attr, column.db_name()):
+                    return column
+            return None
         if isinstance(query.projection, dict):
             node = query.projection.get(name)
             return None if node is None else column_of(node)
@@ -114,8 +134,9 @@ class SelectBase(Node):
     source: Source
     ctes: tuple[Cte, ...] = ()
     joins: tuple[Join, ...] = ()
+    tablesample_: Tablesample | None = None
     where_: Condition | None = None
-    group_by_: tuple[ExprBase, ...] = ()
+    group_by_: tuple[Node, ...] = ()
     having_: Condition | None = None
     order_by_: tuple[ExprBase | OrderBy, ...] = ()
     limit_: int | Placeholder | None = None
@@ -132,22 +153,73 @@ class SelectBase(Node):
         combined = condition if self.where_ is None else and_(self.where_, condition)
         return evolve(self, where_=combined)
 
-    def _join(self, kind: JoinKind, source: Source, on: Condition | None) -> Self:
+    def _join(
+        self, kind: JoinKind, source: Source, on: Condition | None, *, lateral: bool = False
+    ) -> Self:
         if kind in ("RIGHT", "FULL") and self.projection is None:
             raise QueryError(
                 f"{kind.lower()} join needs an explicit select(A, B) so missing rows are typed"
             )
-        return evolve(self, joins=(*self.joins, Join(kind, source, on)))
+        return evolve(self, joins=(*self.joins, Join(kind, source, on, lateral)))
 
     def join(self, source: Source, on: Condition) -> Self:
         return self._join("INNER", source, on)
+
+    def join_lateral(self, source: Source, on: Condition) -> Self:
+        """``JOIN LATERAL``: ``source`` (a subquery) may reference columns of the tables
+        before it."""
+        return self._join("INNER", source, on, lateral=True)
+
+    def left_join_lateral(self, source: Source, on: Condition) -> Self:
+        """``LEFT JOIN LATERAL``."""
+        return self._join("LEFT", source, on, lateral=True)
 
     def cross_join(self, source: Source) -> Self:
         """Every row paired with every row of ``source`` (``CROSS JOIN``, no condition)."""
         return self._join("CROSS", source, None)
 
+    def cross_join_lateral(self, source: Source) -> Self:
+        """``CROSS JOIN LATERAL``: one evaluation of ``source`` per outer row."""
+        return self._join("CROSS", source, None, lateral=True)
+
+    def tablesample(
+        self,
+        method: Literal["SYSTEM", "BERNOULLI"],
+        percent: float,
+        *,
+        seed: float | None = None,
+    ) -> Self:
+        """``TABLESAMPLE method (percent)``: read only a random part of the table.
+        ``SYSTEM`` samples pages (fast), ``BERNOULLI`` samples rows (slower, finer)."""
+        if method not in ("SYSTEM", "BERNOULLI"):
+            raise QueryError(f"tablesample() method must be SYSTEM or BERNOULLI; got {method!r}")
+        if not 0 <= percent <= 100:
+            raise QueryError("tablesample() percent must be between 0 and 100")
+        return evolve(self, tablesample_=Tablesample(method, float(percent), seed))
+
     def group_by(self, *exprs: ExprBase) -> Self:
         return evolve(self, group_by_=(*self.group_by_, *exprs))
+
+    def rollup(self, *exprs: ExprBase) -> Self:
+        """``GROUP BY ROLLUP (...)``: the grouped rows plus subtotals and a grand total."""
+        if not exprs:
+            raise QueryError("rollup() needs at least one expression")
+        return evolve(self, group_by_=(*self.group_by_, Rollup(exprs)))
+
+    def cube(self, *exprs: ExprBase) -> Self:
+        """``GROUP BY CUBE (...)``: subtotals for every combination of the expressions."""
+        if not exprs:
+            raise QueryError("cube() needs at least one expression")
+        return evolve(self, group_by_=(*self.group_by_, Cube(exprs)))
+
+    def grouping_sets(self, *sets: Sequence[ExprBase]) -> Self:
+        """``GROUP BY GROUPING SETS (...)``: one entry per set of expressions; an empty
+        sequence means the grand total."""
+        if not sets:
+            raise QueryError("grouping_sets() needs at least one set")
+        return evolve(
+            self, group_by_=(*self.group_by_, GroupingSets(tuple(tuple(s) for s in sets)))
+        )
 
     def having(self, condition: Condition) -> Self:
         combined = condition if self.having_ is None else and_(self.having_, condition)
@@ -220,9 +292,10 @@ class SelectBase(Node):
             raise QueryError("a row lock takes skip_locked or nowait, not both")
         return evolve(self, lock=Lock(tuple(of), skip_locked, nowait, strength))
 
-    def cte(self, name: str) -> Cte:
-        """Use this query as a named CTE: ``db.with_(cte).select(...).from_(cte)``."""
-        return Cte(name, self)
+    def cte(self, name: str, *, recursive: bool = False) -> Cte:
+        """Use this query as a named CTE: ``db.with_(cte).select(...).from_(cte)``. Mark it
+        ``recursive`` for ``WITH RECURSIVE`` (a query that refers to itself)."""
+        return Cte(name, self, recursive=recursive)
 
     def subquery(self, name: str) -> Cte:
         """Use this query in FROM or a join: ``db.select(sub.c("n", int)).from_(sub)``."""
@@ -352,8 +425,8 @@ class CompoundBase(Node):
     def offset(self, n: int | Expr[int]) -> Self:
         return evolve(self, offset_=_count("offset", n))
 
-    def cte(self, name: str) -> Cte:
-        return Cte(name, self)
+    def cte(self, name: str, *, recursive: bool = False) -> Cte:
+        return Cte(name, self, recursive=recursive)
 
     def subquery(self, name: str) -> Cte:
         return Cte(name, self, inline=True)

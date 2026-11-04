@@ -25,11 +25,13 @@ from mizzle.core.sql.nodes import (
     BoolOp,
     Cast,
     CteColumn,
+    Cube,
     Excluded,
     Exists,
     Fragment,
     Frame,
     Func,
+    GroupingSets,
     Identifier,
     InList,
     Node,
@@ -42,6 +44,7 @@ from mizzle.core.sql.nodes import (
     Placeholder,
     Postfix,
     Raw,
+    Rollup,
     Star,
     Window,
 )
@@ -339,6 +342,16 @@ class Compiler:
     def visit_Star(self, _node: Star) -> str:
         return "*"
 
+    def visit_Rollup(self, node: Rollup) -> str:
+        return f"ROLLUP ({', '.join(self.visit(item) for item in node.items)})"
+
+    def visit_Cube(self, node: Cube) -> str:
+        return f"CUBE ({', '.join(self.visit(item) for item in node.items)})"
+
+    def visit_GroupingSets(self, node: GroupingSets) -> str:
+        rendered = [f"({', '.join(self.visit(item) for item in group)})" for group in node.sets]
+        return f"GROUPING SETS ({', '.join(rendered)})"
+
     def visit_OrderBy(self, node: OrderBy) -> str:
         text = f"{self.visit(node.expr)} {'DESC' if node.descending else 'ASC'}"
         return f"{text} NULLS {node.nulls.upper()}" if node.nulls else text
@@ -489,8 +502,9 @@ class Compiler:
         # Clauses are emitted strictly left to right so $n numbering follows the text.
         parts: list[str] = []
         if node.ctes:
+            keyword = "WITH RECURSIVE" if any(c.recursive for c in node.ctes) else "WITH"
             ctes = ", ".join(f"{self.quote(c.name)} AS ({self.visit(c.query)})" for c in node.ctes)
-            parts.append(f"WITH {ctes}")
+            parts.append(f"{keyword} {ctes}")
         if node.distinct_ and node.distinct_on_:
             raise QueryError("distinct() and distinct_on() cannot be combined")
         if node.distinct_on_:
@@ -505,10 +519,18 @@ class Compiler:
         else:
             items = [self.select_slot(slot) for slot in node.slots()]
         parts.append(", ".join(items))
-        parts.append(f"FROM {self.source(node.source)}")
+        from_ = f"FROM {self.source(node.source)}"
+        if node.tablesample_ is not None:
+            sample = node.tablesample_
+            clause = f"TABLESAMPLE {sample.method} ({sample.percent:g})"
+            if sample.seed is not None:
+                clause += f" REPEATABLE ({sample.seed:g})"
+            from_ += " " + clause
+        parts.append(from_)
         for join in node.joins:
             on = "" if join.on is None else f" ON {self.visit(join.on)}"
-            parts.append(f"{join.kind} JOIN {self.source(join.source)}{on}")
+            lateral = " LATERAL" if join.lateral else ""
+            parts.append(f"{join.kind} JOIN{lateral} {self.source(join.source)}{on}")
         if node.where_ is not None:
             parts.append(f"WHERE {self.visit(node.where_)}")
         if node.group_by_:
