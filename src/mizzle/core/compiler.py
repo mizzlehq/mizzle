@@ -20,6 +20,8 @@ from mizzle.core.schema.column import MISSING, ColumnBase
 from mizzle.core.sql.alias import TableAlias
 from mizzle.core.sql.functions import CaseBase, column_of
 from mizzle.core.sql.nodes import (
+    Aggregate,
+    AnyAll,
     Between,
     BinaryOp,
     BoolOp,
@@ -43,6 +45,7 @@ from mizzle.core.sql.nodes import (
     Param,
     Placeholder,
     Postfix,
+    PostfixOp,
     Raw,
     Rollup,
     Star,
@@ -316,6 +319,12 @@ class Compiler:
     def visit_Postfix(self, node: Postfix) -> str:
         return f"{self.operand(node.item)} {node.op}"
 
+    def visit_PostfixOp(self, node: PostfixOp[object]) -> str:
+        return f"{self.operand(node.item)} {node.op} {self.visit(node.right)}"
+
+    def visit_AnyAll(self, node: AnyAll[object]) -> str:
+        return f"{node.quantifier} ({self.visit(node.value)})"
+
     def visit_InList(self, node: InList) -> str:
         if isinstance(node.values, tuple):
             if not node.values:  # IN () is a syntax error; the meaning is "matches nothing"
@@ -337,7 +346,14 @@ class Compiler:
     def visit_Func(self, node: Func) -> str:
         self._opaque |= node.opaque
         args = ", ".join(self.visit(a) for a in node.args)
-        return f"{node.name}({'DISTINCT ' if node.distinct else ''}{args})"
+        text = f"{node.name}({'DISTINCT ' if node.distinct else ''}{args})"
+        if isinstance(node, Aggregate):
+            if node.filter_ is not None:
+                text += f" FILTER (WHERE {self.visit(node.filter_)})"
+            if node.within_group_:
+                ordered = ", ".join(self.visit(item) for item in node.within_group_)
+                text += f" WITHIN GROUP (ORDER BY {ordered})"
+        return text
 
     def visit_Star(self, _node: Star) -> str:
         return "*"

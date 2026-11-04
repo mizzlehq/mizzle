@@ -14,9 +14,11 @@ from __future__ import annotations
 
 import datetime
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from decimal import Decimal
 from typing import TYPE_CHECKING, Literal, overload
+
+from mizzle.core.errors import QueryError
 
 if TYPE_CHECKING:
     from mizzle.core.query.select import Cte
@@ -372,6 +374,23 @@ class Star(Node):
 
 
 @dataclass(frozen=True)
+class AnyAll[T](Expr[T]):
+    """``= ANY (array)`` / ``> ALL (subquery)``: the right side of a quantified comparison."""
+
+    quantifier: Literal["ANY", "ALL"]
+    value: Node
+
+
+@dataclass(frozen=True)
+class PostfixOp[T](Expr[T]):
+    """``item op right`` for operators that are not comparisons (COLLATE, AT TIME ZONE)."""
+
+    item: Node
+    op: str
+    right: Node
+
+
+@dataclass(frozen=True)
 class Rollup(Node):
     """``GROUP BY ROLLUP (...)```."""
 
@@ -413,6 +432,27 @@ class TypedFunc[T](Func, Expr[T]):
 @dataclass(frozen=True)
 class Aggregate[T](TypedFunc[T]):
     """An aggregate (``count``, ``sum_``...); ``.over(...)`` makes it a window function."""
+
+    # ``FILTER (WHERE ...)``: only these rows feed the aggregate.
+    filter_: Node | None = None
+    # ``WITHIN GROUP (ORDER BY ...)``: the order of an ordered-set aggregate.
+    within_group_: tuple[Node, ...] = ()
+
+    def filter(self, condition: Condition) -> Aggregate[T]:
+        """``FILTER (WHERE ...)``: ``count(Users.id).filter(eq(Users.role, Role.ADMIN))``."""
+        return replace(self, filter_=condition)
+
+    def within_group(self, *exprs: ExprBase | OrderBy) -> Aggregate[T]:
+        """``WITHIN GROUP (ORDER BY ...)`` for ordered-set aggregates."""
+        if not exprs:
+            raise QueryError("within_group() needs at least one expression")
+        return replace(
+            self,
+            within_group_=tuple(
+                e if isinstance(e, OrderBy) else OrderBy(e, descending=False, nulls=None)
+                for e in exprs
+            ),
+        )
 
     def over(
         self,

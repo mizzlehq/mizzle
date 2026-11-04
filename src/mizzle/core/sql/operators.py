@@ -5,23 +5,27 @@ Functions, not overloaded ``==``: overloading ``__eq__`` on columns breaks hashi
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from dataclasses import replace
 from decimal import Decimal
-from typing import Literal, overload
+from typing import Literal, cast, overload
 
 from mizzle.core.errors import QueryError
 from mizzle.core.schema.column import ColumnBase
+from mizzle.core.sql.functions import bind, sql_type_of
 from mizzle.core.sql.nodes import (
     Aggregate,
+    AnyAll,
     Between,
     BinaryOp,
     BoolOp,
+    Cast,
     Condition,
     Excluded,
     Exists,
     Expr,
     ExprBase,
+    Fragment,
     InList,
     Node,
     Not,
@@ -29,6 +33,7 @@ from mizzle.core.sql.nodes import (
     Param,
     Placeholder,
     Postfix,
+    PostfixOp,
     Raw,
     Star,
     TypedNullable,
@@ -217,6 +222,7 @@ def count(expr: ExprBase | None = None, *, distinct: bool = False) -> Aggregate[
 type _Int = Expr[int] | Expr[int | None]
 type _Decimal = Expr[Decimal] | Expr[Decimal | None]
 type _Float = Expr[float] | Expr[float | None]
+type _Number = _Int | _Decimal | _Float
 
 
 # The overloads "overlap" only for impossible bottom types; both checkers flag that.
@@ -265,3 +271,222 @@ def nullable[T](expr: Expr[T]) -> Expr[T | None]:
 def excluded(column: ColumnBase) -> Excluded:
     """The row proposed for insertion, inside ``on_conflict_do_update(set_=...)``."""
     return Excluded(column)
+
+
+# -- null-safe comparison (EX2) -------------------------------------------------------
+
+
+def is_distinct_from[T](left: Expr[T], right: Operand[T] | None) -> Expr[bool]:
+    """``left IS DISTINCT FROM right``: like ``<>`` but NULL is an ordinary value, so the
+    result is never NULL. Use it to compare nullable columns reliably."""
+    return BinaryOp(left, "IS DISTINCT FROM", _wrap(right, left))
+
+
+def is_not_distinct_from[T](left: Expr[T], right: Operand[T] | None) -> Expr[bool]:
+    """``left IS NOT DISTINCT FROM right``: like ``=`` but NULL-safe."""
+    return BinaryOp(left, "IS NOT DISTINCT FROM", _wrap(right, left))
+
+
+# -- quantified comparison (EX1) ------------------------------------------------------
+
+
+def _quantified(values: object) -> Node:
+    if isinstance(values, Node):
+        return values
+    if not isinstance(values, Iterable):
+        return bind(values)
+    items: list[object] = list(values)
+    if not items:
+        raise QueryError("any_()/all_() need at least one value")
+    kind = next((t for v in items if (t := sql_type_of(v)) is not None), "text")
+    return Cast(Param(items), kind + "[]")
+
+
+@overload
+def any_[T](values: Expr[list[T]]) -> Expr[T]: ...
+@overload
+def any_[T](values: Sequence[T]) -> Expr[T]: ...
+@overload
+def any_[T](values: Node) -> Expr[T]: ...
+def any_[T](values: object) -> Expr[T]:
+    """``= ANY (values)``: true when the compared value equals any of them. Use it with
+    ``eq(col, any_([...]))``, or against an array column or a subquery."""
+    return AnyAll[T]("ANY", _quantified(values))
+
+
+@overload
+def all_[T](values: Expr[list[T]]) -> Expr[T]: ...
+@overload
+def all_[T](values: Sequence[T]) -> Expr[T]: ...
+@overload
+def all_[T](values: Node) -> Expr[T]: ...
+def all_[T](values: object) -> Expr[T]:
+    """``= ALL (values)``: true when the value equals every one of them."""
+    return AnyAll[T]("ALL", _quantified(values))
+
+
+# -- container operators (EX3, EX4) ---------------------------------------------------
+
+
+def _container(value: object) -> Node:
+    if isinstance(value, Node):
+        return value
+    if isinstance(value, dict):
+        return Cast(Param(cast("dict[str, object]", value)), "jsonb")
+    if isinstance(value, (list, tuple, set, frozenset)):
+        items: list[object] = list(cast("Iterable[object]", value))
+        if not items:
+            raise QueryError("an empty container is never a useful operand")
+        kind = next((t for v in items if (t := sql_type_of(v)) is not None), "text")
+        return Cast(Param(items), kind + "[]")
+    return bind(value)
+
+
+def contains(left: ExprBase, right: object) -> Expr[bool]:
+    """``left @> right``: left contains right (arrays, ranges, jsonb)."""
+    return BinaryOp(left, "@>", _container(right))
+
+
+def contained_by(left: ExprBase, right: object) -> Expr[bool]:
+    """``left <@ right``: left is contained by right."""
+    return BinaryOp(left, "<@", _container(right))
+
+
+def overlaps(left: ExprBase, right: object) -> Expr[bool]:
+    """``left && right``: the two share any element (arrays, ranges)."""
+    return BinaryOp(left, "&&", _container(right))
+
+
+def _json_key(key: str | int) -> Node:
+    if isinstance(key, int) and not isinstance(key, bool):
+        return Cast(Param(key), "integer")
+    return Cast(Param(key), "text")
+
+
+def get_field[T](value: Expr[T], key: str | int) -> Expr[T]:
+    """``value -> key``: a jsonb field (as jsonb). ``key`` is a string or array index."""
+    return PostfixOp[T](value, "->", _json_key(key))
+
+
+def get_field_text(value: ExprBase, key: str | int) -> Expr[str | None]:
+    """``value ->> key``: a jsonb field as text."""
+    return PostfixOp[str | None](value, "->>", _json_key(key))
+
+
+def get_path[T](value: Expr[T], path: Sequence[str]) -> Expr[T]:
+    """``value #> path``: a jsonb value at a text-array path."""
+    return PostfixOp[T](value, "#>", Cast(Param(list(path)), "text[]"))
+
+
+def get_path_text(value: ExprBase, path: Sequence[str]) -> Expr[str | None]:
+    """``value #>> path``: a jsonb value at a path, as text."""
+    return PostfixOp[str | None](value, "#>>", Cast(Param(list(path)), "text[]"))
+
+
+def has_key(value: ExprBase, key: str) -> Expr[bool]:
+    """``value ? key``: the jsonb object has this top-level key (or the array this string)."""
+    return BinaryOp(value, "?", Cast(Param(key), "text"))
+
+
+def has_any_key(value: ExprBase, keys: Sequence[str]) -> Expr[bool]:
+    """``value ?| keys``: the jsonb object has any of these top-level keys."""
+    return BinaryOp(value, "?|", Cast(Param(list(keys)), "text[]"))
+
+
+def has_all_keys(value: ExprBase, keys: Sequence[str]) -> Expr[bool]:
+    """``value ?& keys``: the jsonb object has all of these top-level keys."""
+    return BinaryOp(value, "?&", Cast(Param(list(keys)), "text[]"))
+
+
+# -- more aggregates (EX7) ------------------------------------------------------------
+
+
+def array_agg[T](expr: Expr[T]) -> Aggregate[list[T] | None]:
+    """Collects the values into an array (NULL when there are no rows)."""
+    return Aggregate[list[T] | None]("array_agg", (expr,))
+
+
+def string_agg[T](expr: Expr[T], delimiter: str | Expr[str]) -> Aggregate[str | None]:
+    """Joins the values with ``delimiter``: ``string_agg(Users.email, ", ")``."""
+    return Aggregate[str | None]("string_agg", (expr, bind(delimiter)))
+
+
+def bool_and(expr: Expr[bool]) -> Aggregate[bool | None]:
+    """True when every row is true."""
+    return Aggregate[bool | None]("bool_and", (expr,))
+
+
+def every(expr: Expr[bool]) -> Aggregate[bool | None]:
+    """``every()`` is SQL's other name for ``bool_and``."""
+    return Aggregate[bool | None]("every", (expr,))
+
+
+def bool_or(expr: Expr[bool]) -> Aggregate[bool | None]:
+    """True when any row is true."""
+    return Aggregate[bool | None]("bool_or", (expr,))
+
+
+def stddev(expr: _Number) -> Aggregate[float | Decimal | None]:
+    """Sample standard deviation (``stddev_samp``); NULL with fewer than two rows."""
+    return Aggregate[float | Decimal | None]("stddev_samp", (expr,))
+
+
+def stddev_pop(expr: _Number) -> Aggregate[float | Decimal | None]:
+    """Population standard deviation."""
+    return Aggregate[float | Decimal | None]("stddev_pop", (expr,))
+
+
+def variance(expr: _Number) -> Aggregate[float | Decimal | None]:
+    """Sample variance (``var_samp``)."""
+    return Aggregate[float | Decimal | None]("var_samp", (expr,))
+
+
+def var_pop(expr: _Number) -> Aggregate[float | Decimal | None]:
+    """Population variance."""
+    return Aggregate[float | Decimal | None]("var_pop", (expr,))
+
+
+def json_agg[T](expr: Expr[T]) -> Aggregate[list[T] | None]:
+    """Collects the values into a ``json`` array."""
+    return Aggregate[list[T] | None]("json_agg", (expr,))
+
+
+def jsonb_agg[T](expr: Expr[T]) -> Aggregate[list[T] | None]:
+    """Collects the values into a ``jsonb`` array."""
+    return Aggregate[list[T] | None]("jsonb_agg", (expr,))
+
+
+def json_object_agg[K, V](key: Expr[K], value: Expr[V]) -> Aggregate[dict[str, V] | None]:
+    """Collects key/value pairs into a ``json`` object."""
+    return Aggregate[dict[str, V] | None]("json_object_agg", (key, value))
+
+
+# -- ordered-set aggregates (EX9) -----------------------------------------------------
+
+
+def _fraction(fraction: float) -> Node:
+    number = float(fraction)
+    if not 0 <= number <= 1:
+        raise QueryError("the fraction must be between 0 and 1")
+    return Fragment((repr(number),))
+
+
+def mode[T](expr: Expr[T]) -> Aggregate[T | None]:
+    """The most frequent value: ``mode(Users.role)``."""
+    return Aggregate[T | None](
+        "mode", (), within_group_=(OrderBy(expr, descending=False, nulls=None),)
+    )
+
+
+def percentile_cont(fraction: float, expr: _Number) -> Aggregate[float | Decimal | None]:
+    """Continuous percentile: interpolates between values."""
+    return Aggregate[float | Decimal | None](
+        "percentile_cont", (_fraction(fraction),), within_group_=(OrderBy(expr, False, None),)
+    )
+
+
+def percentile_disc[T](fraction: float, expr: Expr[T]) -> Aggregate[T | None]:
+    """Discrete percentile: the first value whose cumulative fraction reaches ``fraction``."""
+    return Aggregate[T | None](
+        "percentile_disc", (_fraction(fraction),), within_group_=(OrderBy(expr, False, None),)
+    )

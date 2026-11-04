@@ -12,9 +12,11 @@ import datetime
 import re
 import uuid
 from collections.abc import Iterable, Sequence
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
+from dataclasses import replace as _replace
 from decimal import Decimal
 from typing import Literal, overload
+from typing import cast as _cast
 
 from mizzle.core.errors import QueryError
 from mizzle.core.schema.column import Column, ColumnBase
@@ -35,6 +37,7 @@ from mizzle.core.sql.nodes import (
     Over,
     Param,
     Placeholder,
+    PostfixOp,
     TypedCast,
     TypedFragment,
     TypedFunc,
@@ -57,7 +60,7 @@ _SQL_TYPES: tuple[tuple[type[object], str], ...] = (
 )
 
 
-def _sql_type(value: object) -> str | None:
+def sql_type_of(value: object) -> str | None:
     if isinstance(value, datetime.datetime):
         return "timestamp" if value.tzinfo is None else "timestamptz"
     return next((name for kind, name in _SQL_TYPES if isinstance(value, kind)), None)
@@ -127,13 +130,13 @@ def bind(value: object, like: Iterable[object] = ()) -> Node:
     become parameters encoded by a column among ``like``, or else cast to their SQL type."""
     if isinstance(value, Placeholder):
         column = None if value.column is not None else _first_column(like)
-        return value if column is None else replace(value, column=column)
+        return value if column is None else _replace(value, column=column)
     if isinstance(value, Node):
         return value
     column = _first_column(like)
     if column is not None:
         return Param(value, column)
-    sql_type = _sql_type(value)
+    sql_type = sql_type_of(value)
     return Param(value) if sql_type is None else Cast(Param(value), sql_type)
 
 
@@ -701,3 +704,311 @@ def _rank(
     if norm:
         args += (Fragment((str(_whole("normalization", norm)),)),)
     return TypedFunc[float](name, args)
+
+
+# -- more strings (EX5) ---------------------------------------------------------------
+
+
+def substring[S: (str, str | None)](
+    expr: Expr[S], start: int, length: int | None = None
+) -> Expr[S]:
+    """``substr(expr, start, length)``: ``start`` is 1-based; without ``length`` it runs to
+    the end of the string."""
+    args: tuple[Node, ...] = (expr, Fragment((str(_whole("start", start)),)))
+    if length is not None:
+        args += (Fragment((str(_whole("length", length)),)),)
+    return TypedFunc[S]("substr", args)
+
+
+def replace(expr: Expr[str], old: str, new: str) -> Expr[str]:
+    """Replace every occurrence of ``old`` with ``new``."""
+    return TypedFunc[str]("replace", (expr, bind(old), bind(new)))
+
+
+def strpos(expr: Expr[str], needle: str | Expr[str]) -> Expr[int]:
+    """1-based position of ``needle`` in ``expr``, or 0 when absent."""
+    return TypedFunc[int]("strpos", (expr, bind(needle)))
+
+
+def left(expr: Expr[str], n: int) -> Expr[str]:
+    """The first ``n`` characters."""
+    return TypedFunc[str]("left", (expr, Fragment((str(_whole("n", n)),))))
+
+
+def right(expr: Expr[str], n: int) -> Expr[str]:
+    """The last ``n`` characters."""
+    return TypedFunc[str]("right", (expr, Fragment((str(_whole("n", n)),))))
+
+
+def lpad(expr: Expr[str], length: int, fill: str = " ") -> Expr[str]:
+    """Pad on the left with ``fill`` until ``length`` characters."""
+    return TypedFunc[str]("lpad", (expr, Fragment((str(_whole("length", length)),)), bind(fill)))
+
+
+def rpad(expr: Expr[str], length: int, fill: str = " ") -> Expr[str]:
+    """Pad on the right with ``fill`` until ``length`` characters."""
+    return TypedFunc[str]("rpad", (expr, Fragment((str(_whole("length", length)),)), bind(fill)))
+
+
+def repeat(expr: Expr[str], n: int) -> Expr[str]:
+    """``expr`` repeated ``n`` times."""
+    return TypedFunc[str]("repeat", (expr, Fragment((str(_whole("n", n)),))))
+
+
+def reverse(expr: Expr[str]) -> Expr[str]:
+    """The string with its characters in reverse order."""
+    return TypedFunc[str]("reverse", (expr,))
+
+
+def split_part(expr: Expr[str], delimiter: str | Expr[str], n: int) -> Expr[str]:
+    """The ``n``-th field of ``expr`` split on ``delimiter`` (1-based)."""
+    return TypedFunc[str]("split_part", (expr, bind(delimiter), Fragment((str(_whole("n", n)),))))
+
+
+def starts_with(expr: Expr[str], prefix: str | Expr[str]) -> Expr[bool]:
+    """Whether ``expr`` begins with ``prefix``."""
+    return TypedFunc[bool]("starts_with", (expr, bind(prefix)))
+
+
+def regexp_replace(
+    expr: Expr[str], pattern: str | Expr[str], replacement: str | Expr[str], *, flags: str = ""
+) -> Expr[str]:
+    """Replace the first match of ``pattern`` (all with the ``g`` flag). ``flags`` combines
+    ``g``, ``i``, ``m``, ``n``, ``p``, ``s``, ``x`` and ``w``."""
+    args: tuple[Node, ...] = (expr, bind(pattern), bind(replacement))
+    if flags:
+        args += (bind(flags),)
+    return TypedFunc[str]("regexp_replace", args)
+
+
+def regexp_match(
+    expr: Expr[str], pattern: str | Expr[str], *, flags: str = ""
+) -> Expr[list[str] | None]:
+    """The captured groups of the first match, or NULL when there is none."""
+    args: tuple[Node, ...] = (expr, bind(pattern))
+    if flags:
+        args += (bind(flags),)
+    return TypedFunc[list[str] | None]("regexp_match", args)
+
+
+def md5(expr: Expr[str]) -> Expr[str]:
+    """The MD5 hash of the string, as 32 hex digits."""
+    return TypedFunc[str]("md5", (expr,))
+
+
+# -- more numbers (EX6) ---------------------------------------------------------------
+
+
+def ceil[N: (float, float | None, Decimal, Decimal | None)](expr: Expr[N]) -> Expr[N]:
+    """Round up to the nearest integer."""
+    return TypedFunc[N]("ceil", (expr,))
+
+
+def floor[N: (float, float | None, Decimal, Decimal | None)](expr: Expr[N]) -> Expr[N]:
+    """Round down to the nearest integer."""
+    return TypedFunc[N]("floor", (expr,))
+
+
+def sqrt[N: (float, float | None, Decimal, Decimal | None)](expr: Expr[N]) -> Expr[N]:
+    """Square root (NaN for negative numbers)."""
+    return TypedFunc[N]("sqrt", (expr,))
+
+
+def power[N: (float, Decimal)](base: Expr[N], exponent: N | Expr[N]) -> Expr[N]:
+    """``base`` raised to ``exponent``."""
+    return TypedFunc[N]("power", (base, bind(exponent, (base,))))
+
+
+def ln[N: (float, float | None, Decimal, Decimal | None)](expr: Expr[N]) -> Expr[N]:
+    """Natural logarithm."""
+    return TypedFunc[N]("ln", (expr,))
+
+
+def exp[N: (float, float | None, Decimal, Decimal | None)](expr: Expr[N]) -> Expr[N]:
+    """``e`` raised to ``expr``."""
+    return TypedFunc[N]("exp", (expr,))
+
+
+def log[N: (float, Decimal)](base: Expr[N], value: N | Expr[N]) -> Expr[N]:
+    """Logarithm of ``value`` to ``base``."""
+    return TypedFunc[N]("log", (base, bind(value, (base,))))
+
+
+def mod[N: (int, Decimal)](value: Expr[N], divisor: N | Expr[N]) -> Expr[N]:
+    """``value`` modulo ``divisor``."""
+    return TypedFunc[N]("mod", (value, bind(divisor, (value,))))
+
+
+def sign[N: (float, float | None, Decimal, Decimal | None)](expr: Expr[N]) -> Expr[N]:
+    """-1, 0 or 1 according to the sign of ``expr``."""
+    return TypedFunc[N]("sign", (expr,))
+
+
+def random() -> Expr[float]:
+    """A random value between 0.0 and 1.0."""
+    return TypedFunc[float]("random", ())
+
+
+# -- arrays (EX3) ---------------------------------------------------------------------
+
+
+# An array expression, nullable or not: array columns and ``array_agg`` are nullable.
+type Array[T] = Expr[list[T]] | Expr[list[T] | None]
+
+
+def unnest[T](array: Array[T]) -> Expr[T]:
+    """Expands an array to one row per element (a set-returning function)."""
+    return TypedFunc[T]("unnest", (array,))
+
+
+def array_length[T](array: Array[T], dimension: int = 1) -> Expr[int | None]:
+    """The length of ``array`` along ``dimension`` (NULL when that dimension is empty)."""
+    return TypedFunc[int | None](
+        "array_length", (array, Fragment((str(_whole("dimension", dimension)),)))
+    )
+
+
+def array_position[T](array: Array[T], value: T | Expr[T]) -> Expr[int | None]:
+    """1-based position of ``value`` in ``array``, or NULL when absent."""
+    return TypedFunc[int | None]("array_position", (array, bind(value)))
+
+
+def array_append[T](array: Array[T], value: T | Expr[T]) -> Expr[list[T]]:
+    """``array`` with ``value`` appended at the end."""
+    return TypedFunc[list[T]]("array_append", (array, bind(value)))
+
+
+def array_remove[T](array: Array[T], value: T | Expr[T]) -> Expr[list[T]]:
+    """``array`` with every element equal to ``value`` removed."""
+    return TypedFunc[list[T]]("array_remove", (array, bind(value)))
+
+
+def array_cat[T](left: Array[T], right: Array[T]) -> Expr[list[T]]:
+    """The two arrays concatenated."""
+    return TypedFunc[list[T]]("array_cat", (left, right))
+
+
+# -- json (EX4) -----------------------------------------------------------------------
+
+
+def _jsonb(value: object) -> Node:
+    if isinstance(value, Node):
+        return value
+    if isinstance(value, dict):
+        return Cast(Param(_cast("dict[str, object]", value)), "jsonb")
+    if isinstance(value, list):
+        return Cast(Param(_cast("list[object]", value)), "jsonb")
+    return bind(value)
+
+
+def jsonb_set(
+    target: ExprBase, path: Sequence[str], value: object, *, create: bool = True
+) -> ExprBase:
+    """``jsonb_set(target, path, value, create)``: set the value at a text-array path."""
+    return _func(
+        "jsonb_set",
+        target,
+        Cast(Param(list(path)), "text[]"),
+        _jsonb(value),
+        Fragment(("true" if create else "false",)),
+    )
+
+
+def jsonb_build_object(*pairs: object) -> Expr[dict[str, object]]:
+    """Build a jsonb object from alternating keys and values:
+    ``jsonb_build_object("name", Users.email, "n", count())``."""
+    if len(pairs) % 2:
+        raise QueryError("jsonb_build_object() takes key/value pairs")
+    return TypedFunc[dict[str, object]]("jsonb_build_object", tuple(bind(p) for p in pairs))
+
+
+def jsonb_build_array(*values: object) -> Expr[list[object]]:
+    """Build a jsonb array from the values."""
+    return TypedFunc[list[object]]("jsonb_build_array", tuple(bind(v) for v in values))
+
+
+# -- dates and times, extras (EX10) ---------------------------------------------------
+
+
+@overload
+def age(
+    value: Expr[datetime.datetime] | Expr[datetime.date],
+    start: Expr[datetime.datetime] | Expr[datetime.date],
+) -> Expr[datetime.timedelta]: ...
+@overload
+def age(value: Expr[datetime.datetime] | Expr[datetime.date]) -> Expr[datetime.timedelta]: ...
+def age(value: ExprBase, start: ExprBase | None = None) -> Expr[datetime.timedelta]:
+    """The interval between two timestamps, or from ``value`` to today (at midnight)."""
+    if start is None:
+        return TypedFunc[datetime.timedelta]("age", (value,))
+    return TypedFunc[datetime.timedelta]("age", (value, start))
+
+
+def to_char(value: ExprBase, template: str) -> Expr[str]:
+    """Format a value as text with a template: ``to_char(Users.created_at, "YYYY-MM")``."""
+    return TypedFunc[str]("to_char", (value, bind(template)))
+
+
+def to_date(text: str | Expr[str], format: str) -> Expr[datetime.date]:
+    """Parse ``text`` as a date with a template: ``to_date("2024-01-02", "YYYY-MM-DD")``."""
+    return TypedFunc[datetime.date]("to_date", (bind(text), bind(format)))
+
+
+def to_timestamp(value: float | ExprBase) -> Expr[datetime.datetime]:
+    """A Unix epoch (seconds since 1970) as ``timestamptz``."""
+    return TypedFunc[datetime.datetime]("to_timestamp", (bind(value),))
+
+
+def make_interval(
+    *,
+    years: int = 0,
+    months: int = 0,
+    weeks: int = 0,
+    days: int = 0,
+    hours: int = 0,
+    mins: int = 0,
+    secs: float = 0.0,
+) -> Expr[datetime.timedelta]:
+    """Build an interval from named parts: ``make_interval(days=7)``."""
+    parts = (
+        ("years", years),
+        ("months", months),
+        ("weeks", weeks),
+        ("days", days),
+        ("hours", hours),
+        ("mins", mins),
+        ("secs", secs),
+    )
+    args = [Fragment((f"{name} => {value!r}",)) for name, value in parts if value]
+    return TypedFunc[datetime.timedelta]("make_interval", tuple(args))
+
+
+def current_timestamp() -> Expr[datetime.datetime]:
+    """The start time of the transaction as ``timestamptz`` (SQL standard spelling)."""
+    return TypedFragment[datetime.datetime](("CURRENT_TIMESTAMP",))
+
+
+def localtime() -> Expr[datetime.time]:
+    """The current time of day without a time zone."""
+    return TypedFragment[datetime.time](("LOCALTIME",))
+
+
+# -- collation and time zone (EX11) ---------------------------------------------------
+
+
+def collate[T](expr: Expr[T], name: str) -> Expr[T]:
+    """``expr COLLATE name``: sort/compare ``expr`` with the named collation."""
+    quoted = '"' + name.replace('"', '""') + '"'
+    return PostfixOp[T](expr, "COLLATE", Fragment((quoted,)))
+
+
+def at_time_zone[
+    T: (
+        datetime.datetime,
+        datetime.datetime | None,
+        datetime.time,
+        datetime.time | None,
+    )
+](expr: Expr[T], zone: str | Expr[str]) -> Expr[T]:
+    """``expr AT TIME ZONE zone``: convert between ``timestamp`` and ``timestamptz``."""
+    return PostfixOp[T](expr, "AT TIME ZONE", bind(zone))
