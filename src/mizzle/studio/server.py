@@ -1,9 +1,13 @@
 """Studio backend: a local JSON API over the live database plus the built React UI.
 
 Security model (Studio can read and change data):
-- binds to 127.0.0.1 only, and rejects other Host headers (DNS rebinding);
+- binds to 127.0.0.1 by default, and rejects other Host headers (DNS rebinding);
 - every /api request needs ``Authorization: Bearer <token>``; the random token is only
   in the URL fragment that ``mizzle studio`` prints, which browsers never send to servers;
+- for remote use, bind another host with ``--host`` and pass ``--auth USER:PASSWORD``
+  (HTTP Basic) and/or ``--token`` / ``MIZZLE_STUDIO_TOKEN``; mizzle refuses to listen on a
+  non-loopback host with no credentials. A non-loopback bind drops the Host check (clients
+  reach it by an address it cannot know), which Basic auth covers;
 - no CORS headers, so other websites cannot call the API from a browser;
 - ``--read-only`` blocks every write, and raw SQL runs in a read-only transaction;
 - table and column names are checked against the introspected schema and quoted;
@@ -12,6 +16,7 @@ Security model (Studio can read and change data):
 
 from __future__ import annotations
 
+import base64
 import csv
 import datetime
 import enum
@@ -19,6 +24,7 @@ import hmac
 import io
 import json
 import logging
+import os
 import re
 import secrets
 import webbrowser
@@ -37,7 +43,7 @@ from starlette.routing import BaseRoute, Mount, Route
 from starlette.staticfiles import StaticFiles
 from starlette.types import ASGIApp
 
-from mizzle.core.errors import MizzleError
+from mizzle.core.errors import MigrationError, MizzleError
 from mizzle.core.snapshot import ColumnSnap, Snapshot, TableSnap, key
 from mizzle.dialects.base import Connection, Dialect, Driver
 from mizzle.dialects.postgres.ddl import SERIAL_TYPES, qualified, quote
@@ -595,23 +601,58 @@ def _api(
     return wrapped
 
 
+def _basic_credentials(user: str, password: str) -> bytes:
+    return b"Basic " + base64.b64encode(f"{user}:{password}".encode())
+
+
+def parse_auth(value: str) -> tuple[str, str]:
+    """Parse ``USER:PASSWORD`` for HTTP Basic auth. The password may contain ``:``."""
+    user, sep, password = value.partition(":")
+    if not sep or not user or not password:
+        raise MigrationError("--auth must be USER:PASSWORD, with a non-empty user and password")
+    return user, password
+
+
+def resolve_token(explicit: str | None = None) -> str:
+    """The bearer token: ``--token``, then ``MIZZLE_STUDIO_TOKEN``, then a random one."""
+    return explicit or os.environ.get("MIZZLE_STUDIO_TOKEN") or secrets.token_urlsafe(32)
+
+
 class _Guard(BaseHTTPMiddleware):
     expected: bytes
-    allowed_hosts: set[str]
+    allowed_hosts: set[str] | None
+    basic: bytes | None
 
-    def __init__(self, app: ASGIApp, token: str, allowed_hosts: set[str]) -> None:
+    def __init__(
+        self,
+        app: ASGIApp,
+        token: str,
+        allowed_hosts: set[str] | None,
+        basic_auth: tuple[str, str] | None = None,
+    ) -> None:
         super().__init__(app)
         self.expected = f"Bearer {token}".encode()
         self.allowed_hosts = allowed_hosts
+        self.basic = None if basic_auth is None else _basic_credentials(*basic_auth)
+
+    def _authorized(self, request: Request) -> bool:
+        given = request.headers.get("authorization", "").encode()
+        if hmac.compare_digest(given, self.expected):
+            return True
+        return self.basic is not None and hmac.compare_digest(given, self.basic)
 
     @override
     async def dispatch(self, request: Request, call_next: RequestResponseEndpoint) -> Response:
-        if request.headers.get("host", "") not in self.allowed_hosts:
+        if (
+            self.allowed_hosts is not None
+            and request.headers.get("host", "") not in self.allowed_hosts
+        ):
             return JSONResponse({"error": "forbidden host"}, status_code=403)
-        if request.url.path.startswith("/api/"):
-            given = request.headers.get("authorization", "").encode()
-            if not hmac.compare_digest(given, self.expected):
-                return JSONResponse({"error": "missing or wrong token"}, status_code=401)
+        if request.url.path.startswith("/api/") and not self._authorized(request):
+            headers = {"WWW-Authenticate": 'Basic realm="mizzle studio"'} if self.basic else None
+            return JSONResponse(
+                {"error": "missing or wrong credentials"}, status_code=401, headers=headers
+            )
         response = await call_next(request)
         response.headers.update(_SECURITY_HEADERS)
         return response
@@ -627,10 +668,11 @@ def create_app(
     url: str,
     schemas: list[str],
     token: str,
-    allowed_hosts: set[str],
+    allowed_hosts: set[str] | None,
     read_only: bool = False,
     static_dir: Path = STATIC_DIR,
     state_path: Path | None = None,
+    basic_auth: tuple[str, str] | None = None,
 ) -> Starlette:
     studio = Studio(dialect, url, schemas, read_only, state_path=state_path)
 
@@ -671,7 +713,9 @@ def create_app(
     return Starlette(
         routes=routes,
         lifespan=lifespan,
-        middleware=[Middleware(_Guard, token=token, allowed_hosts=allowed_hosts)],
+        middleware=[
+            Middleware(_Guard, token=token, allowed_hosts=allowed_hosts, basic_auth=basic_auth)
+        ],
     )
 
 
@@ -682,26 +726,53 @@ def serve(
     read_only: bool,
     open_browser: bool,
     ui_dir: str | None = None,
+    host: str = "127.0.0.1",
+    token: str | None = None,
+    auth: str | None = None,
 ) -> None:
     import uvicorn
 
     from mizzle.studio.assets import ui_path
 
+    basic_auth = parse_auth(auth) if auth else None
+    token_value = resolve_token(token)
+    loopback = host in {"127.0.0.1", "localhost", "::1"}
+    if (
+        not loopback
+        and token is None
+        and not os.environ.get("MIZZLE_STUDIO_TOKEN")
+        and not basic_auth
+    ):
+        raise MigrationError(
+            f"refusing to listen on {host} without credentials; pass --auth USER:PASSWORD "
+            "or --token (or set MIZZLE_STUDIO_TOKEN)"
+        )
     static_dir = ui_path(ui_dir)  # downloads and verifies the UI on first run
-    token = secrets.token_urlsafe(32)
     app = create_app(
         dialect=config.dialect(),
         url=config.url(),
         schemas=config.schema_filter,
-        token=token,
-        allowed_hosts={f"127.0.0.1:{port}", f"localhost:{port}"},
+        token=token_value,
+        # A remote client reaches the server by an address it cannot know, so the Host check
+        # only makes sense on loopback (Basic auth covers the difference).
+        allowed_hosts=(
+            {f"127.0.0.1:{port}", f"localhost:{port}", f"[::1]:{port}"} if loopback else None
+        ),
         read_only=read_only,
         static_dir=static_dir,
         state_path=config.root / ".mizzle" / "studio.json",
+        basic_auth=basic_auth,
     )
-    link = f"http://127.0.0.1:{port}/#token={token}"
     mode = " (read-only)" if read_only else ""
-    print(f"mizzle studio{mode} running at {link}\nPress Ctrl+C to stop.")
-    if open_browser:
-        webbrowser.open(link)
-    uvicorn.run(app, host="127.0.0.1", port=port, log_level="warning")
+    if loopback:
+        link = f"http://127.0.0.1:{port}/#token={token_value}"
+        print(f"mizzle studio{mode} running at {link}\nPress Ctrl+C to stop.")
+        if open_browser:
+            webbrowser.open(link)
+    else:
+        how = "HTTP Basic" if basic_auth else "the bearer token"
+        print(
+            f"mizzle studio{mode} listening on {host}:{port} (authenticate with {how}).\n"
+            "Press Ctrl+C to stop."
+        )
+    uvicorn.run(app, host=host, port=port, log_level="warning")

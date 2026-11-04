@@ -5,9 +5,16 @@ from typing import Any
 import pytest
 from starlette.testclient import TestClient
 
+from mizzle.core.errors import MigrationError
 from mizzle.dialects.postgres import PostgresDialect
 from mizzle.dialects.postgres.driver import PostgresDriver
-from mizzle.studio.server import create_app, split_statements
+from mizzle.studio.server import (
+    _basic_credentials,
+    create_app,
+    parse_auth,
+    resolve_token,
+    split_statements,
+)
 
 TOKEN = "test-token"
 AUTH = {"Authorization": f"Bearer {TOKEN}"}
@@ -20,12 +27,15 @@ def make_client(
     read_only: bool = False,
     static: Path | None = None,
     state_path: Path | None = None,
+    basic_auth: tuple[str, str] | None = None,
 ) -> TestClient:
     kwargs: dict[str, Any] = {}
     if static is not None:
         kwargs["static_dir"] = static
     if state_path is not None:
         kwargs["state_path"] = state_path
+    if basic_auth is not None:
+        kwargs["basic_auth"] = basic_auth
     app = create_app(
         dialect=PostgresDialect(),
         url=pg_url,
@@ -36,6 +46,45 @@ def make_client(
         **kwargs,
     )
     return TestClient(app)
+
+
+def test_parse_auth_accepts_user_and_password() -> None:
+    assert parse_auth("admin:secret") == ("admin", "secret")
+    assert parse_auth("admin:pa:ss") == ("admin", "pa:ss")
+    for bad in ("nocolon", "user:", ":pass"):
+        with pytest.raises(MigrationError):
+            parse_auth(bad)
+
+
+def test_resolve_token_prefers_explicit_then_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    assert resolve_token("given") == "given"
+    monkeypatch.setenv("MIZZLE_STUDIO_TOKEN", "from-env")
+    assert resolve_token() == "from-env"
+    assert resolve_token("given") == "given"  # explicit still wins
+    monkeypatch.delenv("MIZZLE_STUDIO_TOKEN")
+    token = resolve_token()
+    assert token and token != "given"
+
+
+def test_basic_auth_guards_the_api(pg_url: str, driver: PostgresDriver) -> None:
+    with make_client(pg_url, basic_auth=("admin", "secret")) as client:
+        unauthorized = client.get("/api/meta")
+        assert unauthorized.status_code == 401
+        assert unauthorized.headers["www-authenticate"] == 'Basic realm="mizzle studio"'
+
+        wrong = client.get(
+            "/api/meta", headers={"Authorization": _basic_credentials("admin", "nope").decode()}
+        )
+        assert wrong.status_code == 401
+
+        good = client.get(
+            "/api/meta", headers={"Authorization": _basic_credentials("admin", "secret").decode()}
+        )
+        assert good.status_code == 200
+        assert good.json()["dialect"] == "postgresql"
+
+        # The bearer token keeps working alongside Basic auth.
+        assert client.get("/api/meta", headers=AUTH).status_code == 200
 
 
 def test_split_statements_handles_quotes_and_comments() -> None:

@@ -96,3 +96,14 @@ The UI downloads on first run (verified by SHA-256). `--ui-path` uses a local bu
 instead, for offline machines. To prefetch the UI ahead of time (for example while
 building an image), run `mizzle studio --download-ui`; it downloads and verifies the UI,
 prints where it landed, and exits without starting the server.
+
+Studio binds `127.0.0.1` and requires a bearer token (printed in the URL it opens), so only
+someone at the machine can reach it. To use it remotely, bind another host and set credentials:
+
+```bash
+mizzle studio --host 0.0.0.0 --auth admin:$(cat /run/secrets/studio-password)
+```
+
+Binding a non-loopback host without `--auth` (or `--token` / `MIZZLE_STUDIO_TOKEN`) is
+refused. Basic auth is over HTTP, so put it behind TLS (a reverse proxy) when the network is
+not trusted.

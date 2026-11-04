@@ -50,8 +50,11 @@ class Args(Protocol):
     to: str | None
     out: str | None
     port: int
+    host: str
     read_only: bool
     no_open: bool
+    auth: str | None
+    token: str | None
     download_ui: bool
     ui_path: str | None
     schema: str
@@ -632,6 +635,9 @@ def cmd_studio(config: Config, args: Args) -> int:
         read_only=args.read_only,
         open_browser=not args.no_open,
         ui_dir=args.ui_path,
+        host=args.host,
+        token=args.token,
+        auth=args.auth,
     )
     return 0
 
@@ -734,8 +740,18 @@ def _parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("studio", help="browse and edit data in the browser")
     p.add_argument("--port", type=int, default=4983)
+    p.add_argument("--host", default="127.0.0.1", help="interface to bind (default: 127.0.0.1)")
     p.add_argument("--read-only", action="store_true")
     p.add_argument("--no-open", action="store_true", help="do not open a browser")
+    p.add_argument(
+        "--auth",
+        metavar="USER:PASSWORD",
+        help="also require HTTP Basic auth (needed to bind a non-loopback host)",
+    )
+    p.add_argument(
+        "--token",
+        help="bearer token (default: a random one, or $MIZZLE_STUDIO_TOKEN)",
+    )
     p.add_argument(
         "--download-ui",
         action="store_true",
