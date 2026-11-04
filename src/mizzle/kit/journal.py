@@ -13,6 +13,7 @@ import hashlib
 import json
 import re
 import shutil
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import NotRequired, TypedDict, cast
@@ -34,6 +35,9 @@ class JournalEntry(TypedDict):
     created_at: str
     # A hand-written (or templated) migration: its SQL is expected to change after generate.
     custom: NotRequired[bool]
+    # A squashed migration: the names it replaces, so a database that applied them already
+    # treats this migration as applied instead of failing "missing on disk".
+    supersedes: NotRequired[list[str]]
 
 
 class Journal(TypedDict):
@@ -71,6 +75,7 @@ class Migration:
     name: str  # folder name, e.g. "0001_create_users"; also the id stored in the database
     path: Path
     custom: bool = False  # a hand-written migration may be edited after generate
+    supersedes: tuple[str, ...] = ()  # names of the migrations a squash replaced
 
     @property
     def sql_path(self) -> Path:
@@ -107,6 +112,11 @@ def _parse_entry(raw: object, source: Path) -> JournalEntry:
             parsed = JournalEntry(index=index, name=name, hash=hash_, created_at=created_at)
             if entry.get("custom") is True:
                 parsed["custom"] = True
+            raw_supersedes = entry.get("supersedes")
+            if isinstance(raw_supersedes, list):
+                names = [s for s in cast("list[object]", raw_supersedes) if isinstance(s, str)]
+                if names:
+                    parsed["supersedes"] = names
             return parsed
     raise MigrationError(f"{source}: malformed journal entry {raw!r}")
 
@@ -150,7 +160,13 @@ class MigrationsDir:
 
     def migrations(self) -> list[Migration]:
         return [
-            Migration(e["index"], e["name"], self.root / e["name"], bool(e.get("custom")))
+            Migration(
+                e["index"],
+                e["name"],
+                self.root / e["name"],
+                bool(e.get("custom")),
+                tuple(e.get("supersedes", ())),
+            )
             for e in self.journal()["entries"]
         ]
 
@@ -165,11 +181,12 @@ class MigrationsDir:
         snapshot: Snapshot,
         header: str = "",
         custom: bool = False,
+        supersedes: Sequence[str] = (),
     ) -> Migration:
         journal = self.journal()
         index = journal["entries"][-1]["index"] + 1 if journal["entries"] else 1
         folder = f"{index:04d}_{slugify(name)}"
-        migration = Migration(index, folder, self.root / folder, custom)
+        migration = Migration(index, folder, self.root / folder, custom, tuple(supersedes))
         migration.path.mkdir(parents=True, exist_ok=False)
         migration.sql_path.write_text(format_sql(statements, header), encoding="utf-8")
         migration.snapshot_path.write_text(json.dumps(snapshot, indent=2) + "\n", encoding="utf-8")
@@ -181,6 +198,8 @@ class MigrationsDir:
         )
         if custom:
             entry["custom"] = True
+        if supersedes:
+            entry["supersedes"] = list(supersedes)
         journal["entries"].append(entry)
         self._save_journal(journal)
         return migration
@@ -208,25 +227,50 @@ class MigrationsDir:
     def repair(self) -> list[str]:
         """Reconcile the journal with the folders on disk: add folders it is missing, drop
         entries whose folder is gone, refresh hashes and re-link the ``prev_id`` chain.
-        Returns the fixes applied (empty when nothing changed)."""
+        Returns the fixes applied (empty when nothing changed).
+
+        It never replaces an entry with a different folder that reuses its number: that
+        branch is ambiguous and refusing keeps an applied migration from being swapped out.
+        """
         if not self.root.exists():
             return []
         journal = self.journal()
         known = {e["index"]: e for e in journal["entries"]}
-        on_disk: dict[int, str] = {}
+        on_disk: dict[int, list[str]] = {}
         for folder in sorted(p for p in self.root.iterdir() if p.is_dir() and p.name != "meta"):
             match = _INDEX.match(folder.name)
             if match is not None:
-                on_disk[int(match.group(1))] = folder.name
+                on_disk.setdefault(int(match.group(1)), []).append(folder.name)
+        for index, names in sorted(on_disk.items()):
+            if len(names) > 1:
+                raise MigrationError(
+                    f"two migrations share number {index:04d}: {', '.join(names)}; "
+                    "rename one of them before --fix"
+                )
         fixes: list[str] = []
         entries: list[JournalEntry] = []
         prev_id: str | None = None
         for index in sorted(on_disk):
-            name = on_disk[index]
+            name = on_disk[index][0]
             migration = Migration(index, name, self.root / name)
-            if not migration.sql_path.exists() or not migration.snapshot_path.exists():
-                continue  # `check` reports the missing file as an error
             old = known.get(index)
+            if old is not None and old["name"] != name:
+                raise MigrationError(
+                    f"journal entry {index:04d} is {old['name']!r} but the folder is {name!r}; "
+                    "refusing to rewrite an entry that may be applied"
+                )
+            if not migration.sql_path.exists() or not migration.snapshot_path.exists():
+                # Do not remove the entry: `check` reports the missing file, and dropping it
+                # here would silently re-link the chain and hide a migration that may be
+                # applied. Keep what the journal already knows.
+                if old is not None:
+                    entries.append(old)
+                    fixes.append(f"{name}: left as is; migration.sql or snapshot.json is missing")
+                    if migration.snapshot_path.exists():
+                        prev_id = migration.snapshot()["id"]
+                else:
+                    fixes.append(f"{name}: ignored; migration.sql or snapshot.json is missing")
+                continue  # `check` reports the missing file as an error
             digest = migration.hash()
             if old is None:
                 created = datetime.datetime.fromtimestamp(
@@ -235,13 +279,13 @@ class MigrationsDir:
                 fixes.append(f"{name}: added to the journal")
             else:
                 created = old["created_at"]
-                if old["name"] != name:
-                    fixes.append(f"{name}: journal name updated")
                 if old["hash"] != digest:
                     fixes.append(f"{name}: hash refreshed")
             entry = JournalEntry(index=index, name=name, hash=digest, created_at=created)
             if old is not None and old.get("custom"):
                 entry["custom"] = True
+            if old is not None and (old_supersedes := old.get("supersedes")):
+                entry["supersedes"] = old_supersedes
             entries.append(entry)
             snapshot = migration.snapshot()
             if snapshot["prev_id"] != prev_id:
@@ -253,7 +297,7 @@ class MigrationsDir:
             prev_id = snapshot["id"]
         for index, old in known.items():
             if index not in on_disk:
-                fixes.append(f"{old['name']}: removed from the journal (folder is gone)")
+                fixes.append(f"{old['name']}: dropped from the journal (folder is gone)")
         journal["entries"] = entries
         if fixes:
             self._save_journal(journal)

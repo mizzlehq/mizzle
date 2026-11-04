@@ -307,8 +307,11 @@ async def test_reset_reruns_every_migration(
     await conn.close()
     capsys.readouterr()
 
-    assert await cli("reset") == 1  # non-interactive: needs --force
-    assert await cli("reset", "--force") == 0
+    database = kit_url.rsplit("/", 1)[-1]
+    assert await cli("reset") == 1  # non-interactive: needs an explicit confirmation
+    assert await cli("reset", "--force") == 1  # --force alone no longer confirms a reset
+    assert await cli("reset", "--force", "--database", "wrong") == 1
+    assert await cli("reset", "--force", "--database", database) == 0
     assert "Reset: applied 1 migration(s)." in capsys.readouterr().out
     conn = await asyncpg.connect(kit_url)
     assert await conn.fetchval("SELECT count(*) FROM users") == 0  # dropped and recreated
@@ -706,3 +709,214 @@ async def test_objects_generate_migrate_push_pull(
     assert await cli("push", "--dry-run") == 0
     out = capsys.readouterr().out
     assert "No schema changes." in out and "Database is up to date." in out
+
+
+async def test_reset_reruns_when_history_lives_in_another_schema(
+    project: Path, kit_url: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # K1: the history schema is not in schema_filter, so a schema drop never cleared it.
+    toml = project / "mizzle.toml"
+    toml.write_text(toml.read_text() + 'migrations_schema = "mizzle_meta"\n')
+    assert await cli("generate") == 0
+    assert await cli("migrate") == 0
+    capsys.readouterr()
+
+    database = kit_url.rsplit("/", 1)[-1]
+    assert await cli("reset", "--force", "--database", database) == 0
+    assert "Reset: applied 1 migration(s)." in capsys.readouterr().out
+    conn = await asyncpg.connect(kit_url)
+    assert await conn.fetchval("SELECT count(*) FROM users") == 0  # really re-ran
+    await conn.close()
+
+
+async def test_reset_keeps_unmanaged_objects(project: Path, kit_url: str) -> None:
+    # K3: reset drops what mizzle manages, never an unmanaged table in public.
+    assert await cli("generate") == 0
+    assert await cli("migrate") == 0
+    conn = await asyncpg.connect(kit_url)
+    await conn.execute("CREATE TABLE public.keepme (id int)")
+    await conn.execute("INSERT INTO public.users (email) VALUES ('a@b.c')")
+    await conn.close()
+
+    database = kit_url.rsplit("/", 1)[-1]
+    assert await cli("reset", "--force", "--database", database) == 0
+    conn = await asyncpg.connect(kit_url)
+    assert await conn.fetchval("SELECT to_regclass('public.keepme')") is not None
+    assert await conn.fetchval("SELECT count(*) FROM users") == 0
+    await conn.close()
+
+
+async def test_squash_refuses_to_lose_hand_written_sql(
+    project: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # K6: collapsing history must not silently delete a custom migration's SQL.
+    assert await cli("generate") == 0
+    assert await cli("generate", "--custom", "--name", "seed") == 0
+    custom = next(project.glob("migrations/0002_seed/migration.sql"))
+    custom.write_text(custom.read_text() + "INSERT INTO users (email) VALUES ('a@b.c');\n")
+    capsys.readouterr()
+    assert await cli("squash", "--name", "baseline") == 1
+    assert "hand-written SQL" in capsys.readouterr().err
+    assert len(list(project.glob("migrations/0[0-9][0-9][0-9]_*"))) == 2  # untouched
+
+
+async def test_squash_is_adopted_by_a_database_that_applied_the_old_history(
+    project: Path, kit_url: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # K7: after a squash, an existing database must not fail "missing on disk".
+    assert await cli("generate") == 0
+    assert await cli("migrate") == 0
+    old_name = MigrationsDir(project / "migrations", "postgresql").migrations()[0].name
+    capsys.readouterr()
+
+    assert await cli("squash", "--name", "baseline") == 0
+    assert "0001_baseline" in next(iter(project.glob("migrations/0001_*"))).name
+
+    assert await cli("migrate") == 0  # adopted, nothing re-run
+    assert "Database is up to date." in capsys.readouterr().out
+    assert await cli("status", "--check") == 0
+    assert await cli("doctor") == 0
+    conn = await asyncpg.connect(kit_url)
+    assert await conn.fetchval("SELECT count(*) FROM users") == 0
+    names = await conn.fetch("SELECT name FROM public.__mizzle_migrations ORDER BY id")
+    await conn.close()
+    assert old_name not in [r["name"] for r in names]
+    assert "0001_baseline" in [r["name"] for r in names]
+
+
+async def test_check_fix_refuses_an_ambiguous_branch(
+    project: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # K8: two folders with the same number are ambiguous; never swap one journal entry.
+    assert await cli("generate") == 0
+    (project / "migrations" / "0001_other_branch").mkdir()
+    capsys.readouterr()
+    assert await cli("check", "--fix") == 1
+    assert "share number" in capsys.readouterr().err
+
+
+async def test_check_fix_reports_a_missing_file(
+    project: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # K8: a deleted migration.sql must be reported, not silently dropped from the journal.
+    assert await cli("generate") == 0
+    sql = next(project.glob("migrations/0001_*/migration.sql"))
+    sql.unlink()
+    capsys.readouterr()
+    assert await cli("check", "--fix") == 1
+    assert "left as is" in capsys.readouterr().out
+    assert len(MigrationsDir(project / "migrations", "postgresql").migrations()) == 1
+
+
+async def test_migrate_dry_run_reports_tampering(
+    project: Path, kit_url: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # K9: --dry-run makes the same checks a real migrate makes.
+    assert await cli("generate") == 0
+    assert await cli("migrate") == 0
+    sql = next(project.glob("migrations/0001_*/migration.sql"))
+    sql.write_text(sql.read_text() + "\n-- edited\n")
+    capsys.readouterr()
+    assert await cli("migrate", "--dry-run") == 1
+    assert "changed after it was applied" in capsys.readouterr().err
+
+
+async def test_status_check_and_doctor_fail_when_a_migration_changed(
+    project: Path, kit_url: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # K11: an edited applied migration is a failure, not just a note.
+    assert await cli("generate") == 0
+    assert await cli("migrate") == 0
+    sql = next(project.glob("migrations/0001_*/migration.sql"))
+    sql.write_text(sql.read_text() + "\n-- edited\n")
+    capsys.readouterr()
+    assert await cli("status", "--check") == 1
+    capsys.readouterr()
+    assert await cli("doctor") == 1
+    assert "edited after they were applied" in capsys.readouterr().out
+
+
+async def test_to_requires_an_exact_name_or_number(
+    project: Path, kit_url: str, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # K12: a typo or a loose prefix must not pick a neighbouring migration.
+    assert await cli("generate") == 0
+    rewrite_schema(
+        project,
+        V1.replace("    name = text()", "    name = text()\n    age = integer()"),
+        monkeypatch,
+    )
+    assert await cli("generate") == 0
+
+    directory = MigrationsDir(project / "migrations", "postgresql")
+    first = directory.migrations()[0].name
+    assert await cli("migrate", "--to", first) == 0
+    assert await cli("migrate", "--to", "000") == 1  # no such number
+    assert await cli("migrate", "--to", "0001_age") == 1  # no such exact name
+    assert "age" not in await columns(kit_url, "users")
+
+    assert await cli("migrate") == 0
+    capsys.readouterr()
+    assert await cli("migrate", "--to", "0001") == 0  # already passed: says so
+    assert "already applied" in capsys.readouterr().out
+
+
+async def test_generate_sql_custom_writes_nothing(
+    project: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # K13: --sql never writes, not even the folder a --custom migration would make.
+    assert await cli("generate", "--custom", "--sql") == 0
+    assert "Custom migration" in capsys.readouterr().out
+    assert not (project / "migrations").exists()
+
+
+async def test_malformed_url_and_missing_template_are_clean_errors(
+    project: Path, kit_url: str, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # K14: no traceback for a bad URL or a --template file that is not there.
+    assert await cli("generate") == 0
+    monkeypatch.setenv("DATABASE_URL", kit_url + "?sslmode=bogus")
+    capsys.readouterr()
+    assert await cli("info") == 1
+    assert "error: cannot connect" in capsys.readouterr().err
+
+    monkeypatch.setenv("DATABASE_URL", kit_url)
+    capsys.readouterr()
+    assert await cli("generate", "--custom", "--template", "/no/such/file.sql") == 1
+    assert "cannot read --template" in capsys.readouterr().err
+
+
+async def test_doctor_does_not_report_role_drift(
+    project: Path, kit_url: str, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # K10: info/doctor must read the role options, or every role looks like drift.
+    admin = f"mizzle_kit_{uuid.uuid4().hex[:8]}"
+    source = f'''
+from mizzle import Constraint, Table, policy, rls, role, sql
+from mizzle.pg import serial, text
+
+ADMIN = role("{admin}")
+
+
+class Users(Table, name="users"):
+    id = serial().primary_key()
+    email = text().not_null()
+
+    @classmethod
+    def config(cls) -> list[Constraint]:
+        return [rls(), policy("users_admins", to=[ADMIN], using=sql("true"))]
+'''
+    rewrite_schema(project, source, monkeypatch)
+    try:
+        assert await cli("generate") == 0
+        capsys.readouterr()
+        assert await cli("doctor") == 1  # not applied yet
+        assert await cli("migrate") == 0
+        capsys.readouterr()
+        assert await cli("doctor") == 0
+        assert "drift:       none" in capsys.readouterr().out
+    finally:
+        conn = await asyncpg.connect(kit_url)
+        await conn.execute(f'DROP OWNED BY "{admin}"')
+        await conn.execute(f'DROP ROLE IF EXISTS "{admin}"')
+        await conn.close()

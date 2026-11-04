@@ -5,14 +5,17 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import copy
 import hashlib
 import importlib
 import json
+import logging
 import sys
 import uuid
 from collections.abc import Awaitable, Callable, Sequence
 from pathlib import Path
 from typing import Protocol, cast
+from urllib.parse import urlparse
 
 from mizzle.core.errors import DatabaseError, DataLossBlocked, MigrationError, MizzleError
 from mizzle.core.snapshot import Snapshot, empty_snapshot
@@ -23,8 +26,16 @@ from mizzle.kit.config import Config, load_config
 from mizzle.kit.diff import RenameKind, RenameResolver, StrictRenames, diff, no_renames
 from mizzle.kit.init import init_project
 from mizzle.kit.journal import Migration, MigrationsDir, format_sql, parse_sql
-from mizzle.kit.migrate import apply_statements, resolve_target, run_migrations
+from mizzle.kit.migrate import (
+    apply_statements,
+    pending_migrations,
+    resolve_target,
+    run_migrations,
+    superseded_names,
+)
 from mizzle.kit.snapshot import build_snapshot
+
+log = logging.getLogger("mizzle")
 
 
 class Args(Protocol):
@@ -40,6 +51,7 @@ class Args(Protocol):
     allow_data_loss: bool
     lock_timeout: float
     force: bool
+    database: str | None
     update: bool
     dry_run: bool
     sql: bool
@@ -121,7 +133,13 @@ def _guard_data_loss(steps: Sequence[Step], allow: bool) -> None:
 
 async def _with_driver[R](config: Config, fn: Callable[[Driver, Dialect], Awaitable[R]]) -> R:
     dialect = config.dialect()
-    driver = await dialect.connect(config.url(), pool_size=1, statement_cache_size=100)
+    url = config.url()
+    try:
+        driver = await dialect.connect(url, pool_size=1, statement_cache_size=100)
+    except MizzleError:
+        raise
+    except Exception as exc:  # a malformed URL is a user error, not a traceback
+        raise MigrationError(f"cannot connect to the database: {exc}") from exc
     try:
         return await fn(driver, dialect)
     finally:
@@ -158,7 +176,17 @@ def cmd_generate(config: Config, args: Args) -> int:
     if args.template and not args.custom:
         raise MigrationError("--template only applies to --custom migrations")
     if args.custom:
-        header = Path(args.template).read_text(encoding="utf-8") if args.template else CUSTOM_HEADER
+        if args.template:
+            template = Path(args.template)
+            try:
+                header = template.read_text(encoding="utf-8")
+            except OSError as exc:
+                raise MigrationError(f"cannot read --template {template}: {exc}") from exc
+        else:
+            header = CUSTOM_HEADER
+        if args.sql:  # --sql writes nothing, not even a --custom folder
+            print(header.rstrip())
+            return 0
         migration = directory.write(args.name or "custom", [], current, header, custom=True)
         print(f"Created {migration.sql_path}")
         return 0
@@ -203,12 +231,48 @@ def cmd_migrate(config: Config, args: Args) -> int:
         )
 
     applied = asyncio.run(_with_driver(config, run))
-    print(f"Applied {len(applied)} migration(s)." if applied else "Database is up to date.")
+    if applied:
+        print(f"Applied {len(applied)} migration(s).")
+        return 0
+    if args.to is not None:
+        note = asyncio.run(_target_note(config, directory, args.to))
+        if note is not None:
+            print(note)
+            return 0
+    print("Database is up to date.")
     return 0
 
 
+async def _target_note(config: Config, directory: MigrationsDir, target: str) -> str | None:
+    """Say that ``--to`` names a migration the database has already passed, instead of the
+    bare "up to date" that hides a target behind the database."""
+
+    async def run(driver: Driver, dialect: Dialect) -> str | None:
+        migrations = directory.migrations()
+        target_index = resolve_target(migrations, target)
+        target_migration = next(m for m in migrations if m.index == target_index)
+        async with driver.acquire() as conn:
+            try:
+                applied = await dialect.applied_migrations(conn, config.migrations_schema)
+            except DatabaseError as exc:
+                if exc.sqlstate in ("42P01", "3F000"):  # undefined table / schema
+                    applied = {}
+                else:
+                    raise
+        last = max((m.index for m in migrations if m.name in applied), default=0)
+        if target_index < last:
+            return (
+                f"Target {target_migration.name} is already applied; the database is ahead "
+                f"of it ({last:04d})."
+            )
+        return None
+
+    return await _with_driver(config, run)
+
+
 def _migrate_dry_run(config: Config, args: Args, directory: MigrationsDir) -> int:
-    """Print the SQL ``migrate`` would run, without touching the database."""
+    """Print the SQL ``migrate`` would run, without touching the database. It makes the same
+    tamper, missing-on-disk and ordering checks, so a run that would fail fails here too."""
 
     async def plan(driver: Driver, dialect: Dialect) -> list[Migration]:
         async with driver.acquire() as conn:
@@ -219,13 +283,7 @@ def _migrate_dry_run(config: Config, args: Args, directory: MigrationsDir) -> in
                     applied = {}
                 else:
                     raise
-        migrations = directory.migrations()
-        target_index = resolve_target(migrations, args.to) if args.to is not None else None
-        return [
-            m
-            for m in migrations
-            if m.name not in applied and (target_index is None or m.index <= target_index)
-        ]
+        return pending_migrations(directory.migrations(), applied, args.to)
 
     pending = asyncio.run(_with_driver(config, plan))
     if not pending:
@@ -238,38 +296,102 @@ def _migrate_dry_run(config: Config, args: Args, directory: MigrationsDir) -> in
     return 0
 
 
+def _url_target(url: str) -> tuple[str, str]:
+    """``(host[:port], database)`` from the URL, without any password."""
+    parsed = urlparse(url)
+    if not parsed.scheme:
+        raise MigrationError("the database URL must be a postgresql:// URL")
+    host = parsed.hostname or "localhost"
+    if parsed.port:
+        host = f"{host}:{parsed.port}"
+    return host, parsed.path.lstrip("/")
+
+
+def _managed_only(live: Snapshot, managed: Snapshot) -> Snapshot:
+    """The part of ``live`` that mizzle manages: objects named in ``managed``. Reset drops
+    this, never an unmanaged table, view, extension or function in the same schema."""
+    out = copy.deepcopy(live)
+    tables = live.get("tables", {})
+    out["tables"] = {k: v for k, v in tables.items() if k in managed.get("tables", {})}
+    views = live.get("views", {})
+    out["views"] = {k: v for k, v in views.items() if k in managed.get("views", {})}
+    enums = live.get("enums", {})
+    out["enums"] = {k: v for k, v in enums.items() if k in managed.get("enums", {})}
+    domains = live.get("domains", {})
+    out["domains"] = {k: v for k, v in domains.items() if k in managed.get("domains", {})}
+    composites = live.get("composites", {})
+    out["composites"] = {k: v for k, v in composites.items() if k in managed.get("composites", {})}
+    functions = live.get("functions", {})
+    out["functions"] = {k: v for k, v in functions.items() if k in managed.get("functions", {})}
+    extensions = live.get("extensions", {})
+    out["extensions"] = {k: v for k, v in extensions.items() if k in managed.get("extensions", {})}
+    return out
+
+
 def cmd_reset(config: Config, args: Args) -> int:
-    """Drop the managed schemas and re-run every migration from scratch."""
+    """Drop every mizzle-managed object and re-run every migration from scratch."""
     directory = MigrationsDir(config.out, config.dialect_name)
-    if not directory.migrations():
+    migrations = directory.migrations()
+    if not migrations:
         print("No migrations to run.")
         return 0
-    if not args.force:
-        if not _interactive():
-            raise MigrationError("reset drops the schema; pass --force to confirm")
-        if not _confirm(f"Drop and recreate {config.schema_filter}, then re-run every migration?"):
-            return 1
-
-    async def wipe(driver: Driver, _dialect: Dialect) -> None:
-        async with driver.acquire() as conn:
-            for schema in config.schema_filter:
-                name = '"' + schema.replace('"', '""') + '"'
-                await conn.execute(f"DROP SCHEMA IF EXISTS {name} CASCADE", [])
-                await conn.execute(f"CREATE SCHEMA {name}", [])
-
-    async def run(driver: Driver, dialect: Dialect) -> list[str]:
-        return await run_migrations(
-            driver,
-            dialect,
-            directory,
-            schema=config.migrations_schema,
-            lock_timeout=args.lock_timeout,
-            on_apply=lambda m: print(f"Applying {m.name}"),
+    host, database = _url_target(config.url())
+    if args.database is not None:
+        if args.database != database:
+            raise MigrationError(
+                f"--database {args.database!r} does not match the URL database {database!r}"
+            )
+    elif args.force:
+        raise MigrationError(
+            f"reset drops every managed object on {host}/{database}; "
+            f"rerun with --force --database {database!r} to confirm"
         )
+    elif not _interactive():
+        raise MigrationError(
+            f"reset drops every managed object on {host}/{database}; "
+            f"pass --force --database {database!r} to confirm"
+        )
+    elif not _confirm(
+        f"Drop every mizzle-managed object on {host}/{database} and re-run all "
+        f"{len(migrations)} migration(s)?"
+    ):
+        return 1
 
-    asyncio.run(_with_driver(config, wipe))
+    async def run(driver: Driver, dialect: Dialect) -> int:
+        latest = directory.latest_snapshot()
+        async with driver.acquire() as conn:
+            await dialect.acquire_migration_lock(conn, args.lock_timeout)
+            try:
+                schemas = _schemas(config, latest)
+                live = await dialect.introspect(conn, schemas, list(latest.get("roles", {})))
+                managed_live = _managed_only(live, latest)
+                steps = diff(
+                    managed_live,
+                    empty_snapshot(config.dialect_name),
+                    no_renames,
+                    compare_expressions=False,
+                )
+                for statement in dialect.render(steps):
+                    await conn.execute(statement.sql, [])
+                # The history table is not in the schema diff; always clear it so every
+                # migration runs again even when its schema is not a managed one.
+                await dialect.drop_migrations_table(conn, config.migrations_schema)
+                await dialect.ensure_migrations_table(conn, config.migrations_schema)
+                for migration in migrations:
+                    print(f"Applying {migration.name}")
+                    record = dialect.record_migration(
+                        config.migrations_schema, migration.name, migration.hash()
+                    )
+                    await apply_statements(conn, migration.statements(), record)
+                return len(migrations)
+            finally:
+                try:
+                    await dialect.release_migration_lock(conn)
+                except Exception:  # the connection may be broken; the lock dies with it
+                    log.warning("could not release the migration lock", exc_info=True)
+
     applied = asyncio.run(_with_driver(config, run))
-    print(f"Reset: applied {len(applied)} migration(s).")
+    print(f"Reset: applied {applied} migration(s).")
     return 0
 
 
@@ -281,14 +403,22 @@ def cmd_squash(config: Config, args: Args) -> int:
     if not migrations:
         print("No migrations to squash.")
         return 0
+    custom = [m.name for m in migrations if m.custom and m.statements()]
+    if custom:
+        raise MigrationError(
+            "squash would lose hand-written SQL in "
+            f"{', '.join(custom)}; move it into the squashed migration by hand first"
+        )
     latest = directory.latest_snapshot()
     steps = diff(empty_snapshot(config.dialect_name), latest, no_renames, compare_expressions=False)
     statements = dialect.render(steps)
     latest["prev_id"] = None
     directory.clear()
-    migration = directory.write(args.name or "squash", statements, latest)
+    migration = directory.write(
+        args.name or "squash", statements, latest, supersedes=[m.name for m in migrations]
+    )
     print(f"Squashed {len(migrations)} migration(s) into {migration.name}.")
-    print("The database was left as it is: run `mizzle reset`, or migrate a fresh database.")
+    print("A database that applied the old history treats it as applied; a fresh one runs it.")
     return 0
 
 
@@ -467,28 +597,31 @@ def cmd_status(config: Config, args: Args) -> int:
     directory = MigrationsDir(config.out, config.dialect_name)
     migrations = directory.migrations()
     applied = _applied_now(config)
+    superseded = superseded_names(migrations)
 
     rows: list[dict[str, object]] = []
-    pending = 0
+    counts = {"applied": 0, "pending": 0, "changed": 0, "unknown": 0}
     for migration in migrations:
         if applied is None:
             state = "unknown"
-        elif migration.name not in applied:
-            state, pending = "pending", pending + 1
-        elif applied[migration.name] != migration.hash():
-            state = "changed"
+        elif migration.name in applied:
+            state = "changed" if applied[migration.name] != migration.hash() else "applied"
+        elif migration.supersedes and set(migration.supersedes) <= set(applied):
+            state = "applied"  # a squash whose replaced names are all applied
         else:
-            state = "applied"
+            state = "pending"
+        counts[state] += 1
         rows.append({"name": migration.name, "state": state})
-    missing = [name for name in (applied or {}) if name not in {m.name for m in migrations}]
+    known = {m.name for m in migrations} | superseded
+    missing = [name for name in (applied or {}) if name not in known]
 
     if args.json:
         print(
             json.dumps(
                 {
                     "migrations": rows,
-                    "applied": len(migrations) - pending,
-                    "pending": pending,
+                    "applied": counts["applied"],
+                    "pending": counts["pending"],
                     "missing": missing,
                 }
             )
@@ -510,9 +643,11 @@ def cmd_status(config: Config, args: Args) -> int:
         else:
             for name in missing:
                 print(f"  {name:<{width}}  applied but missing on disk")
-            print(f"\n{len(migrations) - pending} applied, {pending} pending.")
-    if args.check:
-        return 1 if applied is None or pending or missing else 0
+            print(f"\n{counts['applied']} applied, {counts['pending']} pending.")
+    # An applied migration edited on disk is a failure, exactly as `migrate` treats it.
+    failed = applied is None or counts["pending"] or counts["changed"] or missing
+    if args.check and failed:
+        return 1
     return 0
 
 
@@ -542,15 +677,31 @@ def cmd_info(config: Config, args: Args) -> int:
                     applied = {}
                 else:
                     raise
-            live = await dialect.introspect(conn, _schemas(config, latest))
+            live = await dialect.introspect(
+                conn, _schemas(config, latest), list(latest.get("roles", {}))
+            )
             desired = await dialect.normalize_snapshot(conn, latest)
             drift = diff(live, desired, no_renames, compare_expressions=False)
             return str(row["v"]), applied, drift
 
     version, applied, drift = asyncio.run(_with_driver(config, inspect))
-    pending = sum(1 for m in migrations if m.name not in applied)
+    superseded = superseded_names(migrations)
+    known = {m.name for m in migrations} | superseded
+    missing = [name for name in applied if name not in known]
+    changed = [m.name for m in migrations if m.name in applied and applied[m.name] != m.hash()]
+
+    def in_effect(migration: Migration) -> bool:
+        return migration.name in applied or (
+            bool(migration.supersedes) and set(migration.supersedes) <= set(applied)
+        )
+
+    pending = sum(1 for m in migrations if not in_effect(m))
     print(f"  database:    PostgreSQL {version}")
     print(f"  applied:     {len(migrations) - pending} applied, {pending} pending")
+    if changed:
+        print(f"  changed:     {len(changed)} applied migration(s) edited after they were applied")
+    for name in missing:
+        print(f"  missing:     {name} is applied but not on disk")
     if drift:
         print(f"  drift:       {len(drift)} change(s) between the database and the migrations")
         for step in drift[:10]:
@@ -558,7 +709,7 @@ def cmd_info(config: Config, args: Args) -> int:
     else:
         print("  drift:       none")
     if args.command == "doctor":
-        return 1 if pending or drift else 0
+        return 1 if pending or drift or changed or missing else 0
     return 0
 
 
@@ -678,11 +829,12 @@ def _parser() -> argparse.ArgumentParser:
     p = sub.add_parser("migrate", help="apply pending migrations")
     p.add_argument("--lock-timeout", type=float, default=60.0)
     p.add_argument("--dry-run", action="store_true", help="print the SQL, apply nothing")
-    p.add_argument("--to", help="apply only up to this migration (name, prefix or number)")
+    p.add_argument("--to", help="apply only up to this migration (exact name or number)")
     p.set_defaults(func=cmd_migrate)
 
     p = sub.add_parser("reset", help="drop the schema and re-run every migration")
     p.add_argument("--force", action="store_true", help="do not ask before dropping")
+    p.add_argument("--database", help="the database name, to confirm a destructive reset")
     p.add_argument("--lock-timeout", type=float, default=60.0)
     p.set_defaults(func=cmd_reset)
 

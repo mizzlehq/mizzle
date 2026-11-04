@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 
 from mizzle.core.errors import MigrationError, MigrationTampered
 from mizzle.core.steps import Statement
@@ -49,15 +49,54 @@ async def apply_statements(
 
 
 def resolve_target(migrations: list[Migration], target: str) -> int:
-    """The index of the migration named by ``target`` (a full name, a leading prefix, or a
-    number). Raises when nothing matches."""
-    digits = target.split("_", 1)[0]
+    """The index of the migration named by ``target``: an exact folder name or an exact
+    number. A loose prefix or a wrong name is refused, so a typo cannot pick a neighbour."""
     for migration in migrations:
-        if migration.name == target or migration.name.startswith(target):
+        if migration.name == target:
             return migration.index
-        if digits.isdigit() and migration.index == int(digits):
-            return migration.index
+    if target.isdigit():
+        for migration in migrations:
+            if migration.index == int(target):
+                return migration.index
     raise MigrationError(f"no migration matches --to {target!r}")
+
+
+def superseded_names(migrations: list[Migration]) -> set[str]:
+    """Every name a squashed migration replaces, so it is not reported as missing on disk."""
+    return {old for migration in migrations for old in migration.supersedes}
+
+
+def pending_migrations(
+    migrations: list[Migration], applied: Mapping[str, str], target: str | None = None
+) -> list[Migration]:
+    """The migrations ``migrate`` would run, after the same checks ``migrate`` makes: an
+    applied migration was edited, applied migrations are missing on disk, or a pending
+    migration is older than an applied one."""
+    target_index = resolve_target(migrations, target) if target is not None else None
+    known = {migration.name for migration in migrations} | superseded_names(migrations)
+    if missing := [name for name in applied if name not in known]:
+        raise MigrationError(f"applied migrations are missing on disk: {missing}")
+    last_applied = max((m.index for m in migrations if m.name in applied), default=0)
+    pending: list[Migration] = []
+    for migration in migrations:
+        if migration.name in applied:
+            if applied[migration.name] != migration.hash():
+                raise MigrationTampered(
+                    f"{migration.name}/migration.sql changed after it was applied; "
+                    "restore it and put the change in a new migration"
+                )
+            continue
+        if migration.supersedes and set(migration.supersedes) <= set(applied):
+            continue  # already in effect: the names it replaced are applied
+        if migration.index < last_applied:
+            raise MigrationError(
+                f"{migration.name} is not applied but a later migration is; "
+                "this usually comes from merging branches. Run `mizzle check`."
+            )
+        if target_index is not None and migration.index > target_index:
+            continue
+        pending.append(migration)
+    return pending
 
 
 async def run_migrations(
@@ -73,36 +112,30 @@ async def run_migrations(
     """Apply every pending migration in order, or only those up to ``target``. Returns the
     names that were applied."""
     migrations = directory.migrations()
-    target_index = resolve_target(migrations, target) if target is not None else None
     async with driver.acquire() as conn:
         await dialect.acquire_migration_lock(conn, lock_timeout)
         try:
             await dialect.ensure_migrations_table(conn, schema)
             applied = await dialect.applied_migrations(conn, schema)
-            known = {m.name for m in migrations}
-            if missing := [name for name in applied if name not in known]:
-                raise MigrationError(f"applied migrations are missing on disk: {missing}")
-            last_applied = max((m.index for m in migrations if m.name in applied), default=0)
-            done: list[str] = []
+            # A squashed migration whose replaced names are all applied is already in
+            # effect: replace those names with the squashed one in the history.
             for migration in migrations:
-                hash = migration.hash()
-                if migration.name in applied:
-                    if applied[migration.name] != hash:
-                        raise MigrationTampered(
-                            f"{migration.name}/migration.sql changed after it was applied; "
-                            "restore it and put the change in a new migration"
-                        )
-                    continue
-                if migration.index < last_applied:
-                    raise MigrationError(
-                        f"{migration.name} is not applied but a later migration is; "
-                        "this usually comes from merging branches. Run `mizzle check`."
-                    )
-                if target_index is not None and migration.index > target_index:
-                    continue
+                if (
+                    migration.supersedes
+                    and migration.name not in applied
+                    and set(migration.supersedes) <= set(applied)
+                ):
+                    for old in migration.supersedes:
+                        await conn.execute(*dialect.forget_migration(schema, old))
+                        applied.pop(old, None)
+                    record = dialect.record_migration(schema, migration.name, migration.hash())
+                    await conn.execute(*record)
+                    applied[migration.name] = migration.hash()
+            done: list[str] = []
+            for migration in pending_migrations(migrations, applied, target):
                 if on_apply is not None:
                     on_apply(migration)
-                record = dialect.record_migration(schema, migration.name, hash)
+                record = dialect.record_migration(schema, migration.name, migration.hash())
                 await apply_statements(conn, migration.statements(), record)
                 done.append(migration.name)
             return done

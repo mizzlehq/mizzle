@@ -112,6 +112,10 @@ class PostgresDialect:
             [],
         )
 
+    async def drop_migrations_table(self, conn: Connection, schema: str) -> None:
+        table = ddl.qualified(schema, MIGRATIONS_TABLE)
+        await conn.execute(f"DROP TABLE IF EXISTS {table}", [])
+
     async def applied_migrations(self, conn: Connection, schema: str) -> dict[str, str]:
         table = ddl.qualified(schema, MIGRATIONS_TABLE)
         rows = await conn.fetch_dicts(f"SELECT name, hash FROM {table} ORDER BY id", [])
@@ -120,3 +124,7 @@ class PostgresDialect:
     def record_migration(self, schema: str, name: str, hash: str) -> tuple[str, list[object]]:
         table = ddl.qualified(schema, MIGRATIONS_TABLE)
         return f"INSERT INTO {table} (name, hash) VALUES ($1, $2)", [name, hash]
+
+    def forget_migration(self, schema: str, name: str) -> tuple[str, list[object]]:
+        table = ddl.qualified(schema, MIGRATIONS_TABLE)
+        return f"DELETE FROM {table} WHERE name = $1", [name]
