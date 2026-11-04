@@ -139,6 +139,27 @@ def test_sql_endpoint(client: TestClient) -> None:
     assert error.status_code == 400 and "nope" in error.json()["error"]
 
 
+def test_bad_requests_are_reported(client: TestClient) -> None:
+    bad_json = client.post(
+        ROWS, content=b"not json", headers={**AUTH, "content-type": "application/json"}
+    )
+    assert bad_json.status_code == 400
+    assert client.post(ROWS, json={"values": "x"}, headers=AUTH).status_code == 400
+    assert (
+        client.patch(ROWS, json={"key": {"id": 1}, "values": {}}, headers=AUTH).status_code == 400
+    )
+    wrong_key = client.patch(
+        ROWS, json={"key": {"id": 1, "email": "a"}, "values": {"bio": "x"}}, headers=AUTH
+    )
+    assert wrong_key.status_code == 400
+    assert client.request("DELETE", ROWS, json={"keys": []}, headers=AUTH).status_code == 400
+    bad_op = '[{"column": "email", "op": "nope", "value": "x"}]'
+    assert client.get(ROWS, params={"filters": bad_op}, headers=AUTH).status_code == 400
+    assert client.get(ROWS, params={"limit": "-1"}, headers=AUTH).status_code == 400
+    assert client.post("/api/sql", json={"sql": "  "}, headers=AUTH).status_code == 400
+    assert client.put("/api/queries/saved/x", json={"sql": ""}, headers=AUTH).status_code == 400
+
+
 def test_read_only_mode(pg_url: str, driver: PostgresDriver) -> None:
     with make_client(pg_url, read_only=True) as client:
         assert client.post(ROWS, json={"values": {"email": "x"}}, headers=AUTH).status_code == 403
