@@ -97,6 +97,7 @@ reader = role(READER, existing=True)
 RESET = f"""
 DROP SCHEMA IF EXISTS mg CASCADE;
 DROP SCHEMA IF EXISTS mg2 CASCADE;
+DROP SCHEMA IF EXISTS mg3 CASCADE;
 DROP ROLE IF EXISTS {READER};
 DROP ROLE IF EXISTS {OTHER};
 DROP EXTENSION IF EXISTS hstore, citext, ltree CASCADE;
@@ -1252,3 +1253,44 @@ async def test_composites(driver: PostgresDriver, tmp_path: Path) -> None:
     # A composite drops after the table that uses it.
     steps = await migrate(driver, v1, snap([]))
     assert [s.describe() for s in steps] == ["drop table homes", "drop type caddr"]
+
+
+# -- S8: a domain outside schema_filter, used by a pulled table -----------------------------
+
+
+billing_price = domain(
+    "mg_price",
+    schema="mg3",
+    as_="numeric",
+    not_null=True,
+    checks=["VALUE > 0", "VALUE < 1000000"],
+)
+
+
+@final
+class Invoices(Table, name="invoices", schema="mg"):
+    id = integer().primary_key()
+    price = pg_domain("mg_price", None, schema="mg3")
+
+
+async def test_domain_outside_schema_filter_round_trips(driver: PostgresDriver) -> None:
+    # S8: introspecting only "mg" still pulls the "mg3" domain its column uses, and the
+    # pulled module generates no drift (the hand-written CHECK text is normalized).
+    v1 = snap([Invoices], objects=[billing_price])
+    await migrate(driver, empty_snapshot("postgresql"), v1)
+
+    async with driver.acquire() as conn:
+        only_mg = await dialect.introspect(conn, ["mg"])
+    assert "mg3.mg_price" in only_mg.get("domains", {})
+    assert only_mg["tables"]["mg.invoices"]["columns"]["price"]["type"] == "mg3.mg_price"
+
+    source = render_schema_module(only_mg)
+    compile(source, "pulled_s8.py", "exec")
+    assert "checks=[" in source  # two CHECKs, not check=..., check=...
+    assert "mg3.mg_price" in source
+
+    # The hand-written checks compare equal to what the server prints.
+    async with driver.acquire() as conn:
+        expected = await dialect.normalize_snapshot(conn, v1)
+    remaining = diff(only_mg, expected)
+    assert remaining == [], [s.describe() for s in remaining]

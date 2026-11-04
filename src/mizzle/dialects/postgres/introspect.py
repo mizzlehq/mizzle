@@ -178,7 +178,7 @@ ORDER BY n.nspname, t.typname
 """
 
 _DOMAINS = """
-SELECT n.nspname AS schema, t.typname AS name,
+SELECT t.oid, n.nspname AS schema, t.typname AS name,
        format_type(t.typbasetype, t.typtypmod) AS base_type,
        t.typnotnull AS not_null,
        pg_get_expr(t.typdefaultbin, 0) AS default,
@@ -189,6 +189,21 @@ WHERE t.typtype = 'd' AND n.nspname = ANY($1::text[])
 ORDER BY n.nspname, t.typname
 """
 
+# S8: a pulled table can use a domain from a schema outside schema_filter.
+_DOMAIN_OIDS = """
+SELECT DISTINCT d.oid
+FROM pg_attribute a
+JOIN pg_type t ON t.oid = a.atttypid
+JOIN pg_type d ON d.oid = CASE WHEN t.typtype = 'd' THEN t.oid
+                               WHEN t.typelem <> 0 THEN t.typelem ELSE 0 END
+WHERE a.attrelid = ANY($1::oid[]) AND a.attnum > 0 AND NOT a.attisdropped
+  AND d.typtype = 'd'
+"""
+
+_DOMAINS_BY_OID = _DOMAINS.replace(
+    "t.typtype = 'd' AND n.nspname = ANY($1::text[])", "t.oid = ANY($1::oid[])"
+)
+
 _DOMAIN_CHECKS = """
 SELECT n.nspname AS schema, t.typname AS domain, pg_get_constraintdef(c.oid) AS definition
 FROM pg_constraint c
@@ -197,6 +212,10 @@ JOIN pg_namespace n ON n.oid = t.typnamespace
 WHERE c.contype = 'c' AND n.nspname = ANY($1::text[])
 ORDER BY n.nspname, t.typname
 """
+
+_DOMAIN_CHECKS_BY_OID = _DOMAIN_CHECKS.replace(
+    "n.nspname = ANY($1::text[])", "t.oid = ANY($1::oid[])"
+)
 
 # Standalone composite types; a table's row type is a composite too, so keep only the
 # pg_class rows of relkind 'c' (the ones CREATE TYPE ... AS makes).
@@ -655,12 +674,24 @@ async def introspect(
         snapshot["enums"][key(schema, name)] = enum
         _add_schema(snapshot, schema)
 
+    domain_rows = await conn.fetch_dicts(_DOMAINS, [schema_list])
+    # S8: domains used by the pulled columns but declared in another schema (outside
+    # schema_filter) are part of the schema too, or the column reads as an opaque type and
+    # the next generate drops the domain.
+    referenced = {_int(row["oid"]) for row in await conn.fetch_dicts(_DOMAIN_OIDS, [oids])}
+    referenced -= {_int(row["oid"]) for row in domain_rows}
+    domain_rows += await conn.fetch_dicts(_DOMAINS_BY_OID, [list(referenced)]) if referenced else []
     domain_checks: dict[str, list[str]] = {}
     for row in await conn.fetch_dicts(_DOMAIN_CHECKS, [schema_list]):
         domain_checks.setdefault(key(str(row["schema"]), str(row["domain"])), []).append(
             _check_expression(str(row["definition"]))
         )
-    for row in await conn.fetch_dicts(_DOMAINS, [schema_list]):
+    if referenced:
+        for row in await conn.fetch_dicts(_DOMAIN_CHECKS_BY_OID, [list(referenced)]):
+            domain_checks.setdefault(key(str(row["schema"]), str(row["domain"])), []).append(
+                _check_expression(str(row["definition"]))
+            )
+    for row in domain_rows:
         schema, name = str(row["schema"]), str(row["name"])
         domain = DomainSnap(schema=schema, name=name, base_type=str(row["base_type"]))
         if row["not_null"]:
@@ -828,6 +859,37 @@ class _ReadBack(Protocol):
     async def __call__(self, statements: list[str], query: str, /) -> _Row | None: ...
 
 
+async def _normalize_domain_checks(snapshot: Snapshot, read_back: _ReadBack) -> None:
+    """Domain CHECKs as PostgreSQL prints them: a domain whose text was written by hand
+    (``VALUE ~ '@'``) can differ from ``((VALUE ~ '@'::text))``, and generate would then
+    refuse the change. Create each domain in pg_temp and read its checks back."""
+    domains = snapshot.get("domains", {})
+    for domain in domains.values():
+        if not domain.get("checks"):
+            continue
+        create = _create_domain_for_norm(domain)
+        row = await read_back(
+            [create],
+            "SELECT array_agg(pg_get_constraintdef(c.oid) ORDER BY c.conname) AS d "
+            "FROM pg_constraint c "
+            f"WHERE c.contypid = to_regtype('pg_temp.{quote(_NORM)}') AND c.contype = 'c'",
+        )
+        if row is None or row["d"] is None:
+            continue
+        domain["checks"] = sorted(_check_expression(str(d)) for d in _strs(row["d"]))
+
+
+def _create_domain_for_norm(domain: DomainSnap) -> str:
+    """The CREATE DOMAIN written with a throwaway name in pg_temp."""
+    parts = [f"CREATE DOMAIN pg_temp.{quote(_NORM)} AS {domain['base_type']}"]
+    if collation := domain.get("collation"):
+        parts.append(f"COLLATE {type_ident(collation)}")
+    if default := domain.get("default"):
+        parts.append(f"DEFAULT {default}")
+    parts.extend(f"CHECK ({check})" for check in domain.get("checks", []))
+    return " ".join(parts)
+
+
 class _Undo(Exception):
     """Rolls back a savepoint whose work was only needed to read something."""
 
@@ -918,6 +980,7 @@ async def _normalize(snapshot: Snapshot, read_back: _ReadBack, version: int) -> 
 
     await _normalize_indexes(snapshot, read_back, version)
     await _normalize_grants(snapshot, read_back)
+    await _normalize_domain_checks(snapshot, read_back)
 
     for table in snapshot["tables"].values():
         like = (
