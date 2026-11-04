@@ -401,6 +401,19 @@ class _SchemaWriter:
         for c in table["checks"].values():
             not_valid = ", not_valid=True" if c.get("not_valid") else ""
             items.append(f"check({c['name']!r}, {_sql(c['expression'])}{not_valid})")
+        for e in table.get("exclusions", {}).values():
+            keys: list[str] = []
+            for el in e["elements"]:
+                column = el.get("column")
+                key = (
+                    f"cls.{attrs[column]}" if column is not None else _sql(el.get("expression", ""))
+                )
+                keys.append(f"({key}, {el['operator']!r})")
+            options = f", using={e['method']!r}"
+            if where := e.get("where"):
+                options += f", where={_sql(where)}"
+            options += flags(e, ("deferrable", "initially_deferred"))
+            items.append(f"exclusion({', '.join(keys)}, name={e['name']!r}{options})")
         items += [_index_item(i, attrs) for i in table["indexes"].values()]
         if rls := table.get("rls"):
             args = [] if rls["enabled"] else ["enabled=False"]
@@ -537,6 +550,7 @@ class _SchemaWriter:
                     "unique",
                     "foreign_key",
                     "check",
+                    "exclusion",
                     "unique_index",
                     "index",
                     "rls",

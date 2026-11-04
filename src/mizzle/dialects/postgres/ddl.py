@@ -12,6 +12,8 @@ from mizzle.core.naming import Casing
 from mizzle.core.schema.column import MISSING, ColumnBase
 from mizzle.core.snapshot import (
     ColumnSnap,
+    ExclusionElementSnap,
+    ExclusionSnap,
     ForeignKeySnap,
     FunctionSnap,
     GeneratedSnap,
@@ -30,6 +32,7 @@ from mizzle.core.steps import (
     AddCheck,
     AddColumn,
     AddEnumValue,
+    AddExclusion,
     AddForeignKey,
     AddPrimaryKey,
     AddUnique,
@@ -352,6 +355,19 @@ def _deferred(snap: Mapping[str, object]) -> str:
     return " DEFERRABLE" if snap.get("deferrable") else ""
 
 
+def _exclusion_key(e: ExclusionElementSnap) -> str:
+    column = e.get("column")
+    return quote(column) if column is not None else e.get("expression", "")
+
+
+def _exclusion_fragment(excl: ExclusionSnap) -> str:
+    keys = ", ".join(f"{_exclusion_key(e)} WITH {e['operator']}" for e in excl["elements"])
+    text = f"EXCLUDE USING {excl['method']} ({keys})"
+    if where := excl.get("where"):
+        text += f" WHERE ({where})"
+    return text + _deferred(excl)
+
+
 def _create_table(table: TableSnap) -> str:
     lines = [column_definition(c) for c in table["columns"].values()]
     if pk := table["primary_key"]:
@@ -362,6 +378,10 @@ def _create_table(table: TableSnap) -> str:
         f"CONSTRAINT {quote(u['name'])} {_unique_fragment(u)}({_columns(u['columns'])})"
         f"{_deferred(u)}"
         for u in table["uniques"].values()
+    ]
+    lines += [
+        f"CONSTRAINT {quote(e['name'])} {_exclusion_fragment(e)}"
+        for e in table.get("exclusions", {}).values()
     ]
     lines += [
         f"CONSTRAINT {quote(c['name'])} CHECK ({c['expression']})"
@@ -593,6 +613,12 @@ def render_step(step: Step) -> Statement:
                 schema,
                 table,
                 f"ADD CONSTRAINT {quote(c['name'])} CHECK ({c['expression']}){not_valid}",
+            )
+        case AddExclusion(schema=schema, table=table, exclusion=excl):
+            return alter(
+                schema,
+                table,
+                f"ADD CONSTRAINT {quote(excl['name'])} {_exclusion_fragment(excl)}",
             )
         case AddForeignKey(schema=schema, table=table, foreign_key=fk):
             return alter(schema, table, f"ADD {_foreign_key(fk)}")

@@ -14,10 +14,12 @@ import pytest
 
 from mizzle import (
     Constraint,
+    DatabaseError,
     QueryBuilder,
     Table,
     View,
     check,
+    exclusion,
     function,
     grant,
     index,
@@ -809,4 +811,103 @@ async def test_unlogged_and_storage_parameters(driver: PostgresDriver, tmp_path:
     table = (await live(driver))["tables"]["mg.cache"]
     assert "unlogged" not in table
     assert table.get("options") == {"fillfactor": "90", "autovacuum_enabled": "false"}
+    await assert_pull_round_trip(driver, tmp_path)
+
+
+# -- exclusion constraints -----------------------------------------------------------------
+
+
+@final
+class Reservation(Table, name="reservation", schema="mg"):
+    id = integer().primary_key()
+    room = text().not_null()
+    slot = integer().not_null()
+
+    @classmethod
+    @override
+    def config(cls) -> list[Constraint]:
+        return [
+            exclusion(
+                (cls.room, "="),
+                (cls.slot, "="),
+                name="reservation_booked",
+                using="btree",
+                deferrable=True,
+            ),
+            exclusion(
+                (sql("lower(room)"), "="),
+                name="reservation_lower_room",
+                using="btree",
+                where=sql("slot > 0"),
+            ),
+        ]
+
+
+@final
+class ReservationPlain(Table, name="reservation", schema="mg"):
+    id = integer().primary_key()
+    room = text().not_null()
+    slot = integer().not_null()
+
+    @classmethod
+    @override
+    def config(cls) -> list[Constraint]:
+        return [
+            exclusion(
+                (cls.room, "="),
+                (cls.slot, "="),
+                name="reservation_booked",
+                using="btree",
+            )
+        ]
+
+
+@final
+class ReservationNone(Table, name="reservation", schema="mg"):
+    id = integer().primary_key()
+    room = text().not_null()
+    slot = integer().not_null()
+
+
+async def test_exclusion_constraints_round_trip(driver: PostgresDriver, tmp_path: Path) -> None:
+    v1 = snap([Reservation])
+    await migrate(driver, empty_snapshot("postgresql"), v1)
+    exclusions = (await live(driver))["tables"]["mg.reservation"].get("exclusions", {})
+    booked = exclusions["reservation_booked"]
+    assert booked["method"] == "btree"
+    assert booked.get("deferrable")
+    assert [(e.get("column"), e["operator"]) for e in booked["elements"]] == [
+        ("room", "="),
+        ("slot", "="),
+    ]
+    lower = exclusions["reservation_lower_room"]
+    assert lower["elements"][0].get("expression") == "lower(room)"
+    assert lower.get("where")
+
+    # The constraints are enforced: a duplicate room+slot is rejected, and the expression key
+    # makes "A" collide with "a".
+    await execute(driver, "INSERT INTO mg.reservation (id, room, slot) VALUES (1, 'A', 1)")
+    with pytest.raises(DatabaseError):
+        await execute(driver, "INSERT INTO mg.reservation (id, room, slot) VALUES (2, 'A', 1)")
+    with pytest.raises(DatabaseError):
+        await execute(driver, "INSERT INTO mg.reservation (id, room, slot) VALUES (3, 'a', 1)")
+    await assert_pull_round_trip(driver, tmp_path)
+
+    # A changed option is a drop and add; the constraint can go away entirely.
+    v2 = snap([ReservationPlain])
+    steps = await migrate(driver, v1, v2)
+    described = [s.describe() for s in steps]
+    assert any(d.startswith("drop exclusion") for d in described), described
+    assert any(d.startswith("add exclusion") for d in described), described
+    assert (
+        not (await live(driver))["tables"]["mg.reservation"]
+        .get("exclusions", {})["reservation_booked"]
+        .get("deferrable")
+    )
+    await assert_pull_round_trip(driver, tmp_path)
+
+    v3 = snap([ReservationNone])
+    steps = await migrate(driver, v2, v3)
+    assert any(d.startswith("drop exclusion") for d in [s.describe() for s in steps])
+    assert "exclusions" not in (await live(driver))["tables"]["mg.reservation"]
     await assert_pull_round_trip(driver, tmp_path)

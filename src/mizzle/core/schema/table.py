@@ -12,6 +12,7 @@ from mizzle.core.schema.column import MISSING, ColumnBase
 from mizzle.core.schema.constraints import (
     Check,
     Constraint,
+    Exclusion,
     ForeignKey,
     Grant,
     Index,
@@ -97,6 +98,8 @@ def _constraint_columns(constraint: Constraint) -> tuple[ColumnBase, ...]:
             return tuple(k for k in constraint.columns if isinstance(k, ColumnBase))
         case UniqueConstraint() | PrimaryKey() | ForeignKey():
             return constraint.columns
+        case Exclusion():
+            return tuple(k for k, _ in constraint.elements if isinstance(k, ColumnBase))
         case Check() | Policy() | RowLevelSecurity() | Grant():
             return ()
 

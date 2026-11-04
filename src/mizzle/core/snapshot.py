@@ -74,6 +74,24 @@ class CheckSnap(TypedDict):
     not_valid: NotRequired[bool]
 
 
+class ExclusionElementSnap(TypedDict):
+    """One ``key WITH operator`` of an exclusion constraint. ``column`` is the database
+    column name for a plain key; ``expression`` is the SQL text for an expression key."""
+
+    operator: str
+    column: NotRequired[str]
+    expression: NotRequired[str]
+
+
+class ExclusionSnap(TypedDict):
+    name: str
+    method: str  # access method: gist, btree...
+    elements: list[ExclusionElementSnap]
+    where: NotRequired[str]  # WHERE (predicate): only matching rows are checked
+    deferrable: NotRequired[bool]
+    initially_deferred: NotRequired[bool]
+
+
 class ForeignKeySnap(TypedDict):
     name: str
     columns: list[str]
@@ -152,6 +170,7 @@ class TableSnap(TypedDict):
     comment: NotRequired[str]  # COMMENT ON TABLE
     unlogged: NotRequired[bool]  # CREATE UNLOGGED TABLE
     options: NotRequired[dict[str, str]]  # storage parameters: WITH (fillfactor=70)
+    exclusions: NotRequired[dict[str, ExclusionSnap]]
 
 
 class EnumSnap(TypedDict):

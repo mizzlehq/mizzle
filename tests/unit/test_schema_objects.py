@@ -16,6 +16,7 @@ from mizzle import (
     check,
     count,
     eq,
+    exclusion,
     extension,
     foreign_key,
     function,
@@ -578,6 +579,76 @@ def test_unlogged_and_storage_sql_and_pull(tmp_path: Path) -> None:
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     sys.modules["pulled_unlogged"] = module
+    spec.loader.exec_module(module)
+    members = list(vars(module).values())
+    tables = [
+        v
+        for v in members
+        if isinstance(v, type) and issubclass(v, Table) and "__table__" in vars(v)
+    ]
+    assert diff(original, build_snapshot(tables, dialect)) == []
+
+
+@final
+class Reserved(Table, name="reserved"):
+    id = serial().primary_key()
+    room = text().not_null()
+    slot = integer().not_null()
+
+    @classmethod
+    @override
+    def config(cls) -> list[Constraint]:
+        return [
+            exclusion(
+                (cls.room, "="),
+                (cls.slot, "="),
+                name="reserved_booked",
+                using="btree",
+                deferrable=True,
+                initially_deferred=True,
+            ),
+            exclusion(
+                (sql("lower(room)"), "="),
+                name="reserved_lower_room",
+                using="btree",
+                where=sql("slot > 0"),
+            ),
+        ]
+
+
+def test_exclusion_constraints_sql_snapshot_and_pull(tmp_path: Path) -> None:
+    original = snap([Reserved], objects=[])
+    exclusions = original["tables"]["public.reserved"].get("exclusions", {})
+    booked = exclusions["reserved_booked"]
+    assert booked["method"] == "btree"
+    assert booked.get("deferrable") and booked.get("initially_deferred")
+    assert [(e.get("column"), e["operator"]) for e in booked["elements"]] == [
+        ("room", "="),
+        ("slot", "="),
+    ]
+    lower = exclusions["reserved_lower_room"]
+    assert lower["elements"][0].get("expression") == "lower(room)"
+    assert lower.get("where") == "slot > 0"
+
+    create = next(s for s in sqls(empty_snapshot("postgresql"), original) if "CREATE TABLE" in s)
+    assert (
+        'CONSTRAINT "reserved_booked" EXCLUDE USING btree ("room" WITH =, "slot" WITH =) '
+        "DEFERRABLE INITIALLY DEFERRED" in create
+    )
+    assert 'CONSTRAINT "reserved_lower_room" EXCLUDE USING btree (lower(room) WITH =)' in create
+    assert "WHERE (slot > 0)" in create
+
+    source = render_schema_module(original)
+    assert "exclusion(" in source
+    assert "using='btree'" in source
+    assert "where=sql('slot > 0')" in source
+
+    path = tmp_path / "pulled_exclusion.py"
+    path.write_text(source)
+    spec = importlib.util.spec_from_file_location("pulled_exclusion", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["pulled_exclusion"] = module
     spec.loader.exec_module(module)
     members = list(vars(module).values())
     tables = [

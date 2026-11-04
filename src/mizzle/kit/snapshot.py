@@ -12,6 +12,7 @@ from mizzle.core.naming import Casing
 from mizzle.core.schema.column import ColumnBase, Identity, ReferentialAction
 from mizzle.core.schema.constraints import (
     Check,
+    Exclusion,
     ForeignKey,
     Grant,
     Index,
@@ -28,6 +29,8 @@ from mizzle.core.snapshot import (
     CheckSnap,
     ColumnSnap,
     EnumSnap,
+    ExclusionElementSnap,
+    ExclusionSnap,
     ExtensionSnap,
     ForeignKeySnap,
     FunctionSnap,
@@ -226,6 +229,34 @@ def build_snapshot(
                     if constraint.not_valid:
                         c["not_valid"] = True
                     snap["checks"][constraint.name] = c
+                case Exclusion():
+                    elements: list[ExclusionElementSnap] = []
+                    colnames: list[str] = []
+                    for elem_key, operator in constraint.elements:
+                        if isinstance(elem_key, ColumnBase):
+                            cname = elem_key.db_name(casing)
+                            colnames.append(cname)
+                            elements.append(ExclusionElementSnap(operator=operator, column=cname))
+                        else:
+                            elements.append(
+                                ExclusionElementSnap(
+                                    operator=operator,
+                                    expression=dialect.expression(elem_key, casing),
+                                )
+                            )
+                    derived = f"{tname}_{'_'.join(colnames)}_excl" if colnames else f"{tname}_excl"
+                    excl = ExclusionSnap(
+                        name=constraint.name or trunc(derived),
+                        method=constraint.method,
+                        elements=elements,
+                    )
+                    if constraint.predicate is not None:
+                        excl["where"] = dialect.expression(constraint.predicate, casing)
+                    if constraint.deferrable:
+                        excl["deferrable"] = True
+                    if constraint.initially_deferred:
+                        excl["initially_deferred"] = True
+                    snap.setdefault("exclusions", {})[excl["name"]] = excl
                 case Policy():
                     snap.setdefault("policies", {})[constraint.name] = _policy(
                         constraint, dialect, casing

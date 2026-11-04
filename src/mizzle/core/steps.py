@@ -10,6 +10,7 @@ from mizzle.core.snapshot import (
     CheckSnap,
     ColumnSnap,
     EnumSnap,
+    ExclusionSnap,
     ExtensionSnap,
     ForeignKeySnap,
     FunctionSnap,
@@ -25,7 +26,7 @@ from mizzle.core.snapshot import (
     ViewSnap,
 )
 
-type ConstraintKind = Literal["primary_key", "unique", "check", "foreign_key"]
+type ConstraintKind = Literal["primary_key", "unique", "check", "foreign_key", "exclusion"]
 
 _TEXT = ("text", "character varying")
 _INTS = ("smallint", "integer", "bigint")
@@ -387,6 +388,17 @@ class AddCheck(Step):
     @override
     def describe(self) -> str:
         return f"add check {self.check['name']}"
+
+
+@dataclass(frozen=True)
+class AddExclusion(Step):
+    schema: str
+    table: str
+    exclusion: ExclusionSnap
+
+    @override
+    def describe(self) -> str:
+        return f"add exclusion {self.exclusion['name']}"
 
 
 @dataclass(frozen=True)

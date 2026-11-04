@@ -12,6 +12,8 @@ from mizzle.core.snapshot import (
     CheckSnap,
     ColumnSnap,
     EnumSnap,
+    ExclusionElementSnap,
+    ExclusionSnap,
     ExtensionSnap,
     ForeignKeySnap,
     FunctionSnap,
@@ -99,11 +101,25 @@ SELECT con.conrelid AS table_oid, con.conname AS name, con.contype::text AS kind
        con.condeferrable AS deferrable, con.condeferred AS initially_deferred,
        con.convalidated AS validated,
        EXISTS (SELECT 1 FROM pg_index i WHERE i.indexrelid = con.conindid
-               AND i.indnullsnotdistinct) AS nulls_not_distinct
+               AND i.indnullsnotdistinct) AS nulls_not_distinct,
+       -- Exclusion constraints (contype 'x'): the backing index gives the keys and method.
+       am.amname AS method,
+       ARRAY(SELECT op.oprname FROM unnest(con.conexclop) WITH ORDINALITY k(o, ord)
+             JOIN pg_operator op ON op.oid = k.o ORDER BY k.ord) AS operators,
+       ARRAY(SELECT CASE WHEN k.n = 0 THEN NULL ELSE a.attname END
+             FROM unnest(ix.indkey::int2[]) WITH ORDINALITY k(n, ord)
+             LEFT JOIN pg_attribute a ON a.attrelid = con.conrelid AND a.attnum = k.n
+             ORDER BY k.ord) AS excl_keys,
+       ARRAY(SELECT pg_get_indexdef(con.conindid, k, true)
+             FROM generate_series(1, ix.indnkeyatts) AS k ORDER BY k) AS excl_defs,
+       pg_get_expr(ix.indpred, con.conrelid) AS excl_predicate
 FROM pg_constraint con
 LEFT JOIN pg_class fc ON fc.oid = con.confrelid
 LEFT JOIN pg_namespace fn ON fn.oid = fc.relnamespace
-WHERE con.conrelid = ANY($1::oid[]) AND con.contype IN ('p', 'u', 'f', 'c')
+LEFT JOIN pg_index ix ON ix.indexrelid = con.conindid
+LEFT JOIN pg_class ic ON ic.oid = con.conindid
+LEFT JOIN pg_am am ON am.oid = ic.relam
+WHERE con.conrelid = ANY($1::oid[]) AND con.contype IN ('p', 'u', 'f', 'c', 'x')
 ORDER BY con.conrelid, con.conname
 """
 
@@ -251,6 +267,12 @@ def _strs(value: object) -> list[str]:
     if not isinstance(value, list):
         raise TypeError(f"expected an array from the catalog, got {type(value).__name__}")
     return [str(v) for v in cast(list[object], value)]
+
+
+def _opt_strs(value: object) -> list[str | None]:
+    if not isinstance(value, list):
+        raise TypeError(f"expected an array from the catalog, got {type(value).__name__}")
+    return [None if v is None else str(v) for v in cast(list[object], value)]
 
 
 def _collation(row: _Row) -> str | None:
@@ -495,6 +517,24 @@ async def introspect(
                 if not row["validated"]:
                     fk["not_valid"] = True
                 table["foreign_keys"][name] = fk
+            case "x":
+                elements: list[ExclusionElementSnap] = []
+                keys = _opt_strs(row["excl_keys"])
+                defs = _strs(row["excl_defs"])
+                for i, operator in enumerate(_strs(row["operators"])):
+                    keyname = keys[i] if i < len(keys) else None
+                    if keyname is None:
+                        elements.append(ExclusionElementSnap(operator=operator, expression=defs[i]))
+                    else:
+                        elements.append(ExclusionElementSnap(operator=operator, column=keyname))
+                excl = ExclusionSnap(name=name, method=str(row["method"]), elements=elements)
+                if (where := _opt_str(row["excl_predicate"])) is not None:
+                    excl["where"] = where
+                if row["deferrable"]:
+                    excl["deferrable"] = True
+                if row["initially_deferred"]:
+                    excl["initially_deferred"] = True
+                table.setdefault("exclusions", {})[name] = excl
             case _:
                 pass
 

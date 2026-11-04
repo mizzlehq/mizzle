@@ -25,6 +25,7 @@ from mizzle.core.schema.column import Column
 from mizzle.core.schema.constraints import (
     Constraint,
     check,
+    exclusion,
     foreign_key,
     grant,
     index,
@@ -261,6 +262,7 @@ __all__ = [
     "eq",
     "every",
     "excluded",
+    "exclusion",
     "exists",
     "exp",
     "extension",

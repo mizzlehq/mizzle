@@ -12,6 +12,7 @@ from mizzle.core.errors import MigrationError
 from mizzle.core.snapshot import (
     CheckSnap,
     ColumnSnap,
+    ExclusionSnap,
     GrantsSnap,
     IndexSnap,
     Snapshot,
@@ -26,6 +27,7 @@ from mizzle.core.steps import (
     AddCheck,
     AddColumn,
     AddEnumValue,
+    AddExclusion,
     AddForeignKey,
     AddPrimaryKey,
     AddUnique,
@@ -283,6 +285,10 @@ def _rename_columns_in(table: TableSnap, mapping: Mapping[str, str]) -> None:
         i["columns"] = rn(i["columns"])
     for fk in table["foreign_keys"].values():
         fk["columns"] = rn(fk["columns"])
+    for e in table.get("exclusions", {}).values():
+        for el in e["elements"]:
+            if "column" in el:
+                el["column"] = mapping.get(el["column"], el["column"])
 
 
 def _apply_renames(
@@ -412,6 +418,12 @@ def _without_columns(table: TableSnap, names: list[str]) -> TableSnap:
         for n, i in out["indexes"].items()
         if not uses(i["columns"], i.get("expression"), i["where"])
     }
+    if exclusions := out.get("exclusions"):
+        out["exclusions"] = {
+            n: e
+            for n, e in exclusions.items()
+            if not uses([el.get("column", "") for el in e["elements"]], e.get("where"))
+        }
     return out
 
 
@@ -458,6 +470,7 @@ def _diff_table(old: TableSnap, new: TableSnap, plan: _Plan, compare_expressions
             ("unique", old["uniques"], kept["uniques"]),
             ("check", old["checks"], kept["checks"]),
             ("foreign_key", old["foreign_keys"], kept["foreign_keys"]),
+            ("exclusion", old.get("exclusions", {}), kept.get("exclusions", {})),
         ]
         for kind, was, now in groups:
             bucket = plan.drop_fks if kind == "foreign_key" else plan.drop_constraints
@@ -543,6 +556,22 @@ def _diff_table(old: TableSnap, new: TableSnap, plan: _Plan, compare_expressions
             return False
         return not compare_expressions or a["expression"] == b["expression"]
 
+    def same_exclusion(a: ExclusionSnap, b: ExclusionSnap) -> bool:
+        if a["method"] != b["method"] or len(a["elements"]) != len(b["elements"]):
+            return False
+        if a.get("deferrable") != b.get("deferrable"):
+            return False
+        if a.get("initially_deferred") != b.get("initially_deferred"):
+            return False
+        for x, y in zip(a["elements"], b["elements"], strict=True):
+            if x["operator"] != y["operator"] or x.get("column") != y.get("column"):
+                return False
+        if not compare_expressions:  # the database reformats expressions
+            return ("where" in a) == ("where" in b)
+        return a.get("where") == b.get("where") and [
+            e.get("expression") for e in a["elements"]
+        ] == [e.get("expression") for e in b["elements"]]
+
     old_pk = {old["primary_key"]["name"]: old["primary_key"]} if old["primary_key"] else {}
     new_pk = {new["primary_key"]["name"]: new["primary_key"]} if new["primary_key"] else {}
     _diff_named(
@@ -575,6 +604,14 @@ def _diff_table(old: TableSnap, new: TableSnap, plan: _Plan, compare_expressions
         same,
         drop("foreign_key"),
         lambda fk: plan.add_fks.append(AddForeignKey(schema, name, fk)),
+        rename,
+    )
+    _diff_named(
+        old.get("exclusions", {}),
+        new.get("exclusions", {}),
+        same_exclusion,
+        drop("exclusion"),
+        lambda e: plan.add_constraints.append(AddExclusion(schema, name, e)),
         rename,
     )
 

@@ -105,6 +105,19 @@ class Check:
     not_valid: bool = False  # ADD ... NOT VALID: skip checking existing rows
 
 
+@dataclass(frozen=True)
+class Exclusion:
+    """``EXCLUDE USING method (key WITH operator, ...)``: a generalized unique constraint
+    (ranges that must not overlap: ``(during, "&&")``)."""
+
+    elements: tuple[tuple[ColumnBase | ExprBase, str], ...]
+    name: str | None = None
+    method: str = "gist"
+    predicate: Condition | None = None  # WHERE (...): only rows that match are checked
+    deferrable: bool = False
+    initially_deferred: bool = False
+
+
 type PolicyCommand = Literal["all", "select", "insert", "update", "delete"]
 
 
@@ -182,7 +195,15 @@ class RowLevelSecurity:
 
 
 type Constraint = (
-    Index | UniqueConstraint | PrimaryKey | ForeignKey | Check | Policy | RowLevelSecurity | Grant
+    Index
+    | UniqueConstraint
+    | PrimaryKey
+    | ForeignKey
+    | Check
+    | Exclusion
+    | Policy
+    | RowLevelSecurity
+    | Grant
 )
 
 
@@ -238,6 +259,29 @@ def foreign_key(
 
 def check(name: str, condition: Condition, *, not_valid: bool = False) -> Check:
     return Check(name, condition, not_valid)
+
+
+def exclusion(
+    *elements: tuple[ColumnBase | ExprBase, str],
+    name: str | None = None,
+    using: str = "gist",
+    where: Condition | None = None,
+    deferrable: bool = False,
+    initially_deferred: bool = False,
+) -> Exclusion:
+    """``exclusion((Bookings.during, "&&"), using="gist")``: no two rows may have
+    overlapping ``during`` ranges. Each key is a column or SQL expression and the operator
+    it is compared with (``=``, ``&&``, ``<@``...)."""
+    if not elements:
+        raise SchemaError("exclusion() needs at least one (key, operator) element")
+    return Exclusion(
+        tuple(elements),
+        name,
+        _sql_name("method", using).lower(),
+        where,
+        deferrable,
+        initially_deferred,
+    )
 
 
 def rls(*, enabled: bool = True, force: bool = False) -> RowLevelSecurity:
