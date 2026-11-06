@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Literal, Protocol, Self, override
 
@@ -11,7 +11,7 @@ from mizzle.core.errors import QueryError
 from mizzle.core.query.base import evolve
 from mizzle.core.query.returning import ReturningMixin
 from mizzle.core.query.select import CompoundBase, Cte, SelectBase
-from mizzle.core.schema.column import ColumnBase
+from mizzle.core.schema.column import MISSING, ColumnBase
 from mizzle.core.schema.table import Table
 from mizzle.core.sql.nodes import Expr
 
@@ -74,6 +74,25 @@ def prepare_row(
         elif column.required_on_insert:
             raise QueryError(f"{column.qualified_name} is required")
     return out
+
+
+def missing_defaults(table: type[Table], supplied: Collection[str]) -> list[str]:
+    """Columns whose Python-side ``default_fn`` cannot run once per row.
+
+    ``insert().values()`` calls the factory for each row; a statement that inserts rows the
+    builder has not seen (MERGE from a source, INSERT ... SELECT) can only call it once, so
+    every row would get the same value (B8). Callers refuse with a ``QueryError`` rather
+    than write wrong data: the caller must put the column in the source, or give it a
+    database-side default.
+    """
+    columns = table.__table__.columns
+    return [
+        column.qualified_name
+        for attr, column in columns.items()
+        if attr not in supplied
+        and column.default_factory is not None
+        and column.default_value is MISSING
+    ]
 
 
 def output_width(query: SelectBase | CompoundBase) -> int:
@@ -192,6 +211,13 @@ class Insert[T: Table](ReturningMixin[T]):
         target = (columns,) if isinstance(columns, ColumnBase) else tuple(columns)
         if not target:
             raise QueryError("from_select() needs at least one target column")
+        if missing := missing_defaults(self.table, [c.attr for c in target]):
+            # The factory would run once and every selected row would share the value.
+            raise QueryError(
+                f"insert().from_select() cannot apply the Python default of "
+                f"{', '.join(missing)}: it would run once for every row. Put the column in "
+                "the query, or give it a database-side default"
+            )
         for column in target:
             if column.table is not self.table:
                 raise QueryError(

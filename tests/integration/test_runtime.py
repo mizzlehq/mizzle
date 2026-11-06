@@ -228,6 +228,171 @@ async def test_after_rollback_error_keeps_the_original_error(pg_url: str) -> Non
         assert "after_rollback" in str(caught.value.__context__)
 
 
+async def test_on_connect_does_not_rerun_without_a_reset(pg_url: str) -> None:
+    # B1: the hook ran on every release, so every query paid an extra round trip and a
+    # non-idempotent hook ran once per query.
+    calls = 0
+
+    async def hook(conn: Connection) -> None:
+        nonlocal calls
+        calls += 1
+        await conn.execute("SET application_name = 'hooked'", [])
+
+    async with await Database.connect(
+        pg_url, schema=[Users, Posts], pool_size=1, on_connect=hook
+    ) as db:
+        assert await db.ping() is True
+        for _ in range(5):
+            await db.ping()
+        # Six mizzle-built statements are session-safe: no reset, so no re-run.
+        assert calls == 1
+        assert await setting(db, "application_name") == "hooked"  # raw: one reset
+
+
+async def test_on_connect_reruns_after_each_reset(pg_url: str) -> None:
+    calls = 0
+
+    async def hook(conn: Connection) -> None:
+        nonlocal calls
+        calls += 1
+        await conn.execute("SET application_name = 'hooked'", [])
+
+    async with await Database.connect(
+        pg_url, schema=[Users, Posts], pool_size=1, on_connect=hook
+    ) as db:
+        assert calls == 1
+        for expected in (2, 3, 4):
+            # A raw statement marks the connection dirty; the release resets and re-runs.
+            await db.execute(sql("SELECT 1"))
+            assert calls == expected
+            await db.ping()  # session-safe: no extra reset
+            assert calls == expected
+
+
+async def test_on_connect_reruns_in_always_mode(pg_url: str) -> None:
+    # R1's remaining gap: with "always", asyncpg's own reset ran and the hook did not.
+    calls = 0
+
+    async def hook(conn: Connection) -> None:
+        nonlocal calls
+        calls += 1
+        await conn.execute("SET application_name = 'hooked'", [])
+
+    async with await Database.connect(
+        pg_url,
+        schema=[Users, Posts],
+        pool_size=1,
+        reset_connections="always",
+        on_connect=hook,
+    ) as db:
+        assert calls == 1
+        for expected in (2, 3, 4):
+            assert await setting(db, "application_name") == "hooked"
+            assert calls == expected
+
+
+async def test_savepoint_rollback_keeps_a_released_sibling_hook(pg_url: str) -> None:
+    # B2: clearing the whole list dropped hooks of savepoints that had already committed.
+    fired: list[str] = []
+
+    async def a() -> None:
+        fired.append("a")
+
+    async def b() -> None:
+        fired.append("b")
+
+    async with await Database.connect(pg_url, schema=[Users, Posts], pool_size=1) as db:
+        async with db.transaction() as tx:
+            async with tx.transaction(after_commit=a):
+                pass
+            with pytest.raises(RuntimeError):
+                async with tx.transaction(after_commit=b):
+                    raise RuntimeError("this savepoint rolls back")
+        assert fired == ["a"]
+
+
+@pytest.mark.parametrize("view", ["tag", "timeout", "primary"])
+async def test_hooks_through_a_session_view_run(pg_url: str, view: str) -> None:
+    # B3: _view() made a fresh Session with its own empty queue, so the hook was dropped.
+    fired: list[str] = []
+
+    async def hook() -> None:
+        fired.append("hook")
+
+    async with await Database.connect(pg_url, schema=[Users, Posts], pool_size=1) as db:
+        async with db.transaction() as tx:
+            if view == "tag":
+                inner = tx.tag(request="r")
+            elif view == "timeout":
+                inner = tx.with_timeout(5)
+            else:
+                inner = tx.primary
+            async with inner.transaction(after_commit=hook):
+                pass
+        assert fired == ["hook"]
+
+
+async def test_after_rollback_hook_on_a_released_savepoint_runs_when_outer_rolls_back(
+    pg_url: str,
+) -> None:
+    # B6: after_commit was held for the outer commit but after_rollback was not queued, so
+    # a savepoint's rollback hook silently disappeared when the outer transaction failed.
+    fired: list[str] = []
+
+    async def hook() -> None:
+        fired.append("rollback")
+
+    async with await Database.connect(pg_url, schema=[Users, Posts], pool_size=1) as db:
+        with pytest.raises(RuntimeError, match="outer"):
+            async with db.transaction() as tx:
+                async with tx.transaction(after_rollback=hook):
+                    pass
+                raise RuntimeError("outer rolls back")
+        assert fired == ["rollback"]
+
+        fired.clear()
+        async with db.transaction() as tx, tx.transaction(after_rollback=hook):
+            pass
+        assert fired == []  # committed: no rollback hook
+
+
+async def test_a_failing_after_commit_hook_does_not_skip_the_others(pg_url: str) -> None:
+    # B6: the first raising hook stopped every later one, including the outer transaction's.
+    fired: list[str] = []
+    from mizzle import AfterCommitError
+
+    async def bad() -> None:
+        fired.append("bad")
+        raise RuntimeError("boom")
+
+    async def good() -> None:
+        fired.append("good")
+
+    async with await Database.connect(pg_url, schema=[Users, Posts], pool_size=1) as db:
+        with pytest.raises(AfterCommitError):
+            async with db.transaction(after_commit=bad) as tx, tx.transaction(after_commit=good):
+                pass
+        assert fired == ["good", "bad"]  # both ran; savepoint hook queued first
+
+
+async def test_after_rollback_hook_error_keeps_the_original_context(pg_url: str) -> None:
+    # B4: overwriting __context__ hid an earlier error, and the hook's traceback was lost.
+    async def hook() -> None:
+        raise RuntimeError("hook is down")
+
+    async with await Database.connect(pg_url, schema=[Users, Posts], pool_size=1) as db:
+        with pytest.raises(ValueError, match="real") as caught:
+            async with db.transaction(after_rollback=hook):
+                try:
+                    raise OSError("earlier")
+                except OSError as earlier:
+                    raise ValueError("real") from earlier
+        # The original context (the OSError) survives; the hook error is a note, and its
+        # traceback is reachable through __cause__.
+        assert isinstance(caught.value.__context__, OSError)
+        assert any("after_rollback" in note for note in caught.value.__notes__)
+
+
 async def test_connect_retry_gives_up_on_a_wrong_password(pg_url: str) -> None:
     # R4: a bad password does not fix itself; retrying only delays the error.
     import time

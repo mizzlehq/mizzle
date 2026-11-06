@@ -19,6 +19,7 @@ from typing import TypedDict, cast, override
 from mizzle.core.compiler import CompiledQuery
 from mizzle.core.errors import QueryError
 from mizzle.core.query.base import Converter, Executable, Row, Runner, column_decoder, row_decoder
+from mizzle.core.query.select import Cte
 from mizzle.core.schema.column import ColumnBase
 from mizzle.core.schema.relations import Link
 from mizzle.core.schema.table import Table
@@ -234,6 +235,8 @@ class RelationalStatement(Node):
 
     runner: Runner = field(repr=False)
     plan: LoadPlan
+    # A WITH clause passed with db.with_(...): emitted before the SELECT (B9).
+    ctes: tuple[Cte, ...] = ()
 
 
 @dataclass(frozen=True, eq=False)
@@ -265,10 +268,12 @@ class RelationalFirst[T: Table](RelationalStatement, Executable[T | None]):
 class RelationalQuery[T: Table]:
     _runner: Runner
     _table: type[T]
+    _ctes: tuple[Cte, ...]
 
-    def __init__(self, runner: Runner, table: type[T]) -> None:
+    def __init__(self, runner: Runner, table: type[T], ctes: tuple[Cte, ...] = ()) -> None:
         self._runner = runner
         self._table = table
+        self._ctes = ctes
 
     def find_many(
         self,
@@ -290,7 +295,7 @@ class RelationalQuery[T: Table]:
             offset=offset,
             with_=with_,
         )
-        return RelationalSelect(self._runner, plan)
+        return RelationalSelect(self._runner, plan, self._ctes)
 
     def find_first(
         self,
@@ -303,4 +308,4 @@ class RelationalQuery[T: Table]:
         plan = build_plan(
             self._table, columns=columns, where=where, order_by=order_by, limit=1, with_=with_
         )
-        return RelationalFirst(self._runner, plan)
+        return RelationalFirst(self._runner, plan, self._ctes)

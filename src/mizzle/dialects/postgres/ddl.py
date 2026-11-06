@@ -370,7 +370,9 @@ def _exclusion_key(e: ExclusionElementSnap) -> str:
 
 
 # An operator is made of PostgreSQL's operator characters, or names one with the
-# ``OPERATOR(schema.op)`` form. Anything else (a `;`, a `)`, a quote) is rejected.
+# ``OPERATOR(schema.op)`` form. Anything else (a `;`, a `)`, a quote) is rejected, and so is
+# `--` / `/*` / `*/`, which PostgreSQL would read as the start of a comment, not an operator
+# (B24).
 _OPERATOR_SYMBOL = "+-*/<>=~!@#%^&|`?"
 _EXCLUSION_OPERATOR = re.compile(
     rf"(?:[{re.escape(_OPERATOR_SYMBOL)}]+\Z"
@@ -378,6 +380,7 @@ _EXCLUSION_OPERATOR = re.compile(
     rf"(?:[{re.escape(_OPERATOR_SYMBOL)}]+|[A-Za-z_][A-Za-z0-9_]*)\)\Z)",
     re.IGNORECASE,
 )
+_COMMENT_START = re.compile(r"--|/\*|\*/")
 _EXCLUSION_METHOD = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
 
 
@@ -394,7 +397,7 @@ def _exclusion_fragment(excl: ExclusionSnap) -> str:
 
 
 def _exclusion_operator(operator: str) -> str:
-    if not _EXCLUSION_OPERATOR.fullmatch(operator):
+    if not _EXCLUSION_OPERATOR.fullmatch(operator) or _COMMENT_START.search(operator):
         raise SchemaError(f"invalid exclusion operator {operator!r}")
     return operator
 

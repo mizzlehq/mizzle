@@ -13,7 +13,7 @@ from typing import Literal, Self, override
 from mizzle.core.compiler import CompiledQuery
 from mizzle.core.errors import QueryError
 from mizzle.core.query.base import evolve
-from mizzle.core.query.insert import check_values, prepare_row
+from mizzle.core.query.insert import check_values, missing_defaults
 from mizzle.core.query.returning import ReturningMixin
 from mizzle.core.query.select import Cte, Source
 from mizzle.core.schema.table import Table
@@ -76,11 +76,19 @@ class Merge[T: Table](ReturningMixin[T]):
         self, values: Mapping[str, object], where: Condition | None = None
     ) -> Self:
         """``WHEN NOT MATCHED [AND where] THEN INSERT (...) VALUES (...)``. The values are
-        usually the source row's columns. Python-side defaults fill omitted columns."""
+        usually the source row's columns. ``default_fn`` columns may not be omitted: the
+        source has many rows and a Python default would run once for all of them."""
         if not values:
             raise QueryError("when_not_matched_then_insert() needs a non-empty values")
-        prepared = prepare_row(self.table, values)
-        return self._add(MergeWhen(False, "insert", condition=where, insert_=prepared))
+        check_values(self.table, values)
+        if missing := missing_defaults(self.table, values):
+            # The factory would run once and every inserted row would share the value.
+            raise QueryError(
+                f"when_not_matched_then_insert() cannot apply the Python default of "
+                f"{', '.join(missing)}: it would run once for every row. Include the column "
+                "in the values, or give it a database-side default"
+            )
+        return self._add(MergeWhen(False, "insert", condition=where, insert_=dict(values)))
 
     def when_not_matched_then_do_nothing(self, where: Condition | None = None) -> Self:
         """``WHEN NOT MATCHED [AND where] THEN DO NOTHING``."""

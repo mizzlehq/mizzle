@@ -272,6 +272,11 @@ async def test_jsonb_set_scalar_and_contains_array(db: Database) -> None:
         await db.select(jsonb_set(Posts.meta, ["a"], "hi")).from_(Posts).where(eq(Posts.id, 1))
     )
     assert text_rows == [({"a": "hi", "tags": ["c", "d"]},)]
+    # B10: None used to be bound as SQL NULL, and jsonb_set with a NULL value returns NULL.
+    null_rows = (
+        await db.select(jsonb_set(Posts.meta, ["a"], None)).from_(Posts).where(eq(Posts.id, 1))
+    )
+    assert null_rows == [({"a": None, "tags": ["c", "d"]},)]
     tagged = (
         await db.select(Posts.title)
         .from_(Posts)

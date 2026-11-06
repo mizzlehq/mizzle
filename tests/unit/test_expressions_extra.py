@@ -1,6 +1,8 @@
 """EX1-EX11: quantified comparison, DISTINCT FROM, arrays, json, more string/math/aggregate
 helpers, FILTER, WITHIN GROUP, date/time, COLLATE and AT TIME ZONE."""
 
+import enum
+
 import pytest
 
 from mizzle import (
@@ -247,6 +249,26 @@ def test_date_time_helpers(qb: QueryBuilder) -> None:
         assert fragment in sql_text
 
 
+def test_make_interval_formats_int_subclasses_and_rejects_nan(qb: QueryBuilder) -> None:
+    # B21 (SEC3): repr() of an int subclass wrote the subclass's own __repr__ into SQL.
+    class Week(enum.IntEnum):
+        ONE = 1
+
+    class Evil(int):
+        def __repr__(self) -> str:
+            return "1) ; drop table victim; --"
+
+    for bad_days in (Week.ONE, Evil(1)):
+        rendered = qb.select(make_interval(days=bad_days)).from_(Users).to_sql()[0]
+        assert "make_interval(days => 1)" in rendered
+        assert "victim" not in rendered
+        assert "Week" not in rendered
+
+    for not_finite in (float("nan"), float("inf"), float("-inf")):
+        with pytest.raises(QueryError, match="finite"):
+            make_interval(secs=not_finite)
+
+
 def test_collate_and_at_time_zone(qb: QueryBuilder) -> None:
     assert qb.select(collate(Users.email, "C")).from_(Users).to_sql() == (
         'SELECT "users"."email" COLLATE "C" FROM "users"',
@@ -256,3 +278,48 @@ def test_collate_and_at_time_zone(qb: QueryBuilder) -> None:
         'SELECT "users"."created_at" AT TIME ZONE CAST($1 AS text) FROM "users"',
         ("UTC",),
     )
+
+
+def test_as_rows_checks_column_value_types(qb: QueryBuilder) -> None:
+    # B14: only the key names were checked, so a str column could be declared as int.
+    from typing import TypedDict
+
+    class Good(TypedDict):
+        id: int
+        bio: str | None
+        role: Role
+
+    class WrongType(TypedDict):
+        id: str
+
+    class DropsNone(TypedDict):
+        bio: str
+
+    qb.select({"id": Users.id, "bio": Users.bio, "role": Users.role}).from_(Users).as_rows(Good)
+    with pytest.raises(QueryError, match=r"'id'.*int.*str"):
+        qb.select({"id": Users.id}).from_(Users).as_rows(WrongType)
+    with pytest.raises(QueryError, match=r"'bio'.*NULL"):
+        qb.select({"bio": Users.bio}).from_(Users).as_rows(DropsNone)
+
+
+@pytest.mark.parametrize("value", ["admin", 1])
+def test_a_non_member_for_an_enum_is_a_query_error(qb: QueryBuilder, value: Role) -> None:
+    # The annotation is a lie on purpose: the checkers already reject these values.
+    # B15: a plain str (or anything not a member) raised a raw AttributeError while encoding.
+    with pytest.raises(QueryError, match="expects a Role member, got"):
+        qb.select(Users.id).from_(Users).where(eq(Users.role, value)).to_sql()
+    with pytest.raises(QueryError, match="expects a Role member"):
+        qb.select(Users.id).from_(Users).where(eq(Users.role, any_([value]))).to_sql()
+
+
+@pytest.mark.parametrize("arg", ["percent", "seed"])
+def test_tablesample_signaling_nan_is_a_query_error(qb: QueryBuilder, arg: str) -> None:
+    # B16: Decimal("sNaN") cannot even be compared, so it escaped as a raw ValueError.
+    from decimal import Decimal
+
+    snan = Decimal("sNaN")
+    with pytest.raises(QueryError, match="finite"):
+        if arg == "percent":
+            qb.select(Users.id).from_(Users).tablesample("SYSTEM", snan)  # pyright: ignore[reportArgumentType]
+        else:
+            qb.select(Users.id).from_(Users).tablesample("SYSTEM", 10, seed=snan)  # pyright: ignore[reportArgumentType]

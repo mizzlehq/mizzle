@@ -80,11 +80,15 @@ Two rules keep hook errors from confusing the outcome:
 
 - In a **savepoint**, `after_commit` is queued, not run: releasing a savepoint is not a
   commit, and the outer transaction can still roll back. Queued hooks run after the
-  outermost `COMMIT`, and are dropped if either level rolls back.
+  outermost `COMMIT`, and are dropped if either level rolls back. In the same way, a
+  savepoint's `after_rollback` fires if the outer transaction rolls back even though the
+  savepoint itself was released. Rollback drops only the hooks of the savepoint that
+  failed, not those of siblings that already released.
 - An `after_commit` hook that raises raises `AfterCommitError`. The data **is** committed:
-  the message says so, so a retry does not insert it twice. An `after_rollback` hook that
-  raises does not hide the error that caused the rollback; the hook's failure is logged and
-  attached as the context.
+  the message says so, so a retry does not insert it twice. Every queued hook still runs;
+  one failure does not skip the rest. An `after_rollback` hook that raises does not hide the
+  error that caused the rollback: the original error is raised, and the hook's failure (with
+  its traceback) is kept as its `__cause__` when it had no context, or as a note otherwise.
 
 ## Isolation levels and read-only
 

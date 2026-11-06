@@ -79,7 +79,7 @@ class QueryBuilder:
 
     def query[T: Table](self, table: type[T]) -> RelationalQuery[T]:
         """Relational queries: ``db.query(Users).find_many(with_={"posts": True})``."""
-        return RelationalQuery(self.runner, table)
+        return RelationalQuery(self.runner, table, self.ctes)
 
     def insert[T: Table](self, table: type[T]) -> Insert[T]:
         return Insert(self.runner, table, ctes=self.ctes)

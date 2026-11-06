@@ -98,18 +98,26 @@ def test_merge_validation(qb: QueryBuilder) -> None:
 
 
 def test_merge_insert_applies_python_defaults(qb: QueryBuilder) -> None:
-    # Q4: a column with .default_fn() that the source does not supply is filled here,
-    # not left to the database (which has no default for it).
+    # B8/Q4: a Python default cannot run once per source row, so MERGE refuses instead of
+    # reusing one value for every inserted row.
+    with pytest.raises(QueryError, match=r"Readings\.unit"):
+        (
+            qb.merge(Readings)
+            .using(Users)
+            .on(eq(Readings.sensor, Users.email))
+            .when_not_matched_then_insert({"sensor": Users.email})
+        )
+    # Supplying the column is fine.
     q = (
         qb.merge(Readings)
         .using(Users)
         .on(eq(Readings.sensor, Users.email))
-        .when_not_matched_then_insert({"sensor": Users.email})
+        .when_not_matched_then_insert({"sensor": Users.email, "unit": "kelvin"})
     )
     assert q.to_sql() == (
         'MERGE INTO "merge_readings" USING "users" ON "merge_readings"."sensor" = "users"."email" '
         'WHEN NOT MATCHED THEN INSERT ("sensor", "unit") VALUES ("users"."email", $1)',
-        ("celsius",),
+        ("kelvin",),
     )
 
 
@@ -122,3 +130,17 @@ def test_merge_update_validates_and_needs_a_set(qb: QueryBuilder) -> None:
         base.when_matched_then_update({"nope": 1})
     with pytest.raises(QueryError, match="expects str"):
         base.when_matched_then_update({"title": 123})
+
+
+def test_not_matched_by_source_on_pg15_16_names_the_version() -> None:
+    # B12: PG15/16 stop at "BY", not "SOURCE", so the guard used to miss and a raw syntax
+    # error reached the user.
+    from mizzle.dialects.postgres.driver import _needs_newer_server
+
+    sql = 'MERGE INTO "t" USING "s" ON true WHEN NOT MATCHED BY SOURCE THEN DELETE'
+    message = 'syntax error at or near "BY"'
+    assert _needs_newer_server(message, sql) == (
+        "MERGE ... WHEN NOT MATCHED BY SOURCE needs PostgreSQL 17 or later"
+    )
+    # An unrelated "BY" (ORDER BY) is not taken for the MERGE feature.
+    assert _needs_newer_server(message, "SELECT 1 ORDER BY") is None

@@ -98,6 +98,7 @@ async def expressions(qb: QueryBuilder) -> None:
         percentile_cont,
         power,
         rank,
+        regexp_match,
         replace,
         round_,
         row_number,
@@ -105,6 +106,7 @@ async def expressions(qb: QueryBuilder) -> None:
         strpos,
         sum_,
         to_char,
+        to_date,
         to_tsquery,
         to_tsvector,
         ts_rank,
@@ -147,8 +149,16 @@ async def expressions(qb: QueryBuilder) -> None:
     assert_type(starts_with(Users.bio, "a"), Expr[bool | None])
     assert_type(strpos(Users.bio, "a"), Expr[int | None])
     assert_type(left(Users.bio, 2), Expr[str | None])
-    assert_type(age(Users.created_at), Expr[datetime.timedelta | None])
-    assert_type(to_char(Users.created_at, "YYYY"), Expr[str | None])
+    # B13: a non-null input gives a non-null result; a text column is not a date.
+    assert_type(age(Users.created_at), Expr[datetime.timedelta])
+    assert_type(age(Users.created_at, Users.created_at), Expr[datetime.timedelta])
+    assert_type(age(Users.created_at, nullable(Users.created_at)), Expr[datetime.timedelta | None])
+    age(Users.email)  # type: ignore[arg-type]  # pyright: ignore[reportCallIssue, reportArgumentType]
+    assert_type(to_char(Users.created_at, "YYYY"), Expr[str])
+    assert_type(to_char(Users.id, "999"), Expr[str])
+    assert_type(regexp_match(Users.bio, "a(b)"), Expr[list[str] | None])
+    assert_type(to_date(Users.email, "YYYY-MM-DD"), Expr[datetime.date])
+    assert_type(to_date(Users.bio, "YYYY-MM-DD"), Expr[datetime.date | None])
     assert_type(power(Users.id, 2), Expr[float])
     assert_type(log(Users.id, 10), Expr[Decimal])
     assert_type(mod(Users.id, 2), Expr[int])

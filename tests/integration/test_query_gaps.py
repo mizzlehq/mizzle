@@ -309,6 +309,18 @@ async def test_ctes_run_on_insert_update_and_delete(db: Database) -> None:
     assert await deleted == 1
 
 
+async def test_relational_query_keeps_the_with_clause(db: Database) -> None:
+    # B9: query() dropped the CTEs, so a data-modifying CTE never ran (silently).
+    await seed(db)
+    moved = db.delete(Posts).where(eq(Posts.author_id, 3)).returning(Posts.id).cte("moved")
+    rows = await db.with_(moved).query(Users).find_many(order_by=Users.id)
+    assert [u.email for u in rows] == ["ann@x", "bob@y", "cid@x"]
+    # The DELETE inside the WITH ran.
+    assert await db.select(count(Posts.id)).from_(Posts) == [(2,)]
+    found = await db.with_(moved).query(Users).find_first(where=eq(Users.id, 1))
+    assert found is not None and found.email == "ann@x"
+
+
 async def test_lateral_join_without_a_condition(db: Database) -> None:
     # T6: ON true is written for you, so no sql("true") is needed (and the query stays
     # session-safe).

@@ -9,6 +9,7 @@ otherwise they are cast to the SQL type of the Python value, so functions that t
 from __future__ import annotations
 
 import datetime
+import math
 import re
 import uuid
 from collections.abc import Iterable, Sequence
@@ -167,13 +168,16 @@ def _identifier(kind: str, name: str) -> str:
 def _whole(name: str, value: int) -> int:
     if isinstance(value, bool) or not isinstance(value, int):  # pyright: ignore[reportUnnecessaryIsInstance]
         raise QueryError(f"{name} must be an int; got {value!r}")
-    return value
+    return int(value)  # a subclass (IntEnum) must not write its own repr
 
 
 def _number(name: str, value: int | float) -> int | float:
     if isinstance(value, bool) or not isinstance(value, (int, float)):  # pyright: ignore[reportUnnecessaryIsInstance]
         raise QueryError(f"{name} must be a number; got {value!r}")
-    return value
+    number = float(value) if isinstance(value, float) else int(value)
+    if isinstance(number, float) and not math.isfinite(number):
+        raise QueryError(f"{name} must be a finite number; got {value!r}")
+    return number
 
 
 # -- CASE -----------------------------------------------------------------------------
@@ -807,7 +811,7 @@ def regexp_replace[S: (str, str | None)](
 
 
 def regexp_match(
-    expr: Expr[str], pattern: str | Expr[str], *, flags: str = ""
+    expr: Expr[str] | Expr[str | None], pattern: str | Expr[str], *, flags: str = ""
 ) -> Expr[list[str] | None]:
     """The captured groups of the first match, or NULL when there is none."""
     args: tuple[Node, ...] = (expr, bind(pattern))
@@ -947,8 +951,15 @@ def array_cat[T](left: Array[T], right: Array[T]) -> Expr[list[T]]:
 def _jsonb(value: object) -> Node:
     # Any Python value is JSON: a dict/list encode as before, a scalar (int, str, bool)
     # encodes as a jsonb scalar too (``jsonb_set(meta, ["a"], 5)``), not as bigint/text.
+    # ``None`` is the JSON literal ``null``, not SQL NULL: ``jsonb_set`` with a NULL value
+    # returns NULL and would wipe the whole column (B10).
     if isinstance(value, Node):
         return value
+    if value is None:
+        # A literal SQL NULL keeps jsonb_set's "return NULL" behaviour, so send the JSON
+        # text `null` and cast it. Binding the Python string "null" would instead store the
+        # JSON *string* "null".
+        return Fragment(("CAST('null' AS jsonb)",))
     return Cast(Param(value), "jsonb")
 
 
@@ -988,22 +999,54 @@ def jsonb_build_array(*values: object) -> Expr[list[object]]:
 # -- dates and times, extras (EX10) ---------------------------------------------------
 
 
-def age(value: ExprBase, start: ExprBase | None = None) -> Expr[datetime.timedelta | None]:
+# A date or timestamp expression, non-null or nullable (B13: age/to_char keep nullability).
+type _Moment = Expr[datetime.datetime] | Expr[datetime.date]
+type _MaybeMoment = Expr[datetime.datetime | None] | Expr[datetime.date | None]
+
+
+@overload
+def age(value: _Moment, start: _Moment | None = None) -> Expr[datetime.timedelta]: ...
+@overload
+def age(
+    value: _MaybeMoment, start: _Moment | _MaybeMoment | None = None
+) -> Expr[datetime.timedelta | None]: ...
+@overload
+def age(value: _Moment, start: _MaybeMoment) -> Expr[datetime.timedelta | None]: ...
+def age(value: ExprBase, start: ExprBase | None = None) -> ExprBase:
     """The interval between two timestamps, or from ``value`` to today (at midnight).
     NULL when either timestamp is NULL."""
     args: tuple[Node, ...] = (value,) if start is None else (value, start)
     return TypedFunc[datetime.timedelta | None]("age", args)
 
 
-def to_char(value: ExprBase, template: str) -> Expr[str | None]:
+@overload
+def to_char(
+    value: _Moment | Expr[datetime.timedelta] | Expr[int] | Expr[float] | Expr[Decimal],
+    template: str,
+) -> Expr[str]: ...
+@overload
+def to_char(
+    value: _MaybeMoment
+    | Expr[datetime.timedelta | None]
+    | Expr[int | None]
+    | Expr[float | None]
+    | Expr[Decimal | None],
+    template: str,
+) -> Expr[str | None]: ...
+def to_char(value: ExprBase, template: str) -> ExprBase:
     """Format a value as text with a template: ``to_char(Users.created_at, "YYYY-MM")``.
     NULL when the value is NULL."""
     return TypedFunc[str | None]("to_char", (value, bind(template)))
 
 
-def to_date(text: str | Expr[str], format: str) -> Expr[datetime.date]:
-    """Parse ``text`` as a date with a template: ``to_date("2024-01-02", "YYYY-MM-DD")``."""
-    return TypedFunc[datetime.date]("to_date", (bind(text), bind(format)))
+@overload
+def to_date(text: str | Expr[str], format: str) -> Expr[datetime.date]: ...
+@overload
+def to_date(text: Expr[str | None], format: str) -> Expr[datetime.date | None]: ...
+def to_date(text: str | ExprBase, format: str) -> ExprBase:
+    """Parse ``text`` as a date with a template: ``to_date("2024-01-02", "YYYY-MM-DD")``.
+    NULL when the text is NULL."""
+    return TypedFunc[datetime.date | None]("to_date", (bind(text), bind(format)))
 
 
 def to_timestamp(value: float | ExprBase) -> Expr[datetime.datetime]:
@@ -1031,7 +1074,9 @@ def make_interval(
         ("mins", _whole("mins", mins)),
         ("secs", _number("secs", secs)),
     )
-    args = [Fragment((f"{name} => {value!r}",)) for name, value in parts if value]
+    # ``!r`` on an int subclass (an IntEnum, or one with a crafted __repr__) is not SQL:
+    # format the plain number instead (B21).
+    args = [Fragment((f"{name} => {value}",)) for name, value in parts if value]
     return TypedFunc[datetime.timedelta]("make_interval", tuple(args))
 
 

@@ -189,6 +189,8 @@ class PostgresCompiler(Compiler):
 
     def visit_RelationalStatement(self, node: RelationalStatement) -> str:
         plan = node.plan
+        # The WITH prefix comes first in the text, so its parameters must be numbered first.
+        prefix = self._with_ctes(node.ctes)
         alias = self.new_alias()
         # Columns of the table and of an alias of it (``db.query(alias(Users, "u"))``)
         # both mean the root row.
@@ -201,6 +203,6 @@ class PostgresCompiler(Compiler):
             text += self.quote(alias)
             if plan.where is not None:
                 text += f" WHERE {self.visit(plan.where)}"
-            return text + self._clauses(plan)[1]
+            return prefix + text + self._clauses(plan)[1]
         finally:
             self._scopes.pop()

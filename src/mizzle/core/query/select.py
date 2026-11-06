@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import math
-from collections.abc import AsyncGenerator, Callable, Sequence
+import types
+import typing
+from collections.abc import AsyncGenerator, Callable, Mapping, Sequence
 from contextlib import aclosing
 from dataclasses import dataclass, field, replace
 from typing import Literal, Self, cast, overload, override
@@ -128,6 +130,56 @@ class Cte(Node):
         return None
 
 
+def _hint_types(hint: object) -> list[type[object]] | None:
+    """The classes a type hint allows (``X | None`` gives ``[X, NoneType]``), or None when
+    the hint is not a plain class union (``Any``, ``Literal``, a type variable)."""
+    # ``X | None`` has origin ``types.UnionType``; ``Optional[X]`` a special form that is not
+    # a class (``list[str]``'s is ``list``). A Literal also lands here; its values are not
+    # classes, so it gives None below.
+    origin = typing.get_origin(hint)
+    union = origin is types.UnionType or (origin is not None and not isinstance(origin, type))
+    out: list[type[object]] = []
+    for arg in typing.get_args(hint) if union else (hint,):
+        if arg is None:
+            out.append(type(None))
+            continue
+        origin = typing.get_origin(arg) or arg  # list[str] -> list
+        if not isinstance(origin, type):
+            return None
+        out.append(cast("type[object]", origin))
+    return out
+
+
+def _check_row_types(shape: type[object], projection: Mapping[str, object]) -> None:
+    """A plain column's value type and nullability must fit the TypedDict field (B14)."""
+    try:
+        hints = cast("dict[str, object]", typing.get_type_hints(shape))
+    except Exception:  # an unresolvable forward reference: the names were checked
+        return
+    label = getattr(shape, "__name__", shape)
+    for name, value in projection.items():
+        if not isinstance(value, ColumnBase) or not value.accepts or name not in hints:
+            continue
+        allowed = _hint_types(hints[name])
+        if allowed is None:
+            continue
+        if value.nullable and type(None) not in allowed:
+            raise QueryError(
+                f"as_rows({label}): field {name!r}: the column can be NULL, but the "
+                "TypedDict does not allow None"
+            )
+        classes = [t for t in allowed if t is not type(None)]
+        if classes and not any(
+            issubclass(a, t) or issubclass(t, a) for a in value.accepts for t in classes
+        ):
+            holds = " | ".join(a.__name__ for a in value.accepts)
+            says = " | ".join(t.__name__ for t in classes)
+            raise QueryError(
+                f"as_rows({label}): field {name!r}: the column holds {holds}, but the "
+                f"TypedDict says {says}"
+            )
+
+
 def _count(name: str, value: int | Expr[int]) -> int | Placeholder:
     if isinstance(value, Placeholder):
         return value
@@ -204,9 +256,14 @@ class SelectBase(Node):
         ``SYSTEM`` samples pages (fast), ``BERNOULLI`` samples rows (slower, finer)."""
         if method not in ("SYSTEM", "BERNOULLI"):
             raise QueryError(f"tablesample() method must be SYSTEM or BERNOULLI; got {method!r}")
-        if not 0 <= percent <= 100:
+        try:
+            bad_percent = not 0 <= percent <= 100
+            bad_seed = seed is not None and not math.isfinite(seed)
+        except (ArithmeticError, ValueError):  # Decimal("sNaN") cannot even be compared (B16)
+            raise QueryError("tablesample() percent and seed must be finite numbers") from None
+        if bad_percent:
             raise QueryError("tablesample() percent must be between 0 and 100")
-        if seed is not None and not math.isfinite(seed):
+        if bad_seed:
             raise QueryError("tablesample() seed must be a finite number")
         return evolve(self, tablesample_=Tablesample(method, float(percent), seed))
 
@@ -428,8 +485,8 @@ class Recursive[R]:
     seed: Select[R] | Compound[R]
 
     def step(self, build: Callable[[Cte], Select[R] | Compound[R]]) -> Cte:
-        """``build`` receives the CTE and returns the recursive term (usually the seed
-        ``.union_all(...)``-ed with it)."""
+        """``build`` receives the CTE and returns the recursive term only (a select that
+        reads from it); ``step`` itself joins it to the seed with ``UNION ALL``."""
         reference = Cte(self.name, self.seed)
         term = build(reference)
         return Cte(self.name, self.seed.union_all(term), recursive=True)
@@ -550,7 +607,9 @@ class Select[R](SelectBase, Executable[list[R]], SetOps[R]):
             )  # list[UsersRow]
 
         Nothing changes at runtime: the rows are already dicts keyed by the projection
-        names. A TypedDict whose fields do not match the projection is a ``QueryError``.
+        names. A TypedDict whose fields do not match the projection is a ``QueryError``, and
+        so is a plain column whose value type or nullability the field does not allow (B14).
+        Computed expressions are checked by name only: their Python type is not known here.
         """
         if not isinstance(self.projection, dict):
             raise QueryError("as_rows() needs select({...}) with named fields")
@@ -563,6 +622,7 @@ class Select[R](SelectBase, Executable[list[R]], SetOps[R]):
                     f"as_rows({getattr(shape, '__name__', shape)}): the projection has "
                     f"{sorted(self.projection)} but the TypedDict has {sorted(declared)}"
                 )
+            _check_row_types(shape, self.projection)
         return cast("Select[RowT]", self)
 
     async def first(self) -> R | None:

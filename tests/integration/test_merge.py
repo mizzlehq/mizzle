@@ -120,3 +120,23 @@ async def test_merge_17_syntax_on_an_older_server_names_the_version(
     )
     with pytest.raises(DatabaseError, match=expected):
         await query
+
+
+async def test_not_matched_by_source_on_an_older_server_names_the_version(
+    db: Database, driver: PostgresDriver
+) -> None:
+    # B12: PG15/16 stop at "BY" (not "SOURCE"), which the guard missed.
+    version = await _version(driver)
+    if version >= 170000:
+        pytest.skip("this server supports WHEN NOT MATCHED BY SOURCE")
+    expected = "needs PostgreSQL 17" if version >= 150000 else "needs PostgreSQL 15"
+    await seed(db)
+    source = db.select(Users.id).from_(Users).subquery("src")
+    query = (
+        db.merge(Posts)
+        .using(source)
+        .on(eq(Posts.author_id, source.c("id", int)))
+        .when_not_matched_by_source_then_delete()
+    )
+    with pytest.raises(DatabaseError, match=expected):
+        await query

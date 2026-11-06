@@ -414,9 +414,19 @@ def array[T](item: Column[T], name: str | None = None) -> Column[list[T] | None]
     return column
 
 
-def _enum_value(value: object) -> object:
-    # Only called with members of the column's enum. Enum.value is typed Any in typeshed.
-    return cast(enum.Enum, value).value  # pyright: ignore[reportAny]
+def _enum_encoder(enum_cls: type[enum.Enum]) -> Callable[[object], object]:
+    """Encode a member as its value. Anything else (a plain ``"admin"``) is a
+    ``QueryError``, not a raw ``AttributeError`` from deep in the compiler (B15)."""
+
+    def encode(value: object) -> object:
+        if not isinstance(value, enum_cls):
+            raise QueryError(
+                f"{enum_cls.__name__} column expects a {enum_cls.__name__} member, got "
+                f"{type(value).__name__}"
+            )
+        return value.value  # pyright: ignore[reportAny]  # Enum.value is Any in typeshed
+
+    return encode
 
 
 def pg_enum[E: enum.Enum](
@@ -432,7 +442,7 @@ def pg_enum[E: enum.Enum](
         type_name or snake_case(enum_cls.__name__),
         (enum_cls,),
         name,
-        encoder=_enum_value,
+        encoder=_enum_encoder(enum_cls),
         decoder=enum_cls,
     )
     column.enum = enum_cls

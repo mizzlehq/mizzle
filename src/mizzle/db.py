@@ -87,25 +87,51 @@ type _CallKind = Literal["fetch", "execute", "dicts"]
 MAX_PARAMS = 32767
 
 
-async def _run_commit_hook(hook: Callable[[], Awaitable[None]]) -> None:
-    """Run an after-commit hook; a failure is reported without suggesting the write failed."""
-    try:
-        await hook()
-    except Exception as exc:
+async def _run_commit_hooks(hooks: Sequence[Callable[[], Awaitable[None]]]) -> None:
+    """Run every after-commit hook; a failure is reported without suggesting the write failed.
+
+    One failing hook must not hide the others (B6): all of them run, and the first error is
+    the cause of the ``AfterCommitError``.
+    """
+    error: BaseException | None = None
+    for hook in hooks:
+        try:
+            await hook()
+        except Exception as exc:
+            log.error("mizzle: an after_commit hook failed", exc_info=exc)
+            if error is None:
+                error = exc
+    if error is not None:
         raise AfterCommitError(
             "an after_commit hook failed after the transaction committed; the data is saved. "
             "Do not retry the transaction."
-        ) from exc
+        ) from error
 
 
-async def _run_rollback_hook(hook: Callable[[], Awaitable[None]], original: BaseException) -> None:
-    """Run an after-rollback hook without replacing the error that caused the rollback."""
-    try:
-        await hook()
-    except Exception as exc:
-        # Keep the hook's failure reachable, but let the original error be the one raised.
-        log.error("mizzle: an after_rollback hook failed: %r", exc)
-        original.__context__ = AfterRollbackError(f"an after_rollback hook failed: {exc}")
+async def _run_rollback_hooks(
+    hooks: Sequence[Callable[[], Awaitable[None]]], original: BaseException
+) -> None:
+    """Run after-rollback hooks without replacing the error that caused the rollback.
+
+    The hook error is chained with its traceback (``AfterRollbackError.__cause__``) and
+    attached to the original as context, without clobbering a context it already had.
+    """
+    error: BaseException | None = None
+    for hook in hooks:
+        try:
+            await hook()
+        except Exception as exc:
+            log.error("mizzle: an after_rollback hook failed", exc_info=exc)
+            if error is None:
+                error = exc
+    if error is None:
+        return
+    hook_error = AfterRollbackError(f"an after_rollback hook failed: {error}")
+    hook_error.__cause__ = error  # keep the hook's traceback reachable
+    if original.__context__ is None:
+        original.__context__ = hook_error
+    else:
+        original.add_note(f"an after_rollback hook also failed: {error!r}")
 
 
 class Session(QueryBuilder):
@@ -133,6 +159,9 @@ class Session(QueryBuilder):
     # A savepoint is released, not committed, so running them there fires a side effect for
     # data the outer transaction can still roll back (R2).
     _deferred: list[Callable[[], Awaitable[None]]]
+    # ``after_rollback`` hooks of savepoints that were released: they must run if the
+    # outermost transaction rolls back (their data is undone after all).
+    _rollbacks: list[Callable[[], Awaitable[None]]]
 
     def __init__(
         self,
@@ -166,6 +195,7 @@ class Session(QueryBuilder):
         # inside a transaction queue up instead of failing.
         self._lock = asyncio.Lock()
         self._deferred = []
+        self._rollbacks = []
 
     # -- Runner protocol --------------------------------------------------------------
 
@@ -600,29 +630,36 @@ class Session(QueryBuilder):
           :class:`AfterCommitError` naming it, because the write *did* commit and a caller
           must not treat the failure as "nothing was saved" and retry;
         - an ``after_rollback`` hook that raises does not replace the original error: the
-          original is re-raised and the hook's error is attached as
-          ``AfterRollbackError.__context__``.
+          original is re-raised, and the hook's error is attached as its context (or, when
+          the original already has a context, as a note on it).
         """
         if self._conn is not None:
             if isolation is not None or readonly:
                 raise QueryError("isolation and readonly apply to the outermost transaction only")
+            # A rolled-back savepoint drops only what *it* queued: hooks queued by sibling
+            # savepoints that were already released stay (B2).
+            committed = len(self._deferred)
+            released = len(self._rollbacks)
             with self._transaction_span(isolation):
                 try:
                     async with self._conn.transaction():
                         yield self
                 except BaseException as original:
-                    # A rolled-back savepoint drops whatever it queued (and any queued by a
-                    # savepoint inside it).
-                    self._deferred.clear()
+                    del self._deferred[committed:]
+                    del self._rollbacks[released:]
                     if after_rollback is not None:
-                        await _run_rollback_hook(after_rollback, original)
+                        await _run_rollback_hooks([after_rollback], original)
                     raise
             if after_commit is not None:
                 # Released, not committed: run it only when the outermost transaction commits.
                 self._deferred.append(after_commit)
+            if after_rollback is not None:
+                # ...and if the outer transaction rolls back instead (B6).
+                self._rollbacks.append(after_rollback)
             return
         driver = self._require_driver()
         deferred: list[Callable[[], Awaitable[None]]] = []
+        rollbacks: list[Callable[[], Awaitable[None]]] = []
         with self._transaction_span(isolation):
             try:
                 async with driver.acquire() as conn, conn.transaction(isolation, readonly):
@@ -639,16 +676,17 @@ class Session(QueryBuilder):
                     )
                     tx._timeout = self._timeout
                     deferred = tx._deferred
+                    rollbacks = tx._rollbacks
                     yield tx
             except BaseException as original:
+                hooks = [*rollbacks, *([after_rollback] if after_rollback is not None else [])]
                 deferred.clear()
-                if after_rollback is not None:
-                    await _run_rollback_hook(after_rollback, original)
+                rollbacks.clear()
+                await _run_rollback_hooks(hooks, original)
                 raise
-        for hook in deferred:
-            await _run_commit_hook(hook)
         if after_commit is not None:
-            await _run_commit_hook(after_commit)
+            deferred.append(after_commit)
+        await _run_commit_hooks(deferred)
 
     @property
     def dialect(self) -> Dialect:
@@ -679,8 +717,11 @@ class Session(QueryBuilder):
             connection=self._conn,
             replicas=self._replicas,
         )
-        # Shared, so a view of a transaction still runs one statement at a time.
+        # Shared, so a view of a transaction still runs one statement at a time, and so
+        # hooks registered through a view land in the transaction's queues (B3).
         view._lock = self._lock
+        view._deferred = self._deferred
+        view._rollbacks = self._rollbacks
         view._next_replica = self._next_replica
         view._use_primary = self._use_primary
         view._timeout = self._timeout
@@ -1048,9 +1089,10 @@ class Database(Session):
         ``slow_query_ms`` logs a warning for statements that take at least that long.
         ``tracer`` (see ``mizzle.tracing``) opens a span around each statement and
         transaction. ``on_connect`` runs on each new connection (e.g. ``SET search_path`` or
-        session settings); ``server_settings`` sets PostgreSQL GUCs for every connection.
-        ``connect_retries`` (with ``connect_backoff`` seconds, doubling each time) retries
-        a failed connection, to survive a database that is not up yet.
+        session settings), and again after a connection is reset (see ``reset_connections``),
+        because a reset undoes what the hook set; ``server_settings`` sets PostgreSQL GUCs for
+        every connection. ``connect_retries`` (with ``connect_backoff`` seconds, doubling each
+        time) retries a failed connection, to survive a database that is not up yet.
 
         ``reset_connections="auto"`` (the default) resets a connection's session state when
         it goes back to the pool only after a statement that may have changed it: raw
@@ -1058,7 +1100,8 @@ class Database(Session):
         Skipping the reset after mizzle-built statements saves a round trip per query (2x on
         a real network). Use ``"always"`` if triggers or database functions change session
         settings themselves (``SET`` or ``set_config(..., false)`` without LOCAL, session
-        advisory locks, temp tables), because mizzle cannot see inside them."""
+        advisory locks, temp tables), because mizzle cannot see inside them; the reset then
+        (and the ``on_connect`` hook with it) runs on every release."""
         dialect = dialect_for_url(url)
         for replica in replicas:
             if dialect_for_url(replica).name != dialect.name:

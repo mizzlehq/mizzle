@@ -143,14 +143,17 @@ _NEWER_SYNTAX = (
     ("MERGE", "MERGE", 15, None),
     ("RETURNING", "MERGE ... RETURNING", 17, "MERGE"),
     ("SOURCE", "MERGE ... WHEN NOT MATCHED BY SOURCE", 17, "MERGE"),
+    # PG15/16 stop one word earlier, at BY (B12).
+    ("BY", "MERGE ... WHEN NOT MATCHED BY SOURCE", 17, "NOT MATCHED BY SOURCE"),
     ("NULLS", "a unique constraint or index with NULLS NOT DISTINCT", 15, "NULLS NOT DISTINCT"),
 )
 
 
 def _needs_newer_server(message: str, sql: str) -> str | None:
     upper = sql.upper()
+    near = message.upper()  # the server quotes the word as it was written
     for word, feature, version, also in _NEWER_SYNTAX:
-        if f'at or near "{word}"' in message and word in upper and (also is None or also in upper):
+        if f'AT OR NEAR "{word}"' in near and word in upper and (also is None or also in upper):
             return f"{feature} needs PostgreSQL {version} or later"
     return None
 
@@ -627,6 +630,9 @@ class _PoolConnection(asyncpg.Connection):
     _mizzle_dirty: bool = False  # no __slots__ here, so instances can set it
     # The on_connect hook the pool was created with, so a reset can re-run it (R1).
     _mizzle_on_connect: Callable[[PostgresConnection], Awaitable[None]] | None = None
+    # "auto": reset only after a statement that may have changed session state. "always":
+    # reset (and re-run the hook) on every release, as asyncpg does by default.
+    _mizzle_reset_mode: ResetMode = "auto"
 
     def mark_dirty(self) -> None:
         self._mizzle_dirty = True
@@ -639,17 +645,32 @@ class _PoolConnection(asyncpg.Connection):
         """Remember the pool's ``on_connect``, so a reset can run it again."""
         self._mizzle_on_connect = hook
 
+    def set_reset_mode(self, mode: ResetMode) -> None:
+        self._mizzle_reset_mode = mode
+
     async def reset_session(self) -> None:
         """Undo session state, then re-apply the ``on_connect`` hook.
 
         ``RESET ALL`` undoes whatever the hook set (a ``search_path``, a role), and asyncpg
         only runs ``init`` on a new connection, so the hook has to run again here. Otherwise
         it works on the first query and is silently gone after any raw statement.
+
+        The hook runs *only* when the connection was actually reset (B1): running it on
+        every release made each query pay for it, and ran a non-idempotent hook once per
+        query. In ``"always"`` mode every release resets, so the hook re-runs every time.
         """
-        if self.take_dirty():
-            await self.execute(self.get_reset_query())
+        if self._mizzle_reset_mode == "always":
+            # asyncpg's full reset (open transaction rollback, RESET ALL, UNLISTEN, ...).
+            # ``reset()`` calls ``_reset()`` and then the reset query; it does not call this
+            # hook again, so there is no recursion.
+            await self.reset()
+            reset = True
+        else:
+            reset = self.take_dirty()
+            if reset:
+                await self.execute(self.get_reset_query())
         hook = self._mizzle_on_connect
-        if hook is not None:
+        if hook is not None and reset:
             await hook(PostgresConnection(self))
 
 
@@ -784,6 +805,7 @@ class PostgresDriver:
             await _init_connection(conn)
             if isinstance(conn, _PoolConnection):
                 conn.set_on_connect(on_connect)
+                conn.set_reset_mode(reset_connections)
             if on_connect is not None:
                 await on_connect(PostgresConnection(conn))
 
@@ -798,8 +820,9 @@ class PostgresDriver:
                 server_settings=None if server_settings is None else dict(server_settings),
                 init=init,
                 connection_class=_PoolConnection,
-                # None: asyncpg's own full reset on every release.
-                reset=_reset_connection if reset_connections == "auto" else None,
+                # Never asyncpg's default reset: ours runs the reset only when needed ("auto",
+                # after a dirty statement) or every time ("always"), and re-runs on_connect.
+                reset=_reset_connection,
             )
         except (OSError, asyncpg.PostgresError) as exc:
             # The URL is left out on purpose: it may contain a password.
