@@ -121,6 +121,11 @@ def _parse_entry(raw: object, source: Path) -> JournalEntry:
     raise MigrationError(f"{source}: malformed journal entry {raw!r}")
 
 
+def _schema(snapshot: Snapshot) -> dict[str, object]:
+    """A snapshot without its identity: what the schema is, not where it sits."""
+    return {k: v for k, v in snapshot.items() if k not in ("id", "prev_id")}
+
+
 class MigrationsDir:
     root: Path
     dialect: str
@@ -226,11 +231,15 @@ class MigrationsDir:
 
     def repair(self) -> list[str]:
         """Reconcile the journal with the folders on disk: add folders it is missing, drop
-        entries whose folder is gone, refresh hashes and re-link the ``prev_id`` chain.
-        Returns the fixes applied (empty when nothing changed).
+        entries whose folder is gone and re-link the ``prev_id`` chain. Returns the fixes
+        applied (empty when nothing changed).
 
         It never replaces an entry with a different folder that reuses its number: that
         branch is ambiguous and refusing keeps an applied migration from being swapped out.
+        It never refreshes a recorded hash, so ``check`` keeps reporting SQL edited after
+        generate. It re-links a snapshot only when the parent it was generated on has the
+        same schema as the migration before it; otherwise the snapshot is stale (another
+        branch) and the migration must be generated again.
         """
         if not self.root.exists():
             return []
@@ -247,9 +256,18 @@ class MigrationsDir:
                     f"two migrations share number {index:04d}: {', '.join(names)}; "
                     "rename one of them before --fix"
                 )
+        snapshots: dict[str, Snapshot] = {}
+        for names in on_disk.values():
+            path = self.root / names[0] / "snapshot.json"
+            if path.exists():
+                snap = cast(Snapshot, json.loads(path.read_text(encoding="utf-8")))
+                snapshots[snap["id"]] = snap
+        empty = empty_snapshot(self.dialect)
         fixes: list[str] = []
         entries: list[JournalEntry] = []
+        relinked: list[tuple[Migration, Snapshot]] = []
         prev_id: str | None = None
+        prev_name = "the empty schema"
         for index in sorted(on_disk):
             name = on_disk[index][0]
             migration = Migration(index, name, self.root / name)
@@ -267,20 +285,18 @@ class MigrationsDir:
                     entries.append(old)
                     fixes.append(f"{name}: left as is; migration.sql or snapshot.json is missing")
                     if migration.snapshot_path.exists():
-                        prev_id = migration.snapshot()["id"]
+                        prev_id, prev_name = migration.snapshot()["id"], name
                 else:
                     fixes.append(f"{name}: ignored; migration.sql or snapshot.json is missing")
                 continue  # `check` reports the missing file as an error
-            digest = migration.hash()
             if old is None:
+                digest = migration.hash()
                 created = datetime.datetime.fromtimestamp(
                     migration.path.stat().st_mtime, datetime.UTC
                 ).isoformat(timespec="seconds")
                 fixes.append(f"{name}: added to the journal")
-            else:
-                created = old["created_at"]
-                if old["hash"] != digest:
-                    fixes.append(f"{name}: hash refreshed")
+            else:  # the generated hash stays: `check` must still see an edit
+                digest, created = old["hash"], old["created_at"]
             entry = JournalEntry(index=index, name=name, hash=digest, created_at=created)
             if old is not None and old.get("custom"):
                 entry["custom"] = True
@@ -288,16 +304,27 @@ class MigrationsDir:
                 entry["supersedes"] = old_supersedes
             entries.append(entry)
             snapshot = migration.snapshot()
-            if snapshot["prev_id"] != prev_id:
+            if (claimed := snapshot["prev_id"]) != prev_id:
+                parent = snapshots.get(claimed) if claimed is not None else empty
+                expected = snapshots[prev_id] if prev_id is not None else empty
+                if parent is None or _schema(parent) != _schema(expected):
+                    raise MigrationError(
+                        f"{name} was generated on top of another migration than {prev_name} "
+                        "(two branches?), so its snapshot lacks the changes before it and the "
+                        f"next generate would repeat them. Delete {name} and run `mizzle "
+                        "generate` again on the merged history (keep any SQL you wrote by hand)"
+                    )
                 snapshot["prev_id"] = prev_id
-                migration.snapshot_path.write_text(
-                    json.dumps(snapshot, indent=2) + "\n", encoding="utf-8"
-                )
+                relinked.append((migration, snapshot))
                 fixes.append(f"{name}: prev_id re-linked")
-            prev_id = snapshot["id"]
+            prev_id, prev_name = snapshot["id"], name
         for index, old in known.items():
             if index not in on_disk:
                 fixes.append(f"{old['name']}: dropped from the journal (folder is gone)")
+        for migration, snapshot in relinked:  # only once nothing was refused
+            migration.snapshot_path.write_text(
+                json.dumps(snapshot, indent=2) + "\n", encoding="utf-8"
+            )
         journal["entries"] = entries
         if fixes:
             self._save_journal(journal)

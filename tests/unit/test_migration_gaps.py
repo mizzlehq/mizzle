@@ -2,6 +2,8 @@
 identity options and long generated names (no database)."""
 
 import copy
+import sys
+from pathlib import Path
 from typing import final, override
 
 import pytest
@@ -16,6 +18,7 @@ from mizzle import (
     composite,
     domain,
     exclusion,
+    extension,
     function,
     grant,
     index,
@@ -28,6 +31,8 @@ from mizzle.core.errors import MigrationError
 from mizzle.core.snapshot import Snapshot, empty_snapshot
 from mizzle.dialects.postgres import PostgresDialect
 from mizzle.dialects.postgres.ddl import _without_defaults
+from mizzle.kit.cli import main
+from mizzle.kit.config import Config
 from mizzle.kit.diff import StrictRenames, diff, no_renames
 from mizzle.kit.snapshot import build_snapshot
 from mizzle.pg import bit, integer, pg_composite, pg_domain, text
@@ -800,6 +805,22 @@ def test_exclusion_operators_cannot_break_out_of_the_constraint() -> None:
         sqls(empty_snapshot("postgresql"), build_snapshot([Room], dialect))
 
 
+@pytest.mark.parametrize("operator", ["--", "--x", "/*", "*/", "&&/*"])
+def test_exclusion_operators_reject_comment_starts(operator: str) -> None:
+    # B24: these match the operator-character pattern but become comments in the SQL.
+    @final
+    class Note(Table, name="note"):
+        slot = integer().not_null()
+
+        @classmethod
+        @override
+        def config(cls) -> list[Constraint]:
+            return [exclusion((cls.slot, operator), name="bad")]
+
+    with pytest.raises(SchemaError, match="exclusion operator"):
+        sqls(empty_snapshot("postgresql"), build_snapshot([Note], dialect))
+
+
 def test_make_interval_rejects_values_that_are_not_numbers() -> None:
     assert make_interval(days=7) is not None
     with pytest.raises(QueryError, match="must be an int"):
@@ -865,3 +886,28 @@ def test_a_partitioned_table_cannot_be_unlogged() -> None:
 
     with pytest.raises(SchemaError, match="cannot be unlogged"):
         build_snapshot([P], dialect)
+
+
+def test_schema_objects_in_a_list_or_tuple_are_collected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # D4: `exts = [extension("hstore"), ...]` (as the docs show) must not be ignored.
+    module = "d4_schema_objects"
+    (tmp_path / f"{module}.py").write_text(
+        "from mizzle import extension\n"
+        'exts = [extension("hstore"), extension("citext")]\n'
+        'more = (extension("ltree"),)\n'
+        'single = extension("hstore")\n'
+        'unrelated = [1, "x"]\n'
+    )
+    monkeypatch.syspath_prepend(tmp_path)
+    monkeypatch.delitem(sys.modules, module, raising=False)
+    config = Config(root=tmp_path, schema=[module], out=tmp_path / "migrations")
+    assert config.load_objects() == [extension("hstore"), extension("citext"), extension("ltree")]
+
+
+def test_typegen_help_mentions_row_types(capsys: pytest.CaptureFixture[str]) -> None:
+    # D2: typegen also writes the <Table>Row TypedDicts.
+    with pytest.raises(SystemExit):
+        main(["--help"])
+    assert "write row/insert/update TypedDicts" in capsys.readouterr().out

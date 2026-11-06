@@ -25,12 +25,21 @@ from mizzle.kit.codegen import render_schema_module, render_types_module
 from mizzle.kit.config import Config, load_config
 from mizzle.kit.diff import RenameKind, RenameResolver, StrictRenames, diff, no_renames
 from mizzle.kit.init import init_project
-from mizzle.kit.journal import Migration, MigrationsDir, format_sql, parse_sql
+from mizzle.kit.journal import (
+    JournalEntry,
+    Migration,
+    MigrationsDir,
+    format_sql,
+    parse_sql,
+    slugify,
+)
 from mizzle.kit.migrate import (
     apply_statements,
     pending_migrations,
+    refuse_partial_squash,
     resolve_target,
     run_migrations,
+    squash_adopted,
     superseded_names,
 )
 from mizzle.kit.snapshot import build_snapshot
@@ -244,8 +253,8 @@ def cmd_migrate(config: Config, args: Args) -> int:
 
 
 async def _target_note(config: Config, directory: MigrationsDir, target: str) -> str | None:
-    """Say that ``--to`` names a migration the database has already passed, instead of the
-    bare "up to date" that hides a target behind the database."""
+    """Say that ``--to`` names a migration the database has already applied, instead of the
+    bare "up to date" that hides the migrations after it."""
 
     async def run(driver: Driver, dialect: Dialect) -> str | None:
         migrations = directory.migrations()
@@ -260,12 +269,10 @@ async def _target_note(config: Config, directory: MigrationsDir, target: str) ->
                 else:
                     raise
         last = max((m.index for m in migrations if m.name in applied), default=0)
-        if target_index < last:
-            return (
-                f"Target {target_migration.name} is already applied; the database is ahead "
-                f"of it ({last:04d})."
-            )
-        return None
+        if target_index > last:
+            return None
+        ahead = f"; the database is ahead of it ({last:04d})" if target_index < last else ""
+        return f"Target {target_migration.name} is already applied{ahead}."
 
     return await _with_driver(config, run)
 
@@ -298,12 +305,16 @@ def _migrate_dry_run(config: Config, args: Args, directory: MigrationsDir) -> in
 
 def _url_target(url: str) -> tuple[str, str]:
     """``(host[:port], database)`` from the URL, without any password."""
-    parsed = urlparse(url)
+    try:
+        parsed = urlparse(url)
+        port = parsed.port
+    except ValueError as exc:  # its message names the bad part, never the password
+        raise MigrationError(f"the database URL is malformed: {exc}") from None
     if not parsed.scheme:
         raise MigrationError("the database URL must be a postgresql:// URL")
     host = parsed.hostname or "localhost"
-    if parsed.port:
-        host = f"{host}:{parsed.port}"
+    if port:
+        host = f"{host}:{port}"
     return host, parsed.path.lstrip("/")
 
 
@@ -336,25 +347,42 @@ def cmd_reset(config: Config, args: Args) -> int:
         print("No migrations to run.")
         return 0
     host, database = _url_target(config.url())
-    if args.database is not None:
-        if args.database != database:
-            raise MigrationError(
-                f"--database {args.database!r} does not match the URL database {database!r}"
-            )
-    elif args.force:
+    if args.database is not None and args.database != database:
         raise MigrationError(
-            f"reset drops every managed object on {host}/{database}; "
-            f"rerun with --force --database {database!r} to confirm"
+            f"--database {args.database!r} does not match the URL database {database!r}"
         )
+    # Reset re-runs every migration on top of dropping only what the latest snapshot holds.
+    # In one transaction a failure rolls everything back; a statement that cannot run in a
+    # transaction rules that out, and then hand-written SQL (which may create objects reset
+    # does not drop, so it fails the second time) could leave the database half reset.
+    hand = _hand_written(directory)
+    one_transaction = all(s.transactional for m in migrations for s in m.statements())
+    if hand and not one_transaction:
+        raise MigrationError(
+            f"reset cannot safely re-run the hand-written SQL in {', '.join(hand)}: it may "
+            "create objects reset does not drop, and a migration that cannot run in a "
+            "transaction means a failure could not be rolled back. Drop and recreate the "
+            "database instead, then run `mizzle migrate`"
+        )
+    if args.force:
+        if args.database is None:
+            raise MigrationError(
+                f"reset drops every managed object on {host}/{database}; "
+                f"rerun with --force --database {database!r} to confirm"
+            )
     elif not _interactive():
         raise MigrationError(
             f"reset drops every managed object on {host}/{database}; "
             f"pass --force --database {database!r} to confirm"
         )
-    elif not _confirm(
-        f"Drop every mizzle-managed object on {host}/{database} and re-run all "
-        f"{len(migrations)} migration(s)?"
+    elif (
+        input(
+            f"Drop every mizzle-managed object on {host}/{database} and re-run all "
+            f"{len(migrations)} migration(s)? Type the database name to confirm: "
+        ).strip()
+        != database
     ):
+        print("Cancelled: that is not the database name.")
         return 1
 
     async def run(driver: Driver, dialect: Dialect) -> int:
@@ -371,18 +399,37 @@ def cmd_reset(config: Config, args: Args) -> int:
                     no_renames,
                     compare_expressions=False,
                 )
-                for statement in dialect.render(steps):
-                    await conn.execute(statement.sql, [])
-                # The history table is not in the schema diff; always clear it so every
-                # migration runs again even when its schema is not a managed one.
-                await dialect.drop_migrations_table(conn, config.migrations_schema)
-                await dialect.ensure_migrations_table(conn, config.migrations_schema)
-                for migration in migrations:
-                    print(f"Applying {migration.name}")
-                    record = dialect.record_migration(
-                        config.migrations_schema, migration.name, migration.hash()
+
+                async def rerun() -> None:
+                    for migration in migrations:
+                        print(f"Applying {migration.name}")
+                        record = dialect.record_migration(
+                            config.migrations_schema, migration.name, migration.hash()
+                        )
+                        await apply_statements(conn, migration.statements(), record)
+
+                try:
+                    async with conn.transaction():  # all drops, or none
+                        for statement in dialect.render(steps):
+                            await conn.execute(statement.sql, [])
+                        # The history table is not in the schema diff; always clear it so
+                        # every migration runs again even when its schema is not managed.
+                        await dialect.drop_migrations_table(conn, config.migrations_schema)
+                        await dialect.ensure_migrations_table(conn, config.migrations_schema)
+                        if one_transaction:
+                            await rerun()
+                except DatabaseError as exc:
+                    hint = (
+                        f" Hand-written SQL in {', '.join(hand)} may create objects reset "
+                        "does not drop; drop them by hand, or recreate the database."
+                        if hand
+                        else ""
                     )
-                    await apply_statements(conn, migration.statements(), record)
+                    raise MigrationError(
+                        f"reset failed and was rolled back; the database is unchanged: {exc}{hint}"
+                    ) from exc
+                if not one_transaction:
+                    await rerun()
                 return len(migrations)
             finally:
                 try:
@@ -403,20 +450,38 @@ def cmd_squash(config: Config, args: Args) -> int:
     if not migrations:
         print("No migrations to squash.")
         return 0
-    custom = [m.name for m in migrations if m.custom and m.statements()]
-    if custom:
+    if len(migrations) == 1 and migrations[0].supersedes:
+        print("Nothing to squash: the history is already one squashed migration.")
+        return 0
+    if hand := _hand_written(directory):
         raise MigrationError(
-            "squash would lose hand-written SQL in "
-            f"{', '.join(custom)}; move it into the squashed migration by hand first"
+            f"squash would lose hand-written SQL in {', '.join(hand)} (a custom migration, "
+            "or SQL edited after generate); take it out, squash, then add it to the squashed "
+            "migration by hand"
+        )
+    # Every name any database may have applied, so each history can adopt the squash.
+    supersedes = [name for m in migrations for name in (*m.supersedes, m.name)]
+    base = slugify(args.name or "squash")[:40]
+    slug, n = base, 1
+    while f"0001_{slug}" in supersedes:  # a reused name would read as an edited migration
+        n += 1
+        slug = f"{base}_{n}"
+    try:
+        applied = _applied_now(config)
+    except MizzleError:  # squash works offline; the warning below is best effort
+        applied = None
+    if applied and supersedes[-1] not in applied and any(name in applied for name in supersedes):
+        print(
+            f"warning: the database applied only part of this history (not "
+            f"{supersedes[-1]}), so it cannot adopt the squashed migration; run "
+            "`mizzle migrate` before squashing"
         )
     latest = directory.latest_snapshot()
     steps = diff(empty_snapshot(config.dialect_name), latest, no_renames, compare_expressions=False)
     statements = dialect.render(steps)
     latest["prev_id"] = None
     directory.clear()
-    migration = directory.write(
-        args.name or "squash", statements, latest, supersedes=[m.name for m in migrations]
-    )
+    migration = directory.write(slug, statements, latest, supersedes=supersedes)
     print(f"Squashed {len(migrations)} migration(s) into {migration.name}.")
     print("A database that applied the old history treats it as applied; a fresh one runs it.")
     return 0
@@ -528,6 +593,21 @@ CUSTOM_HEADER = "-- Custom migration. Separate statements with: -- mizzle:breakp
 _CUSTOM_HASH = hashlib.sha256(format_sql([], CUSTOM_HEADER).encode()).hexdigest()
 
 
+def _edited(entry: JournalEntry, migration: Migration) -> bool:
+    """A generated migration whose SQL changed after generate. A --custom one is meant to be
+    written after generate (an old journal marks it only by its empty-template hash)."""
+    return not migration.custom and entry["hash"] not in (migration.hash(), _CUSTOM_HASH)
+
+
+def _hand_written(directory: MigrationsDir) -> list[str]:
+    """Migrations holding SQL a person wrote: custom ones, and generated ones edited later."""
+    return [
+        m.name
+        for entry, m in zip(directory.journal()["entries"], directory.migrations(), strict=True)
+        if _edited(entry, m) or ((m.custom or entry["hash"] == _CUSTOM_HASH) and m.statements())
+    ]
+
+
 def cmd_check(config: Config, args: Args) -> int:
     directory = MigrationsDir(config.out, config.dialect_name)
     if args.fix:
@@ -545,12 +625,7 @@ def cmd_check(config: Config, args: Args) -> int:
         if not migration.sql_path.exists() or not migration.snapshot_path.exists():
             problems.append(f"{migration.name}: migration.sql or snapshot.json is missing")
             continue
-        if (
-            migration.hash() != entry["hash"]
-            and entry["hash"] != _CUSTOM_HASH
-            and not migration.custom
-        ):
-            # A --custom migration is meant to be written after generate.
+        if _edited(entry, migration):
             warnings.append(f"{migration.name}: migration.sql was edited after generate")
         snapshot = migration.snapshot()
         if snapshot["prev_id"] != prev_id:
@@ -597,6 +672,8 @@ def cmd_status(config: Config, args: Args) -> int:
     directory = MigrationsDir(config.out, config.dialect_name)
     migrations = directory.migrations()
     applied = _applied_now(config)
+    if applied is not None:
+        refuse_partial_squash(migrations, applied)
     superseded = superseded_names(migrations)
 
     rows: list[dict[str, object]] = []
@@ -606,8 +683,8 @@ def cmd_status(config: Config, args: Args) -> int:
             state = "unknown"
         elif migration.name in applied:
             state = "changed" if applied[migration.name] != migration.hash() else "applied"
-        elif migration.supersedes and set(migration.supersedes) <= set(applied):
-            state = "applied"  # a squash whose replaced names are all applied
+        elif squash_adopted(migration, applied):
+            state = "applied"  # a squash whose replaced history is applied
         else:
             state = "pending"
         counts[state] += 1
@@ -691,9 +768,7 @@ def cmd_info(config: Config, args: Args) -> int:
     changed = [m.name for m in migrations if m.name in applied and applied[m.name] != m.hash()]
 
     def in_effect(migration: Migration) -> bool:
-        return migration.name in applied or (
-            bool(migration.supersedes) and set(migration.supersedes) <= set(applied)
-        )
+        return migration.name in applied or squash_adopted(migration, applied)
 
     pending = sum(1 for m in migrations if not in_effect(m))
     print(f"  database:    PostgreSQL {version}")
@@ -833,7 +908,7 @@ def _parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_migrate)
 
     p = sub.add_parser("reset", help="drop the schema and re-run every migration")
-    p.add_argument("--force", action="store_true", help="do not ask before dropping")
+    p.add_argument("--force", action="store_true", help="do not ask (needs --database to confirm)")
     p.add_argument("--database", help="the database name, to confirm a destructive reset")
     p.add_argument("--lock-timeout", type=float, default=60.0)
     p.set_defaults(func=cmd_reset)
@@ -886,7 +961,7 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--force", action="store_true", help="drop without checking the database")
     p.set_defaults(func=cmd_drop)
 
-    p = sub.add_parser("typegen", help="write insert/update TypedDicts")
+    p = sub.add_parser("typegen", help="write row/insert/update TypedDicts")
     p.add_argument("--out")
     p.set_defaults(func=cmd_typegen)
 

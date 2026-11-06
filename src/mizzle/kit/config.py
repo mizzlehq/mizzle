@@ -110,9 +110,16 @@ class Config:
         return tables
 
     def load_objects(self) -> list[SchemaObject]:
-        """The extensions, functions, triggers, roles and domains the schema modules expose."""
-        objects: list[SchemaObject] = []
+        """The extensions, functions, triggers, roles and domains the schema modules expose,
+        also inside a top-level list or tuple (``exts = [extension("hstore"), ...]``)."""
+        candidates: list[object] = []
         for value in self._members():
+            if isinstance(value, list | tuple):
+                candidates += cast("list[object] | tuple[object, ...]", value)
+            else:
+                candidates.append(value)
+        objects: list[SchemaObject] = []
+        for value in candidates:
             if (
                 isinstance(value, Extension | Function | Trigger | Role | Domain | Composite)
                 and value not in objects

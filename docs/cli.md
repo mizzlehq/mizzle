@@ -58,8 +58,8 @@ non-zero on the same failures; it only skips sending the statements.
 
 `--to <name>` stops after that migration. The target is matched by exact folder name or by
 exact number, never by prefix: `--to 3` means migration 0003, not `0031_...`. When the
-target was already applied, `migrate --to` says so instead of claiming everything is
-up to date.
+target is already applied, `migrate --to` says so instead of claiming everything is
+up to date (later migrations may still be pending).
 
 Each migration runs in one transaction. Many app servers can run `migrate` at the same time:
 an advisory lock lets one apply and the others wait. A server that waits longer than
@@ -96,9 +96,18 @@ mizzle check --fix   # repair journal and prev_id inconsistencies
 Fails when the journal and the migration folders disagree. Warns when a `migration.sql`
 was edited after `generate` (custom migrations are expected to be edited). Run it in CI.
 
-`--fix` rewrites the journal where it can: a missing `prev_id`, a duplicate number it can
-resolve unambiguously. It never touches an entry that may already be applied, refuses
-ambiguous branch cases instead of guessing, and prints every change it makes.
+`--fix` rewrites the journal where it can: it adds a migration folder the journal is
+missing, drops an entry whose folder is gone, and re-links a `prev_id` when the migration
+it was generated on has the same schema as the one now before it (for example a custom
+migration merged in between). It prints every change it makes, and refuses instead of
+guessing:
+
+- two folders with the same number: rename one first;
+- a migration generated on another branch, whose snapshot lacks the changes now before it:
+  re-linking it would make the next `generate` repeat those changes, so delete it and run
+  `generate` again on the merged history;
+- it never refreshes a recorded hash, so a `migration.sql` edited after `generate` keeps
+  its warning (and `squash` keeps refusing it).
 
 ## status
 
@@ -115,7 +124,8 @@ migrations whose state is known.
 
 `--check` exits 1 when anything is pending, and also when an applied migration was edited
 after it was applied. `--json` prints
-`{"migrations": [...], "applied": n, "pending": n, "missing": n}`.
+`{"migrations": [...], "applied": n, "pending": n, "missing": [names]}`, where `missing`
+lists the applied migrations that are not on disk.
 
 ```text
   0001_create_users   applied
@@ -135,11 +145,20 @@ Only mizzle-managed objects are dropped: unmanaged tables in the same schema, in
 extensions and `public`'s owner and grants survive. The migrations table is always cleared,
 so every migration runs again even when its schema is outside `schema_filter`.
 
-`reset` is destructive, so it asks first and shows the host and database. `--force` skips
-the prompt but still requires `--database <name>` matching the database in the URL, so
-`DATABASE_URL=<production> mizzle reset --force` cannot wipe production by accident. It
+`reset` is destructive, so it shows the host and database and asks you to type the
+database name. Without a terminal (CI) it refuses unless you pass `--force`. `--force`
+skips the prompt but still requires `--database <name>` matching the database in the URL,
+so `DATABASE_URL=<production> mizzle reset --force` cannot wipe production by accident. It
 takes the same advisory lock as `migrate`, so a concurrent `migrate` waits instead of
 failing.
+
+The drops, the history reset and (when every statement can run in a transaction) the
+re-run of all migrations happen in one transaction: if anything fails, for example an
+unmanaged view that depends on a managed table, or a custom migration whose SQL creates an
+object reset does not drop, everything is rolled back and the database is unchanged. When
+a migration cannot run in a transaction (adding an enum value), `reset` refuses up front
+if the history holds hand-written SQL, since a failure could not be rolled back; drop and
+recreate the database instead.
 
 ## squash
 
@@ -148,11 +167,20 @@ mizzle squash --name initial
 ```
 
 Replaces the applied history with one migration holding the latest snapshot. It refuses to
-run when the range contains custom (hand-written) migrations, because their SQL would be
-lost; move that SQL into the squashed migration by hand first.
+run when the history holds hand-written SQL, because that SQL would be lost: a custom
+migration with statements, or a generated `migration.sql` edited after `generate` (the
+edit `check` warns about). Take that SQL out, squash, then add it to the squashed migration
+by hand.
 
 Databases that already applied the old migrations are not broken: the squashed migration
-records the names it `supersedes`, and `migrate` treats it as applied for them.
+records every name it `supersedes`, including those an earlier squash replaced, and
+`migrate` treats it as applied for a database that applied that whole history. Each squash
+gets a name no earlier migration used (`0001_squash`, then `0001_squash_2`, ...).
+
+A database that applied only part of the history (say 0001 of 2) can neither adopt the
+squash nor run it: `squash` warns about it when the database URL is set, and `migrate`,
+`migrate --dry-run` and `status` refuse with an error. Migrate it to the end of the old
+history first.
 
 ## seed
 
@@ -196,13 +224,17 @@ mizzle studio --host 0.0.0.0
 ```
 
 Binding a non-loopback host without `--auth` / `MIZZLE_STUDIO_AUTH` (or
-`--token` / `MIZZLE_STUDIO_TOKEN`) is refused. A token used for a remote bind must be at
-least 32 characters; omit `--token` to have one generated.
+`--token` / `MIZZLE_STUDIO_TOKEN`) is refused. A token from `--token` or
+`MIZZLE_STUDIO_TOKEN` must be at least 32 characters, on any host and also when `--auth` is
+set (the bearer token is accepted alongside Basic auth); omit it to have one generated. The
+Basic auth password must be at least 12 characters.
 
-Failed logins are throttled: after 10 wrong credentials within a minute the server answers
-`429` with `Retry-After` and refuses every attempt for 30 seconds, including a correct one.
-A successful login clears the count. Basic auth is over HTTP, so put
-it behind TLS (a reverse proxy) when the network is not trusted.
+Failed logins are throttled per client address: after 10 wrong credentials within a minute,
+that client's further wrong attempts get `429` with `Retry-After` until the oldest failure
+is a minute old. A correct credential is never refused, so another client's failures cannot
+lock you out. Behind a reverse proxy every client has the proxy's address, so they share one
+budget. Basic auth is over HTTP, so put it behind TLS (a reverse proxy) when the network is
+not trusted.
 
 Behind that proxy, set `MIZZLE_STUDIO_ORIGIN` to the public origin (comma-separated for
 several) so Studio's cross-site request check accepts the browser's `Origin`:
@@ -217,14 +249,27 @@ Studio refuses cross-site requests: a state-changing call must be `Content-Type:
 application/json` and must not come from another site (`Sec-Fetch-Site` / `Origin`). This
 matters because a browser attaches cached Basic credentials to a form post from any page.
 
-Read-only mode blocks writes and also refuses statements that could leave the read-only
-transaction or act on the server: `BEGIN`/`COMMIT`/`ROLLBACK`/`SAVEPOINT`, `SET`/`RESET`,
-`COPY`, `DO`, `NOTIFY`, `pg_read_file`, `pg_terminate_backend` and similar. That blocklist
-cannot cover everything a superuser can do, so a read-only Studio started on a superuser
-connection prints a warning: use a non-superuser role.
+`--read-only` needs a non-privileged database role. Read-only mode runs SQL in a
+`READ ONLY` transaction, and that stops writes to tables but not what a privileged role can
+do on the server (read files, run programs, signal other backends). So read-only Studio
+refuses to start when the role is a superuser, has `REPLICATION`, or is a member of
+`pg_read_server_files`, `pg_write_server_files`, `pg_execute_server_program` or
+`pg_signal_backend`. Create a plain role for it:
 
-CSV export prefixes a cell starting with `=`, `+`, `-` or `@` with an apostrophe, so a
-spreadsheet treats it as text rather than a formula. JSON export is unaltered.
+```sql
+CREATE ROLE studio_ro LOGIN PASSWORD '...';
+GRANT USAGE ON SCHEMA public TO studio_ro;
+GRANT SELECT ON ALL TABLES IN SCHEMA public TO studio_ro;
+```
+
+As defence in depth, read-only mode also refuses statements that could leave the read-only
+transaction (`BEGIN`/`COMMIT`/`ROLLBACK`/`SAVEPOINT`, `SET`/`RESET`, ...) and a list of
+server-side functions (`pg_read_file`, `pg_notify`, replication slot functions, ...). That
+list is not the security control and cannot be complete; the role is.
+
+CSV export prefixes a text cell starting with `=`, `+`, `-` or `@` (also after leading
+whitespace) with an apostrophe, so a spreadsheet treats it as text rather than a formula.
+Numbers, intervals, dates and times are left as they are. JSON export is unaltered.
 
 In the browser, a table's **Structure** tab can create and alter tables and columns: add a
 table, add or drop a column, change a column's type, nullability or default, and drop a

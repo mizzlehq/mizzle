@@ -1264,6 +1264,39 @@ async def test_partitions(driver: PostgresDriver, tmp_path: Path) -> None:
     assert [s.describe() for s in steps] == ["drop table regions"]
 
 
+@final
+class Events(Table, name="events", schema="mg", partition_by="RANGE (at)"):
+    id = integer()
+    at = timestamp(tz=True)
+
+    @classmethod
+    @override
+    def config(cls) -> list[Constraint]:
+        return [
+            partition("events_2026", for_values="for values from ('2026-01-01') to ('2027-01-01')"),
+            partition("events_def", for_values="default"),
+        ]
+
+
+@final
+class Codes(Table, name="codes", schema="mg", partition_by="LIST (code)"):
+    code = integer()
+
+    @classmethod
+    @override
+    def config(cls) -> list[Constraint]:
+        return [partition("codes_low", for_values="for values in (1, 2)")]
+
+
+async def test_partition_bounds_in_any_spelling_do_not_drift(driver: PostgresDriver) -> None:
+    # B30: the bound must be normalized against an existing parent too (info/doctor/push).
+    desired = snap([Events, Codes])
+    await migrate(driver, empty_snapshot("postgresql"), desired)  # asserts no drift
+    async with driver.acquire() as conn:
+        normalized = await dialect.normalize_snapshot(conn, desired)
+    assert normalized["tables"]["mg.events"].get("partitions", {})["events_def"] == "DEFAULT"
+
+
 # -- composite types ---------------------------------------------------------------------
 
 caddr = composite(

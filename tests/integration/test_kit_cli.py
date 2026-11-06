@@ -3,6 +3,7 @@
 import asyncio
 import importlib
 import json
+import shutil
 import subprocess
 import sys
 import uuid
@@ -12,6 +13,7 @@ from pathlib import Path
 import asyncpg
 import pytest
 
+import mizzle.kit.cli as kit_cli
 from mizzle.core.errors import MigrationError, MigrationTampered
 from mizzle.dialects.postgres import PostgresDialect
 from mizzle.dialects.postgres.driver import PostgresDriver
@@ -277,10 +279,16 @@ async def test_check_fix_repairs_journal(project: Path, capsys: pytest.CaptureFi
     snapshot.write_text(json.dumps(data, indent=2) + "\n")
     capsys.readouterr()
     assert await cli("check") == 1  # a broken prev_id is a problem
+    # B5: an unknown parent means the snapshot may be stale: refuse instead of re-linking,
+    # and never refresh the hash of an edited migration (that would hide the edit).
+    assert await cli("check", "--fix") == 1
+    assert "generate" in capsys.readouterr().err
+    data["prev_id"] = None
+    snapshot.write_text(json.dumps(data, indent=2) + "\n")
     assert await cli("check", "--fix") == 0
-    out = capsys.readouterr().out
-    assert "hash refreshed" in out and "prev_id re-linked" in out
+    assert "hash refreshed" not in capsys.readouterr().out
     assert await cli("check") == 0
+    assert "edited after generate" in capsys.readouterr().out
 
 
 async def test_custom_migration_template(project: Path, capsys: pytest.CaptureFixture[str]) -> None:
@@ -920,3 +928,279 @@ class Users(Table, name="users"):
         await conn.execute(f'DROP OWNED BY "{admin}"')
         await conn.execute(f'DROP ROLE IF EXISTS "{admin}"')
         await conn.close()
+
+
+# -- BUGS.md: reset, squash, check --fix, migrate --to ----------------------------------
+
+
+@pytest.fixture
+async def other_url(pg_url: str) -> AsyncGenerator[str]:
+    name = f"kit_{uuid.uuid4().hex[:10]}"
+    admin = await asyncpg.connect(pg_url)
+    await admin.execute(f'CREATE DATABASE "{name}"')
+    base, _, _ = pg_url.rpartition("/")
+    yield f"{base}/{name}"
+    await admin.execute(f'DROP DATABASE "{name}" WITH (FORCE)')
+    await admin.close()
+
+
+async def fetchval(url: str, query: str) -> object:
+    conn = await asyncpg.connect(url)
+    try:
+        return await conn.fetchval(query)
+    finally:
+        await conn.close()
+
+
+WITH_AGE = V1.replace("    name = text()", "    name = text()\n    age = integer()")
+WITH_BIO = WITH_AGE.replace("    age = integer()", "    age = integer()\n    bio = text()")
+
+
+async def test_reset_prompt_requires_the_database_name(
+    project: Path, kit_url: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # K4: the prompt makes you type the database name; B5: no --force and no TTY refuses.
+    assert await cli("generate") == 0
+    assert await cli("migrate") == 0
+    await fetchval(kit_url, "INSERT INTO users (email) VALUES ('a@b.c')")
+    database = kit_url.rsplit("/", 1)[-1]
+    assert await cli("reset", "--database", database) == 1  # no TTY to ask on
+    assert await fetchval(kit_url, "SELECT count(*) FROM users") == 1
+
+    monkeypatch.setattr(kit_cli, "_interactive", lambda: True)
+    answers = iter(["y", database])
+    monkeypatch.setattr("builtins.input", lambda _prompt: next(answers))
+    assert await cli("reset") == 1  # "y" is not the database name
+    assert await fetchval(kit_url, "SELECT count(*) FROM users") == 1
+    assert await cli("reset") == 0
+    assert await fetchval(kit_url, "SELECT count(*) FROM users") == 0
+
+
+async def test_reset_with_a_malformed_url_is_a_clean_error(
+    project: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # B31: no traceback, and the password is never printed.
+    assert await cli("generate") == 0
+    for url in ("postgresql://u:secretpw@localhost:badport/db", "postgresql://u:secretpw@[::1/db"):
+        monkeypatch.setenv("DATABASE_URL", url)
+        capsys.readouterr()
+        assert await cli("reset", "--force", "--database", "db") == 1
+        err = capsys.readouterr().err
+        assert err.startswith("error:") and "secretpw" not in err
+
+
+async def test_reset_failure_leaves_the_database_untouched(
+    project: Path, kit_url: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # B26: an unmanaged view on a managed table stops the drops; nothing may be dropped.
+    assert await cli("generate") == 0
+    assert await cli("migrate") == 0
+    await fetchval(kit_url, "CREATE VIEW zv AS SELECT * FROM users")
+    database = kit_url.rsplit("/", 1)[-1]
+    capsys.readouterr()
+    assert await cli("reset", "--force", "--database", database) == 1
+    assert "rolled back" in capsys.readouterr().err
+    assert await fetchval(kit_url, "SELECT to_regclass('public.posts')::text") == "posts"
+    assert await fetchval(kit_url, "SELECT count(*) FROM public.__mizzle_migrations") == 1
+
+
+async def test_reset_with_custom_sql_is_never_half_done(
+    project: Path, kit_url: str, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # B25: a custom migration creates an object reset does not manage.
+    assert await cli("generate") == 0
+    assert await cli("generate", "--custom", "--name", "extra") == 0
+    custom = next(project.glob("migrations/0002_extra/migration.sql"))
+    custom.write_text(custom.read_text() + "CREATE TABLE public.custom_made (id int);\n")
+    assert await cli("migrate") == 0
+    await fetchval(kit_url, "INSERT INTO users (email) VALUES ('a@b.c')")
+    database = kit_url.rsplit("/", 1)[-1]
+    capsys.readouterr()
+    assert await cli("reset", "--force", "--database", database) == 1
+    err = capsys.readouterr().err
+    assert "rolled back" in err and "0002_extra" in err
+    assert await fetchval(kit_url, "SELECT count(*) FROM users") == 1
+    assert await fetchval(kit_url, "SELECT count(*) FROM public.__mizzle_migrations") == 2
+
+    # A new enum value cannot run in one transaction: refuse before dropping anything.
+    rewrite_schema(
+        project, V1.replace('USER = "user"', 'USER = "user"\n    GUEST = "guest"'), monkeypatch
+    )
+    assert await cli("generate") == 0
+    assert await cli("migrate") == 0
+    capsys.readouterr()
+    assert await cli("reset", "--force", "--database", database) == 1
+    assert "0002_extra" in capsys.readouterr().err
+    assert await fetchval(kit_url, "SELECT count(*) FROM users") == 1
+
+
+async def test_squash_refuses_sql_edited_after_generate(
+    project: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # B27: SQL added to a generated migration would be lost; check --fix must not hide it.
+    assert await cli("generate") == 0
+    sql = next(project.glob("migrations/0001_*/migration.sql"))
+    sql.write_text(sql.read_text() + "CREATE INDEX users_email_custom ON users (email);\n")
+    capsys.readouterr()
+    assert await cli("squash") == 1
+    assert "hand-written SQL" in capsys.readouterr().err
+    assert await cli("check", "--fix") == 0
+    out = capsys.readouterr().out
+    assert "hash refreshed" not in out and "edited after generate" in out
+    assert await cli("squash") == 1
+    assert "users_email_custom" in sql.read_text()
+
+
+async def test_a_second_squash_is_adopted(
+    project: Path,
+    kit_url: str,
+    other_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # B28: a unique name, and supersedes carries the first squash's own list.
+    assert await cli("generate") == 0
+    rewrite_schema(project, WITH_AGE, monkeypatch)
+    assert await cli("generate") == 0
+    assert await cli("migrate") == 0
+    monkeypatch.setenv("DATABASE_URL", other_url)
+    assert await cli("migrate") == 0  # other_url stays on the original history
+    monkeypatch.setenv("DATABASE_URL", kit_url)
+
+    assert await cli("squash") == 0
+    assert await cli("migrate") == 0  # kit_url adopts the first squash
+    rewrite_schema(project, WITH_BIO, monkeypatch)
+    assert await cli("generate") == 0
+    assert await cli("migrate") == 0
+    first = MigrationsDir(project / "migrations", "postgresql").migrations()[0].name
+
+    capsys.readouterr()
+    assert await cli("squash") == 0
+    [second] = MigrationsDir(project / "migrations", "postgresql").migrations()
+    assert second.name != first
+    assert first in second.supersedes and len(second.supersedes) == 4
+    assert await cli("migrate", "--dry-run") == 0  # adopted: nothing to run
+    assert "Database is up to date." in capsys.readouterr().out
+    assert await cli("migrate") == 0
+    assert "Database is up to date." in capsys.readouterr().out
+    assert await cli("status", "--check") == 0
+
+    # other_url never applied the bio migration: it cannot adopt, and says why.
+    monkeypatch.setenv("DATABASE_URL", other_url)
+    assert await cli("migrate") == 1
+    assert "only part of the history" in capsys.readouterr().err
+
+    # A history that is one squash already has nothing to squash.
+    assert await cli("squash") == 0
+    assert "Nothing to squash" in capsys.readouterr().out
+    assert [m.name for m in MigrationsDir(project / "migrations", "postgresql").migrations()] == [
+        second.name
+    ]
+
+
+async def test_squash_of_a_partly_migrated_database(
+    project: Path, kit_url: str, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # B29: a database at 0001 of 2 cannot adopt the squash: warn, then refuse clearly.
+    assert await cli("generate") == 0
+    rewrite_schema(project, WITH_AGE, monkeypatch)
+    assert await cli("generate") == 0
+    assert await cli("migrate", "--to", "1") == 0
+    capsys.readouterr()
+    assert await cli("squash") == 0
+    assert "warning:" in capsys.readouterr().out
+    for args in (("migrate", "--dry-run"), ("migrate",), ("status",)):
+        assert await cli(*args) == 1
+        assert "only part of the history" in capsys.readouterr().err
+
+
+async def test_migrate_to_the_last_applied_migration_says_so(
+    project: Path, kit_url: str, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # B5: `--to` naming the last applied migration (a later one pending) is not "up to date".
+    assert await cli("generate") == 0
+    rewrite_schema(project, WITH_AGE, monkeypatch)
+    assert await cli("generate") == 0
+    assert await cli("migrate", "--to", "1") == 0
+    capsys.readouterr()
+    assert await cli("migrate", "--to", "1") == 0
+    out = capsys.readouterr().out
+    assert "already applied" in out and "up to date" not in out
+
+
+def _branch_migrations(project: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path, Path]:
+    """0001, then two branches that each generated 0002 on top of it: 0002_alpha is in the
+    journal, the other branch's folder is copied in as 0003_beta."""
+    migrations = project / "migrations"
+    alpha = "\nclass Alpha(Table, name='alpha'):\n    id = serial().primary_key()\n"
+    beta = "\nclass Beta(Table, name='beta'):\n    id = serial().primary_key()\n"
+    run("generate")
+    rewrite_schema(project, V1 + beta, monkeypatch)
+    run("generate", "--name", "beta")
+    stash = project / "beta_branch"
+    shutil.copytree(migrations / "0002_beta", stash)
+    MigrationsDir(migrations, "postgresql").drop_latest()
+    rewrite_schema(project, V1 + alpha, monkeypatch)
+    run("generate", "--name", "alpha")
+    shutil.copytree(stash, migrations / "0003_beta")
+    rewrite_schema(project, V1 + alpha + beta, monkeypatch)
+    return migrations / "0002_alpha", migrations / "0003_beta"
+
+
+async def test_check_fix_refuses_to_relink_a_stale_branch(
+    project: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # B32 / B5: re-linking 0003_beta would hide that its snapshot lacks alpha.
+    _, beta = await asyncio.to_thread(_branch_migrations, project, monkeypatch)
+    before = (beta / "snapshot.json").read_text()
+    capsys.readouterr()
+    assert await cli("check", "--fix") == 1
+    assert "generate" in capsys.readouterr().err
+    assert (beta / "snapshot.json").read_text() == before
+    assert await cli("check") == 1
+
+
+async def test_check_fix_relinks_when_the_parent_has_the_same_schema(
+    project: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # A branch generated on 0001 while 0002 (custom) changed no schema: safe to re-link.
+    assert await cli("generate") == 0
+    assert await cli("generate", "--custom", "--name", "noop") == 0
+    rewrite_schema(project, WITH_AGE, monkeypatch)
+    assert await cli("generate") == 0
+    directory = MigrationsDir(project / "migrations", "postgresql")
+    first, _, third = directory.migrations()
+    data = third.snapshot()
+    data["prev_id"] = first.snapshot()["id"]
+    third.snapshot_path.write_text(json.dumps(data, indent=2) + "\n")
+    assert await cli("check") == 1
+    capsys.readouterr()
+    assert await cli("check", "--fix") == 0
+    assert "prev_id re-linked" in capsys.readouterr().out
+    assert await cli("check") == 0
+
+
+async def test_reset_with_a_new_enum_value(
+    project: Path, kit_url: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Adding an enum value cannot run in a transaction: reset re-runs the history after the
+    # drops (no hand-written SQL, so nothing can fail on objects reset did not drop).
+    assert await cli("generate") == 0
+    rewrite_schema(
+        project, V1.replace('USER = "user"', 'USER = "user"\n    GUEST = "guest"'), monkeypatch
+    )
+    assert await cli("generate") == 0
+    assert await cli("migrate") == 0
+    await fetchval(kit_url, "INSERT INTO users (email, role) VALUES ('a@b.c', 'guest')")
+    database = kit_url.rsplit("/", 1)[-1]
+    assert await cli("reset", "--force", "--database", database) == 0
+    assert await fetchval(kit_url, "SELECT count(*) FROM users") == 0
+
+
+async def test_squash_without_a_reachable_database(
+    project: Path, kit_url: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The partial-history warning is best effort: squash itself needs no database.
+    assert await cli("generate") == 0
+    monkeypatch.setenv("DATABASE_URL", kit_url + "?sslmode=bogus")
+    assert await cli("squash") == 0

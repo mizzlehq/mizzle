@@ -1046,20 +1046,21 @@ async def _normalize(snapshot: Snapshot, read_back: _ReadBack, version: int) -> 
             )
             if row is not None and row["k"] is not None:
                 table["partition_by"] = str(row["k"])
-        if partitions := table.get("partitions"):
-            # Create each partition for real (rolled back after) so a timestamptz bound
-            # reads back as the database prints it, not as the user spelled it.
-            parent = qualified(table["schema"], table["name"])
-            reg = qualified(table["schema"], _NORM).replace("'", "''")
+        if (partitions := table.get("partitions")) and partition_by is not None:
+            # Create each partition (rolled back after) so a timestamptz bound reads back as
+            # the database prints it, not as the user spelled it. Its parent is a temporary
+            # copy: a partition of the real parent would overlap the one already there.
+            columns = ", ".join(
+                f"{quote(c['name'])} {SERIAL_TYPES.get(c['type'], c['type'])}"
+                for c in table["columns"].values()
+            )
+            parent = f"CREATE TEMP TABLE {quote(_NORM)} ({columns}) PARTITION BY {partition_by}"
+            part = quote(f"{_NORM}_part")
             for pname, bound in partitions.items():
-                create = (
-                    f"CREATE TABLE {qualified(table['schema'], _NORM)} "
-                    f"PARTITION OF {parent} {bound}"
-                )
                 row = await read_back(
-                    [create],
+                    [parent, f"CREATE TEMP TABLE {part} PARTITION OF {norm} {bound}"],
                     "SELECT pg_get_expr(c.relpartbound, c.oid) AS b FROM pg_class c "
-                    f"WHERE c.oid = to_regclass('{reg}')",
+                    f"WHERE c.oid = to_regclass('pg_temp.{part}')",
                 )
                 if row is not None and row["b"] is not None:
                     partitions[pname] = str(row["b"])

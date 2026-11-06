@@ -66,6 +66,27 @@ def superseded_names(migrations: list[Migration]) -> set[str]:
     return {old for migration in migrations for old in migration.supersedes}
 
 
+def squash_adopted(migration: Migration, applied: Mapping[str, str]) -> bool:
+    """A squash is in effect when the last migration it replaced is applied: every squash
+    replaces the whole history before it, and ``migrate`` applies in order."""
+    return bool(migration.supersedes) and migration.supersedes[-1] in applied
+
+
+def refuse_partial_squash(migrations: list[Migration], applied: Mapping[str, str]) -> None:
+    """Fail when the database applied only part of the history a squash replaced: it can
+    neither adopt the squash nor run it (that would recreate what is already there)."""
+    for migration in migrations:
+        if migration.name in applied or squash_adopted(migration, applied):
+            continue
+        if done := [name for name in migration.supersedes if name in applied]:
+            raise MigrationError(
+                f"the database applied only part of the history {migration.name} replaced "
+                f"({', '.join(done)}, but not {migration.supersedes[-1]}), so it can neither "
+                "adopt nor run it. Check out the commit before the squash and run "
+                "`mizzle migrate` there first, or reset this database."
+            )
+
+
 def pending_migrations(
     migrations: list[Migration], applied: Mapping[str, str], target: str | None = None
 ) -> list[Migration]:
@@ -76,6 +97,7 @@ def pending_migrations(
     known = {migration.name for migration in migrations} | superseded_names(migrations)
     if missing := [name for name in applied if name not in known]:
         raise MigrationError(f"applied migrations are missing on disk: {missing}")
+    refuse_partial_squash(migrations, applied)
     last_applied = max((m.index for m in migrations if m.name in applied), default=0)
     pending: list[Migration] = []
     for migration in migrations:
@@ -86,8 +108,8 @@ def pending_migrations(
                     "restore it and put the change in a new migration"
                 )
             continue
-        if migration.supersedes and set(migration.supersedes) <= set(applied):
-            continue  # already in effect: the names it replaced are applied
+        if squash_adopted(migration, applied):
+            continue  # already in effect: the history it replaced is applied
         if migration.index < last_applied:
             raise MigrationError(
                 f"{migration.name} is not applied but a later migration is; "
@@ -120,11 +142,7 @@ async def run_migrations(
             # A squashed migration whose replaced names are all applied is already in
             # effect: replace those names with the squashed one in the history.
             for migration in migrations:
-                if (
-                    migration.supersedes
-                    and migration.name not in applied
-                    and set(migration.supersedes) <= set(applied)
-                ):
+                if migration.name not in applied and squash_adopted(migration, applied):
                     for old in migration.supersedes:
                         await conn.execute(*dialect.forget_migration(schema, old))
                         applied.pop(old, None)
