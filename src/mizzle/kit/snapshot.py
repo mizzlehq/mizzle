@@ -296,6 +296,7 @@ def build_snapshot(
             if (needed := dialect.type_extension(column.sql_type)) is not None:
                 snapshot.setdefault("extensions", {}).setdefault(needed, ExtensionSnap(name=needed))
 
+    declared_exts: dict[str, ExtensionSnap] = {}
     for obj in [*objects, *(o.execute for o in objects if isinstance(o, Trigger))]:
         match obj:
             case Role():
@@ -306,6 +307,13 @@ def build_snapshot(
                     ext["schema"] = obj.schema
                 if obj.version is not None:
                     ext["version"] = obj.version
+                # Two declarations that disagree silently kept the last one. One a column
+                # type implied (no options) may be replaced by the declared one.
+                if declared_exts.get(obj.name, ext) != ext:
+                    raise SchemaError(
+                        f"extension {obj.name!r} is declared twice with different options"
+                    )
+                declared_exts[obj.name] = ext
                 snapshot.setdefault("extensions", {})[obj.name] = ext
             case Function():
                 fn = _function(obj, default_schema)

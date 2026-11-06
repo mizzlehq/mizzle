@@ -26,6 +26,7 @@ BREAKPOINT = "-- mizzle:breakpoint"
 NO_TRANSACTION = "-- mizzle:no-transaction"
 JOURNAL_VERSION = 1
 _INDEX = re.compile(r"^(\d+)_")
+_FOLDER = re.compile(r"\d+_[\w-]+")
 
 
 class JournalEntry(TypedDict):
@@ -114,6 +115,9 @@ def _parse_entry(raw: object, source: Path) -> JournalEntry:
         if (
             isinstance(index, int)
             and isinstance(name, str)
+            # A plain folder name: squash and drop delete self.root / name, so "../x" from
+            # a merged journal.json would delete a folder outside migrations/.
+            and _FOLDER.fullmatch(name) is not None
             and isinstance(hash_, str)
             and isinstance(created_at, str)
         ):

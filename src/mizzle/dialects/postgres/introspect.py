@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import logging
 import re
 from collections.abc import Sequence
 from typing import Protocol, cast
@@ -70,9 +71,12 @@ WHERE c.relkind IN ('r', 'p') AND n.nspname = ANY($1::text[]) AND c.relname <> $
 ORDER BY n.nspname, c.relname
 """
 
+log = logging.getLogger("mizzle")
+
 _PARTITIONS = """
-SELECT c.relname AS name, pn.nspname AS parent_schema, pc.relname AS parent_name,
-       pg_get_expr(c.relpartbound, c.oid) AS bound
+SELECT c.relname AS name, n.nspname AS schema, pn.nspname AS parent_schema,
+       pc.relname AS parent_name,
+       pg_get_expr(c.relpartbound, c.oid) AS bound, pg_get_partkeydef(c.oid) AS sub_key
 FROM pg_class c
 JOIN pg_namespace n ON n.oid = c.relnamespace
 JOIN pg_inherits i ON i.inhrelid = c.oid
@@ -571,6 +575,16 @@ async def introspect(
         parent = snapshot["tables"].get(key(str(row["parent_schema"]), str(row["parent_name"])))
         if parent is not None:  # a partition whose parent is outside the schemas read
             parent.setdefault("partitions", {})[str(row["name"])] = str(row["bound"])
+        if row["sub_key"] is not None:
+            # Sub-partitions are not modelled: say so rather than drop them silently (a
+            # pulled schema creates the partition without them).
+            log.warning(
+                "mizzle: partition %s.%s is itself partitioned (%s); mizzle does not model "
+                "sub-partitions, so they are left out of the schema",
+                row["schema"],
+                row["name"],
+                row["sub_key"],
+            )
 
     oids = list(by_oid)
     for row in await conn.fetch_dicts(_COLUMNS, [oids]):

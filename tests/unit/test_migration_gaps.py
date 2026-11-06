@@ -925,3 +925,32 @@ def test_a_squash_is_adopted_only_for_a_whole_history() -> None:
     assert history_complete(twice, dict.fromkeys(["0001_squash", "0003_d"], ""))
     assert history_complete(twice, dict.fromkeys(["0001_a", "0002_b", "0003_d"], ""))
     assert not history_complete(twice, dict.fromkeys(["0001_a", "0003_d"], ""))
+
+
+def test_a_journal_entry_cannot_name_a_folder_outside_migrations(tmp_path: Path) -> None:
+    # squash and drop delete root / name: "../victim" would reach outside migrations/.
+    import json
+
+    from mizzle.core.errors import MigrationError
+    from mizzle.kit.journal import MigrationsDir
+
+    (tmp_path / "victim").mkdir()
+    meta = tmp_path / "migrations" / "meta"
+    meta.mkdir(parents=True)
+    entry = {"index": 1, "name": "../victim", "hash": "x", "created_at": "2026-01-01"}
+    journal = {"version": 1, "dialect": "postgresql", "entries": [entry]}
+    (meta / "journal.json").write_text(json.dumps(journal))
+    with pytest.raises(MigrationError, match="malformed journal entry"):
+        MigrationsDir(tmp_path / "migrations", "postgresql").clear()
+    assert (tmp_path / "victim").is_dir()
+
+
+def test_an_extension_declared_twice_with_different_options_is_refused() -> None:
+    # Two declarations (top level and in a list) silently kept the last one.
+    from mizzle.kit.snapshot import build_snapshot
+
+    same = [extension("hstore"), extension("hstore")]
+    assert "hstore" in build_snapshot([], dialect, objects=same).get("extensions", {})
+    clash = [extension("hstore"), extension("hstore", schema="ext")]
+    with pytest.raises(SchemaError, match=r"hstore.*declared twice"):
+        build_snapshot([], dialect, objects=clash)

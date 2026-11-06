@@ -1458,3 +1458,23 @@ async def test_domain_outside_schema_filter_round_trips(driver: PostgresDriver) 
         expected = await dialect.normalize_snapshot(conn, v1)
     remaining = diff(only_mg, expected)
     assert remaining == [], [s.describe() for s in remaining]
+
+
+async def test_a_sub_partitioned_partition_is_reported(
+    driver: PostgresDriver, caplog: pytest.LogCaptureFixture
+) -> None:
+    # Sub-partitions are not modelled: introspection said nothing, and pull lost them.
+    async with driver.acquire() as conn:
+        await conn.execute(
+            "CREATE SCHEMA mg; "
+            "CREATE TABLE mg.sp (id int, region text, at date) PARTITION BY LIST (region); "
+            "CREATE TABLE mg.sp_eu PARTITION OF mg.sp FOR VALUES IN ('eu') "
+            "PARTITION BY RANGE (at); "
+            "CREATE TABLE mg.sp_eu_2026 PARTITION OF mg.sp_eu "
+            "FOR VALUES FROM ('2026-01-01') TO ('2027-01-01')",
+            [],
+        )
+    with caplog.at_level("WARNING", logger="mizzle"):
+        snapshot = await live(driver)
+    assert snapshot["tables"]["mg.sp"].get("partitions", {}).keys() == {"sp_eu"}
+    assert any("mg.sp_eu is itself partitioned" in r.getMessage() for r in caplog.records)
