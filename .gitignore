@@ -33,3 +33,5 @@ mutants/
 # Local review notes: not part of the project, never published.
 ISSUES.md
 ISSUES-STUDIO-RUNTIME.md
+GAPS.md
+BUGS.md
