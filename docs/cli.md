@@ -230,10 +230,11 @@ set (the bearer token is accepted alongside Basic auth); omit it to have one gen
 Basic auth password must be at least 12 characters.
 
 Failed logins are throttled per client address: after 10 wrong credentials within a minute,
-that client's further wrong attempts get `429` with `Retry-After` until the oldest failure
-is a minute old. A correct credential is never refused, so another client's failures cannot
-lock you out. Behind a reverse proxy every client has the proxy's address, so they share one
-budget. Basic auth is over HTTP, so put it behind TLS (a reverse proxy) when the network is
+that client gets `429` with `Retry-After` for every API request, a correct one included, until
+the oldest failure is a minute old. Other clients are not affected, so an attacker cannot lock
+you out. Behind a reverse proxy on the same host, the proxy's `X-Forwarded-For` gives each
+client its own address; for a proxy on another host, set `FORWARDED_ALLOW_IPS` to its address
+(otherwise every client shares the proxy's budget). Basic auth is over HTTP, so put it behind TLS (a reverse proxy) when the network is
 not trusted.
 
 Behind that proxy, set `MIZZLE_STUDIO_ORIGIN` to the public origin (comma-separated for

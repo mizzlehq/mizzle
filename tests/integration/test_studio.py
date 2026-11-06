@@ -815,8 +815,9 @@ def test_repeated_failed_logins_are_throttled_per_client(
     pg_url: str, driver: PostgresDriver, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # SS4: a remote bind is reachable from anywhere, so a guessed token must not be
-    # brute-forceable at network speed. B7: the throttle is per client, and a correct
-    # credential is never refused, so an attacker cannot lock the real user out.
+    # brute-forceable at network speed. B7: the throttle is per client, so an attacker
+    # cannot lock the real user out. B34: a throttled client is refused even with the right
+    # credential; otherwise the throttle did not slow guessing at all (a hit still got 200).
     monkeypatch.setattr(server, "LOGIN_MAX_FAILURES", 3)
     wrong = {"Authorization": "Bearer no"}
     with (
@@ -828,8 +829,8 @@ def test_repeated_failed_logins_are_throttled_per_client(
         blocked = attacker.get("/api/meta", headers=wrong)
         assert blocked.status_code == 429
         assert int(blocked.headers["retry-after"]) >= 1
-        # The right credential gets through, even from the throttled client.
-        assert attacker.get("/api/meta", headers=AUTH).status_code == 200
+        # A correct guess from the throttled client is refused too.
+        assert attacker.get("/api/meta", headers=AUTH).status_code == 429
         # Another client is not affected by the attacker's failures...
         assert user.get("/api/meta", headers=AUTH).status_code == 200
         assert user.get("/api/meta", headers=wrong).status_code == 401

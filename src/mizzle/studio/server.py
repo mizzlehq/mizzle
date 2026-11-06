@@ -67,11 +67,12 @@ _DOLLAR = re.compile(r"\$[A-Za-z_\x80-\U0010ffff][A-Za-z0-9_\x80-\U0010ffff]*\$|
 # A -- comment ends at either newline character, as in PostgreSQL's scanner.
 _LINE_END = re.compile(r"[\r\n]")
 
-# Failed-login throttle (SS4, B7): a client address with this many wrong credentials within
-# the window gets 429 for further wrong ones until the oldest ages out. It is per client and
-# a correct credential always passes, so an attacker can only slow down their own guessing,
-# never lock out the real user. At most LOGIN_MAX_CLIENTS addresses are tracked (oldest
-# dropped first), so a spray from many addresses cannot grow the table without limit.
+# Failed-login throttle (SS4, B7, B34): a client address with this many wrong credentials
+# within the window gets 429 for every API request, a correct one included, until the oldest
+# failure ages out. That caps guessing at LOGIN_MAX_FAILURES per window per address. It is per
+# client, so an attacker only blocks themselves, never the real user. At most
+# LOGIN_MAX_CLIENTS addresses are tracked (oldest dropped first), so a spray from many
+# addresses cannot grow the table without limit.
 LOGIN_MAX_FAILURES = 10
 LOGIN_WINDOW_SECONDS = 60.0
 LOGIN_MAX_CLIENTS = 1024
@@ -982,13 +983,19 @@ class _Guard(BaseHTTPMiddleware):
             and request.headers.get("host", "") not in self.allowed_hosts
         ):
             return self._error("forbidden host", 403)
-        if request.url.path.startswith("/api/") and not self._authorized(request):
+        if request.url.path.startswith("/api/"):
+            # The throttle comes before the credential check: if a throttled client's correct
+            # guess still got through, the throttle would not slow guessing at all (B34). It
+            # is per client address, so only the guessing client waits, not the real user.
+            # Behind a reverse proxy on this host, uvicorn's proxy headers give the real
+            # client address (FORWARDED_ALLOW_IPS for a proxy elsewhere).
             client = request.client.host if request.client else ""
             if (wait := self._retry_after(client)) is not None:
-                self._record_failure(client)
                 return self._error(
                     "too many failed attempts; try again shortly", 429, {"Retry-After": str(wait)}
                 )
+        if request.url.path.startswith("/api/") and not self._authorized(request):
+            client = request.client.host if request.client else ""
             self._record_failure(client)
             headers = {"WWW-Authenticate": 'Basic realm="mizzle studio"'} if self.basic else None
             return self._error("missing or wrong credentials", 401, headers)
