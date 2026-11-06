@@ -5,9 +5,11 @@ from __future__ import annotations
 import math
 import types
 import typing
+import weakref
 from collections.abc import AsyncGenerator, Callable, Mapping, Sequence
 from contextlib import aclosing
 from dataclasses import dataclass, field, replace
+from decimal import Decimal
 from typing import Literal, Self, cast, overload, override
 
 from mizzle.core.compiler import CompiledQuery
@@ -144,16 +146,49 @@ def _hint_types(hint: object) -> list[type[object]] | None:
             out.append(type(None))
             continue
         origin = typing.get_origin(arg) or arg  # list[str] -> list
-        if not isinstance(origin, type):
+        # ``Any`` is a class since Python 3.11; typegen writes it for ranges, geometry and
+        # unknown domains, so it must allow anything rather than be checked (B42).
+        if not isinstance(origin, type) or origin is typing.Any or origin is object:
             return None
         out.append(cast("type[object]", origin))
     return out
 
 
+# Weak, so a TypedDict defined inside a function is not kept alive by the cache.
+_HINTS: weakref.WeakKeyDictionary[type[object], dict[str, object]] = weakref.WeakKeyDictionary()
+
+
+def _type_hints(shape: type[object]) -> dict[str, object]:
+    """``get_type_hints``, cached: it cost more than compiling the query (B47). A failure
+    raises and is not cached, so a forward reference resolved later still counts."""
+    hints = _HINTS.get(shape)
+    if hints is None:
+        hints = _HINTS[shape] = cast("dict[str, object]", typing.get_type_hints(shape))
+    return hints
+
+
+def _decoded(column: ColumnBase) -> tuple[type[object], ...]:
+    """The classes a column's values decode to. ``accepts`` is the write side: a float or
+    numeric column also takes an ``int`` but never returns one (B46)."""
+    accepts = column.accepts or ()
+    return accepts[:1] if accepts and accepts[0] in (float, Decimal) else accepts
+
+
+def _fits(value: type[object], hint: type[object]) -> bool | None:
+    """Whether a decoded value class fits a hinted class; None when the hint cannot be
+    checked (a TypedDict or a Protocol refuses ``issubclass``, B45)."""
+    if hint is float and value is int:  # PEP 484: int is acceptable where float is
+        return True
+    try:
+        return issubclass(value, hint)
+    except TypeError:
+        return None
+
+
 def _check_row_types(shape: type[object], projection: Mapping[str, object]) -> None:
     """A plain column's value type and nullability must fit the TypedDict field (B14)."""
     try:
-        hints = cast("dict[str, object]", typing.get_type_hints(shape))
+        hints = _type_hints(shape)
     except Exception:  # an unresolvable forward reference: the names were checked
         return
     label = getattr(shape, "__name__", shape)
@@ -169,10 +204,10 @@ def _check_row_types(shape: type[object], projection: Mapping[str, object]) -> N
                 "TypedDict does not allow None"
             )
         classes = [t for t in allowed if t is not type(None)]
-        if classes and not any(
-            issubclass(a, t) or issubclass(t, a) for a in value.accepts for t in classes
-        ):
-            holds = " | ".join(a.__name__ for a in value.accepts)
+        decoded = _decoded(value)
+        fits = [_fits(d, t) for d in decoded for t in classes]
+        if classes and None not in fits and not any(fits):
+            holds = " | ".join(d.__name__ for d in decoded)
             says = " | ".join(t.__name__ for t in classes)
             raise QueryError(
                 f"as_rows({label}): field {name!r}: the column holds {holds}, but the "
@@ -256,6 +291,8 @@ class SelectBase(Node):
         ``SYSTEM`` samples pages (fast), ``BERNOULLI`` samples rows (slower, finer)."""
         if method not in ("SYSTEM", "BERNOULLI"):
             raise QueryError(f"tablesample() method must be SYSTEM or BERNOULLI; got {method!r}")
+        if isinstance(percent, bool) or isinstance(seed, bool):  # True is not 1 percent
+            raise QueryError("tablesample() percent and seed must be numbers, not bool")
         try:
             bad_percent = not 0 <= percent <= 100
             bad_seed = seed is not None and not math.isfinite(seed)

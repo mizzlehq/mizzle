@@ -988,12 +988,18 @@ def jsonb_build_object(*pairs: object) -> Expr[dict[str, object]]:
     ``jsonb_build_object("name", Users.email, "n", count())``."""
     if len(pairs) % 2:
         raise QueryError("jsonb_build_object() takes key/value pairs")
-    return TypedFunc[dict[str, object]]("jsonb_build_object", tuple(bind(p) for p in pairs))
+    return TypedFunc[dict[str, object]]("jsonb_build_object", tuple(_json_arg(p) for p in pairs))
 
 
 def jsonb_build_array(*values: object) -> Expr[list[object]]:
     """Build a jsonb array from the values."""
-    return TypedFunc[list[object]]("jsonb_build_array", tuple(bind(v) for v in values))
+    return TypedFunc[list[object]]("jsonb_build_array", tuple(_json_arg(v) for v in values))
+
+
+def _json_arg(value: object) -> Node:
+    """An argument of a ``variadic "any"`` JSON builder. PostgreSQL cannot type a bare NULL
+    parameter there, so ``None`` is sent as ``NULL::text``, which becomes JSON null (B50)."""
+    return Cast(Param(None), "text") if value is None else bind(value)
 
 
 # -- dates and times, extras (EX10) ---------------------------------------------------
@@ -1074,6 +1080,9 @@ def make_interval(
         ("mins", _whole("mins", mins)),
         ("secs", _number("secs", secs)),
     )
+    for name, value in parts[:-1]:  # PostgreSQL takes these as 32-bit integers
+        if not -(2**31) <= value < 2**31:
+            raise QueryError(f"make_interval() {name} must fit in 32 bits; got {value}")
     # ``!r`` on an int subclass (an IntEnum, or one with a crafted __repr__) is not SQL:
     # format the plain number instead (B21).
     args = [Fragment((f"{name} => {value}",)) for name, value in parts if value]

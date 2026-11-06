@@ -81,6 +81,10 @@ class Merge[T: Table](ReturningMixin[T]):
         if not values:
             raise QueryError("when_not_matched_then_insert() needs a non-empty values")
         check_values(self.table, values)
+        columns = self.table.__table__.columns
+        for attr, column in columns.items():
+            if column.required_on_insert and attr not in values:
+                raise QueryError(f"{column.qualified_name} is required")  # B48
         if missing := missing_defaults(self.table, values):
             # The factory would run once and every inserted row would share the value.
             raise QueryError(

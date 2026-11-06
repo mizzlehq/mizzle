@@ -415,8 +415,10 @@ def array[T](item: Column[T], name: str | None = None) -> Column[list[T] | None]
 
 
 def _enum_encoder(enum_cls: type[enum.Enum]) -> Callable[[object], object]:
-    """Encode a member as its value. Anything else (a plain ``"admin"``) is a
-    ``QueryError``, not a raw ``AttributeError`` from deep in the compiler (B15)."""
+    """Encode a member as its label, ``str(member.value)`` (the label the snapshot creates).
+    An IntEnum's value is an int, which a text enum parameter refused (B49). Anything else
+    (a plain ``"admin"``) is a ``QueryError``, not a raw ``AttributeError`` from deep in the
+    compiler (B15)."""
 
     def encode(value: object) -> object:
         if not isinstance(value, enum_cls):
@@ -424,9 +426,20 @@ def _enum_encoder(enum_cls: type[enum.Enum]) -> Callable[[object], object]:
                 f"{enum_cls.__name__} column expects a {enum_cls.__name__} member, got "
                 f"{type(value).__name__}"
             )
-        return value.value  # pyright: ignore[reportAny]  # Enum.value is Any in typeshed
+        return str(cast(object, value.value))
 
     return encode
+
+
+def _enum_decoder(enum_cls: type[enum.Enum]) -> Callable[[object], object]:
+    """A label back to its member, also for an IntEnum, whose labels are ``"1"``, ``"2"``."""
+    by_label: dict[str, enum.Enum] = {str(cast(object, m.value)): m for m in enum_cls}
+
+    def decode(value: object) -> object:
+        member = by_label.get(value) if isinstance(value, str) else None
+        return member if member is not None else enum_cls(value)
+
+    return decode
 
 
 def pg_enum[E: enum.Enum](
@@ -443,7 +456,7 @@ def pg_enum[E: enum.Enum](
         (enum_cls,),
         name,
         encoder=_enum_encoder(enum_cls),
-        decoder=enum_cls,
+        decoder=_enum_decoder(enum_cls),
     )
     column.enum = enum_cls
     column.enum_schema = schema

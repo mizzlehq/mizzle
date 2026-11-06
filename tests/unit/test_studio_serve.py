@@ -236,10 +236,9 @@ def test_forwarded_headers_are_trusted_only_when_configured(
 ) -> None:
     # B67: uvicorn trusts X-Forwarded-For from 127.0.0.1 by default, so a local client could
     # name a fresh address for every guess and never be throttled.
-    serve = {"port": 4983, "read_only": False, "open_browser": False, "token": "t" * 32}
-    studio_server.serve(config, **serve)
-    monkeypatch.setenv("FORWARDED_ALLOW_IPS", "127.0.0.1")
-    studio_server.serve(config, **serve)
+    for _ in range(2):
+        studio_server.serve(config, port=4983, read_only=False, open_browser=False, token="t" * 32)
+        monkeypatch.setenv("FORWARDED_ALLOW_IPS", "127.0.0.1")
     assert PROXY_HEADERS == [False, True]
 
 

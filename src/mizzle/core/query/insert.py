@@ -45,10 +45,15 @@ def check_values(table: type[Table], values: Mapping[str, object]) -> None:
 
 
 def prepare_row(
-    table: type[Table], row: Mapping[str, object], *, allow_identity: bool = False
+    table: type[Table],
+    row: Mapping[str, object],
+    *,
+    allow_identity: bool = False,
+    defaults: bool = True,
 ) -> dict[str, object]:
     """Validate one insert row and apply Python-side defaults. ``allow_identity`` lets it
-    set ``GENERATED ALWAYS`` identity columns (for ``overriding_system_value()``)."""
+    set ``GENERATED ALWAYS`` identity columns (for ``overriding_system_value()``).
+    ``defaults=False`` leaves ``default_fn`` columns out, for the caller to fill later."""
     columns = table.__table__.columns
     if not row.keys() <= columns.keys():
         check_values(table, row)  # raises with the unknown names
@@ -68,6 +73,8 @@ def prepare_row(
             column.validate(value)
             out[attr] = value
         elif column.default_factory is not None:
+            if not defaults:
+                continue
             value = column.default_factory()
             column.validate(value)
             out[attr] = value
@@ -159,6 +166,9 @@ class Insert[T: Table](ReturningMixin[T]):
     source_columns: tuple[ColumnBase, ...] = ()
     # A WITH clause passed with db.with_(...): emitted before the INSERT.
     ctes: tuple[Cte, ...] = ()
+    # Per row, the ``default_fn`` columns it leaves out. They are filled when the statement
+    # compiles, so a prepared or re-awaited insert gets a fresh value each run (B43).
+    defaulted: tuple[frozenset[str], ...] = ()
 
     def values(self, rows: RowLike | Sequence[RowLike] | None = None, /, **fields: object) -> Self:
         """``values(email="a")``, ``values({"email": "a"})`` or ``values([{...}, {...}])``."""
@@ -176,7 +186,11 @@ class Insert[T: Table](ReturningMixin[T]):
                 raise QueryError("values() got an empty list")
         else:
             batch = [as_mapping(rows)]
-        rows = tuple(prepare_row(self.table, row, allow_identity=True) for row in batch)
+        rows = tuple(
+            prepare_row(self.table, row, allow_identity=True, defaults=False) for row in batch
+        )
+        factories = [a for a, c in self.table.__table__.columns.items() if c.default_factory]
+        defaulted = tuple(frozenset(a for a in factories if a not in row) for row in rows)
         identity = next(
             (
                 column
@@ -187,7 +201,26 @@ class Insert[T: Table](ReturningMixin[T]):
             ),
             None,
         )
-        return evolve(self, rows=rows, identity=identity)
+        return evolve(
+            self, rows=rows, identity=identity, defaulted=defaulted if any(defaulted) else ()
+        )
+
+    def with_defaults(self) -> Self:
+        """This insert with every left-out ``default_fn`` column called now."""
+        if not self.defaulted:
+            return self
+        columns = self.table.__table__.columns
+        rows: list[dict[str, object]] = []
+        for row, attrs in zip(self.rows, self.defaulted, strict=True):
+            filled = dict(row)
+            for attr in attrs:
+                factory = columns[attr].default_factory
+                assert factory is not None
+                value = factory()
+                columns[attr].validate(value)
+                filled[attr] = value
+            rows.append(filled)
+        return evolve(self, rows=tuple(rows), defaulted=())
 
     def overriding_system_value(self) -> Self:
         """``OVERRIDING SYSTEM VALUE``: store the given values of ``GENERATED ALWAYS``

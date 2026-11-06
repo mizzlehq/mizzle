@@ -238,8 +238,9 @@ class Compiler:
             case bool():
                 return "true" if value else "false"
             case enum.Enum():
-                member_value: object = value.value  # pyright: ignore[reportAny]  # Enum.value is Any in typeshed
-                return self.literal(member_value)
+                # Quoted, so an IntEnum default on an enum column is its label '1' (B49); an
+                # untyped quoted literal still coerces to a number column.
+                return self.literal(str(cast(object, value.value)))
             case int() | float() | Decimal():
                 return str(value)
             case str():
@@ -657,6 +658,10 @@ class Compiler:
             return prefix + self._insert_select_text(node, node.source)
         if not node.rows:
             raise QueryError(f"insert into {node.table.__name__} has no values()")
+        if node.defaulted:
+            # A default_fn runs per execution, so a prepared statement compiles again (B43).
+            node = node.with_defaults()
+            self._dynamic = True
         if node.identity is not None and node.overriding is None:
             raise QueryError(
                 f"{node.identity.qualified_name} is GENERATED ALWAYS AS IDENTITY; the "

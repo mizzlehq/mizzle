@@ -65,7 +65,7 @@ _ISOLATION: dict[IsolationLevel, _AsyncpgIsolation] = {
 }
 
 
-def map_error(exc: BaseException, sql: str) -> MizzleError | None:
+def map_error(exc: BaseException, sql: str, server: int | None = None) -> MizzleError | None:
     """Translate an asyncpg error. The message never includes ``exc.detail``, which can
     contain row values (e.g. "Key (email)=(a@b.c) already exists")."""
     match exc:
@@ -113,7 +113,7 @@ def map_error(exc: BaseException, sql: str) -> MizzleError | None:
             # Misuse such as a wrong number of arguments: not a lost connection, so the pool
             # is kept and reads are not retried. These messages hold no values.
             return DatabaseError(f"{type(exc).__name__}: {exc}", sql=sql, original=exc)
-        case pg.PostgresSyntaxError() if needs := _needs_newer_server(exc.message, sql):
+        case pg.PostgresSyntaxError() if needs := _needs_newer_server(exc.message, sql, server):
             return DatabaseError(f"{needs} ({exc.message})", sql=sql, original=exc)
         case asyncpg.PostgresError() if not exc.message:
             # Raised client-side by asyncpg while encoding params; its text includes the value.
@@ -135,25 +135,38 @@ def map_error(exc: BaseException, sql: str) -> MizzleError | None:
             return None
 
 
+_MERGE = r"^\s*(?:WITH\b.*?\b)?MERGE\s+INTO\b"
+_BY_SOURCE = r"\bNOT\s+MATCHED\s+BY\s+SOURCE\b"
 # SQL that older servers reject as a syntax error: (word they stop at, feature, version,
-# another token the SQL must contain so the word is not matched in an unrelated statement).
-_NEWER_SYNTAX = (
-    ("EXPRESSION", "ALTER COLUMN ... SET EXPRESSION", 17, None),
-    ("VIRTUAL", "VIRTUAL generated columns", 18, None),
-    ("MERGE", "MERGE", 15, None),
-    ("RETURNING", "MERGE ... RETURNING", 17, "MERGE"),
-    ("SOURCE", "MERGE ... WHEN NOT MATCHED BY SOURCE", 17, "MERGE"),
-    # PG15/16 stop one word earlier, at BY (B12).
-    ("BY", "MERGE ... WHEN NOT MATCHED BY SOURCE", 17, "NOT MATCHED BY SOURCE"),
-    ("NULLS", "a unique constraint or index with NULLS NOT DISTINCT", 15, "NULLS NOT DISTINCT"),
+# the shape the SQL must have, so the word is not matched in an unrelated statement).
+_NEWER_SYNTAX = tuple(
+    (word, feature, version, re.compile(shape, re.IGNORECASE | re.DOTALL))
+    for word, feature, version, shape in (
+        ("EXPRESSION", "ALTER COLUMN ... SET EXPRESSION", 17, r"\bSET\s+EXPRESSION\b"),
+        ("VIRTUAL", "VIRTUAL generated columns", 18, r"\bVIRTUAL\b"),
+        ("MERGE", "MERGE", 15, _MERGE),
+        ("RETURNING", "MERGE ... RETURNING", 17, _MERGE),
+        ("SOURCE", "MERGE ... WHEN NOT MATCHED BY SOURCE", 17, _BY_SOURCE),
+        # PG15/16 stop one word earlier, at BY (B12).
+        ("BY", "MERGE ... WHEN NOT MATCHED BY SOURCE", 17, _BY_SOURCE),
+        (
+            "NULLS",
+            "a unique constraint or index with NULLS NOT DISTINCT",
+            15,
+            r"\bNULLS\s+NOT\s+DISTINCT\b",
+        ),
+    )
 )
 
 
-def _needs_newer_server(message: str, sql: str) -> str | None:
-    upper = sql.upper()
+def _needs_newer_server(message: str, sql: str, server: int | None = None) -> str | None:
+    """Name the feature an older server lacks. Never on a server new enough for it: there
+    the syntax error is a real one (B44)."""
     near = message.upper()  # the server quotes the word as it was written
-    for word, feature, version, also in _NEWER_SYNTAX:
-        if f'AT OR NEAR "{word}"' in near and word in upper and (also is None or also in upper):
+    for word, feature, version, shape in _NEWER_SYNTAX:
+        if server is not None and server >= version:
+            continue
+        if f'AT OR NEAR "{word}"' in near and shape.search(sql):
             return f"{feature} needs PostgreSQL {version} or later"
     return None
 
@@ -166,10 +179,10 @@ def _connection_broken(exc: BaseException) -> bool:
     return any(marker in text for marker in _BROKEN_CONNECTION)
 
 
-def _translate(exc: Exception, sql: str) -> Exception:
+def _translate(exc: Exception, sql: str, server: int | None = None) -> Exception:
     """Map ``exc``; callers raise the result ``from None`` so tracebacks do not print the
     driver error, whose DETAIL can hold row values. It stays reachable as ``.original``."""
-    mapped = map_error(exc, sql)
+    mapped = map_error(exc, sql, server)
     if mapped is None:
         return exc
     return mapped
@@ -233,6 +246,13 @@ class PostgresConnection:
         self._conn = conn
         self.dirty = False
 
+    def _translate(self, exc: Exception, sql: str) -> Exception:
+        try:
+            server = self._conn.get_server_version().major
+        except Exception:  # a detached pool proxy: the version is not needed then
+            server = None
+        return _translate(exc, sql, server)
+
     async def fetch(
         self,
         sql: str,
@@ -245,7 +265,7 @@ class PostgresConnection:
         try:
             return list(await self._conn.fetch(sql, *params, timeout=timeout))
         except Exception as exc:
-            raise _translate(exc, sql) from None
+            raise self._translate(exc, sql) from None
 
     async def fetch_dicts(
         self, sql: str, params: Sequence[object], timeout: float | None = None
@@ -256,7 +276,7 @@ class PostgresConnection:
                 dict(record) for record in await self._conn.fetch(sql, *params, timeout=timeout)
             ]
         except Exception as exc:
-            raise _translate(exc, sql) from None
+            raise self._translate(exc, sql) from None
 
     async def execute(
         self,
@@ -270,7 +290,7 @@ class PostgresConnection:
         try:
             return _rowcount(await self._conn.execute(sql, *params, timeout=timeout))
         except Exception as exc:
-            raise _translate(exc, sql) from None
+            raise self._translate(exc, sql) from None
 
     async def executemany(
         self, sql: str, params: Sequence[Sequence[object]], timeout: float | None = None
@@ -280,7 +300,7 @@ class PostgresConnection:
             # asyncpg pipelines these in as few round trips as it can.
             await self._conn.executemany(sql, params, timeout=timeout)
         except Exception as exc:
-            raise _translate(exc, sql) from None
+            raise self._translate(exc, sql) from None
         return len(params)
 
     @asynccontextmanager
@@ -318,7 +338,7 @@ class PostgresConnection:
             while batch := await cursor.fetch(batch_size, timeout=timeout):
                 yield list(batch)
         except Exception as exc:
-            raise _translate(exc, sql) from None
+            raise self._translate(exc, sql) from None
 
     async def copy_records(
         self,
@@ -344,7 +364,7 @@ class PostgresConnection:
                 original=exc,
             ) from None
         except Exception as exc:
-            raise _translate(exc, sql) from None
+            raise self._translate(exc, sql) from None
         return _rowcount(status)
 
     async def copy_out(
@@ -374,7 +394,7 @@ class PostgresConnection:
                 timeout=timeout,
             )
         except Exception as exc:
-            raise _translate(exc, sql) from None
+            raise self._translate(exc, sql) from None
         return _rowcount(status)
 
     async def _inline(self, sql: str, params: Sequence[object]) -> str:
