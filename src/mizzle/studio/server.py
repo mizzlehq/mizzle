@@ -9,13 +9,16 @@ Security model (Studio can read and change data):
   non-loopback host with no credentials. A non-loopback bind drops the Host check (clients
   reach it by an address it cannot know), which Basic auth covers;
 - no CORS headers, so other websites cannot call the API from a browser;
-- ``--read-only`` blocks every write, and raw SQL runs in a read-only transaction;
+- ``--read-only`` blocks every write, and raw SQL runs in a read-only transaction; it
+  refuses to start as a role with server-side abilities (superuser and friends), which a
+  READ ONLY transaction does not stop;
 - table and column names are checked against the introspected schema and quoted;
   values are always bind parameters.
 """
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import csv
 import datetime
@@ -28,17 +31,14 @@ import math
 import os
 import re
 import secrets
-import sys
 import time
 import webbrowser
-from collections import deque
 from collections.abc import AsyncGenerator, Awaitable, Callable, Mapping, Sequence
 from contextlib import aclosing, asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import cast, override
 
-import asyncpg
 from starlette.applications import Starlette
 from starlette.middleware import Middleware
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
@@ -62,31 +62,57 @@ MAX_SQL_ROWS = 1000
 MAX_PAGE = 500
 MAX_HISTORY = 100
 _COMPARE = {"eq": "=", "ne": "<>", "lt": "<", "lte": "<=", "gt": ">", "gte": ">="}
-_DOLLAR = re.compile(r"\$[A-Za-z_][A-Za-z0-9_]*\$|\$\$")
+# PostgreSQL's dolq_start / dolq_cont: any non-ASCII character counts as a letter.
+_DOLLAR = re.compile(r"\$[A-Za-z_\x80-\U0010ffff][A-Za-z0-9_\x80-\U0010ffff]*\$|\$\$")
+# A -- comment ends at either newline character, as in PostgreSQL's scanner.
+_LINE_END = re.compile(r"[\r\n]")
 
-# Failed-login throttle (SS4): after this many wrong credentials within the window, even a
-# correct one is refused for the lockout period. A remote bind is reachable from anywhere, so
-# a short token must not be guessable at network speed.
+# Failed-login throttle (SS4, B7): a client address with this many wrong credentials within
+# the window gets 429 for further wrong ones until the oldest ages out. It is per client and
+# a correct credential always passes, so an attacker can only slow down their own guessing,
+# never lock out the real user. At most LOGIN_MAX_CLIENTS addresses are tracked (oldest
+# dropped first), so a spray from many addresses cannot grow the table without limit.
 LOGIN_MAX_FAILURES = 10
 LOGIN_WINDOW_SECONDS = 60.0
-LOGIN_LOCKOUT_SECONDS = 30.0
+LOGIN_MAX_CLIENTS = 1024
 
+# Read-only mode's control is the role check in ``privileged_roles``: a role with no
+# server-side abilities, in a READ ONLY transaction. The lists below are defence in depth on
+# top of that. A text blocklist cannot be complete (``U&"..."`` names, dynamic SQL), so it
+# is never the reason read-only holds.
+#
 # Statements that change the transaction, the session or the process rather than the data.
-# In read-only mode a batch must not be able to leave the READ ONLY transaction it runs in
-# (``commit; insert ...`` was a working write), so these are refused outright.
+# A batch must not be able to leave the READ ONLY transaction it runs in (``commit; insert
+# ...`` was a working write). Matched on the first token after comments.
 _READ_ONLY_DENIED = re.compile(
     r"(?:BEGIN|START\s+TRANSACTION|COMMIT|END|ROLLBACK|ABORT|SAVEPOINT|RELEASE"
     r"|SET|RESET|DISCARD|LOCK|PREPARE\s+TRANSACTION|NOTIFY|LISTEN|UNLISTEN"
-    r"|COPY|DO)\b",
+    r"|COPY|DO|CHECKPOINT|LOAD)\b",
     re.IGNORECASE,
 )
 # Server-side functions that read or change things outside the transaction, which READ ONLY
-# does not (and cannot) stop.
+# does not stop, plus the ways found to spell or call them indirectly.
 _READ_ONLY_DENIED_CALLS = re.compile(
-    r"\b(?:pg_read_file|pg_read_binary_file|pg_ls_dir|pg_stat_file|pg_terminate_backend"
+    r"\b(?:pg_read_file|pg_read_binary_file|pg_ls_\w+|pg_stat_file|pg_terminate_backend"
     r"|pg_cancel_backend|pg_reload_conf|pg_rotate_logfile|pg_switch_wal|pg_promote"
-    r"|lo_import|lo_export|dblink|dblink_exec|pg_file_write|pg_file_rename|pg_file_unlink)\b",
+    r"|pg_notify|pg_\w*replication_slot\w*|pg_logical_\w+|pg_log_backend_memory_contexts"
+    r"|lo_import|lo_export|dblink|dblink_exec|pg_file_write|pg_file_rename|pg_file_unlink"
+    r"|query_to_xml\w*)\b"
+    r"|\bU&\"",
     re.IGNORECASE,
+)
+# A role that is, or can become, one of these can act on the server from inside a READ ONLY
+# transaction, so read-only Studio refuses to run as it (B18).
+_PRIVILEGED_ROLES = (
+    "pg_read_server_files",
+    "pg_write_server_files",
+    "pg_execute_server_program",
+    "pg_signal_backend",
+)
+_PRIVILEGED_SQL = (
+    "SELECT rolname, rolsuper, rolreplication FROM pg_roles "
+    "WHERE pg_has_role(current_user, oid, 'MEMBER') AND (rolsuper OR rolreplication "
+    f"OR rolname IN ({', '.join(repr(r) for r in _PRIVILEGED_ROLES)})) ORDER BY rolname"
 )
 
 log = logging.getLogger("mizzle")
@@ -328,6 +354,34 @@ def _skip_block_comment(text: str, i: int) -> int:
     return i
 
 
+def _comment_end(text: str, i: int) -> int | None:
+    """The index just past the comment starting at ``i``, or None if none starts there."""
+    if text.startswith("--", i):
+        end = _LINE_END.search(text, i)
+        return len(text) if end is None else end.end()
+    if text.startswith("/*", i):
+        return _skip_block_comment(text, i)
+    return None
+
+
+def _first_token(text: str) -> int:
+    """The index of the first character that is neither whitespace nor inside a comment.
+
+    PostgreSQL's comment rules (nested ``/* */``, ``--`` ending at ``\r`` or ``\n``) are the
+    only ones that matter here: reading a comment differently from the server is how a
+    ``COMMIT`` hid from the read-only check (B17).
+    """
+    i, n = 0, len(text)
+    while i < n:
+        if text[i].isspace():
+            i += 1
+        elif (end := _comment_end(text, i)) is not None:
+            i = end
+        else:
+            return i
+    return n
+
+
 def split_statements(text: str) -> list[str]:
     """Split SQL on top-level semicolons, honouring single/double quotes, dollar-quoted
     bodies and comments, so the console can run several statements in one go."""
@@ -342,56 +396,66 @@ def split_statements(text: str) -> list[str]:
             )
             i = _skip_quoted(text, i, ch, escapes=escapes)
         elif ch == "$":
-            tag = _DOLLAR.match(text, i)
+            # ``a$b$`` is one identifier: a dollar quote only starts where a name cannot
+            # continue.
+            tag = None if _is_ident_char(text, i - 1) else _DOLLAR.match(text, i)
             if tag is None:
                 i += 1
             else:
                 close = text.find(tag.group(0), i + len(tag.group(0)))
                 i = n if close == -1 else close + len(tag.group(0))
-        elif text.startswith("--", i):
-            newline = text.find("\n", i)
-            i = n if newline == -1 else newline + 1
-        elif text.startswith("/*", i):
-            i = _skip_block_comment(text, i)
+        elif (end := _comment_end(text, i)) is not None:
+            i = end
         elif ch == ";":
             parts.append(text[start:i])
             start = i = i + 1
         else:
             i += 1
     parts.append(text[start:])
-    return [p.strip() for p in parts if _has_sql(p)]
+    return [p.strip() for p in parts if _first_token(p) < len(p)]
 
 
 def _is_ident_char(text: str, index: int) -> bool:
-    """Whether the character before an ``E`` makes it part of a longer word (``SOME'x'``)."""
+    """Whether ``text[index]`` can continue an identifier (``ident_cont`` in PostgreSQL's
+    scanner, where every non-ASCII character counts as a letter)."""
     if index < 0:
         return False
     char = text[index]
-    return char.isalnum() or char in "_$"
-
-
-def _has_sql(chunk: str) -> bool:
-    return any(line.strip() and not line.strip().startswith("--") for line in chunk.splitlines())
+    return char.isalnum() or char in "_$" or ord(char) >= 0x80
 
 
 # A cell a spreadsheet would evaluate as a formula. CSV has no types, so the only defence is
 # to make the text unambiguous: a leading apostrophe is the conventional "this is text" mark
 # (Excel, LibreOffice and Sheets all show the rest of the cell and keep it inert).
-_FORMULA_LEAD = ("=", "+", "-", "@", "\t", "\r")
+_FORMULA_LEAD = ("=", "+", "-", "@")
+# Types whose text form is a number, interval, date or time: a leading "-" is a sign, not a
+# formula, and prefixing it corrupted the value (B19). to_jsonb() turns intervals, money and
+# dates into JSON strings, so the column type, not the Python type, tells them apart.
+_SIGNED_TYPE = re.compile(
+    r"(?:smallint|integer|bigint|(?:small|big)?serial|numeric|decimal|real|double precision"
+    r"|money|interval|date|time|timestamp)\b",
+    re.IGNORECASE,
+)
 
 
 def _csv_safe(text: str) -> str:
-    return f"'{text}" if text.startswith(_FORMULA_LEAD) else text
+    # The spreadsheet skips leading whitespace, so " =1+1" and "\n=cmd" are formulas too.
+    risky = text.startswith(("\t", "\r")) or text.lstrip().startswith(_FORMULA_LEAD)
+    return f"'{text}" if risky else text
 
 
-def _cell(value: object) -> str:
+def _cell(value: object, column_type: str) -> str:
+    """One CSV cell. Only text is neutralised: a number, or a string from a numeric,
+    interval, date or time column, cannot be a formula."""
     if value is None:
         return ""
-    if isinstance(value, dict | list):
-        return _csv_safe(json.dumps(value))
     if isinstance(value, bool):
         return "true" if value else "false"
-    return _csv_safe(str(value))
+    if isinstance(value, dict | list):
+        return json.dumps(value)  # starts with { or [, never a formula
+    if isinstance(value, str) and not _SIGNED_TYPE.match(column_type):
+        return _csv_safe(value)
+    return str(value)
 
 
 def jsonable(value: object) -> JSON:
@@ -487,7 +551,7 @@ async def list_rows(studio: Studio, request: Request) -> Response:
     async with studio.pool().acquire() as conn:
         [total] = await conn.fetch(f"SELECT count(*) FROM {source}{where}", params)
         rows = await conn.fetch(
-            f"SELECT to_jsonb(t) FROM {source}{where}{order_sql} LIMIT {limit} OFFSET {offset}",
+            f"SELECT to_jsonb(t.*) FROM {source}{where}{order_sql} LIMIT {limit} OFFSET {offset}",
             params,
         )
     return JSONResponse({"total": total[0], "rows": [jsonable(r[0]) for r in rows]})
@@ -526,12 +590,13 @@ async def export_rows(studio: Studio, request: Request) -> Response:
     where = _where(table, filters, params)
     order_sql = _order_sql(table, q)
     source = f"{qualified(table['schema'], table['name'])} AS t"
-    sql = f"SELECT to_jsonb(t) FROM {source}{where}{order_sql}"
+    sql = f"SELECT to_jsonb(t.*) FROM {source}{where}{order_sql}"
     headers = {
         "Content-Disposition": _download_name(table["schema"], table["name"], fmt),
         "Cache-Control": "no-store",
     }
     columns = list(table["columns"])
+    types = [c["type"] for c in table["columns"].values()]
     batch_size = 1000
 
     async def body() -> AsyncGenerator[bytes]:
@@ -547,7 +612,7 @@ async def export_rows(studio: Studio, request: Request) -> Response:
             async with aclosing(conn.cursor(sql, params, batch_size)) as batches:
                 async for batch in batches:
                     if fmt == "csv":
-                        yield _csv_chunk(columns, batch)
+                        yield _csv_chunk(columns, types, batch)
                         continue
                     for row in batch:
                         text = json.dumps(jsonable(row[0]))
@@ -560,12 +625,12 @@ async def export_rows(studio: Studio, request: Request) -> Response:
     return StreamingResponse(body(), media_type=media, headers=headers)
 
 
-def _csv_chunk(columns: Sequence[str], batch: Sequence[Row]) -> bytes:
+def _csv_chunk(columns: Sequence[str], types: Sequence[str], batch: Sequence[Row]) -> bytes:
     buffer = io.StringIO()
     writer = csv.writer(buffer)
     for row in batch:
         values = cast("Mapping[str, object]", row[0])
-        writer.writerow([_cell(values.get(c)) for c in columns])
+        writer.writerow([_cell(values.get(c), t) for c, t in zip(columns, types, strict=True)])
     return buffer.getvalue().encode()
 
 
@@ -579,9 +644,9 @@ async def insert_row(studio: Studio, request: Request) -> Response:
         columns = [_column(table, c) for c in values]
         names = ", ".join(quote(c["name"]) for c in columns)
         placeholders = ", ".join(_param(params, c, values[c["name"]]) for c in columns)
-        sql = f"INSERT INTO {target} ({names}) VALUES ({placeholders}) RETURNING to_jsonb(t)"
+        sql = f"INSERT INTO {target} ({names}) VALUES ({placeholders}) RETURNING to_jsonb(t.*)"
     else:
-        sql = f"INSERT INTO {target} DEFAULT VALUES RETURNING to_jsonb(t)"
+        sql = f"INSERT INTO {target} DEFAULT VALUES RETURNING to_jsonb(t.*)"
     async with studio.pool().acquire() as conn:
         [row] = await conn.fetch(sql, params)
     return JSONResponse({"row": jsonable(row[0])}, status_code=201)
@@ -602,7 +667,7 @@ async def update_row(studio: Studio, request: Request) -> Response:
     match = _key_match(table, body.get("key"), params)
     sql = (
         f"UPDATE {qualified(table['schema'], table['name'])} AS t SET {sets} "
-        f"WHERE {match} RETURNING to_jsonb(t)"
+        f"WHERE {match} RETURNING to_jsonb(t.*)"
     )
     async with studio.pool().acquire() as conn:
         rows = await conn.fetch(sql, params)
@@ -636,25 +701,11 @@ def _reject_read_only(statements: Sequence[str]) -> None:
     transaction is still the one we opened.
     """
     for statement in statements:
-        body = _strip_leading_comments(statement)
+        body = statement[_first_token(statement) :]
         if (match := _READ_ONLY_DENIED.match(body)) is not None:
             raise StudioError(f"{match.group(0).upper()} is not allowed in read-only mode", 403)
         if (call := _READ_ONLY_DENIED_CALLS.search(body)) is not None:
             raise StudioError(f"{call.group(0)} is not allowed in read-only mode", 403)
-
-
-def _strip_leading_comments(statement: str) -> str:
-    """The statement without leading ``--``/``/* */`` comments, so the first keyword is found."""
-    rest = statement.lstrip()
-    while True:
-        if rest.startswith("--"):
-            newline = rest.find("\n")
-            rest = "" if newline == -1 else rest[newline + 1 :].lstrip()
-        elif rest.startswith("/*"):
-            close = rest.find("*/", 2)
-            rest = "" if close == -1 else rest[close + 2 :].lstrip()
-        else:
-            return rest
 
 
 async def run_sql(studio: Studio, request: Request) -> Response:
@@ -812,6 +863,7 @@ def parse_auth(value: str) -> tuple[str, str]:
 
 
 MIN_TOKEN_LENGTH = 32
+MIN_PASSWORD_LENGTH = 12
 
 
 def resolve_token(explicit: str | None = None) -> str:
@@ -828,12 +880,13 @@ def resolve_auth(explicit: str | None = None) -> str | None:
 
 
 def check_token_length(token: str) -> None:
-    """Refuse a remote bind with a guessable token. A loopback bind is fine: it is reachable
-    only from this machine, and a short token there is just a session marker."""
+    """Refuse a guessable token. It is checked for every bind and alongside ``--auth``: the
+    bearer token is accepted whenever it is set, and other users of this machine can reach a
+    loopback bind too (B11)."""
     if len(token) < MIN_TOKEN_LENGTH:
         raise MigrationError(
-            f"a bearer token for a remote bind needs at least {MIN_TOKEN_LENGTH} characters "
-            f"(got {len(token)}); omit --token to have one generated"
+            f"a bearer token needs at least {MIN_TOKEN_LENGTH} characters "
+            f"(got {len(token)}); omit --token / MIZZLE_STUDIO_TOKEN to have one generated"
         )
 
 
@@ -861,10 +914,8 @@ class _Guard(BaseHTTPMiddleware):
     allowed_hosts: set[str] | None
     basic: bytes | None
     origins: set[str] | None
-    # Failed-attempt throttle (SS4). Shared by every request: an attacker guessing a token
-    # hits the same budget whichever connection they use.
-    _failures: deque[float]
-    _locked_until: float
+    # Recent failure times per client address, oldest client first (B7).
+    _failures: dict[str, list[float]]
 
     def __init__(
         self,
@@ -881,32 +932,24 @@ class _Guard(BaseHTTPMiddleware):
         # The origins a browser request may come from. Loopback serves the UI itself; a
         # remote bind is behind a reverse proxy, whose public origin is passed in.
         self.origins = origins
-        self._failures = deque()
-        self._locked_until = 0.0
+        self._failures = {}
 
-    def _too_many_failures(self) -> int | None:
-        """Seconds to wait, or None when this request may be tried.
-
-        After ``LOGIN_MAX_FAILURES`` wrong credentials in a row the server refuses even a
-        correct one for a while, so a guessed token cannot be brute-forced at full speed.
-        """
+    def _retry_after(self, client: str) -> int | None:
+        """Seconds until ``client`` may try a wrong credential again, or None if it may now."""
         now = time.monotonic()
-        while self._failures and now - self._failures[0] > LOGIN_WINDOW_SECONDS:
-            self._failures.popleft()
-        if self._locked_until > now:
-            return max(1, math.ceil(self._locked_until - now))
-        return None
+        recent = [t for t in self._failures.get(client, ()) if now - t < LOGIN_WINDOW_SECONDS]
+        if len(recent) < LOGIN_MAX_FAILURES:
+            return None
+        return max(1, math.ceil(recent[-LOGIN_MAX_FAILURES] + LOGIN_WINDOW_SECONDS - now))
 
-    def _record_failure(self) -> None:
+    def _record_failure(self, client: str) -> None:
         now = time.monotonic()
-        self._failures.append(now)
-        if len(self._failures) >= LOGIN_MAX_FAILURES:
-            self._locked_until = now + LOGIN_LOCKOUT_SECONDS
-            self._failures.clear()
-
-    def _record_success(self) -> None:
-        self._failures.clear()
-        self._locked_until = 0.0
+        # Popped and re-inserted, so the dict stays ordered by each client's latest failure.
+        times = [t for t in self._failures.pop(client, []) if now - t < LOGIN_WINDOW_SECONDS]
+        times.append(now)
+        self._failures[client] = times[-LOGIN_MAX_FAILURES:]
+        while len(self._failures) > LOGIN_MAX_CLIENTS:
+            del self._failures[next(iter(self._failures))]
 
     def _authorized(self, request: Request) -> bool:
         given = request.headers.get("authorization", "").encode()
@@ -939,18 +982,16 @@ class _Guard(BaseHTTPMiddleware):
             and request.headers.get("host", "") not in self.allowed_hosts
         ):
             return self._error("forbidden host", 403)
-        if request.url.path.startswith("/api/"):
-            if (wait := self._too_many_failures()) is not None:
+        if request.url.path.startswith("/api/") and not self._authorized(request):
+            client = request.client.host if request.client else ""
+            if (wait := self._retry_after(client)) is not None:
+                self._record_failure(client)
                 return self._error(
                     "too many failed attempts; try again shortly", 429, {"Retry-After": str(wait)}
                 )
-            if not self._authorized(request):
-                headers = (
-                    {"WWW-Authenticate": 'Basic realm="mizzle studio"'} if self.basic else None
-                )
-                self._record_failure()
-                return self._error("missing or wrong credentials", 401, headers)
-            self._record_success()
+            self._record_failure(client)
+            headers = {"WWW-Authenticate": 'Basic realm="mizzle studio"'} if self.basic else None
+            return self._error("missing or wrong credentials", 401, headers)
         if request.url.path.startswith("/api/") and self._cross_site(request):
             return self._error("cross-site request refused", 403)
         if request.url.path.startswith("/api/") and not _writes_json(request):
@@ -990,8 +1031,11 @@ def create_app(
     @asynccontextmanager
     async def lifespan(_app: Starlette) -> AsyncGenerator[None]:
         studio.driver = await dialect.connect(url, pool_size=4, statement_cache_size=100)
-        studio.load_state()
         try:
+            if read_only:
+                async with studio.driver.acquire() as conn:
+                    _refuse_privileged(await _privileged(conn))
+            studio.load_state()
             yield
         finally:
             await studio.driver.close()
@@ -1040,27 +1084,33 @@ def create_app(
     )
 
 
-def _is_superuser(url: str) -> bool:
-    """Whether the configured URL connects as a superuser. Best effort: it opens one
-    connection, and a failure (unreachable, no permission) just means no warning."""
-    import asyncio
+async def _privileged(conn: Connection) -> list[str]:
+    """The roles that give the current user server-side abilities (empty when none)."""
+    names: list[str] = []
+    for name, superuser, replication in await conn.fetch(_PRIVILEGED_SQL, []):
+        suffix = " (superuser)" if superuser else " (replication)" if replication else ""
+        names.append(f"{name}{suffix}")
+    return names
 
-    async def check() -> bool:
-        try:
-            conn = await asyncpg.connect(url)
-        except Exception:
-            return False
-        try:
-            rows = await conn.fetch("SELECT rolsuper FROM pg_roles WHERE rolname = current_user")
-            [row] = cast("Sequence[Sequence[object]]", rows)
-            return bool(row[0])
-        finally:
-            await conn.close()
 
+def _refuse_privileged(names: Sequence[str]) -> None:
+    if names:
+        raise MigrationError(
+            "refusing to start read-only Studio: the database role is or can become "
+            f"{', '.join(names)}, which can act on the server from inside a read-only "
+            "transaction (read files, run programs, signal backends). Connect as a role "
+            "without these privileges."
+        )
+
+
+async def privileged_roles(dialect: Dialect, url: str) -> list[str]:
+    """``_privileged`` over a short-lived connection, for the CLI's start-up check."""
+    driver = await dialect.connect(url, pool_size=1, statement_cache_size=0)
     try:
-        return asyncio.run(check())
-    except Exception:
-        return False
+        async with driver.acquire() as conn:
+            return await _privileged(conn)
+    finally:
+        await driver.close()
 
 
 def _server_origins(host: str, port: int) -> set[str]:
@@ -1106,8 +1156,14 @@ def serve(
             f"refusing to listen on {host} without credentials; pass --auth USER:PASSWORD "
             "or --token (or set MIZZLE_STUDIO_TOKEN / MIZZLE_STUDIO_AUTH)"
         )
-    if not loopback and basic_auth is None:
-        check_token_length(token_value)
+    check_token_length(token_value)
+    if basic_auth is not None and len(basic_auth[1]) < MIN_PASSWORD_LENGTH:
+        raise MigrationError(
+            f"the --auth / MIZZLE_STUDIO_AUTH password needs at least {MIN_PASSWORD_LENGTH} "
+            f"characters (got {len(basic_auth[1])})"
+        )
+    if read_only:
+        _refuse_privileged(asyncio.run(privileged_roles(config.dialect(), config.url())))
     static_dir = ui_path(ui_dir)  # downloads and verifies the UI on first run
     app = create_app(
         dialect=config.dialect(),
@@ -1129,13 +1185,6 @@ def serve(
         basic_auth=basic_auth,
     )
     mode = " (read-only)" if read_only else ""
-    if read_only and _is_superuser(config.url()):
-        print(
-            "warning: Studio is read-only, but this connection is a superuser. Read-only "
-            "blocks writes, not server-side abilities (COPY ... PROGRAM, pg_read_file, "
-            "pg_terminate_backend are refused, nothing else is). Use a non-superuser role.",
-            file=sys.stderr,
-        )
     if loopback:
         link = f"http://127.0.0.1:{port}/#token={token_value}"
         print(f"mizzle studio{mode} running at {link}\nPress Ctrl+C to stop.")

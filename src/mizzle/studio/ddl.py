@@ -39,47 +39,40 @@ _OPERATIONS: tuple[Operation, ...] = (
 )
 
 _IDENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,62}\Z")
-# A PostgreSQL type: a (possibly dotted, possibly multi-word) name, optional (p) / (p,s)
-# modifier and [] arrays. This rejects anything with quotes, semicolons or trailing text such
-# as "integer REFERENCES users(id)".
-# A type name: an optionally schema-qualified name, or one of the multi-word spellings
-# PostgreSQL uses (``double precision``, ``character varying``, ``timestamp with time zone``,
-# ``bit varying``). Only those, never arbitrary trailing words: ``int references victim on
-# delete cascade`` used to match, which let the editor create constraints it does not model.
-_MULTIWORD = (
-    "double precision",
-    "character varying",
-    "char varying",
-    "bit varying",
-    "timestamp with time zone",
-    "timestamp without time zone",
-    "time with time zone",
-    "time without time zone",
+
+# A PostgreSQL type, built from the shapes PostgreSQL accepts and nothing else: never trailing
+# words, so ``int references victim on delete cascade`` (SF1) and ``int unique``, ``collate``,
+# ``default``, ``not null`` and the like are rejected. A quoted name is a single identifier
+# to PostgreSQL, whatever it contains, so it cannot smuggle a clause in.
+_NAME = r'(?:[A-Za-z_][A-Za-z0-9_]*|"(?:[^"]|"")+")'
+_MODIFIER = r"(?:\s*\(\s*[0-9]+\s*(?:,\s*[0-9]+\s*)?\))"
+_PRECISION = r"(?:\s*\(\s*[0-9]+\s*\))"
+_INTERVAL_FIELDS = (
+    r"(?:year\s+to\s+month|day\s+to\s+(?:hour|minute|second)|hour\s+to\s+(?:minute|second)"
+    r"|minute\s+to\s+second|year|month|day|hour|minute|second)"
 )
-_TYPE = re.compile(
-    r"(?:"
-    + "|".join(re.escape(word) for word in sorted(_MULTIWORD, key=len, reverse=True))
-    + r"|[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)?)"
-    r"(?:\s*\(\s*[0-9]+\s*(?:,\s*[0-9]+\s*)?\))?"
-    r"(?:\[\])*\Z",
-    re.IGNORECASE,
+_TYPE_SHAPE = (
+    r"(?:(?:timestamp|time)"
+    rf"{_PRECISION}?(?:\s+with(?:out)?\s+time\s+zone)?"
+    rf"|interval(?:{_PRECISION}|\s+{_INTERVAL_FIELDS}{_PRECISION}?)?"
+    rf"|(?:double\s+precision|(?:character|char|bit)\s+varying){_MODIFIER}?"
+    rf"|{_NAME}(?:\.{_NAME})?{_MODIFIER}?)"
+    r"(?:\[[0-9]*\])*"
 )
-# The type a default may be cast to: the same shapes, with nothing after the cast.
-_CAST_TYPE = (
-    r"(?:"
-    + "|".join(re.escape(word) for word in sorted(_MULTIWORD, key=len, reverse=True))
-    + r"|[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)?)"
-    r"(?:\s*\([0-9]+(?:,[0-9]+)?\))?(?:\[\])*"
-)
-# A default expression: a literal, a known zero-argument function or keyword, each with an
-# optional cast to an allowed type and nothing after it.
-_DEFAULT = re.compile(
-    r"(?:NULL|TRUE|FALSE|-?[0-9]+(?:\.[0-9]+)?|'(?:[^']|'')*'"
+_TYPE = re.compile(rf"{_TYPE_SHAPE}\Z", re.IGNORECASE)
+
+# A default expression: terms joined by + or -, each with an optional cast to an allowed type.
+# A term is a literal, a known function or keyword, ``interval '...'`` or ``nextval('...')``.
+# The operators need spaces around them, so ``1--1`` (a ``--`` comment) cannot be formed.
+_STRING = r"'(?:[^']|'')*'"
+_TERM = (
+    rf"(?:NULL|TRUE|FALSE|-?[0-9]+(?:\.[0-9]+)?|{_STRING}"
     r"|CURRENT_TIMESTAMP|CURRENT_DATE|CURRENT_TIME|CURRENT_USER|SESSION_USER"
-    r"|(?:now|gen_random_uuid|uuid_generate_v4)\(\))"
-    rf"(?:::{_CAST_TYPE})?\Z",
-    re.IGNORECASE,
+    r"|(?:now|gen_random_uuid|uuid_generate_v4)\(\)"
+    rf"|interval\s+{_STRING}|nextval\(\s*{_STRING}(?:::regclass)?\s*\))"
+    rf"(?:::{_TYPE_SHAPE})?"
 )
+_DEFAULT = re.compile(rf"{_TERM}(?:\s+[-+]\s+{_TERM})*\Z", re.IGNORECASE)
 
 
 def _str(data: Mapping[str, object], field: str) -> str:

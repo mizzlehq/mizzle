@@ -3,11 +3,13 @@ import io
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 import pytest
 from starlette.testclient import TestClient
+from starlette.types import Receive, Scope, Send
 
-from mizzle.core.errors import MigrationError
+from mizzle.core.errors import MigrationError, MizzleError
 from mizzle.dialects.postgres import PostgresDialect
 from mizzle.dialects.postgres.driver import PostgresDriver
 from mizzle.studio import server
@@ -31,6 +33,7 @@ def make_client(
     static: Path | None = None,
     state_path: Path | None = None,
     basic_auth: tuple[str, str] | None = None,
+    address: str = "testclient",
 ) -> TestClient:
     kwargs: dict[str, Any] = {}
     if static is not None:
@@ -48,7 +51,33 @@ def make_client(
         read_only=read_only,
         **kwargs,
     )
-    return TestClient(app)
+    return TestClient(app, client=(address, 50000))
+
+
+RO_ROLE = "mizzle_studio_ro"
+
+
+@pytest.fixture
+async def ro_url(pg_url: str, driver: PostgresDriver) -> str:
+    """A plain (non-superuser) role that may write to the test tables.
+
+    Read-only Studio refuses to start as a superuser (B18), and the role can write so the
+    tests show that Studio's read-only mode, not a missing grant, stops the writes.
+    """
+    async with driver.acquire() as conn:
+        await conn.execute(
+            f"DO $$ BEGIN CREATE ROLE {RO_ROLE} LOGIN PASSWORD 'ro'; "
+            "EXCEPTION WHEN duplicate_object THEN NULL; END $$",
+            [],
+        )
+        await conn.execute(
+            f"GRANT USAGE ON SCHEMA public TO {RO_ROLE}; "
+            f"GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO {RO_ROLE}; "
+            f"GRANT USAGE ON ALL SEQUENCES IN SCHEMA public TO {RO_ROLE}",
+            [],
+        )
+    parts = urlsplit(pg_url)
+    return urlunsplit(parts._replace(netloc=f"{RO_ROLE}:ro@{parts.hostname}:{parts.port}"))
 
 
 def test_parse_auth_accepts_user_and_password() -> None:
@@ -212,8 +241,8 @@ def test_bad_requests_are_reported(client: TestClient) -> None:
     assert client.put("/api/queries/saved/x", json={"sql": ""}, headers=AUTH).status_code == 400
 
 
-def test_read_only_mode(pg_url: str, driver: PostgresDriver) -> None:
-    with make_client(pg_url, read_only=True) as client:
+def test_read_only_mode(ro_url: str) -> None:
+    with make_client(ro_url, read_only=True) as client:
         assert client.post(ROWS, json={"values": {"email": "x"}}, headers=AUTH).status_code == 403
         assert (
             client.patch(ROWS, json={"key": {"id": 1}, "values": {}}, headers=AUTH).status_code
@@ -390,32 +419,36 @@ def test_ddl_preview_and_apply(client: TestClient) -> None:
     )
 
 
-def test_ddl_preview_works_but_apply_is_blocked_read_only(
-    pg_url: str, driver: PostgresDriver
-) -> None:
+def test_ddl_preview_works_but_apply_is_blocked_read_only(ro_url: str) -> None:
     op = {
         "operation": "create_table",
         "schema": "public",
         "name": "st_ro",
         "columns": [{"name": "id", "type": "integer"}],
     }
-    with make_client(pg_url, read_only=True) as client:
+    with make_client(ro_url, read_only=True) as client:
         assert client.post(DDL_PREVIEW, json=op, headers=AUTH).status_code == 200
         assert client.post(DDL_APPLY, json=op, headers=AUTH).status_code == 403
 
 
-def test_read_only_refuses_transaction_control(pg_url: str, driver: PostgresDriver) -> None:
+def test_read_only_refuses_transaction_control(pg_url: str, ro_url: str) -> None:
     # SS1: a COMMIT / ROLLBACK / SET in the middle of a batch used to end the READ ONLY
     # transaction, so the statements after it ran read-write.
     with make_client(pg_url) as writable:  # seed outside read-only: it refuses writes
         writable.post(ROWS, json={"values": {"email": "victim"}}, headers=AUTH)
-    with make_client(pg_url, read_only=True) as client:
+    with make_client(ro_url, read_only=True) as client:
         for sql in (
             "select 1; commit; insert into users (email) values ('x')",
             "set transaction_read_only = off; insert into users (email) values ('x')",
             "rollback; begin; insert into users (email) values ('x'); commit",
             "savepoint s; insert into users (email) values ('x')",
             "/* a comment */ commit",
+            # B17: PostgreSQL ends a -- comment at \r too, and nests /* */ comments.
+            "--x\rcommit\n; insert into users (email) values ('cr')",
+            "/* /* */ x */ commit; insert into users (email) values ('nested')",
+            "/* /* */ */ rollback\n; insert into users (email) values ('nested2')",
+            "/* /* */ */ set transaction_read_only = off",
+            "-- a\r/* b /* c */ d */\n\t commit",
         ):
             response = client.post("/api/sql", json={"sql": sql}, headers=AUTH)
             assert response.status_code == 403, (sql, response.text)
@@ -451,18 +484,55 @@ def test_read_only_allows_queries_that_mention_blocked_words(
         _reject_read_only([sql])
 
 
-def test_read_only_refuses_server_side_calls(pg_url: str, driver: PostgresDriver) -> None:
-    # SS2: READ ONLY does not stop a superuser from acting outside the transaction.
-    with make_client(pg_url, read_only=True) as client:
+def test_read_only_refuses_server_side_calls(ro_url: str) -> None:
+    # SS2: defence in depth only; the role check (B18) is the control.
+    with make_client(ro_url, read_only=True) as client:
         for sql in (
             "select pg_read_file('/etc/hostname')",
             "select pg_terminate_backend(1)",
             "copy (select 1) to program 'true'",
             "do $$ begin end $$",
             "notify chan",
+            # B18: bypasses found by the verifier.
+            "select pg_notify('ch', 'x')",
+            "select pg_create_physical_replication_slot('verifyslot', true)",
+            "select pg_ls_waldir()",
+            "checkpoint",
+            "load 'auto_explain'",
+            "select U&\"pg\\005Fread_file\"('/etc/hostname')",
+            "select query_to_xml('select 1', true, false, '')",
         ):
             response = client.post("/api/sql", json={"sql": sql}, headers=AUTH)
             assert response.status_code == 403, (sql, response.text)
+
+
+def test_read_only_refuses_a_privileged_role(pg_url: str, ro_url: str) -> None:
+    # B18: a text blocklist cannot stop a superuser, so read-only Studio refuses to start.
+    with pytest.raises(MigrationError, match="superuser"), make_client(pg_url, read_only=True):
+        pass
+    # Membership in a role with server-side abilities is refused the same way.
+    with make_client(pg_url) as admin:
+        admin.post("/api/sql", json={"sql": f"grant pg_signal_backend to {RO_ROLE}"}, headers=AUTH)
+        try:
+            with (
+                pytest.raises(MigrationError, match="pg_signal_backend"),
+                make_client(ro_url, read_only=True),
+            ):
+                pass
+        finally:
+            sql = f"revoke pg_signal_backend from {RO_ROLE}"
+            admin.post("/api/sql", json={"sql": sql}, headers=AUTH)
+    # A writable Studio is not limited: the role check is about the read-only promise.
+    with make_client(pg_url) as client:
+        assert client.get("/api/meta", headers=AUTH).status_code == 200
+
+
+async def test_privileged_roles_for_the_cli_check(pg_url: str, ro_url: str) -> None:
+    # The start-up check `mizzle studio --read-only` runs before serving (B18).
+    assert "mizzle (superuser)" in await server.privileged_roles(PostgresDialect(), pg_url)
+    assert await server.privileged_roles(PostgresDialect(), ro_url) == []
+    with pytest.raises(MizzleError, match="could not connect"):  # the CLI prints it
+        await server.privileged_roles(PostgresDialect(), "postgresql://x@127.0.0.1:1/x")
 
 
 def test_cross_site_post_is_refused(pg_url: str, driver: PostgresDriver) -> None:
@@ -519,6 +589,32 @@ def test_csv_export_neutralizes_formulas(client: TestClient) -> None:
     assert js[0]["email"].startswith("=")
 
 
+def test_csv_export_keeps_signed_values_and_catches_padded_formulas(
+    client: TestClient,
+) -> None:
+    # B19: numbers and intervals are data, not formulas: -5 must not export as '-5. A
+    # formula behind leading whitespace is still a formula.
+    client.post(
+        "/api/sql",
+        json={
+            "sql": "drop table if exists st_csv; "
+            "create table st_csv (id int primary key, n int, d numeric, i interval, s text); "
+            "insert into st_csv values (1, -5, -1.5, '-1 day', ' =1+1'), "
+            "(2, 3, 2, '1 day', E'\\n=cmd'), (3, -1, -2, '-2 hours', '-2+3')"
+        },
+        headers=AUTH,
+    )
+    text = client.get(
+        "/api/tables/public/st_csv/export", params={"format": "csv", "order": "id"}, headers=AUTH
+    ).text
+    rows = list(csv.reader(io.StringIO(text)))
+    assert rows[1:] == [
+        ["1", "-5", "-1.5", "-1 days", "' =1+1"],
+        ["2", "3", "2", "1 day", "'\n=cmd"],
+        ["3", "-1", "-2", "-02:00:00", "'-2+3"],
+    ]
+
+
 def test_ddl_is_limited_to_the_configured_schemas(pg_url: str, driver: PostgresDriver) -> None:
     # SF2: information_schema is a plain identifier, so only the schema filter stops it.
     with make_client(pg_url) as client:
@@ -552,6 +648,94 @@ def test_ddl_type_allow_list_rejects_constraint_clauses(
     for good in ("integer", "varchar(255)", "numeric(10,2)", "timestamp with time zone"):
         assert ddl._TYPE.fullmatch(good), good
     assert not ddl._DEFAULT.fullmatch("0::int unique")
+
+
+def test_ddl_type_and_default_grammar_accepts_valid_postgres() -> None:
+    # B22: SF1 made the grammar too strict for valid types and defaults.
+    import mizzle.studio.ddl as ddl
+
+    for good in (
+        "timestamp(3) with time zone",
+        "timestamp(6) without time zone",
+        "time with time zone",
+        "time(2) without time zone",
+        "interval",
+        "interval(3)",
+        "interval day to second",
+        "interval day to second(3)",
+        "interval year to month",
+        "interval hour",
+        "interval minute to second",
+        '"MyType"',
+        'public."MyType"',
+        '"my schema"."My Type"[]',
+        "double precision[]",
+        "character varying(20)",
+        "int[3]",
+    ):
+        assert ddl._TYPE.fullmatch(good), good
+    for bad in (
+        "int references victim",
+        '"MyType" references victim',
+        "timestamp with time zone primary key",
+        "interval day to second unique",
+        "int check (true)",
+        'text collate "C"',
+        "int default 1",
+        "int generated always as (1) stored",
+        "int not null",
+        "int null",
+        "int constraint c check (true)",
+        "interval day to week",
+        '"a"; drop table users',
+    ):
+        assert not ddl._TYPE.fullmatch(bad), bad
+    for good in (
+        "now() + interval '1 day'",
+        "now() - interval '2 hours'",
+        "nextval('seq'::regclass)",
+        "nextval('public.\"Seq\"'::regclass)",
+        "'2026-01-01'::timestamp(3) with time zone",
+        "'P1D'::interval day to second",
+        "0::int",
+        "1 - -1",
+    ):
+        assert ddl._DEFAULT.fullmatch(good), good
+    for bad in (
+        "0::int unique",
+        "now() references victim",
+        "now() + interval '1 day' not null",
+        "'x'::text collate \"C\"",
+        "1--1",
+        "1 - -- comment",
+        "nextval('s')::regclass primary key",
+        "now() /* x */",
+        "0::int check (true)",
+        "0 constraint c",
+    ):
+        assert not ddl._DEFAULT.fullmatch(bad), bad
+
+
+def test_ddl_editor_creates_columns_with_the_wider_grammar(client: TestClient) -> None:
+    client.post("/api/sql", json={"sql": "drop table if exists st_types"}, headers=AUTH)
+    client.post("/api/sql", json={"sql": "drop sequence if exists st_seq"}, headers=AUTH)
+    client.post("/api/sql", json={"sql": "create sequence st_seq"}, headers=AUTH)
+    op = {
+        "operation": "create_table",
+        "schema": "public",
+        "name": "st_types",
+        "columns": [
+            {"name": "id", "type": "bigint", "default": "nextval('st_seq'::regclass)"},
+            {
+                "name": "at",
+                "type": "timestamp(3) with time zone",
+                "default": "now() + interval '1 day'",
+            },
+            {"name": "span", "type": "interval day to second"},
+        ],
+    }
+    applied = client.post(DDL_APPLY, json=op, headers=AUTH)
+    assert applied.status_code == 200, applied.text
 
 
 async def test_export_filename_survives_odd_table_names(
@@ -617,34 +801,71 @@ def test_splitter_handles_escapes_and_nested_comments() -> None:
     assert split_statements("select 'a\\\\'; select 2") == ["select 'a\\\\'", "select 2"]
 
 
-def test_repeated_failed_logins_are_throttled(pg_url: str, driver: PostgresDriver) -> None:
+def test_splitter_reads_identifiers_and_comments_like_postgres() -> None:
+    # B20: $b$ inside an identifier is not a dollar quote; \r ends a -- comment.
+    assert split_statements("select 1 as a$b$; select 2") == ["select 1 as a$b$", "select 2"]
+    assert split_statements("select 1 as é$b$; select 2") == ["select 1 as é$b$", "select 2"]
+    assert split_statements("select 1 --x\r; select 2\n") == ["select 1 --x", "select 2"]
+    assert split_statements("select $é$a;b$é$") == ["select $é$a;b$é$"]
+    # A chunk of only comments is not a statement, whatever the comment style.
+    assert split_statements("select 1; /* only */ -- also\r") == ["select 1"]
+
+
+def test_repeated_failed_logins_are_throttled_per_client(
+    pg_url: str, driver: PostgresDriver, monkeypatch: pytest.MonkeyPatch
+) -> None:
     # SS4: a remote bind is reachable from anywhere, so a guessed token must not be
-    # brute-forceable at network speed.
-    import mizzle.studio.server as studio_server
+    # brute-forceable at network speed. B7: the throttle is per client, and a correct
+    # credential is never refused, so an attacker cannot lock the real user out.
+    monkeypatch.setattr(server, "LOGIN_MAX_FAILURES", 3)
+    wrong = {"Authorization": "Bearer no"}
+    with (
+        make_client(pg_url, address="10.0.0.66") as attacker,
+        make_client(pg_url, address="10.0.0.7") as user,
+    ):
+        for _ in range(3):
+            assert attacker.get("/api/meta", headers=wrong).status_code == 401
+        blocked = attacker.get("/api/meta", headers=wrong)
+        assert blocked.status_code == 429
+        assert int(blocked.headers["retry-after"]) >= 1
+        # The right credential gets through, even from the throttled client.
+        assert attacker.get("/api/meta", headers=AUTH).status_code == 200
+        # Another client is not affected by the attacker's failures...
+        assert user.get("/api/meta", headers=AUTH).status_code == 200
+        assert user.get("/api/meta", headers=wrong).status_code == 401
+        # ...and its successes do not reset the attacker's count.
+        assert attacker.get("/api/meta", headers=wrong).status_code == 429
 
-    original = studio_server.LOGIN_MAX_FAILURES
-    studio_server.LOGIN_MAX_FAILURES = 3
-    try:
-        with make_client(pg_url) as client:
-            for _ in range(3):
-                assert (
-                    client.get("/api/meta", headers={"Authorization": "Bearer no"}).status_code
-                    == 401
-                )
-            blocked = client.get("/api/meta", headers={"Authorization": "Bearer no"})
-            assert blocked.status_code == 429
-            assert int(blocked.headers["retry-after"]) >= 1
-            # Even the correct token is refused while locked out: the budget is global.
-            assert client.get("/api/meta", headers=AUTH).status_code == 429
-    finally:
-        studio_server.LOGIN_MAX_FAILURES = original
+
+def test_failure_table_is_bounded(monkeypatch: pytest.MonkeyPatch) -> None:
+    # B7: one entry per client address, so a spray from many addresses must not grow it
+    # without limit; the oldest entries are dropped first.
+    monkeypatch.setattr(server, "LOGIN_MAX_CLIENTS", 4)
+
+    async def app(scope: Scope, receive: Receive, send: Send) -> None: ...
+
+    guard = server._Guard(app, "t" * 32, None)
+    for i in range(10):
+        guard._record_failure(f"10.0.0.{i}")
+    assert list(guard._failures) == [f"10.0.0.{i}" for i in range(6, 10)]
 
 
-def test_a_successful_login_clears_the_failure_budget(pg_url: str, driver: PostgresDriver) -> None:
+async def test_a_column_named_like_the_row_alias(pg_url: str, driver: PostgresDriver) -> None:
+    # B33: `to_jsonb(t)` read a column named "t" instead of the row alias, so listing,
+    # export, insert and update broke on such a table.
+    async with driver.acquire() as conn:
+        await conn.execute("DROP TABLE IF EXISTS public.alias_clash", [])
+        await conn.execute(
+            "CREATE TABLE public.alias_clash (id int GENERATED ALWAYS AS IDENTITY PRIMARY KEY, "
+            "t text)",
+            [],
+        )
+    base = "/api/tables/public/alias_clash"
     with make_client(pg_url) as client:
-        for _ in range(5):
-            client.get("/api/meta", headers={"Authorization": "Bearer no"})
-        assert client.get("/api/meta", headers=AUTH).status_code == 200
-        # The counter is reset, so the next few failures are not an immediate lockout.
-        assert client.get("/api/meta", headers={"Authorization": "Bearer no"}).status_code == 401
-        assert client.get("/api/meta", headers=AUTH).status_code == 200
+        created = client.post(f"{base}/rows", json={"values": {"t": "x"}}, headers=AUTH)
+        assert created.status_code in (200, 201), created.text
+        listed = client.get(f"{base}/rows", headers=AUTH)
+        assert listed.status_code == 200, listed.text
+        exported = client.get(f"{base}/export", params={"format": "json"}, headers=AUTH)
+        assert exported.status_code == 200
+        assert [row["t"] for row in exported.json()] == ["x"]

@@ -66,7 +66,7 @@ def test_remote_bind_accepts_a_basic_auth_password(config: Config, no_ui: None) 
         read_only=False,
         open_browser=False,
         host="0.0.0.0",
-        auth="admin:secret",
+        auth="admin:correct-horse",
     )
     assert SERVED
 
@@ -75,7 +75,7 @@ def test_remote_bind_accepts_basic_auth_from_the_environment(
     config: Config, no_ui: None, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # SS4: the environment form keeps the password out of `ps`.
-    monkeypatch.setenv("MIZZLE_STUDIO_AUTH", "admin:secret")
+    monkeypatch.setenv("MIZZLE_STUDIO_AUTH", "admin:correct-horse")
     studio_server.serve(config, port=4983, read_only=False, open_browser=False, host="0.0.0.0")
     assert SERVED
 
@@ -97,14 +97,66 @@ def test_remote_bind_rejects_a_short_token(config: Config, no_ui: None) -> None:
     assert SERVED
 
 
-def test_loopback_accepts_the_generated_token(config: Config, no_ui: None) -> None:
-    # Loopback is reachable only from this machine, so the short-token rule does not apply.
+def test_loopback_opens_the_token_link(config: Config, no_ui: None) -> None:
+    token = "t" * 32
     studio_server.serve(
-        config, port=4983, read_only=False, open_browser=True, host="127.0.0.1", token="short"
+        config, port=4983, read_only=False, open_browser=True, host="127.0.0.1", token=token
     )
     assert SERVED
     # The URL it "opens" carries the token in the fragment, so it never reaches the server.
-    assert OPENED == ["http://127.0.0.1:4983/#token=short"]
+    link = f"http://127.0.0.1:4983/#token={token}"
+    assert [link] == OPENED
+
+
+@pytest.mark.parametrize("host", ["0.0.0.0", "127.0.0.1"])
+def test_short_token_is_refused_in_every_mode(
+    config: Config, no_ui: None, monkeypatch: pytest.MonkeyPatch, host: str
+) -> None:
+    # B11: with --auth set the token length was not checked, yet the bearer token was
+    # still accepted: --auth admin:x --token a let anyone in with "Bearer a".
+    with pytest.raises(MigrationError, match="at least 32 characters"):
+        studio_server.serve(
+            config,
+            port=4983,
+            read_only=False,
+            open_browser=False,
+            host=host,
+            token="a",
+            auth="admin:correct-horse",
+        )
+    monkeypatch.setenv("MIZZLE_STUDIO_TOKEN", "short")
+    with pytest.raises(MigrationError, match="at least 32 characters"):
+        studio_server.serve(config, port=4983, read_only=False, open_browser=False, host=host)
+    assert not SERVED
+
+
+def test_short_basic_password_is_refused(config: Config, no_ui: None) -> None:
+    # B11: --auth admin:x was accepted.
+    with pytest.raises(MigrationError, match="at least 12 characters"):
+        studio_server.serve(
+            config, port=4983, read_only=False, open_browser=False, host="0.0.0.0", auth="admin:x"
+        )
+    assert not SERVED
+
+
+def test_read_only_refuses_a_privileged_role(
+    config: Config, no_ui: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # B18: read-only is only a promise for a role without server-side abilities.
+    async def privileged(_dialect: object, _url: str) -> list[str]:
+        return ["mizzle (superuser)"]
+
+    monkeypatch.setattr(studio_server, "privileged_roles", privileged)
+    with pytest.raises(MigrationError, match=r"read-only.*mizzle \(superuser\)"):
+        studio_server.serve(config, port=4983, read_only=True, open_browser=False)
+    assert not SERVED
+
+    async def plain(_dialect: object, _url: str) -> list[str]:
+        return []
+
+    monkeypatch.setattr(studio_server, "privileged_roles", plain)
+    studio_server.serve(config, port=4983, read_only=True, open_browser=False)
+    assert SERVED
 
 
 def test_origins_are_the_loopback_urls(config: Config) -> None:

@@ -28,10 +28,16 @@ jobs:
         # interpolated into a shell command is code execution for anyone who can trigger it.
         env:
           SCOPE: ${{ inputs.scope || 'mizzle.core.compiler* mizzle.core.naming* mizzle.core.errors* mizzle.core.steps* mizzle.core.snapshot*' }}
-        # Unquoted, so the space-separated wildcards become separate arguments.
-        run: >-
-          uv run --group mutation mutmut run
-          $SCOPE
+        # Each space-separated wildcard becomes one argument, and only module-path
+        # characters are allowed, so the input cannot add mutmut options (B23) or glob
+        # against the checkout.
+        run: |
+          if [[ ! "$SCOPE" =~ ^[A-Za-z0-9_.*\ ]+$ ]]; then
+            echo "scope may only hold module wildcards (letters, digits, _ . *)" >&2
+            exit 1
+          fi
+          read -ra scope <<< "$SCOPE"
+          uv run --group mutation mutmut run "${scope[@]}"
       - name: Mutation score
         run: |
           uv run --group mutation mutmut export-cicd-stats

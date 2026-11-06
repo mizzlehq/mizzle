@@ -186,7 +186,9 @@ uses the same `mizzle.toml` and database URL as the other commands.
 
 - It listens on `127.0.0.1` only, and every API call needs the one-time token in the
   printed link. Other websites cannot call it.
-- `--read-only` blocks every write; SQL runs in a read-only transaction.
+- `--read-only` blocks every write; SQL runs in a read-only transaction. It needs a
+  non-privileged database role and refuses to start as a superuser (see
+  [the CLI reference](../cli.md#studio)).
 - The UI (about 250 KB) downloads on first run into your virtual environment, checked by
   SHA-256. On offline machines pass `--ui-path` with a local build.
 
