@@ -64,7 +64,9 @@ _TYPE = re.compile(rf"{_TYPE_SHAPE}\Z", re.IGNORECASE)
 # A default expression: terms joined by + or -, each with an optional cast to an allowed type.
 # A term is a literal, a known function or keyword, ``interval '...'`` or ``nextval('...')``.
 # The operators need spaces around them, so ``1--1`` (a ``--`` comment) cannot be formed.
-_STRING = r"'(?:[^']|'')*'"
+# No backslash: with ``standard_conforming_strings = off`` the server reads ``\'`` as an
+# escaped quote, so a literal holding one could end somewhere this pattern did not (B74).
+_STRING = r"'(?:[^'\\]|'')*'"
 _TERM = (
     rf"(?:NULL|TRUE|FALSE|-?[0-9]+(?:\.[0-9]+)?|{_STRING}"
     r"|CURRENT_TIMESTAMP|CURRENT_DATE|CURRENT_TIME|CURRENT_USER|SESSION_USER"

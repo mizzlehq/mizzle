@@ -225,27 +225,32 @@ mizzle studio --host 0.0.0.0
 
 Binding a non-loopback host without `--auth` / `MIZZLE_STUDIO_AUTH` (or
 `--token` / `MIZZLE_STUDIO_TOKEN`) is refused. A token from `--token` or
-`MIZZLE_STUDIO_TOKEN` must be at least 32 characters, on any host and also when `--auth` is
-set (the bearer token is accepted alongside Basic auth); omit it to have one generated. The
-Basic auth password must be at least 12 characters.
+`MIZZLE_STUDIO_TOKEN` must have at least 32 non-space characters, on any host and also when
+`--auth` is set (the bearer token is accepted alongside Basic auth); omit it to have one
+generated. The Basic auth password must have at least 12 non-space characters.
 
-Failed logins are throttled per client address: after 10 wrong credentials within a minute,
-that client gets `429` with `Retry-After` for every API request, a correct one included, until
-the oldest failure is a minute old. Other clients are not affected, so an attacker cannot lock
-you out. Requests a browser marks as coming from another site are refused before the login
-check and never count, so a web page you visit cannot lock out a local Studio either. Behind a reverse proxy on the same host, the proxy's `X-Forwarded-For` gives each
-client its own address; for a proxy on another host, set `FORWARDED_ALLOW_IPS` to its address
-(otherwise every client shares the proxy's budget). Basic auth is over HTTP, so put it behind TLS (a reverse proxy) when the network is
-not trusted.
+Failed logins are throttled per client address: after 10 different wrong credentials within
+a minute, that client gets `429` with `Retry-After` for every API request, a correct one
+included, until the oldest failure is a minute old. Only new guesses count: a request with no
+credential, or the same wrong one again (an old tab after a Studio restart), does not.
+Requests a browser marks as coming from another site are refused before the login check and
+never count, so a web page you visit cannot lock out a local Studio either.
 
-Behind that proxy, set `MIZZLE_STUDIO_ORIGIN` to the public origin (comma-separated for
-several) so Studio's cross-site request check accepts the browser's `Origin`:
+The client address is the TCP peer. On a loopback bind every local client shares
+`127.0.0.1`, so another local user who guesses wrong can make you wait a minute. Behind a
+reverse proxy, set `FORWARDED_ALLOW_IPS` to the proxy's address (`127.0.0.1` for a proxy on
+the same host): its `X-Forwarded-For` then gives each client its own address. Without it,
+`X-Forwarded-For` is ignored and every client shares the proxy's budget. Basic auth is over
+HTTP, so put it behind TLS (a reverse proxy) when the network is not trusted.
+
+A browser request that carries an `Origin` header must come from the page Studio served: on
+a remote bind, its origin must match the `Host` the request was sent to. If the proxy changes
+the `Host` header, set `MIZZLE_STUDIO_ORIGIN` to the public origin (comma-separated for
+several):
 
 ```bash
 export MIZZLE_STUDIO_ORIGIN="https://studio.example.com"
 ```
-
-Without it, a request that carries an `Origin` header is refused, which fails closed.
 
 Studio refuses cross-site requests: a state-changing call must be `Content-Type:
 application/json` and must not come from another site (`Sec-Fetch-Site` / `Origin`). This
@@ -254,9 +259,10 @@ matters because a browser attaches cached Basic credentials to a form post from 
 `--read-only` needs a non-privileged database role. Read-only mode runs SQL in a
 `READ ONLY` transaction, and that stops writes to tables but not what a privileged role can
 do on the server (read files, run programs, signal other backends). So read-only Studio
-refuses to start when the role is a superuser, has `REPLICATION`, or is a member of
-`pg_read_server_files`, `pg_write_server_files`, `pg_execute_server_program` or
-`pg_signal_backend`. Create a plain role for it:
+refuses to start when the login role, or the role it switches to, is a superuser, has
+`REPLICATION`, or is a member of `pg_read_server_files`, `pg_write_server_files`,
+`pg_execute_server_program`, `pg_signal_backend` or `pg_maintain`. Create a plain role for
+it:
 
 ```sql
 CREATE ROLE studio_ro LOGIN PASSWORD '...';
@@ -265,7 +271,8 @@ GRANT SELECT ON ALL TABLES IN SCHEMA public TO studio_ro;
 ```
 
 As defence in depth, read-only mode also refuses statements that could leave the read-only
-transaction (`BEGIN`/`COMMIT`/`ROLLBACK`/`SAVEPOINT`, `SET`/`RESET`, ...) and a list of
+transaction (`BEGIN`/`START`/`COMMIT`/`ROLLBACK`/`SAVEPOINT`/`PREPARE`, `SET`/`RESET`, ...),
+statements that rewrite or lock tables (`CLUSTER`, `REINDEX`, `ANALYZE`, `VACUUM`) and a list of
 server-side functions (`pg_read_file`, `pg_notify`, replication slot functions, ...). That
 list is not the security control and cannot be complete; the role is.
 

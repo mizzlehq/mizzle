@@ -449,6 +449,15 @@ def test_read_only_refuses_transaction_control(pg_url: str, ro_url: str) -> None
             "/* /* */ */ rollback\n; insert into users (email) values ('nested2')",
             "/* /* */ */ set transaction_read_only = off",
             "-- a\r/* b /* c */ d */\n\t commit",
+            # B65, B66: a comment between the two words made the transaction writable.
+            "start/**/transaction read write; insert into users (email) values ('start')",
+            "start--\ntransaction isolation level read committed, read write; "
+            "update users set email = 'pwn'",
+            "prepare/**/transaction 'x'; insert into users (email) values ('prep')",
+            # B70: allowed in a READ ONLY transaction, but rewrite or lock tables.
+            "cluster users using users_pkey",
+            "reindex table users",
+            "analyze users",
         ):
             response = client.post("/api/sql", json={"sql": sql}, headers=AUTH)
             assert response.status_code == 403, (sql, response.text)
@@ -824,8 +833,9 @@ def test_repeated_failed_logins_are_throttled_per_client(
         make_client(pg_url, address="10.0.0.66") as attacker,
         make_client(pg_url, address="10.0.0.7") as user,
     ):
-        for _ in range(3):
-            assert attacker.get("/api/meta", headers=wrong).status_code == 401
+        for guess in range(3):
+            response = attacker.get("/api/meta", headers={"Authorization": f"Bearer {guess}"})
+            assert response.status_code == 401
         blocked = attacker.get("/api/meta", headers=wrong)
         assert blocked.status_code == 429
         assert int(blocked.headers["retry-after"]) >= 1
@@ -847,7 +857,7 @@ def test_failure_table_is_bounded(monkeypatch: pytest.MonkeyPatch) -> None:
 
     guard = server._Guard(app, "t" * 32, None)
     for i in range(10):
-        guard._record_failure(f"10.0.0.{i}")
+        guard._record_failure(f"10.0.0.{i}", b"Bearer x")
     assert list(guard._failures) == [f"10.0.0.{i}" for i in range(6, 10)]
 
 
@@ -891,3 +901,109 @@ def test_a_web_page_cannot_lock_out_a_local_studio(
                 response = client.request(method, "/api/meta", headers=headers)
                 assert response.status_code == 403, (method, headers)
         assert client.get("/api/meta", headers=AUTH).status_code == 200
+
+
+def test_only_new_guesses_count_toward_the_throttle(
+    pg_url: str, driver: PostgresDriver, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # B68: a tab still holding an old token re-sends it on every reload, two requests each.
+    # On loopback the real user shares the address, so five reloads locked them out.
+    monkeypatch.setattr(server, "LOGIN_MAX_FAILURES", 3)
+    stale = {"Authorization": "Bearer old-token-from-the-last-run"}
+    with make_client(pg_url, address="127.0.0.1") as client:
+        for _ in range(10):
+            assert client.get("/api/meta", headers=stale).status_code == 401
+            assert client.get("/api/meta").status_code == 401  # no credential at all
+        assert client.get("/api/meta", headers=AUTH).status_code == 200
+
+
+def test_same_origin_requests_pass_without_an_origin_setting(
+    pg_url: str, driver: PostgresDriver
+) -> None:
+    # B72: a remote bind without MIZZLE_STUDIO_ORIGIN accepts the origin of the Host the
+    # request was sent to, and still refuses any other.
+    with make_client(pg_url) as client:
+        same = {**AUTH, "Origin": "http://testserver"}
+        assert client.post("/api/sql", json={"sql": "select 1"}, headers=same).status_code == 200
+        other = {**AUTH, "Origin": "http://studio.evil"}
+        assert client.post("/api/sql", json={"sql": "select 1"}, headers=other).status_code == 403
+
+
+def test_read_only_checks_the_login_role_too(pg_url: str, ro_url: str) -> None:
+    # B69: a superuser whose ALTER ROLE ... SET role starts it as a plain role passed the
+    # check, then set_config('role', 'none', false) made it a superuser again.
+    sup = "mizzle_studio_sup"
+    with make_client(pg_url) as admin:
+        admin.post(
+            "/api/sql",
+            json={
+                "sql": f"drop role if exists {sup}; "
+                f"create role {sup} superuser login password 'sup'; "
+                f"alter role {sup} set role = {RO_ROLE}"
+            },
+            headers=AUTH,
+        )
+        try:
+            parts = urlsplit(pg_url)
+            url = urlunsplit(parts._replace(netloc=f"{sup}:sup@{parts.hostname}:{parts.port}"))
+            with (
+                pytest.raises(MigrationError, match="superuser"),
+                make_client(url, read_only=True),
+            ):
+                pass
+        finally:
+            admin.post("/api/sql", json={"sql": f"drop role {sup}"}, headers=AUTH)
+
+
+def test_rows_keep_numbers_a_browser_cannot_hold(client: TestClient) -> None:
+    # B71: rows were decoded through float, so numeric(40,20) came back rounded.
+    big = "12345678901234567890.12345678901234567890"
+    client.post(
+        "/api/sql",
+        json={
+            "sql": "drop table if exists st_num; "
+            "create table st_num (id int primary key, n numeric(40,20), b bigint, f float8); "
+            f"insert into st_num values (1, {big}, 9007199254740993, 1.5)"
+        },
+        headers=AUTH,
+    )
+    [row] = client.get("/api/tables/public/st_num/rows", headers=AUTH).json()["rows"]
+    assert row == {"id": 1, "n": big, "b": "9007199254740993", "f": 1.5}
+    exported = client.get(
+        "/api/tables/public/st_num/export", params={"format": "json"}, headers=AUTH
+    ).text
+    assert big in exported
+    assert "9007199254740993" in exported
+    csv_text = client.get(
+        "/api/tables/public/st_num/export", params={"format": "csv"}, headers=AUTH
+    ).text
+    assert big in csv_text
+
+
+def test_csv_type_check_is_not_fooled_by_a_schema_name(client: TestClient) -> None:
+    # B73: a domain "date".note over text started with "date", so its formula exported raw.
+    client.post(
+        "/api/sql",
+        json={
+            "sql": 'drop table if exists st_dom; drop schema if exists "date" cascade; '
+            'create schema "date"; create domain "date".note as text; '
+            'create table st_dom (id int primary key, v "date".note); '
+            "insert into st_dom values (1, '=cmd')"
+        },
+        headers=AUTH,
+    )
+    text = client.get(
+        "/api/tables/public/st_dom/export", params={"format": "csv"}, headers=AUTH
+    ).text
+    assert list(csv.reader(io.StringIO(text)))[1] == ["1", "'=cmd"]
+    client.post(
+        "/api/sql", json={"sql": 'drop table st_dom; drop schema "date" cascade'}, headers=AUTH
+    )
+
+
+def test_ddl_default_refuses_a_backslash() -> None:
+    # B74: with standard_conforming_strings = off the server reads \' as an escaped quote.
+    import mizzle.studio.ddl as ddl
+
+    assert not ddl._DEFAULT.fullmatch("'\\' + ' ; create table pwned(); --'")
+    assert ddl._DEFAULT.fullmatch("'it''s'")

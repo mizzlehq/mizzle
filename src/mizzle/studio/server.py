@@ -23,6 +23,7 @@ import base64
 import csv
 import datetime
 import enum
+import hashlib
 import hmac
 import io
 import json
@@ -36,6 +37,7 @@ import webbrowser
 from collections.abc import AsyncGenerator, Awaitable, Callable, Mapping, Sequence
 from contextlib import aclosing, asynccontextmanager
 from dataclasses import dataclass, field
+from decimal import Decimal
 from pathlib import Path
 from typing import cast, override
 
@@ -84,11 +86,15 @@ LOGIN_MAX_CLIENTS = 1024
 #
 # Statements that change the transaction, the session or the process rather than the data.
 # A batch must not be able to leave the READ ONLY transaction it runs in (``commit; insert
-# ...`` was a working write). Matched on the first token after comments.
+# ...`` was a working write). Matched on the first token after comments, as one word:
+# ``START``/``PREPARE`` alone, since a comment may sit between ``START`` and ``TRANSACTION``
+# (``start/**/transaction read write`` made the open transaction writable, B65, B66).
+# CLUSTER, REINDEX and ANALYZE are allowed in a READ ONLY transaction but rewrite tables or
+# take exclusive locks (B70).
 _READ_ONLY_DENIED = re.compile(
-    r"(?:BEGIN|START\s+TRANSACTION|COMMIT|END|ROLLBACK|ABORT|SAVEPOINT|RELEASE"
-    r"|SET|RESET|DISCARD|LOCK|PREPARE\s+TRANSACTION|NOTIFY|LISTEN|UNLISTEN"
-    r"|COPY|DO|CHECKPOINT|LOAD)\b",
+    r"(?:BEGIN|START|COMMIT|END|ROLLBACK|ABORT|SAVEPOINT|RELEASE"
+    r"|SET|RESET|DISCARD|LOCK|PREPARE|EXECUTE|NOTIFY|LISTEN|UNLISTEN"
+    r"|COPY|DO|CHECKPOINT|LOAD|CLUSTER|REINDEX|ANALYZE|ANALYSE|VACUUM|REFRESH)\b",
     re.IGNORECASE,
 )
 # Server-side functions that read or change things outside the transaction, which READ ONLY
@@ -109,10 +115,15 @@ _PRIVILEGED_ROLES = (
     "pg_write_server_files",
     "pg_execute_server_program",
     "pg_signal_backend",
+    "pg_maintain",  # PostgreSQL 17+: CLUSTER/REINDEX on any table
 )
+# ``session_user`` as well as ``current_user``: a login role with ``ALTER ROLE ... SET role``
+# starts as the plain role but can ``set_config('role', 'none', false)`` back to itself
+# (B69). Every role the login role can SET ROLE to is in its MEMBER chain.
 _PRIVILEGED_SQL = (
     "SELECT rolname, rolsuper, rolreplication FROM pg_roles "
-    "WHERE pg_has_role(current_user, oid, 'MEMBER') AND (rolsuper OR rolreplication "
+    "WHERE (pg_has_role(session_user, oid, 'MEMBER') "
+    "OR pg_has_role(current_user, oid, 'MEMBER')) AND (rolsuper OR rolreplication "
     f"OR rolname IN ({', '.join(repr(r) for r in _PRIVILEGED_ROLES)})) ORDER BY rolname"
 )
 
@@ -432,9 +443,12 @@ _FORMULA_LEAD = ("=", "+", "-", "@")
 # Types whose text form is a number, interval, date or time: a leading "-" is a sign, not a
 # formula, and prefixing it corrupted the value (B19). to_jsonb() turns intervals, money and
 # dates into JSON strings, so the column type, not the Python type, tells them apart.
+# The whole type name must match (``fullmatch``): a domain ``"date".note`` over text starts
+# with ``date`` too (B73). Only modifiers may follow: ``(3)``, ``with time zone``,
+# ``day to second``.
 _SIGNED_TYPE = re.compile(
     r"(?:smallint|integer|bigint|(?:small|big)?serial|numeric|decimal|real|double precision"
-    r"|money|interval|date|time|timestamp)\b",
+    r"|money|interval|date|time|timestamp)\b[a-z0-9 (),]*",
     re.IGNORECASE,
 )
 
@@ -454,7 +468,7 @@ def _cell(value: object, column_type: str) -> str:
         return "true" if value else "false"
     if isinstance(value, dict | list):
         return json.dumps(value)  # starts with { or [, never a formula
-    if isinstance(value, str) and not _SIGNED_TYPE.match(column_type):
+    if isinstance(value, str) and not _SIGNED_TYPE.fullmatch(column_type):
         return _csv_safe(value)
     return str(value)
 
@@ -477,6 +491,28 @@ def jsonable(value: object) -> JSON:
             return jsonable(cast(object, value.value))
         case _:  # Decimal, UUID, timedelta, IP addresses, ...
             return str(value)
+
+
+# A browser reads a JSON number as a double: past 2**53 an integer is no longer exact.
+_EXACT_INT = 2**53
+# Each row as the server's JSON text, decoded by ``_row_json``.
+_ROW = "to_jsonb(t.*)::text"
+
+
+def _exact_int(text: str) -> int | str:
+    value = int(text)
+    return value if abs(value) <= _EXACT_INT else text
+
+
+def _exact_float(text: str) -> float | str:
+    value = float(text)
+    return value if math.isfinite(value) and Decimal(repr(value)) == Decimal(text) else text
+
+
+def _row_json(text: str) -> JSON:
+    """A ``to_jsonb(t.*)::text`` row, with every number a double cannot hold kept as its
+    exact text. Decoding through ``float`` showed ``numeric(40,20)`` values rounded (B71)."""
+    return cast(JSON, json.loads(text, parse_int=_exact_int, parse_float=_exact_float))
 
 
 # -- handlers -------------------------------------------------------------------------
@@ -552,10 +588,10 @@ async def list_rows(studio: Studio, request: Request) -> Response:
     async with studio.pool().acquire() as conn:
         [total] = await conn.fetch(f"SELECT count(*) FROM {source}{where}", params)
         rows = await conn.fetch(
-            f"SELECT to_jsonb(t.*) FROM {source}{where}{order_sql} LIMIT {limit} OFFSET {offset}",
+            f"SELECT {_ROW} FROM {source}{where}{order_sql} LIMIT {limit} OFFSET {offset}",
             params,
         )
-    return JSONResponse({"total": total[0], "rows": [jsonable(r[0]) for r in rows]})
+    return JSONResponse({"total": total[0], "rows": [_row_json(cast(str, r[0])) for r in rows]})
 
 
 def _download_name(schema: str, table: str, fmt: str) -> str:
@@ -591,7 +627,7 @@ async def export_rows(studio: Studio, request: Request) -> Response:
     where = _where(table, filters, params)
     order_sql = _order_sql(table, q)
     source = f"{qualified(table['schema'], table['name'])} AS t"
-    sql = f"SELECT to_jsonb(t.*) FROM {source}{where}{order_sql}"
+    sql = f"SELECT {_ROW} FROM {source}{where}{order_sql}"
     headers = {
         "Content-Disposition": _download_name(table["schema"], table["name"], fmt),
         "Cache-Control": "no-store",
@@ -616,8 +652,8 @@ async def export_rows(studio: Studio, request: Request) -> Response:
                         yield _csv_chunk(columns, types, batch)
                         continue
                     for row in batch:
-                        text = json.dumps(jsonable(row[0]))
-                        yield (b"" if first else b",") + text.encode()
+                        # The server's own JSON text: exact numbers, nothing re-encoded.
+                        yield (b"" if first else b",") + cast(str, row[0]).encode()
                         first = False
             if fmt == "json":
                 yield b"]"
@@ -630,7 +666,7 @@ def _csv_chunk(columns: Sequence[str], types: Sequence[str], batch: Sequence[Row
     buffer = io.StringIO()
     writer = csv.writer(buffer)
     for row in batch:
-        values = cast("Mapping[str, object]", row[0])
+        values = cast("Mapping[str, object]", _row_json(cast(str, row[0])))
         writer.writerow([_cell(values.get(c), t) for c, t in zip(columns, types, strict=True)])
     return buffer.getvalue().encode()
 
@@ -645,12 +681,12 @@ async def insert_row(studio: Studio, request: Request) -> Response:
         columns = [_column(table, c) for c in values]
         names = ", ".join(quote(c["name"]) for c in columns)
         placeholders = ", ".join(_param(params, c, values[c["name"]]) for c in columns)
-        sql = f"INSERT INTO {target} ({names}) VALUES ({placeholders}) RETURNING to_jsonb(t.*)"
+        sql = f"INSERT INTO {target} ({names}) VALUES ({placeholders}) RETURNING {_ROW}"
     else:
-        sql = f"INSERT INTO {target} DEFAULT VALUES RETURNING to_jsonb(t.*)"
+        sql = f"INSERT INTO {target} DEFAULT VALUES RETURNING {_ROW}"
     async with studio.pool().acquire() as conn:
         [row] = await conn.fetch(sql, params)
-    return JSONResponse({"row": jsonable(row[0])}, status_code=201)
+    return JSONResponse({"row": _row_json(cast(str, row[0]))}, status_code=201)
 
 
 async def update_row(studio: Studio, request: Request) -> Response:
@@ -668,13 +704,13 @@ async def update_row(studio: Studio, request: Request) -> Response:
     match = _key_match(table, body.get("key"), params)
     sql = (
         f"UPDATE {qualified(table['schema'], table['name'])} AS t SET {sets} "
-        f"WHERE {match} RETURNING to_jsonb(t.*)"
+        f"WHERE {match} RETURNING {_ROW}"
     )
     async with studio.pool().acquire() as conn:
         rows = await conn.fetch(sql, params)
     if not rows:
         raise StudioError("row not found", 404)
-    return JSONResponse({"row": jsonable(rows[0][0])})
+    return JSONResponse({"row": _row_json(cast(str, rows[0][0]))})
 
 
 async def delete_rows(studio: Studio, request: Request) -> Response:
@@ -869,7 +905,9 @@ MIN_PASSWORD_LENGTH = 12
 
 def resolve_token(explicit: str | None = None) -> str:
     """The bearer token: ``--token``, then ``MIZZLE_STUDIO_TOKEN``, then a random one."""
-    return explicit or os.environ.get("MIZZLE_STUDIO_TOKEN") or secrets.token_urlsafe(32)
+    if explicit is not None:  # ``--token ''`` is refused by the length check, not replaced
+        return explicit
+    return os.environ.get("MIZZLE_STUDIO_TOKEN") or secrets.token_urlsafe(32)
 
 
 def resolve_auth(explicit: str | None = None) -> str | None:
@@ -884,11 +922,16 @@ def check_token_length(token: str) -> None:
     """Refuse a guessable token. It is checked for every bind and alongside ``--auth``: the
     bearer token is accepted whenever it is set, and other users of this machine can reach a
     loopback bind too (B11)."""
-    if len(token) < MIN_TOKEN_LENGTH:
+    if _strength(token) < MIN_TOKEN_LENGTH:
         raise MigrationError(
-            f"a bearer token needs at least {MIN_TOKEN_LENGTH} characters "
-            f"(got {len(token)}); omit --token / MIZZLE_STUDIO_TOKEN to have one generated"
+            f"a bearer token needs at least {MIN_TOKEN_LENGTH} non-space characters "
+            f"(got {_strength(token)}); omit --token / MIZZLE_STUDIO_TOKEN to have one generated"
         )
+
+
+def _strength(secret: str) -> int:
+    """The length that counts: whitespace adds nothing to guess (B75)."""
+    return len("".join(secret.split()))
 
 
 _SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
@@ -915,8 +958,9 @@ class _Guard(BaseHTTPMiddleware):
     allowed_hosts: set[str] | None
     basic: bytes | None
     origins: set[str] | None
-    # Recent failure times per client address, oldest client first (B7).
-    _failures: dict[str, list[float]]
+    # Recent failures per client address, oldest client first (B7): when, and a digest of
+    # the wrong credential.
+    _failures: dict[str, list[tuple[float, bytes]]]
 
     def __init__(
         self,
@@ -931,24 +975,33 @@ class _Guard(BaseHTTPMiddleware):
         self.allowed_hosts = allowed_hosts
         self.basic = None if basic_auth is None else _basic_credentials(*basic_auth)
         # The origins a browser request may come from. Loopback serves the UI itself; a
-        # remote bind is behind a reverse proxy, whose public origin is passed in.
+        # remote bind is behind a reverse proxy, whose public origin is passed in. None means
+        # "the origin of the Host the request was sent to" (a same-origin request).
         self.origins = origins
         self._failures = {}
 
     def _retry_after(self, client: str) -> int | None:
         """Seconds until ``client`` may try a wrong credential again, or None if it may now."""
         now = time.monotonic()
-        recent = [t for t in self._failures.get(client, ()) if now - t < LOGIN_WINDOW_SECONDS]
+        recent = [t for t, _ in self._failures.get(client, ()) if now - t < LOGIN_WINDOW_SECONDS]
         if len(recent) < LOGIN_MAX_FAILURES:
             return None
         return max(1, math.ceil(recent[-LOGIN_MAX_FAILURES] + LOGIN_WINDOW_SECONDS - now))
 
-    def _record_failure(self, client: str) -> None:
+    def _record_failure(self, client: str, given: bytes) -> None:
+        """Count a wrong credential. Only a new guess counts: no credential at all, or the
+        same wrong one again, is not guessing. A tab still holding the token of an earlier
+        Studio run re-sends it on every reload, and on loopback that locked out the real
+        user, who shares the address (B68)."""
+        if not given:
+            return
         now = time.monotonic()
+        digest = hashlib.sha256(given).digest()
         # Popped and re-inserted, so the dict stays ordered by each client's latest failure.
-        times = [t for t in self._failures.pop(client, []) if now - t < LOGIN_WINDOW_SECONDS]
-        times.append(now)
-        self._failures[client] = times[-LOGIN_MAX_FAILURES:]
+        recent = [f for f in self._failures.pop(client, []) if now - f[0] < LOGIN_WINDOW_SECONDS]
+        if all(d != digest for _, d in recent):
+            recent.append((now, digest))
+        self._failures[client] = recent[-LOGIN_MAX_FAILURES:]
         while len(self._failures) > LOGIN_MAX_CLIENTS:
             del self._failures[next(iter(self._failures))]
 
@@ -975,7 +1028,10 @@ class _Guard(BaseHTTPMiddleware):
         raw = request.headers.get("origin")
         if raw is None:  # not a browser request (curl, a test client): no CSRF surface
             return False
-        return raw not in (self.origins or set())
+        if self.origins is None:
+            host = request.headers.get("host", "")
+            return raw not in (f"http://{host}", f"https://{host}")
+        return raw not in self.origins
 
     @override
     async def dispatch(self, request: Request, call_next: RequestResponseEndpoint) -> Response:
@@ -993,8 +1049,8 @@ class _Guard(BaseHTTPMiddleware):
             # The throttle comes before the credential check: if a throttled client's correct
             # guess still got through, the throttle would not slow guessing at all (B34). It
             # is per client address, so only the guessing client waits, not the real user.
-            # Behind a reverse proxy on this host, uvicorn's proxy headers give the real
-            # client address (FORWARDED_ALLOW_IPS for a proxy elsewhere).
+            # The client address is the TCP peer. Behind a reverse proxy, FORWARDED_ALLOW_IPS
+            # names the proxy and its X-Forwarded-For then gives the real client (B67).
             client = request.client.host if request.client else ""
             if (wait := self._retry_after(client)) is not None:
                 return self._error(
@@ -1002,7 +1058,7 @@ class _Guard(BaseHTTPMiddleware):
                 )
         if request.url.path.startswith("/api/") and not self._authorized(request):
             client = request.client.host if request.client else ""
-            self._record_failure(client)
+            self._record_failure(client, request.headers.get("authorization", "").encode())
             headers = {"WWW-Authenticate": 'Basic realm="mizzle studio"'} if self.basic else None
             return self._error("missing or wrong credentials", 401, headers)
         if request.url.path.startswith("/api/") and not _writes_json(request):
@@ -1124,18 +1180,19 @@ async def privileged_roles(dialect: Dialect, url: str) -> list[str]:
         await driver.close()
 
 
-def _server_origins(host: str, port: int) -> set[str]:
+def _server_origins(host: str, port: int) -> set[str] | None:
     """The origins a same-site browser request can carry.
 
     Loopback is unambiguous: the UI is served from one of these three. A remote bind sits
     behind a TLS reverse proxy whose public origin the server cannot derive, so
     ``MIZZLE_STUDIO_ORIGIN`` (comma-separated) supplies it; without it a browser request
-    carrying an ``Origin`` header is refused, which fails closed."""
+    carrying an ``Origin`` header must match the ``Host`` it was sent to. Guessing
+    ``http://<bind address>`` broke every write behind ``--host 0.0.0.0`` (B72)."""
     if host in {"127.0.0.1", "localhost", "::1"}:
         return {f"http://127.0.0.1:{port}", f"http://localhost:{port}", f"http://[::1]:{port}"}
     extra = os.environ.get("MIZZLE_STUDIO_ORIGIN", "")
     origins = {o.strip().rstrip("/") for o in extra.split(",") if o.strip()}
-    return origins or {f"http://{host}:{port}", f"https://{host}:{port}"}
+    return origins or None
 
 
 def serve(
@@ -1168,10 +1225,10 @@ def serve(
             "or --token (or set MIZZLE_STUDIO_TOKEN / MIZZLE_STUDIO_AUTH)"
         )
     check_token_length(token_value)
-    if basic_auth is not None and len(basic_auth[1]) < MIN_PASSWORD_LENGTH:
+    if basic_auth is not None and _strength(basic_auth[1]) < MIN_PASSWORD_LENGTH:
         raise MigrationError(
             f"the --auth / MIZZLE_STUDIO_AUTH password needs at least {MIN_PASSWORD_LENGTH} "
-            f"characters (got {len(basic_auth[1])})"
+            f"non-space characters (got {_strength(basic_auth[1])})"
         )
     if read_only:
         _refuse_privileged(asyncio.run(privileged_roles(config.dialect(), config.url())))
@@ -1207,4 +1264,13 @@ def serve(
             f"mizzle studio{mode} listening on {host}:{port} (authenticate with {how}).\n"
             "Press Ctrl+C to stop."
         )
-    uvicorn.run(app, host=host, port=port, log_level="warning")
+    # uvicorn trusts X-Forwarded-For from 127.0.0.1 by default, so any local process could
+    # pick a fresh address per guess and never be throttled (B67). Only a proxy the user
+    # names in FORWARDED_ALLOW_IPS is trusted.
+    uvicorn.run(
+        app,
+        host=host,
+        port=port,
+        log_level="warning",
+        proxy_headers="FORWARDED_ALLOW_IPS" in os.environ,
+    )

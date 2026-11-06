@@ -31,9 +31,13 @@ def no_ui(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setitem(sys.modules, "uvicorn", types.SimpleNamespace(run=_record_run))
 
 
-def _record_run(app: object, *, host: str, port: int, log_level: str) -> None:
+def _record_run(app: object, *, host: str, port: int, log_level: str, proxy_headers: bool) -> None:
     """uvicorn.run, without listening."""
     SERVED.append((app, host, port))
+    PROXY_HEADERS.append(proxy_headers)
+
+
+PROXY_HEADERS: list[bool] = []
 
 
 SERVED: list[tuple[object, str, int]] = []
@@ -45,12 +49,18 @@ def no_browser(monkeypatch: pytest.MonkeyPatch) -> None:
     """Never launch a browser from a test (it really would open one)."""
     SERVED.clear()
     OPENED.clear()
+    PROXY_HEADERS.clear()
     monkeypatch.setattr(studio_server, "webbrowser", types.SimpleNamespace(open=OPENED.append))
 
 
 @pytest.fixture(autouse=True)
 def clean_env(monkeypatch: pytest.MonkeyPatch) -> None:
-    for name in ("MIZZLE_STUDIO_TOKEN", "MIZZLE_STUDIO_AUTH", "MIZZLE_STUDIO_ORIGIN"):
+    for name in (
+        "MIZZLE_STUDIO_TOKEN",
+        "MIZZLE_STUDIO_AUTH",
+        "MIZZLE_STUDIO_ORIGIN",
+        "FORWARDED_ALLOW_IPS",
+    ):
         monkeypatch.delenv(name, raising=False)
 
 
@@ -82,7 +92,7 @@ def test_remote_bind_accepts_basic_auth_from_the_environment(
 
 def test_remote_bind_rejects_a_short_token(config: Config, no_ui: None) -> None:
     # SS4: a one-character token is guessable, so a remote bind needs a real one.
-    with pytest.raises(MigrationError, match="at least 32 characters"):
+    with pytest.raises(MigrationError, match="at least 32 non-space characters"):
         studio_server.serve(
             config, port=4983, read_only=False, open_browser=False, host="0.0.0.0", token="a"
         )
@@ -114,7 +124,7 @@ def test_short_token_is_refused_in_every_mode(
 ) -> None:
     # B11: with --auth set the token length was not checked, yet the bearer token was
     # still accepted: --auth admin:x --token a let anyone in with "Bearer a".
-    with pytest.raises(MigrationError, match="at least 32 characters"):
+    with pytest.raises(MigrationError, match="at least 32 non-space characters"):
         studio_server.serve(
             config,
             port=4983,
@@ -125,14 +135,14 @@ def test_short_token_is_refused_in_every_mode(
             auth="admin:correct-horse",
         )
     monkeypatch.setenv("MIZZLE_STUDIO_TOKEN", "short")
-    with pytest.raises(MigrationError, match="at least 32 characters"):
+    with pytest.raises(MigrationError, match="at least 32 non-space characters"):
         studio_server.serve(config, port=4983, read_only=False, open_browser=False, host=host)
     assert not SERVED
 
 
 def test_short_basic_password_is_refused(config: Config, no_ui: None) -> None:
     # B11: --auth admin:x was accepted.
-    with pytest.raises(MigrationError, match="at least 12 characters"):
+    with pytest.raises(MigrationError, match="at least 12 non-space characters"):
         studio_server.serve(
             config, port=4983, read_only=False, open_browser=False, host="0.0.0.0", auth="admin:x"
         )
@@ -194,3 +204,45 @@ def test_token_length_check_names_the_limit() -> None:
     studio_server.check_token_length("t" * 32)
     with pytest.raises(MigrationError, match="at least 32"):
         studio_server.check_token_length("t" * 31)
+
+
+def test_blank_secrets_are_refused(config: Config, no_ui: None) -> None:
+    # B75: 32 spaces passed the length check, and --token '' silently became a random token
+    # that was never printed.
+    for token in (" " * 32, ""):
+        with pytest.raises(MigrationError, match="at least 32 non-space characters"):
+            studio_server.serve(
+                config,
+                port=4983,
+                read_only=False,
+                open_browser=False,
+                host="127.0.0.2",
+                token=token,
+            )
+    with pytest.raises(MigrationError, match="at least 12 non-space characters"):
+        studio_server.serve(
+            config,
+            port=4983,
+            read_only=False,
+            open_browser=False,
+            host="0.0.0.0",
+            auth="admin:" + " " * 12,
+        )
+    assert not SERVED
+
+
+def test_forwarded_headers_are_trusted_only_when_configured(
+    config: Config, no_ui: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # B67: uvicorn trusts X-Forwarded-For from 127.0.0.1 by default, so a local client could
+    # name a fresh address for every guess and never be throttled.
+    serve = {"port": 4983, "read_only": False, "open_browser": False, "token": "t" * 32}
+    studio_server.serve(config, **serve)
+    monkeypatch.setenv("FORWARDED_ALLOW_IPS", "127.0.0.1")
+    studio_server.serve(config, **serve)
+    assert PROXY_HEADERS == [False, True]
+
+
+def test_a_remote_bind_without_an_origin_setting_matches_the_host() -> None:
+    # B72: guessing http://0.0.0.0:port refused every browser write behind --host 0.0.0.0.
+    assert studio_server._server_origins("0.0.0.0", 4983) is None
