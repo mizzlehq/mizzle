@@ -749,6 +749,9 @@ class _Acquire:
             conn, self._conn = self._conn, None
             dirty = self._wrapper is None or self._wrapper.dirty
             self._wrapper = None
+            # Checked before the release: asyncpg terminates a connection whose reset fails,
+            # so afterwards it is always closed (B38).
+            closed = _is_closed(conn)
             try:
                 if dirty:
                     # The proxy forwards to the _PoolConnection the pool was created with.
@@ -760,7 +763,7 @@ class _Acquire:
                 # Not raised: the statement itself finished, and raising here would make a
                 # completed write look failed. A connection the server already closed (a
                 # killed backend, a restart) is expected to fail here: not worth a warning.
-                closed = _is_closed(conn)
+                # A reset or on_connect hook that fails on a live connection is.
                 level = logging.DEBUG if closed else logging.WARNING
                 log.log(level, "mizzle: could not return a connection to the pool", exc_info=True)
 

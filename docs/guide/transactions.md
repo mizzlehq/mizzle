@@ -81,14 +81,21 @@ Two rules keep hook errors from confusing the outcome:
 - In a **savepoint**, `after_commit` is queued, not run: releasing a savepoint is not a
   commit, and the outer transaction can still roll back. Queued hooks run after the
   outermost `COMMIT`, and are dropped if either level rolls back. In the same way, a
-  savepoint's `after_rollback` fires if the outer transaction rolls back even though the
-  savepoint itself was released. Rollback drops only the hooks of the savepoint that
-  failed, not those of siblings that already released.
+  savepoint's `after_rollback` fires if an enclosing savepoint or the outer transaction
+  rolls back even though the savepoint itself was released. Rollback drops only the hooks
+  of the savepoint that failed, not those of siblings that already released.
 - An `after_commit` hook that raises raises `AfterCommitError`. The data **is** committed:
   the message says so, so a retry does not insert it twice. Every queued hook still runs;
-  one failure does not skip the rest. An `after_rollback` hook that raises does not hide the
-  error that caused the rollback: the original error is raised, and the hook's failure (with
-  its traceback) is kept as its `__cause__` when it had no context, or as a note otherwise.
+  one failure does not skip the rest. The first failure is the error's `__cause__`; later
+  ones are only logged. An `after_rollback` hook that raises does not hide the error that
+  caused the rollback: the original error is raised. When it had no visible context, its
+  `__context__` is an `AfterRollbackError` whose `__cause__` is the hook's failure (with its
+  traceback); otherwise a note on the original names the failure.
+- A cancel or timeout that arrives after `COMMIT`, while the connection goes back to the
+  pool, still propagates, but the `after_commit` hooks run, the `after_rollback` hooks do
+  not, and a note on the error says the transaction was committed. Do not retry it.
+- Savepoints on one transaction run one at a time, from the task that opened them. A
+  savepoint started from another task while one is open raises `QueryError`.
 
 ## Isolation levels and read-only
 

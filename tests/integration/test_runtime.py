@@ -404,3 +404,150 @@ async def test_connect_retry_gives_up_on_a_wrong_password(pg_url: str) -> None:
     with pytest.raises(DbConnectionError):
         await Database.connect(bad, schema=[Users, Posts], connect_retries=3, connect_backoff=1.0)
     assert time.monotonic() - started < 1.0  # no 1s + 2s + 4s of sleeping
+
+
+async def test_a_cancel_after_commit_runs_the_commit_hooks(pg_url: str) -> None:
+    # B36: a cancel while the connection was released (after COMMIT) ran the rollback
+    # hooks and dropped the commit hooks, for data that was saved.
+    import asyncio
+
+    ran: list[str] = []
+    released = asyncio.Event()
+
+    async def slow_hook(conn: Connection) -> None:
+        released.set()
+        await asyncio.sleep(0.5)
+
+    async def after_commit() -> None:
+        ran.append("commit")
+
+    async def after_rollback() -> None:
+        ran.append("rollback")
+
+    async with await Database.connect(
+        pg_url,
+        schema=[Users, Posts],
+        pool_size=1,
+        reset_connections="always",
+        on_connect=slow_hook,
+    ) as db:
+        await db.delete(Users).where(eq(Users.email, "b36@x"))
+
+        async def write() -> None:
+            async with db.transaction(
+                after_commit=after_commit, after_rollback=after_rollback
+            ) as tx:
+                await tx.insert(Users).values({"email": "b36@x"})
+
+        released.clear()  # the on_connect of the first connection already ran
+        task = asyncio.create_task(write())
+        await released.wait()  # COMMIT done; the reset's on_connect hook is sleeping
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError) as caught:
+            await task
+        assert ran == ["commit"]
+        assert any("committed" in note for note in caught.value.__notes__)
+        rows = await db.select().from_(Users).where(eq(Users.email, "b36@x"))
+        assert len(rows) == 1
+
+
+async def test_a_rolled_back_savepoint_runs_the_hooks_of_savepoints_inside_it(
+    pg_url: str,
+) -> None:
+    # B37: a savepoint released inside one that then rolled back lost its after_rollback.
+    ran: list[str] = []
+
+    def hook(name: str) -> Any:
+        async def run() -> None:
+            ran.append(name)
+
+        return run
+
+    async with await Database.connect(pg_url, schema=[Users, Posts], pool_size=1) as db:
+        async with db.transaction(after_commit=hook("L0-ac")) as tx:
+            with pytest.raises(RuntimeError):
+                async with tx.transaction(after_rollback=hook("L1-rb")) as s1:
+                    async with s1.transaction(after_rollback=hook("L2-rb")):
+                        pass
+                    raise RuntimeError("s1 fails")
+        assert ran == ["L2-rb", "L1-rb", "L0-ac"]
+
+
+async def test_a_savepoint_on_an_ended_transaction_runs_no_rollback_hook(pg_url: str) -> None:
+    # B39: a view kept past its transaction started no savepoint, yet after_rollback ran.
+    ran: list[str] = []
+
+    async def hook() -> None:
+        ran.append("rollback")
+
+    async with await Database.connect(pg_url, schema=[Users, Posts], pool_size=1) as db:
+        async with db.transaction() as tx:
+            stale = tx.tag(x=1)
+        with pytest.raises(Exception):  # noqa: B017 - the driver's "released" error
+            async with stale.transaction(after_rollback=hook):
+                pass
+        assert ran == []
+
+
+async def test_savepoints_from_two_tasks_are_refused(pg_url: str) -> None:
+    # B39: concurrent savepoints failed with "another operation is in progress", labelled
+    # as a COMMIT.
+    import asyncio
+
+    async with await Database.connect(pg_url, schema=[Users, Posts], pool_size=1) as db:
+
+        async def savepoint(tx: Any) -> None:
+            async with tx.transaction():
+                await asyncio.sleep(0.05)
+
+        async with db.transaction() as tx:
+            results = await asyncio.gather(savepoint(tx), savepoint(tx), return_exceptions=True)
+            errors = [r for r in results if isinstance(r, BaseException)]
+            assert len(errors) == 1
+            assert isinstance(errors[0], QueryError)
+            assert "another task" in str(errors[0])
+            await savepoint(tx)  # the transaction is still usable
+
+
+async def test_a_failing_on_connect_after_a_reset_is_a_warning(
+    pg_url: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    # B38: asyncpg closes a connection whose reset fails, so the check after the release
+    # always saw a closed connection and logged at DEBUG.
+    calls = 0
+
+    async def flaky(conn: Connection) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise RuntimeError("on_connect failed")
+
+    async with await Database.connect(
+        pg_url, schema=[Users, Posts], pool_size=1, reset_connections="always", on_connect=flaky
+    ) as db:
+        with caplog.at_level(logging.WARNING, logger="mizzle"):
+            await db.execute(sql("SELECT 1"))
+        assert any("could not return" in r.getMessage() for r in caplog.records)
+
+
+async def test_a_hook_error_is_visible_after_raise_from(pg_url: str) -> None:
+    # B40: with `raise X from Y` the context is hidden (__suppress_context__), so a hook
+    # error put there never showed. The chain must also not loop back to the original.
+    async def hook() -> None:
+        raise RuntimeError("hook is down")
+
+    async with await Database.connect(pg_url, schema=[Users, Posts], pool_size=1) as db:
+        with pytest.raises(ValueError, match="real") as caught:
+            async with db.transaction(after_rollback=hook):
+                raise ValueError("real") from KeyError("cause")
+        assert any("after_rollback" in note for note in caught.value.__notes__)
+
+        with pytest.raises(ValueError) as plain:
+            async with db.transaction(after_rollback=hook):
+                raise ValueError("plain")
+        seen: set[int] = set()
+        error: BaseException | None = plain.value
+        while error is not None:
+            assert id(error) not in seen, "the exception chain is a cycle"
+            seen.add(id(error))
+            error = error.__cause__ or error.__context__
