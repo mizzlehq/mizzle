@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 
 from mizzle.core.errors import MigrationError, MigrationTampered
 from mizzle.core.steps import Statement
@@ -66,10 +66,25 @@ def superseded_names(migrations: list[Migration]) -> set[str]:
     return {old for migration in migrations for old in migration.supersedes}
 
 
+def history_complete(names: Sequence[str], applied: Mapping[str, str]) -> bool:
+    """Whether the database applied the whole history ``names`` (a squash's supersedes).
+
+    An earlier squash in the list (a ``0001_`` name after the first) stands for every name
+    before it, so a database that ran that squash, or the history it replaced, counts.
+    Checking only the last name adopted a database with a gap (B57).
+    """
+    complete = True
+    for position, name in enumerate(names):
+        if position > 0 and name.startswith("0001_"):
+            complete = complete or name in applied
+        else:
+            complete = complete and name in applied
+    return complete
+
+
 def squash_adopted(migration: Migration, applied: Mapping[str, str]) -> bool:
-    """A squash is in effect when the last migration it replaced is applied: every squash
-    replaces the whole history before it, and ``migrate`` applies in order."""
-    return bool(migration.supersedes) and migration.supersedes[-1] in applied
+    """A squash is in effect when the database applied the whole history it replaced."""
+    return bool(migration.supersedes) and history_complete(migration.supersedes, applied)
 
 
 def refuse_partial_squash(migrations: list[Migration], applied: Mapping[str, str]) -> None:
@@ -79,12 +94,17 @@ def refuse_partial_squash(migrations: list[Migration], applied: Mapping[str, str
         if migration.name in applied or squash_adopted(migration, applied):
             continue
         if done := [name for name in migration.supersedes if name in applied]:
-            raise MigrationError(
-                f"the database applied only part of the history {migration.name} replaced "
-                f"({', '.join(done)}, but not {migration.supersedes[-1]}), so it can neither "
-                "adopt nor run it. Check out the commit before the squash and run "
-                "`mizzle migrate` there first, or reset this database."
-            )
+            raise MigrationError(partial_squash_message(migration.name, migration.supersedes, done))
+
+
+def partial_squash_message(name: str, supersedes: Sequence[str], done: Sequence[str]) -> str:
+    missing = [n for n in supersedes if n not in done]
+    return (
+        f"the database applied only part of the history {name} replaced "
+        f"({', '.join(done)}, but not {', '.join(missing)}), so it can neither adopt nor "
+        "run it. Check out the commit before the squash and run `mizzle migrate` there "
+        "first, or reset this database."
+    )
 
 
 def pending_migrations(

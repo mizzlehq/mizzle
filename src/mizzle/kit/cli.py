@@ -35,6 +35,8 @@ from mizzle.kit.journal import (
 )
 from mizzle.kit.migrate import (
     apply_statements,
+    history_complete,
+    partial_squash_message,
     pending_migrations,
     refuse_partial_squash,
     resolve_target,
@@ -43,6 +45,7 @@ from mizzle.kit.migrate import (
     superseded_names,
 )
 from mizzle.kit.snapshot import build_snapshot
+from mizzle.kit.sqltext import transaction_control
 
 log = logging.getLogger("mizzle")
 
@@ -87,8 +90,17 @@ def _interactive() -> bool:
     return sys.stdin.isatty() and sys.stdout.isatty()
 
 
+def _ask(prompt: str) -> str:
+    """``input()``, where Ctrl-D is an empty answer rather than an EOFError traceback (B60)."""
+    try:
+        return input(prompt).strip()
+    except EOFError:
+        print()
+        return ""
+
+
 def _confirm(question: str) -> bool:
-    return input(f"{question} [y/N] ").strip().lower() in ("y", "yes")
+    return _ask(f"{question} [y/N] ").lower() in ("y", "yes")
 
 
 def _ask_renames(
@@ -101,11 +113,11 @@ def _ask_renames(
             break
         options = ", ".join(left)
         what = "a move" if scope == "*" else "a rename"  # "*": names are "schema.table"
-        answer = input(
+        answer = _ask(
             f"{kind} {new if scope == '*' else f'{scope}.{new}'} is new. Is it {what} of one "
             f"of: {options}? "
             "Type the old name, or press enter to create it: "
-        ).strip()
+        )
         if answer:
             if answer not in left:
                 raise MigrationError(f"{answer!r} is not one of {left}")
@@ -347,6 +359,13 @@ def cmd_reset(config: Config, args: Args) -> int:
         print("No migrations to run.")
         return 0
     host, database = _url_target(config.url())
+    if not database:
+        # The driver would connect to ?dbname=, PGDATABASE or the user name instead, so the
+        # name the user confirms could differ from the database dropped (B56).
+        raise MigrationError(
+            "reset needs the database URL to name the database (postgresql://host/NAME), "
+            "so the name you confirm is the database it drops"
+        )
     if args.database is not None and args.database != database:
         raise MigrationError(
             f"--database {args.database!r} does not match the URL database {database!r}"
@@ -356,7 +375,22 @@ def cmd_reset(config: Config, args: Args) -> int:
     # transaction rules that out, and then hand-written SQL (which may create objects reset
     # does not drop, so it fails the second time) could leave the database half reset.
     hand = _hand_written(directory)
-    one_transaction = all(s.transactional for m in migrations for s in m.statements())
+    for migration in migrations:
+        if word := transaction_control(migration.sql()):
+            # Every migration runs inside reset's transaction; a COMMIT in one ended it, so
+            # the drops stayed while reset reported a rollback (B52).
+            raise MigrationError(
+                f"{migration.name} contains {word}: mizzle runs each migration in a "
+                "transaction, and a statement that ends it would make reset impossible to "
+                "roll back. Take the transaction control out of the migration"
+            )
+    # The migrations before the first one that cannot run in a transaction re-run in the
+    # same transaction as the drops; the rest run after it commits (B51).
+    first = next(
+        (i for i, m in enumerate(migrations) if not all(s.transactional for s in m.statements())),
+        len(migrations),
+    )
+    one_transaction = first == len(migrations)
     if hand and not one_transaction:
         raise MigrationError(
             f"reset cannot safely re-run the hand-written SQL in {', '.join(hand)}: it may "
@@ -375,11 +409,17 @@ def cmd_reset(config: Config, args: Args) -> int:
             f"reset drops every managed object on {host}/{database}; "
             f"pass --force --database {database!r} to confirm"
         )
-    elif (
-        input(
+    if not one_transaction:
+        print(
+            f"Note: {migrations[first].name} cannot run in a transaction, so a failure from "
+            "there on cannot be rolled back; reset then stops and says what it applied."
+        )
+    if (
+        not args.force
+        and _ask(
             f"Drop every mizzle-managed object on {host}/{database} and re-run all "
             f"{len(migrations)} migration(s)? Type the database name to confirm: "
-        ).strip()
+        )
         != database
     ):
         print("Cancelled: that is not the database name.")
@@ -400,13 +440,11 @@ def cmd_reset(config: Config, args: Args) -> int:
                     compare_expressions=False,
                 )
 
-                async def rerun() -> None:
-                    for migration in migrations:
-                        print(f"Applying {migration.name}")
-                        record = dialect.record_migration(
-                            config.migrations_schema, migration.name, migration.hash()
-                        )
-                        await apply_statements(conn, migration.statements(), record)
+                async def rerun(migration: Migration) -> None:
+                    record = dialect.record_migration(
+                        config.migrations_schema, migration.name, migration.hash()
+                    )
+                    await apply_statements(conn, migration.statements(), record)
 
                 try:
                     async with conn.transaction():  # all drops, or none
@@ -416,8 +454,8 @@ def cmd_reset(config: Config, args: Args) -> int:
                         # every migration runs again even when its schema is not managed.
                         await dialect.drop_migrations_table(conn, config.migrations_schema)
                         await dialect.ensure_migrations_table(conn, config.migrations_schema)
-                        if one_transaction:
-                            await rerun()
+                        for migration in migrations[:first]:
+                            await rerun(migration)
                 except DatabaseError as exc:
                     hint = (
                         f" Hand-written SQL in {', '.join(hand)} may create objects reset "
@@ -428,8 +466,20 @@ def cmd_reset(config: Config, args: Args) -> int:
                     raise MigrationError(
                         f"reset failed and was rolled back; the database is unchanged: {exc}{hint}"
                     ) from exc
-                if not one_transaction:
-                    await rerun()
+                for migration in migrations[:first]:  # printed once they are committed
+                    print(f"Applied {migration.name}")
+                for done, migration in enumerate(migrations[first:], first):
+                    try:
+                        await rerun(migration)
+                    except DatabaseError as exc:
+                        raise MigrationError(
+                            f"reset dropped the managed objects and re-ran {done} "
+                            f"migration(s), then {migration.name} failed: {exc}. The database "
+                            "is partly reset: a statement that cannot run in a transaction "
+                            "cannot be rolled back. Fix the cause, then run `mizzle migrate` "
+                            "to apply the rest"
+                        ) from exc
+                    print(f"Applied {migration.name}")
                 return len(migrations)
             finally:
                 try:
@@ -453,6 +503,12 @@ def cmd_squash(config: Config, args: Args) -> int:
     if len(migrations) == 1 and migrations[0].supersedes:
         print("Nothing to squash: the history is already one squashed migration.")
         return 0
+    if unlisted := directory.unlisted():
+        # A folder from a merged branch: squash must not delete SQL it does not know (B54).
+        raise MigrationError(
+            f"{', '.join(unlisted)} is not in the journal; run `mizzle check --fix` (or "
+            "remove the folder) before squashing"
+        )
     if hand := _hand_written(directory):
         raise MigrationError(
             f"squash would lose hand-written SQL in {', '.join(hand)} (a custom migration, "
@@ -470,11 +526,13 @@ def cmd_squash(config: Config, args: Args) -> int:
         applied = _applied_now(config)
     except MizzleError:  # squash works offline; the warning below is best effort
         applied = None
-    if applied and supersedes[-1] not in applied and any(name in applied for name in supersedes):
-        print(
-            f"warning: the database applied only part of this history (not "
-            f"{supersedes[-1]}), so it cannot adopt the squashed migration; run "
-            "`mizzle migrate` before squashing"
+    done = [name for name in supersedes if applied and name in applied]
+    if applied is not None and done and not history_complete(supersedes, applied):
+        # Squashing anyway left advice that could only be followed after a git restore (B63).
+        raise MigrationError(
+            "refusing to squash: "
+            + partial_squash_message("the squash", supersedes, done)
+            + " Run `mizzle migrate` first"
         )
     latest = directory.latest_snapshot()
     steps = diff(empty_snapshot(config.dialect_name), latest, no_renames, compare_expressions=False)
@@ -771,12 +829,19 @@ def cmd_info(config: Config, args: Args) -> int:
         return migration.name in applied or squash_adopted(migration, applied)
 
     pending = sum(1 for m in migrations if not in_effect(m))
+    try:
+        refuse_partial_squash(migrations, applied)
+        partial = None
+    except MigrationError as exc:  # migrate refuses this state; say so here too (B62)
+        partial = str(exc)
     print(f"  database:    PostgreSQL {version}")
     print(f"  applied:     {len(migrations) - pending} applied, {pending} pending")
     if changed:
         print(f"  changed:     {len(changed)} applied migration(s) edited after they were applied")
     for name in missing:
         print(f"  missing:     {name} is applied but not on disk")
+    if partial:
+        print(f"  squash:      {partial}")
     if drift:
         print(f"  drift:       {len(drift)} change(s) between the database and the migrations")
         for step in drift[:10]:
@@ -784,7 +849,7 @@ def cmd_info(config: Config, args: Args) -> int:
     else:
         print("  drift:       none")
     if args.command == "doctor":
-        return 1 if pending or drift or changed or missing else 0
+        return 1 if pending or drift or changed or missing or partial else 0
     return 0
 
 

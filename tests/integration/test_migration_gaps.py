@@ -2,6 +2,7 @@
 function bodies, operator classes, generated column rebuilds, enums in other schemas, table
 moves and identity options: applied, introspected without drift, and pulled back."""
 
+import copy
 import enum
 import importlib.util
 import sys
@@ -1295,6 +1296,79 @@ async def test_partition_bounds_in_any_spelling_do_not_drift(driver: PostgresDri
     async with driver.acquire() as conn:
         normalized = await dialect.normalize_snapshot(conn, desired)
     assert normalized["tables"]["mg.events"].get("partitions", {})["events_def"] == "DEFAULT"
+
+
+class NewMood(enum.Enum):
+    CALM = "calm"
+
+
+@final
+class EventsWithMood(Table, name="events", schema="mg", partition_by="RANGE (at)"):
+    id = integer()
+    at = timestamp(tz=True)
+    mood = pg_enum(NewMood, schema="mg")
+
+    @classmethod
+    @override
+    def config(cls) -> list[Constraint]:
+        return Events.config()
+
+
+async def test_partition_bounds_normalize_with_a_column_of_a_new_type(
+    driver: PostgresDriver,
+) -> None:
+    # B55: the temporary parent copied every column, so one of a type not created yet
+    # failed the copy and the bound compared as spelled: "changing the bound" on push.
+    await migrate(driver, empty_snapshot("postgresql"), snap([Events]))
+    async with driver.acquire() as conn:
+        current = await dialect.introspect(conn, SCHEMAS)
+        desired = await dialect.normalize_snapshot(conn, snap([EventsWithMood]))
+    assert desired["tables"]["mg.events"].get("partitions") == current["tables"]["mg.events"].get(
+        "partitions"
+    )
+    diff(current, desired, compare_expressions=False)  # does not raise
+
+
+async def test_partition_bounds_normalize_without_the_temp_privilege(
+    driver: PostgresDriver,
+) -> None:
+    # B59: without TEMP every bound compared as spelled, on a schema that had not changed.
+    await migrate(driver, empty_snapshot("postgresql"), snap([Events]))
+    notemp = "mizzle_mg_notemp"
+    async with driver.acquire() as conn:
+        [row] = await conn.fetch_dicts("SELECT current_database() AS d", [])
+        database = f'"{row["d"]}"'
+        current = await dialect.introspect(conn, SCHEMAS)
+        await conn.execute(
+            f"REVOKE TEMP ON DATABASE {database} FROM PUBLIC; CREATE ROLE {notemp}; "
+            f"GRANT USAGE, CREATE ON SCHEMA mg TO {notemp}; SET ROLE {notemp}",
+            [],
+        )
+        try:
+            with pytest.raises(DatabaseError, match="permission denied"):
+                await conn.execute("CREATE TEMP TABLE t_probe (x int)", [])
+            desired = await dialect.normalize_snapshot(conn, snap([Events]))
+        finally:
+            await conn.execute(
+                f"RESET ROLE; GRANT TEMP ON DATABASE {database} TO PUBLIC; "
+                f"DROP OWNED BY {notemp}; DROP ROLE {notemp}",
+                [],
+            )
+    assert desired["tables"]["mg.events"].get("partitions") == current["tables"]["mg.events"].get(
+        "partitions"
+    )
+
+
+def test_a_changed_bound_names_both_and_hints_at_the_time_zone() -> None:
+    # B64: a changed database timezone made a bare date bound look changed, with no hint.
+    old = snap([Events])
+    new = copy.deepcopy(old)
+    new["tables"]["mg.events"]["partitions"] = {
+        **new["tables"]["mg.events"].get("partitions", {}),
+        "events_2026": "FOR VALUES FROM ('2026-02-01') TO ('2027-01-01')",
+    }
+    with pytest.raises(MigrationError, match=r"database: .*schema: .*TimeZone"):
+        diff(old, new, StrictRenames())
 
 
 # -- composite types ---------------------------------------------------------------------

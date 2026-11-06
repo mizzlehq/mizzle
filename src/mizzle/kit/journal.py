@@ -13,7 +13,7 @@ import hashlib
 import json
 import re
 import shutil
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import NotRequired, TypedDict, cast
@@ -86,16 +86,24 @@ class Migration:
         return self.path / "snapshot.json"
 
     def sql(self) -> str:
-        return self.sql_path.read_text(encoding="utf-8")
+        return self._read(self.sql_path).decode("utf-8")
 
     def hash(self) -> str:
-        return hashlib.sha256(self.sql_path.read_bytes()).hexdigest()
+        return hashlib.sha256(self._read(self.sql_path)).hexdigest()
 
     def statements(self) -> list[Statement]:
         return parse_sql(self.sql())
 
     def snapshot(self) -> Snapshot:
-        return cast(Snapshot, json.loads(self.snapshot_path.read_text(encoding="utf-8")))
+        return cast(Snapshot, json.loads(self._read(self.snapshot_path)))
+
+    def _read(self, path: Path) -> bytes:
+        try:
+            return path.read_bytes()
+        except FileNotFoundError:  # a MigrationError, not a traceback (B61)
+            raise MigrationError(
+                f"{self.name}/{path.name} is missing; restore it from version control"
+            ) from None
 
 
 def _parse_entry(raw: object, source: Path) -> JournalEntry:
@@ -124,6 +132,18 @@ def _parse_entry(raw: object, source: Path) -> JournalEntry:
 def _schema(snapshot: Snapshot) -> dict[str, object]:
     """A snapshot without its identity: what the schema is, not where it sits."""
     return {k: v for k, v in snapshot.items() if k not in ("id", "prev_id")}
+
+
+def _hand_written_folder(
+    snapshot: Snapshot, snapshots: Mapping[str, Snapshot], empty: Snapshot
+) -> bool:
+    """Whether a migration folder holds hand-written SQL, judged by its snapshot alone. A
+    generated migration always changes the schema; a ``--custom`` one leaves it as its
+    parent had it. An unknown parent counts as hand-written: squash then refuses rather
+    than lose SQL."""
+    claimed = snapshot["prev_id"]
+    parent = snapshots.get(claimed) if claimed is not None else empty
+    return parent is None or _schema(parent) == _schema(snapshot)
 
 
 class MigrationsDir:
@@ -221,12 +241,22 @@ class MigrationsDir:
         self._save_journal(journal)
         return migration
 
+    def unlisted(self) -> list[str]:
+        """Migration folders on disk that the journal does not list (a branch merged in)."""
+        if not self.root.exists():
+            return []
+        listed = {e["name"] for e in self.journal()["entries"]}
+        return sorted(
+            p.name
+            for p in self.root.iterdir()
+            if p.is_dir() and p.name != "meta" and p.name not in listed
+        )
+
     def clear(self) -> None:
-        """Remove every migration folder (keeping ``meta/``) and empty the journal."""
-        if self.root.exists():
-            for child in self.root.iterdir():
-                if child.is_dir() and child.name != "meta":
-                    shutil.rmtree(child, ignore_errors=True)
+        """Remove the journal's migration folders and empty the journal. A folder the
+        journal does not list is left alone: it may hold SQL nothing else has (B54)."""
+        for entry in self.journal()["entries"]:
+            shutil.rmtree(self.root / entry["name"], ignore_errors=True)
         self._save_journal(Journal(version=JOURNAL_VERSION, dialect=self.dialect, entries=[]))
 
     def repair(self) -> list[str]:
@@ -263,6 +293,7 @@ class MigrationsDir:
                 snap = cast(Snapshot, json.loads(path.read_text(encoding="utf-8")))
                 snapshots[snap["id"]] = snap
         empty = empty_snapshot(self.dialect)
+        no_snapshot: list[str] = []  # folders whose snapshot.json is gone
         fixes: list[str] = []
         entries: list[JournalEntry] = []
         relinked: list[tuple[Migration, Snapshot]] = []
@@ -277,6 +308,8 @@ class MigrationsDir:
                     f"journal entry {index:04d} is {old['name']!r} but the folder is {name!r}; "
                     "refusing to rewrite an entry that may be applied"
                 )
+            if not migration.snapshot_path.exists():
+                no_snapshot.append(name)
             if not migration.sql_path.exists() or not migration.snapshot_path.exists():
                 # Do not remove the entry: `check` reports the missing file, and dropping it
                 # here would silently re-link the chain and hide a migration that may be
@@ -298,15 +331,29 @@ class MigrationsDir:
             else:  # the generated hash stays: `check` must still see an edit
                 digest, created = old["hash"], old["created_at"]
             entry = JournalEntry(index=index, name=name, hash=digest, created_at=created)
+            snapshot = migration.snapshot()
             if old is not None and old.get("custom"):
                 entry["custom"] = True
+            elif old is None and _hand_written_folder(snapshot, snapshots, empty):
+                # A folder the journal lost (a merged branch) may be a --custom migration.
+                # Recording it as generated, with its current hash, hid its SQL from squash,
+                # which then deleted it (B53).
+                entry["custom"] = True
+                fixes[-1] += " as a custom migration"
             if old is not None and (old_supersedes := old.get("supersedes")):
                 entry["supersedes"] = old_supersedes
             entries.append(entry)
-            snapshot = migration.snapshot()
             if (claimed := snapshot["prev_id"]) != prev_id:
                 parent = snapshots.get(claimed) if claimed is not None else empty
                 expected = snapshots[prev_id] if prev_id is not None else empty
+                if parent is None and no_snapshot:
+                    # The parent is unknown because a snapshot file is gone, not because of a
+                    # branch: deleting this migration would be the wrong fix (B58).
+                    raise MigrationError(
+                        f"snapshot.json is missing in {', '.join(no_snapshot)}, so the chain "
+                        f"before {name} cannot be checked; restore it from version control "
+                        "and run `mizzle check --fix` again"
+                    )
                 if parent is None or _schema(parent) != _schema(expected):
                     raise MigrationError(
                         f"{name} was generated on top of another migration than {prev_name} "

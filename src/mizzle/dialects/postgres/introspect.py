@@ -897,6 +897,19 @@ class _Undo(Exception):
 _NORM = "__mizzle_norm"
 
 
+def _mentions(expression: str, column: str) -> bool:
+    """Whether a partition key names ``column`` (quoted, or as a plain identifier)."""
+    if f'"{column}"' in expression:
+        return True
+    plain = re.escape(column)
+    return re.search(rf"(?<![\w$\"]){plain}(?![\w$\"])", expression, re.IGNORECASE) is not None
+
+
+def _text(value: str) -> str:
+    """``value`` as an SQL string literal."""
+    return "'" + value.replace("'", "''") + "'"
+
+
 async def normalize_snapshot(conn: Connection, snapshot: Snapshot) -> Snapshot:
     """Let the server print view queries, function signatures, policy expressions and
     trigger conditions, by creating each as a temporary object and reading it back.
@@ -1050,20 +1063,32 @@ async def _normalize(snapshot: Snapshot, read_back: _ReadBack, version: int) -> 
             # Create each partition (rolled back after) so a timestamptz bound reads back as
             # the database prints it, not as the user spelled it. Its parent is a temporary
             # copy: a partition of the real parent would overlap the one already there.
+            # Only the key's columns: a column of a type not created yet failed the whole
+            # copy, and the bound then compared as spelled (B55).
+            keyed = [
+                c for c in table["columns"].values() if _mentions(partition_by, c["name"])
+            ] or list(table["columns"].values())
             columns = ", ".join(
-                f"{quote(c['name'])} {SERIAL_TYPES.get(c['type'], c['type'])}"
-                for c in table["columns"].values()
+                f"{quote(c['name'])} {SERIAL_TYPES.get(c['type'], c['type'])}" for c in keyed
             )
-            parent = f"CREATE TEMP TABLE {quote(_NORM)} ({columns}) PARTITION BY {partition_by}"
-            part = quote(f"{_NORM}_part")
-            for pname, bound in partitions.items():
-                row = await read_back(
-                    [parent, f"CREATE TEMP TABLE {part} PARTITION OF {norm} {bound}"],
-                    "SELECT pg_get_expr(c.relpartbound, c.oid) AS b FROM pg_class c "
-                    f"WHERE c.oid = to_regclass('pg_temp.{part}')",
-                )
-                if row is not None and row["b"] is not None:
-                    partitions[pname] = str(row["b"])
+            # TEMP first; a role without the TEMP privilege uses its own schema instead,
+            # inside the same rolled-back savepoint (B59).
+            for where, kind in (("pg_temp", "TEMP TABLE"), (table["schema"], "TABLE")):
+                home, part = qualified(where, _NORM), qualified(where, f"{_NORM}_part")
+                parent = f"CREATE {kind} {home} ({columns}) PARTITION BY {partition_by}"
+                done = True
+                for pname, bound in partitions.items():
+                    row = await read_back(
+                        [parent, f"CREATE {kind} {part} PARTITION OF {home} {bound}"],
+                        "SELECT pg_get_expr(c.relpartbound, c.oid) AS b FROM pg_class c "
+                        f"WHERE c.oid = to_regclass({_text(part)})",
+                    )
+                    if row is not None and row["b"] is not None:
+                        partitions[pname] = str(row["b"])
+                    else:
+                        done = False
+                if done:
+                    break
         for policy in table.get("policies", {}).values():
             create = f"CREATE POLICY p ON {norm} FOR {policy['command'].upper()}"
             if policy["using"] is not None:

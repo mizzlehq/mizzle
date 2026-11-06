@@ -911,3 +911,17 @@ def test_typegen_help_mentions_row_types(capsys: pytest.CaptureFixture[str]) -> 
     with pytest.raises(SystemExit):
         main(["--help"])
     assert "write row/insert/update TypedDicts" in capsys.readouterr().out
+
+
+def test_a_squash_is_adopted_only_for_a_whole_history() -> None:
+    # B57: only the last replaced name was checked, so a database with a gap was adopted.
+    from mizzle.kit.migrate import history_complete
+
+    names = ["0001_a", "0002_b", "0003_c"]
+    assert history_complete(names, dict.fromkeys(names, ""))
+    assert not history_complete(names, dict.fromkeys(["0001_a", "0003_c"], ""))
+    # An earlier squash stands for the names before it: either history counts.
+    twice = ["0001_a", "0002_b", "0001_squash", "0003_d"]
+    assert history_complete(twice, dict.fromkeys(["0001_squash", "0003_d"], ""))
+    assert history_complete(twice, dict.fromkeys(["0001_a", "0002_b", "0003_d"], ""))
+    assert not history_complete(twice, dict.fromkeys(["0001_a", "0003_d"], ""))

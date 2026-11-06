@@ -107,7 +107,11 @@ guessing:
   re-linking it would make the next `generate` repeat those changes, so delete it and run
   `generate` again on the merged history;
 - it never refreshes a recorded hash, so a `migration.sql` edited after `generate` keeps
-  its warning (and `squash` keeps refusing it).
+  its warning (and `squash` keeps refusing it);
+- a `snapshot.json` that is missing: restore it from version control first.
+
+A folder it adds whose snapshot does not change the schema (a `--custom` migration from
+another branch) is recorded as custom, so `squash` keeps its SQL.
 
 ## status
 
@@ -146,19 +150,23 @@ extensions and `public`'s owner and grants survive. The migrations table is alwa
 so every migration runs again even when its schema is outside `schema_filter`.
 
 `reset` is destructive, so it shows the host and database and asks you to type the
-database name. Without a terminal (CI) it refuses unless you pass `--force`. `--force`
+database name. The URL must name the database (`postgresql://host/NAME`). Without a terminal (CI) it refuses unless you pass `--force`. `--force`
 skips the prompt but still requires `--database <name>` matching the database in the URL,
 so `DATABASE_URL=<production> mizzle reset --force` cannot wipe production by accident. It
 takes the same advisory lock as `migrate`, so a concurrent `migrate` waits instead of
 failing.
 
-The drops, the history reset and (when every statement can run in a transaction) the
-re-run of all migrations happen in one transaction: if anything fails, for example an
-unmanaged view that depends on a managed table, or a custom migration whose SQL creates an
-object reset does not drop, everything is rolled back and the database is unchanged. When
-a migration cannot run in a transaction (adding an enum value), `reset` refuses up front
-if the history holds hand-written SQL, since a failure could not be rolled back; drop and
-recreate the database instead.
+The drops, the history reset and the re-run of the migrations happen in one transaction:
+if anything fails, for example an unmanaged view that depends on a managed table, or a
+custom migration whose SQL creates an object reset does not drop, everything is rolled back
+and the database is unchanged. When a migration cannot run in a transaction (adding an enum
+value), the transaction ends just before it, and the rest run after. `reset` says so before
+it asks. A failure from there on cannot be rolled back: `reset` stops, says how many
+migrations it re-ran, and you fix the cause and run `mizzle migrate`. With hand-written SQL
+in the history, `reset` refuses that case up front; drop and recreate the database instead.
+
+A migration that contains `BEGIN`, `COMMIT`, `ROLLBACK` or other transaction control is
+refused: mizzle runs each migration in a transaction, and such a statement would end it.
 
 ## squash
 
@@ -177,10 +185,13 @@ records every name it `supersedes`, including those an earlier squash replaced, 
 `migrate` treats it as applied for a database that applied that whole history. Each squash
 gets a name no earlier migration used (`0001_squash`, then `0001_squash_2`, ...).
 
-A database that applied only part of the history (say 0001 of 2) can neither adopt the
-squash nor run it: `squash` warns about it when the database URL is set, and `migrate`,
-`migrate --dry-run` and `status` refuse with an error. Migrate it to the end of the old
-history first.
+A database that applied only part of the history (say 0001 of 2, or 0001 and 0003 but not
+0002) can neither adopt the squash nor run it: `squash` refuses when the database URL is
+set, `migrate`, `migrate --dry-run` and `status` refuse with an error, and `info` and
+`doctor` report it. Migrate it to the end of the old history first.
+
+`squash` also refuses while a migration folder is missing from the journal (a merged
+branch): run `mizzle check --fix` first, so its SQL is not deleted.
 
 ## seed
 

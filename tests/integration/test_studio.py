@@ -12,13 +12,13 @@ from starlette.types import Receive, Scope, Send
 from mizzle.core.errors import MigrationError, MizzleError
 from mizzle.dialects.postgres import PostgresDialect
 from mizzle.dialects.postgres.driver import PostgresDriver
+from mizzle.kit.sqltext import split_statements
 from mizzle.studio import server
 from mizzle.studio.server import (
     _basic_credentials,
     create_app,
     parse_auth,
     resolve_token,
-    split_statements,
 )
 
 TOKEN = "test-token"
@@ -470,7 +470,7 @@ def test_read_only_refuses_transaction_control(pg_url: str, ro_url: str) -> None
 def test_read_only_checks_each_split_statement(pg_url: str, driver: PostgresDriver) -> None:
     # The check runs on the statements split_statements produced, so a COPY after a
     # harmless SELECT is caught; smoke-testing the raw text would miss it.
-    from mizzle.studio.server import _reject_read_only, split_statements
+    from mizzle.studio.server import _reject_read_only
 
     statements = split_statements("select 1; copy (select 1) to program 'true'")
     assert len(statements) == 2

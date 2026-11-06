@@ -548,6 +548,10 @@ def _diff_named[T: Mapping[str, object]](
         on_add(new[name])
 
 
+# A quoted date or timestamp with no offset after it: '2026-01-01' or '2026-01-01 10:00'.
+_NAIVE_MOMENT = re.compile(r"'\d{4}-\d{2}-\d{2}(?: [\d:.]+)?'")
+
+
 def _diff_partitions(old: TableSnap, new: TableSnap, plan: _Plan) -> None:
     """Partitions of an existing table: add the new ones, drop the gone ones. A change to
     the key or to a partition's bound is not expressible (it needs a detach/attach)."""
@@ -559,8 +563,18 @@ def _diff_partitions(old: TableSnap, new: TableSnap, plan: _Plan) -> None:
         if pname not in before:
             plan.create_partitions.append(CreatePartition(schema, name, pname, bound))
         elif before[pname] != bound:
+            # A date or time literal without a UTC offset is read in the session TimeZone,
+            # so a changed database timezone looks like a changed bound (B64).
+            hint = (
+                ". A timestamp bound without a UTC offset is read in the session TimeZone; "
+                "if the database timezone changed, write the offset (for example "
+                "'2026-01-01 00:00:00+00')"
+                if _NAIVE_MOMENT.search(bound)
+                else ""
+            )
             raise MigrationError(
-                f"table {name}: changing the bound of partition {pname} needs a custom migration"
+                f"table {name}: changing the bound of partition {pname} needs a custom "
+                f"migration (database: {before[pname]}; schema: {bound}){hint}"
             )
     for pname in before:
         if pname not in after:

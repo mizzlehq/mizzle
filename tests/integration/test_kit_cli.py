@@ -1107,11 +1107,20 @@ async def test_squash_of_a_partly_migrated_database(
     assert await cli("generate") == 0
     assert await cli("migrate", "--to", "1") == 0
     capsys.readouterr()
+    # B63: squash refuses instead of warning and squashing anyway.
+    assert await cli("squash") == 1
+    assert "only part of the history" in capsys.readouterr().err
+    assert len(MigrationsDir(project / "migrations", "postgresql").migrations()) == 2
+    monkeypatch.delenv("DATABASE_URL")  # squashed where the database cannot be checked
     assert await cli("squash") == 0
-    assert "warning:" in capsys.readouterr().out
+    monkeypatch.setenv("DATABASE_URL", kit_url)
+    capsys.readouterr()
     for args in (("migrate", "--dry-run"), ("migrate",), ("status",)):
         assert await cli(*args) == 1
         assert "only part of the history" in capsys.readouterr().err
+    # B62: info and doctor report it too.
+    assert await cli("doctor") == 1
+    assert "squash:" in capsys.readouterr().out
 
 
 async def test_migrate_to_the_last_applied_migration_says_so(
@@ -1204,3 +1213,142 @@ async def test_squash_without_a_reachable_database(
     assert await cli("generate") == 0
     monkeypatch.setenv("DATABASE_URL", kit_url + "?sslmode=bogus")
     assert await cli("squash") == 0
+
+
+# -- round 2: reset, squash, check --fix ------------------------------------------------
+
+TMP = "\nclass Tmp(Table, name='tmp_t'):\n    id = serial().primary_key()\n"
+GUEST = V1.replace('USER = "user"', 'USER = "user"\n    GUEST = "guest"')
+
+
+async def test_reset_after_a_non_transactional_step_says_it_is_partly_done(
+    project: Path, kit_url: str, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # B51: a failure after the enum value migration left the database half reset, silently.
+    assert await cli("generate") == 0
+    rewrite_schema(project, GUEST, monkeypatch)
+    assert await cli("generate") == 0  # 0002: ADD VALUE, not in a transaction
+    rewrite_schema(project, GUEST + TMP, monkeypatch)
+    assert await cli("generate") == 0  # 0003 creates tmp_t
+    rewrite_schema(project, GUEST, monkeypatch)
+    assert await cli("generate", "--allow-data-loss") == 0  # 0004 drops it
+    assert await cli("migrate") == 0
+    await fetchval(kit_url, "CREATE TABLE tmp_t (x int)")  # unmanaged, in 0003's way
+    database = kit_url.rsplit("/", 1)[-1]
+    capsys.readouterr()
+    assert await cli("reset", "--force", "--database", database) == 1
+    out, err = capsys.readouterr()
+    assert "cannot run in a transaction" in out
+    assert "partly reset" in err and "re-ran 2 migration" in err and "0003" in err
+    assert "rolled back" not in err.split("partly")[0]
+
+
+async def test_reset_refuses_transaction_control_in_a_migration(
+    project: Path, kit_url: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # B52: COMMIT in a custom migration ended reset's transaction; reset then claimed the
+    # database was unchanged.
+    assert await cli("generate") == 0
+    assert await cli("generate", "--custom", "--name", "tx") == 0
+    custom = next(project.glob("migrations/0002_tx/migration.sql"))
+    custom.write_text(
+        custom.read_text() + "BEGIN;\nINSERT INTO users (email) VALUES ('x@y.z');\nCOMMIT;\n"
+    )
+    assert await cli("migrate") == 0
+    database = kit_url.rsplit("/", 1)[-1]
+    capsys.readouterr()
+    assert await cli("reset", "--force", "--database", database) == 1
+    assert "0002_tx contains BEGIN" in capsys.readouterr().err
+    assert await fetchval(kit_url, "SELECT count(*) FROM users") == 1
+
+
+async def test_reset_needs_a_database_in_the_url(
+    project: Path, kit_url: str, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # B56: with no path the confirmation compared with '' while ?dbname= picked the target.
+    assert await cli("generate") == 0
+    base, _, database = kit_url.rpartition("/")
+    monkeypatch.setenv("DATABASE_URL", f"{base}?dbname={database}")
+    capsys.readouterr()
+    assert await cli("reset", "--force", "--database", "") == 1
+    assert "name the database" in capsys.readouterr().err
+
+
+async def test_ctrl_d_at_the_reset_prompt_cancels(
+    project: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # B60: EOFError escaped as a traceback.
+    assert await cli("generate") == 0
+
+    def eof(_prompt: str) -> str:
+        raise EOFError
+
+    monkeypatch.setattr(kit_cli, "_interactive", lambda: True)
+    monkeypatch.setattr("builtins.input", eof)
+    assert await cli("reset") == 1
+    assert "Cancelled" in capsys.readouterr().out
+
+
+async def test_check_fix_keeps_a_readded_custom_migration_custom(
+    project: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # B53: re-adding a folder recorded it as generated, so squash deleted its SQL.
+    assert await cli("generate") == 0
+    assert await cli("generate", "--custom", "--name", "hand") == 0
+    custom = next(project.glob("migrations/0002_hand/migration.sql"))
+    custom.write_text(custom.read_text() + "SELECT 1;\n")
+    journal = project / "migrations" / "meta" / "journal.json"
+    data = json.loads(journal.read_text())
+    data["entries"] = data["entries"][:1]  # a merge conflict resolved by dropping it
+    journal.write_text(json.dumps(data))
+    capsys.readouterr()
+    assert await cli("check", "--fix") == 0
+    assert "0002_hand: added to the journal as a custom migration" in capsys.readouterr().out
+    assert await cli("squash") == 1
+    assert "hand-written SQL in 0002_hand" in capsys.readouterr().err
+    assert "SELECT 1;" in custom.read_text()
+
+
+async def test_squash_refuses_a_folder_the_journal_does_not_list(
+    project: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # B54: squash deleted every folder, including a merged branch's unlisted one.
+    assert await cli("generate") == 0
+    rewrite_schema(project, WITH_AGE, monkeypatch)
+    assert await cli("generate") == 0
+    stray = project / "migrations" / "0003_backfill"
+    stray.mkdir()
+    (stray / "migration.sql").write_text("UPDATE users SET name = 'x';\n")
+    capsys.readouterr()
+    assert await cli("squash") == 1
+    assert "0003_backfill is not in the journal" in capsys.readouterr().err
+    assert (stray / "migration.sql").exists()
+
+
+async def test_check_fix_names_a_missing_snapshot(
+    project: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # B58: the advice was to delete the next migration, which may be applied.
+    assert await cli("generate") == 0
+    rewrite_schema(project, WITH_AGE, monkeypatch)
+    assert await cli("generate") == 0
+    rewrite_schema(project, WITH_BIO, monkeypatch)
+    assert await cli("generate") == 0
+    next(project.glob("migrations/0002_*/snapshot.json")).unlink()
+    capsys.readouterr()
+    assert await cli("check", "--fix") == 1
+    err = capsys.readouterr().err
+    assert "snapshot.json is missing in 0002_" in err and "Delete" not in err
+
+
+async def test_a_missing_migration_file_is_a_clean_error(
+    project: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # B61: FileNotFoundError tracebacks in squash, reset, migrate and status.
+    assert await cli("generate") == 0
+    assert await cli("migrate") == 0
+    next(project.glob("migrations/0001_*/migration.sql")).unlink()
+    for args in (("status",), ("migrate",), ("squash",)):
+        capsys.readouterr()
+        assert await cli(*args) == 1
+        assert "migration.sql is missing" in capsys.readouterr().err
