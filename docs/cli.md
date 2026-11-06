@@ -232,7 +232,8 @@ Basic auth password must be at least 12 characters.
 Failed logins are throttled per client address: after 10 wrong credentials within a minute,
 that client gets `429` with `Retry-After` for every API request, a correct one included, until
 the oldest failure is a minute old. Other clients are not affected, so an attacker cannot lock
-you out. Behind a reverse proxy on the same host, the proxy's `X-Forwarded-For` gives each
+you out. Requests a browser marks as coming from another site are refused before the login
+check and never count, so a web page you visit cannot lock out a local Studio either. Behind a reverse proxy on the same host, the proxy's `X-Forwarded-For` gives each
 client its own address; for a proxy on another host, set `FORWARDED_ALLOW_IPS` to its address
 (otherwise every client shares the proxy's budget). Basic auth is over HTTP, so put it behind TLS (a reverse proxy) when the network is
 not trusted.

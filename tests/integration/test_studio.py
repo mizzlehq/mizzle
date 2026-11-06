@@ -870,3 +870,24 @@ async def test_a_column_named_like_the_row_alias(pg_url: str, driver: PostgresDr
         exported = client.get(f"{base}/export", params={"format": "json"}, headers=AUTH)
         assert exported.status_code == 200
         assert [row["t"] for row in exported.json()] == ["x"]
+
+
+def test_a_web_page_cannot_lock_out_a_local_studio(
+    pg_url: str, driver: PostgresDriver, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # B35: on a loopback bind every client is 127.0.0.1, so a web page the user visits could
+    # send wrong-credential requests through the browser and trip the throttle for the real
+    # user. Cross-site browser requests are refused before the credential check and are not
+    # counted as failures.
+    monkeypatch.setattr(server, "LOGIN_MAX_FAILURES", 3)
+    page_requests = [
+        {"Sec-Fetch-Site": "cross-site"},
+        {"Sec-Fetch-Site": "same-site"},
+        {"Origin": "http://evil.example"},
+    ]
+    with make_client(pg_url, address="127.0.0.1") as client:
+        for headers in page_requests * 3:
+            for method in ("GET", "POST"):
+                response = client.request(method, "/api/meta", headers=headers)
+                assert response.status_code == 403, (method, headers)
+        assert client.get("/api/meta", headers=AUTH).status_code == 200

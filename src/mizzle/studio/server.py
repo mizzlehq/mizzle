@@ -965,9 +965,10 @@ class _Guard(BaseHTTPMiddleware):
         ``text/plain`` form body parses as JSON, so neither the credentials nor
         ``request.json()`` is proof that our own UI sent the request. ``Origin`` and
         ``Sec-Fetch-Site`` are the signals a page cannot forge.
+
+        Every method is checked, reads included: the UI is same-origin, and a page's
+        no-credential requests must not count as failed logins (B35).
         """
-        if request.method in _SAFE_METHODS:
-            return False
         fetch_site = request.headers.get("sec-fetch-site", "")
         if fetch_site in ("cross-site", "same-site"):
             return True
@@ -983,6 +984,11 @@ class _Guard(BaseHTTPMiddleware):
             and request.headers.get("host", "") not in self.allowed_hosts
         ):
             return self._error("forbidden host", 403)
+        if request.url.path.startswith("/api/") and self._cross_site(request):
+            # Before the throttle and the credential check, and not counted as a failure: on a
+            # loopback bind every client is 127.0.0.1, so a web page driving the browser could
+            # otherwise trip the throttle and lock the real user out (B35).
+            return self._error("cross-site request refused", 403)
         if request.url.path.startswith("/api/"):
             # The throttle comes before the credential check: if a throttled client's correct
             # guess still got through, the throttle would not slow guessing at all (B34). It
@@ -999,8 +1005,6 @@ class _Guard(BaseHTTPMiddleware):
             self._record_failure(client)
             headers = {"WWW-Authenticate": 'Basic realm="mizzle studio"'} if self.basic else None
             return self._error("missing or wrong credentials", 401, headers)
-        if request.url.path.startswith("/api/") and self._cross_site(request):
-            return self._error("cross-site request refused", 403)
         if request.url.path.startswith("/api/") and not _writes_json(request):
             return self._error("Content-Type must be application/json", 415)
         response = await call_next(request)
