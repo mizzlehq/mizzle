@@ -1190,10 +1190,10 @@ def _defer_calls(plan: _Plan, old_tables: Mapping[str, TableSnap], new: Snapshot
             ):
                 continue
             if not gen["stored"]:  # cannot be made plain: dropped now, else rebuilt (K4-30)
-                if col_after is None:
+                if col_after is None:  # after the views reading it (K4-32)
                     drop_col = DropColumn(schema, name, col["name"])
                     plan.drop_columns = [s for s in plan.drop_columns if s != drop_col]
-                    plan.drop_calls.append(drop_col)
+                    plan.drop_rebuilt.append(drop_col)
                 continue
             plain = AlterColumnGenerated(schema, name, col["name"], gen, None, col_after)
             plan.alter_columns = [s for s in plan.alter_columns if s != plain]

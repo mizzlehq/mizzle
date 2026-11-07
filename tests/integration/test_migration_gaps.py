@@ -1929,6 +1929,92 @@ async def test_virtual_column_under_a_function_whose_result_type_changes(
     await migrate(driver, v1, snap(tables, [abs_fn("bigint")]))
 
 
+@pytest.mark.parametrize("view", ["view", "materialized"])
+@pytest.mark.parametrize("stored", [True, False], ids=["stored", "virtual"])
+@pytest.mark.parametrize("then", ["kept", "made plain", "column dropped", "table dropped"])
+async def test_view_over_a_column_under_a_function_whose_result_type_changes(
+    driver: PostgresDriver, view: str, stored: bool, then: str
+) -> None:
+    # K4-32: a generated column calling a function dropped and created again goes (or loses
+    # its expression) before the DROP FUNCTION; a view reading it must be dropped first.
+    if not stored and await server_version(driver) < 180000:
+        pytest.skip("VIRTUAL is PostgreSQL 18+")
+    # A VIRTUAL column cannot call a user-defined function: mg.abs only matches the word.
+    fn_name, call = ("k32f", "mg.k32f(a)") if stored else ("abs", "abs(a)")
+
+    def fn(returns: str) -> Function:
+        return function(
+            fn_name,
+            schema="mg",
+            returns=returns,
+            args="x integer",
+            volatility="immutable",
+            body="BEGIN RETURN x; END",
+        )
+
+    def table(kind: str) -> type[Table]:
+        @final
+        class K32(Table, name="k32t", schema="mg"):
+            a = integer()
+            b = integer()
+
+        if kind == "column dropped":
+            del K32.__table__.columns["b"]
+        elif kind != "made plain":
+            K32.__table__.columns["b"].computed = Computed(sql(call), stored=stored)
+            K32.__table__.columns["b"].generated = True
+        return K32
+
+    def reader(columns: str) -> type[View]:
+        @final
+        class K32View(View, name="k32v", schema="mg", materialized=view == "materialized"):
+            a = integer()
+
+            @classmethod
+            @override
+            def query(cls, db: QueryBuilder):
+                return sql(f"SELECT {columns} FROM mg.k32t")
+
+        return K32View
+
+    v1 = snap([table("kept"), reader("a, b")], [fn("integer")])
+    await migrate(driver, empty_snapshot("postgresql"), v1)
+    await execute(driver, "INSERT INTO mg.k32t (a) VALUES (3)")
+    after: dict[str, list[type[Table]]] = {
+        "kept": [table("kept"), reader("a, b")],
+        "made plain": [table("made plain"), reader("a, b")],
+        "column dropped": [table("column dropped"), reader("a")],
+        "table dropped": [],
+    }
+    await migrate(driver, v1, snap(after[then], [fn("bigint")]))
+
+
+async def test_view_over_a_domain_column_under_a_function_whose_result_type_changes(
+    driver: PostgresDriver,
+) -> None:
+    # K4-32: the domain's CHECK goes before the DROP FUNCTION; a view of the column stays.
+    @final
+    class Coded(Table, name="k27t", schema="mg"):
+        id = integer().primary_key()
+        code = pg_domain("k27_code", str, schema="mg")
+
+    @final
+    class Codes(View, name="k32codes", schema="mg"):
+        code = text()
+
+        @classmethod
+        @override
+        def query(cls, db: QueryBuilder):
+            return sql("SELECT code FROM mg.k27t")
+
+    v1 = snap([Coded, Codes], k27("integer"))
+    await migrate(driver, empty_snapshot("postgresql"), v1)
+    await execute(driver, "INSERT INTO mg.k27t (id) VALUES (1)")
+    await migrate(driver, v1, snap([Coded, Codes], k27("bigint")))
+    [row] = await execute(driver, "SELECT code FROM mg.k32codes")
+    assert row["code"] == "2"
+
+
 def k27(returns: str, *, cycle: bool = False) -> list[SchemaObject]:
     """mg.k27_code, a domain whose CHECK and DEFAULT call mg.k27_score, and mg.k27_len,
     which takes the domain."""
