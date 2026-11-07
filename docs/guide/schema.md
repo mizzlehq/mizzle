@@ -279,6 +279,9 @@ A domain is a base type with constraints and a default, declared once and reused
 as a module-level object (like an extension or function); the migration kit collects it.
 
 ```python
+import decimal
+from typing import final
+
 from mizzle import Table, domain
 from mizzle.pg import pg_domain, serial
 
@@ -286,7 +289,7 @@ from mizzle.pg import pg_domain, serial
 email = domain("email", as_="text", not_null=True, check="VALUE ~ '@'")
 
 # use `schema="app"` on both to keep the domain outside the default schema
-price = domain("price", as_="numeric(10,2)", check="VALUE >= 0", collation="C")
+price = domain("price", as_="numeric(10,2)", check="VALUE >= 0")
 
 
 @final
@@ -298,9 +301,9 @@ class Users(Table, name="users"):
 
 `as_` is the base SQL type (PostgreSQL spelling: `character varying(255)`, not `varchar`).
 `check` (or `checks=[...]`) adds CHECK constraints where `VALUE` is the domain's value;
-`default=` is an SQL expression, `collation=` a collation name. Migrations create the domain
-before the tables that use it and drop it after them. Changing a domain in place needs a
-hand-written migration: `mizzle generate` stops and says so.
+`default=` is an SQL expression, `collation=` a collation name (text-like base types
+only). Migrations create the domain before the tables that use it and drop it after them.
+Changing a domain in place needs a hand-written migration: `mizzle generate` stops and says so.
 
 ## Composite types
 

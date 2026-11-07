@@ -361,15 +361,24 @@ top_posts = await (
 
 ### Recursive CTEs
 
-`db.recursive(name, seed)` builds the self-reference for you, so the name is written once:
+`db.recursive(name, seed)` builds the self-reference for you, so the name is written once.
+Everyone who reports to a manager, at any depth:
 
 ```python
-tree = (
-    db.recursive("walk", db.select({"n": 3}))
-    .step(lambda walk: db.select({"n": walk.c("n", int) - 1}).from_(walk))
+from mizzle import eq
+
+reports = db.recursive(
+    "reports", db.select({"id": Users.id}).from_(Users).where(eq(Users.manager_id, boss_id))
+).step(
+    lambda reports: db.select({"id": Users.id})
+    .from_(Users)
+    .join(reports, eq(Users.manager_id, reports.c("id", int)))
 )
-rows = await db.with_(tree).select(tree.c("n", int)).from_(tree)  # 3, 2, 1
+rows = await db.with_(reports).select(reports.c("id", int)).from_(reports)
 ```
+
+The step runs until it adds no new rows, so it must stop by itself: here, at people with
+no reports. A step that always finds rows (`n - 1` with no `where`) never ends.
 
 `query.cte(name, recursive=True)` still works when you already have the step query built
 against a CTE of the same name.

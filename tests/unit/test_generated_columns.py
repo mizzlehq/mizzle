@@ -2,6 +2,7 @@
 
 import copy
 import datetime as dt
+import enum
 import importlib.util
 import sys
 from pathlib import Path
@@ -303,3 +304,29 @@ def test_pydantic_models() -> None:
     insert.model_validate({"body": "x", "embedding": [1, 2, 3]})
     with pytest.raises(ValueError, match="at least 3"):
         insert.model_validate({"body": "x", "embedding": [1, 2]})
+
+
+class Box:
+    class Color(enum.StrEnum):
+        RED = "red"
+
+
+def test_typegen_imports_nested_enums_and_types_inet_fully() -> None:
+    # C37: "from m import Box.Color" is a SyntaxError; inet was typed IPv4Address only.
+    from mizzle.pg import cidr, inet, pg_enum
+
+    class Nets(Table, name="nets"):
+        id = integer().primary_key()
+        color = pg_enum(Box.Color)
+        ip = inet().not_null()
+        net = cidr().not_null()
+
+    source = render_types_module([Nets])
+    compile(source, "types.py", "exec")
+    assert f"from {__name__} import Box\n" in source
+    assert "    color: Box.Color | None" in source
+    assert (
+        "    ip: ipaddress.IPv4Address | ipaddress.IPv6Address | ipaddress.IPv4Interface"
+        " | ipaddress.IPv6Interface | ipaddress.IPv4Network | ipaddress.IPv6Network\n" in source
+    )
+    assert "    net: ipaddress.IPv4Network | ipaddress.IPv6Network\n" in source

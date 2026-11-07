@@ -69,11 +69,14 @@ class QueryBuilder:
     def recursive[R](self, name: str, seed: Select[R] | Compound[R]) -> Recursive[R]:
         """Build a ``WITH RECURSIVE`` CTE without naming it twice::
 
-        tree = (
-            db.recursive("walk", db.select({"n": 3}))
-            .step(lambda walk: db.select({"n": walk.c("n", int) - 1}).from_(walk))
+        reports = db.recursive(
+            "reports", db.select({"id": Users.id}).from_(Users).where(eq(Users.manager_id, 1))
+        ).step(
+            lambda reports: db.select({"id": Users.id})
+            .from_(Users)
+            .join(reports, eq(Users.manager_id, reports.c("id", int)))
         )
-        await db.with_(tree).select(tree.c("n", int)).from_(tree)
+        await db.with_(reports).select(reports.c("id", int)).from_(reports)
         """
         return Recursive(name, seed)
 

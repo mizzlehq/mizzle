@@ -108,3 +108,52 @@ def test_include_is_an_allowlist() -> None:
     assert "id" in update_model(Users, include=["id", "bio"]).model_fields  # explicit opt-in
     with pytest.raises(SchemaError):
         insert_model(Users, include=["nope"])
+
+
+def test_models_accept_every_value_the_column_holds() -> None:
+    # C35: inet/cidr were IPv4-only; Range, Point, Box and BitString broke schema building.
+    import ipaddress
+
+    from asyncpg import BitString, Box, Point, Range
+
+    from mizzle.pg import box, cidr, inet, int4range, point, varbit
+
+    class Net(Table, name="net"):
+        id = serial().primary_key()
+        ip = inet().not_null()
+        net = cidr()
+        r = int4range()
+        p = point()
+        b = box()
+        bits = varbit()
+
+    Model = select_model(Net)
+    for ip in ("::1", "10.1.2.3", "10.1.2.3/24"):
+        Model.model_validate(
+            {
+                "id": 1,
+                "ip": ip,
+                "net": "2001:db8::/32",
+                "r": None,
+                "p": None,
+                "b": None,
+                "bits": None,
+            }
+        )
+    row = Model.model_validate(
+        {
+            "id": 1,
+            "ip": ipaddress.ip_interface("10.1.2.3/24"),
+            "net": ipaddress.ip_network("10.0.0.0/8"),
+            "r": Range(1, 5),
+            "p": Point(1, 2),
+            "b": Box((0, 0), (1, 1)),
+            "bits": BitString.from_int(5, 3),
+        }
+    )
+    assert row.model_dump()["r"] == Range(1, 5)
+    with pytest.raises(pydantic.ValidationError):
+        Model.model_validate(
+            {"id": 1, "ip": "::1", "net": None, "r": "[1,5)", "p": None, "b": None, "bits": None}
+        )
+    insert_model(Net).model_validate({"ip": "::1"})

@@ -65,7 +65,28 @@ def column_type(column: ColumnBase) -> object:
         return Annotated[Decimal, pydantic.Field(max_digits=digits, decimal_places=places)]
     if base is float:
         return float
-    return base
+    kinds = tuple(_pydantic_type(kind) for kind in column.accepts)
+    # inet holds addresses, interfaces and networks of both IP versions (C35).
+    union = kinds[0]
+    for kind in kinds[1:]:
+        union = cast(type[object], union) | cast(type[object], kind)
+    return union
+
+
+def _pydantic_type(kind: type) -> object:
+    """``kind``, or an isinstance check when pydantic has no schema for it (asyncpg's
+    Range, Point, Box, BitString): such fields accept those objects as they are."""
+    try:
+        pydantic.TypeAdapter(kind)
+    except pydantic.PydanticSchemaGenerationError:
+
+        def check(value: object) -> object:
+            if not isinstance(value, kind):
+                raise ValueError(f"expected {kind.__module__}.{kind.__qualname__}")
+            return value
+
+        return Annotated[object, pydantic.PlainValidator(check)]
+    return kind
 
 
 def _field(column: ColumnBase, mode: Mode, override: object) -> tuple[object, object]:

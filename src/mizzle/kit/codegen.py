@@ -875,7 +875,9 @@ _VECTOR = re.compile(r"(?:vector|halfvec)\(\d+\)")
 
 def _py_type(column: ColumnBase, imports: set[str]) -> str:
     if column.enum is not None:
-        imports.add(f"from {column.enum.__module__} import {column.enum.__qualname__}")
+        # A nested enum (Box.Color) is imported by its outer name (C37).
+        top = column.enum.__qualname__.split(".")[0]
+        imports.add(f"from {column.enum.__module__} import {top}")
         base = column.enum.__qualname__
         if column.sql_type.endswith("[]"):
             base = f"list[{base}]"
@@ -887,7 +889,11 @@ def _py_type(column: ColumnBase, imports: set[str]) -> str:
         base = "list[Any]" if column.accepts else "Any"
     else:
         # The first accepted type is the column's own; extra ones (int for float) are leniency.
-        base = _PY_TYPES.get(column.accepts[0], "Any")
+        # inet and cidr hold any of their address types, of both IP versions (C37).
+        kinds = (
+            column.accepts if column.accepts[0].__module__ == "ipaddress" else column.accepts[:1]
+        )
+        base = " | ".join(_PY_TYPES.get(kind, "Any") for kind in kinds)
     for module in ("decimal", "datetime", "uuid", "ipaddress"):
         if base.startswith(f"{module}."):
             imports.add(f"import {module}")

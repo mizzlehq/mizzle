@@ -3,6 +3,12 @@
 The examples use these two tables:
 
 ```python
+from typing import final, override
+
+from mizzle import Constraint, Table, check, many, one, sql
+from mizzle.pg import integer, serial, text
+
+
 @final
 class Accounts(Table, name="txdoc_accounts"):
     id = serial().primary_key()
