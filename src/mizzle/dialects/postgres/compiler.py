@@ -209,6 +209,14 @@ class PostgresCompiler(Compiler):
     # Types JSON cannot carry exactly are cast so Python can restore them losslessly.
 
     def json_value(self, ref: str, column: ColumnBase) -> str:
+        if column.json_type is not None:  # a domain or composite, as its type (Q4-6)
+            return self.json_value(ref, column.json_type)
+        if column.json_fields is not None:
+            # num_nulls: a composite whose fields are all NULL IS NULL, yet is a value.
+            fields = ", ".join(
+                self.json_value(f"({ref}).{self.quote(n)}", c) for n, c in column.json_fields
+            )
+            return f"CASE WHEN num_nulls({ref}) = 1 THEN NULL ELSE json_build_array({fields}) END"
         if column.item is not None:
             item = self.json_value("x.v", column.item)
             if item == "x.v":

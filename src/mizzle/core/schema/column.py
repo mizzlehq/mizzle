@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import enum
-from collections.abc import Callable, Iterable
+from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Final, Literal, Self, cast, overload, override
 
@@ -12,6 +12,7 @@ from mizzle.core.naming import Casing, snake_case
 from mizzle.core.sql.nodes import Condition, Expr, ExprBase, Node, Raw
 
 if TYPE_CHECKING:
+    from mizzle.core.query.base import Runner
     from mizzle.core.schema.table import Table
 
 type ReferentialAction = Literal["cascade", "restrict", "no action", "set null", "set default"]
@@ -82,6 +83,11 @@ class ColumnBase(ExprBase):
     # Turns the JSON a relational query nests this column as back into its Python value,
     # for types JSON cannot carry (ranges, geometry, cidr, bit strings).
     json_decoder: Callable[[object], object] | None
+    # A domain or composite: how its nested JSON is built and read (its base type, or its
+    # fields), looked up by json_load before a relational query nests it (Q4-6).
+    json_type: ColumnBase | None
+    json_load: Callable[[Runner], Awaitable[ColumnBase]] | None
+    json_fields: tuple[tuple[str, ColumnBase], ...] | None  # a composite's fields, in order
     is_primary_key: bool
     is_unique: bool
     unique_name: str | None
@@ -125,6 +131,9 @@ class ColumnBase(ExprBase):
         self.enum_schema = None
         self.item = None  # element column of an array
         self.json_decoder = None
+        self.json_type = None
+        self.json_load = None
+        self.json_fields = None
         self.is_primary_key = False
         self.is_unique = False
         self.unique_name = None

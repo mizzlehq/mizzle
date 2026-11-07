@@ -22,7 +22,7 @@ from mizzle.core.schema.types import (
 )
 from mizzle.core.sql.operators import eq
 from mizzle.dialects.postgres.driver import _needs_newer_server
-from mizzle.dialects.postgres.types import int4range, pg_enum, serial
+from mizzle.dialects.postgres.types import array, int4range, pg_enum, serial
 from tests.models import Users
 
 
@@ -307,3 +307,37 @@ def test_in_a_placeholder_is_an_array_typed_by_the_column(qb: QueryBuilder) -> N
         compiled = qb.select(Kinds.id).from_(Kinds).where(cond).prepare().compiled
         assert compiled.sql.endswith(f'"kinds"."level" {op}')
         assert compiled.bind({"p": [Level.HIGH]}).params == (["2"],)
+
+
+class Tagged(Table, name="tagged"):
+    id = serial().primary_key()
+    tags = array(text())
+
+
+def test_an_array_column_against_a_list_of_arrays_is_refused(qb: QueryBuilder) -> None:
+    # Q4-3: "tags" = ANY ($1) failed in PostgreSQL (no array type for text[]).
+    from mizzle import all_, any_, in_, not_in, placeholder
+
+    for cond in (
+        in_(Tagged.tags, placeholder("x")),
+        not_in(Tagged.tags, placeholder("x")),
+        eq(Tagged.tags, any_(placeholder("x"))),
+        eq(Tagged.tags, any_([["c"]])),
+        eq(Tagged.tags, all_([["c"]])),
+    ):
+        with pytest.raises(QueryError, match="is an array"):
+            qb.select(Tagged.id).from_(Tagged).where(cond).to_sql()
+    sql, _ = qb.select(Tagged.id).from_(Tagged).where(in_(Tagged.tags, [["c"]])).to_sql()
+    assert sql.endswith('"tagged"."tags" IN ($1)')  # literal values still work
+
+
+def test_a_nul_in_raw_sql_or_a_collation_is_a_query_error(qb: QueryBuilder) -> None:
+    # Q4-8: the NUL reached asyncpg (ProtocolViolationError), read as a lost connection.
+    from mizzle import collate, sql
+
+    for query in (
+        qb.select(sql("'a\x00b'")).from_(Users),
+        qb.select(collate(Users.email, "C\x00")).from_(Users),
+    ):
+        with pytest.raises(QueryError, match="NUL"):
+            query.to_sql()

@@ -5,12 +5,13 @@ from __future__ import annotations
 import datetime as _dt
 import enum
 import ipaddress
+import json as _jsonlib
 import re
 import struct
 import uuid as _uuid
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from decimal import Decimal
-from typing import Protocol, cast, runtime_checkable
+from typing import Protocol, cast, override, runtime_checkable
 
 from asyncpg import (
     BitString,
@@ -24,8 +25,11 @@ from asyncpg import (
     Range,
 )
 
+from mizzle.core.compiler import CompiledQuery
 from mizzle.core.errors import QueryError
 from mizzle.core.naming import snake_case
+from mizzle.core.query.base import Runner
+from mizzle.core.schema import types as _core
 from mizzle.core.schema.column import Column, ColumnBase
 from mizzle.core.sql.nodes import Expr, Node, Param, TypedOperation
 
@@ -306,14 +310,35 @@ def inet(name: str | None = None) -> Column[IPAddress | None]:
     return Column("inet", _IP_TYPES, name)
 
 
-class jsonb[T](Column[T | None]):
+class JsonText(str):
+    """A JSON document already serialized: the driver's json/jsonb codec sends it as is."""
+
+    __slots__: tuple[str, ...] = ()
+
+
+def _json_documents(values: object) -> object:
+    # A str is one array element to asyncpg; a list would be another array dimension (Q4-5).
+    return [
+        None if v is None else JsonText(_jsonlib.dumps(v)) for v in cast(Iterable[object], values)
+    ]
+
+
+class _JsonColumn[T](Column[T | None]):
+    @override
+    def array_column(self) -> ColumnBase:
+        column = super().array_column()
+        column.encoder = _json_documents
+        return column
+
+
+class jsonb[T](_JsonColumn[T]):
     """``jsonb[dict[str, int]]()``. ``T`` is a static hint only; it is not checked at runtime."""
 
     def __init__(self, name: str | None = None) -> None:
         super().__init__("jsonb", None, name)
 
 
-class json[T](Column[T | None]):
+class json[T](_JsonColumn[T]):
     """``json[list[str]]()``. ``T`` is a static hint only; it is not checked at runtime."""
 
     def __init__(self, name: str | None = None) -> None:
@@ -556,11 +581,12 @@ def pg_domain[T](
     column: Column[T | None] = Column(
         sql_type, (py_type,) if py_type is not None else None, name, decoder=decoder
     )
+    column.json_load = lambda runner: _json_type(runner, sql_type)  # its base type (Q4-6)
     return column
 
 
 def _composite_json(py_type: type | None) -> Callable[[object], object]:
-    """A composite nested in a relational row arrives as a JSON object of its fields (Q2):
+    """A composite nested in a relational row arrives as a dict of its fields (Q2, Q4-6):
     keep it by name, like asyncpg's Record, unless ``py_type`` wants positional values."""
 
     def parse(value: object) -> object:
@@ -583,8 +609,88 @@ def pg_composite[T](
     asyncpg reads a composite as an ``asyncpg.Record`` (fields by name) and writes a tuple of
     field values in order or a dict by field name; pass ``py_type`` (``tuple`` or ``dict``,
     say) to decode to that instead. Give ``schema`` when the type lives outside the
-    database's default schema. In a relational (nested) row the field values are JSON."""
+    database's default schema. In a relational (nested) row it is a dict by field name."""
     sql_type = type_name if schema in (None, "public") else f"{schema}.{type_name}"
     # dict too: the form py_type=dict reads back must be writable (Q9).
     column: Column[T | None] = Column(sql_type, (tuple, dict), name, decoder=py_type)
+    column.json_load = lambda runner: _json_type(runner, sql_type)  # its field types (Q4-6)
     return _json(column, _composite_json(py_type))
+
+
+# -- domains and composites nested in relational queries (Q4-6) ------------------------
+# JSON carries a numeric as a float, a timestamp as a string...: a domain is nested like
+# its base type and a composite field by field, both looked up in the database once.
+
+_JSON_BASES: dict[str, Callable[[], ColumnBase]] = {
+    "numeric": _core.numeric,
+    "real": _core.real,
+    "double precision": _core.double_precision,
+    "date": _core.date,
+    "timestamp without time zone": _core.timestamp,
+    "timestamp with time zone": lambda: _core.timestamp(tz=True),
+    "time without time zone": time,
+    "time with time zone": lambda: time(tz=True),
+    "interval": interval,
+    "uuid": uuid,
+    "bytea": bytea,
+    "inet": inet,
+    "cidr": cidr,
+    "bit": bit,
+    "bit varying": varbit,
+    "point": point,
+    "line": line,
+    "lseg": lseg,
+    "box": box,
+    "path": path,
+    "polygon": polygon,
+    "circle": circle,
+    "hstore": hstore,
+    "int4range": int4range,
+    "int8range": int8range,
+    "numrange": numrange,
+    "tsrange": tsrange,
+    "tstzrange": tstzrange,
+    "daterange": daterange,
+    "int4multirange": int4multirange,
+    "int8multirange": int8multirange,
+    "nummultirange": nummultirange,
+    "tsmultirange": tsmultirange,
+    "tstzmultirange": tstzmultirange,
+    "datemultirange": datemultirange,
+}
+
+_FIELDS = (
+    "FROM pg_attribute a WHERE a.attrelid = t.typrelid AND a.attnum > 0"
+    " AND NOT a.attisdropped ORDER BY a.attnum"
+)
+_LOOKUP = (
+    "SELECT t.typtype::text, format_type(t.typbasetype, t.typtypmod),"
+    f" ARRAY(SELECT a.attname::text {_FIELDS}),"
+    f" ARRAY(SELECT format_type(a.atttypid, a.atttypmod) {_FIELDS})"
+    " FROM pg_type t WHERE t.oid = to_regtype($1)"
+)
+# ponytail: per process, by type name; a database where the name is another type needs a
+# new process.
+_JSON_TYPES: dict[str, ColumnBase] = {}
+
+
+async def _json_type(runner: Runner, type_text: str) -> ColumnBase:
+    """A column that nests and reads like ``type_text`` (as ``format_type`` prints it)."""
+    if type_text.endswith("[]"):
+        return (await _json_type(runner, type_text[:-2])).array_column()
+    name = re.sub(r"\(.*?\)", "", type_text)  # numeric(10,2), timestamp(3) with time zone
+    if (base := _JSON_BASES.get(name)) is not None:
+        return base()
+    if (known := _JSON_TYPES.get(name)) is not None:
+        return known
+    rows = await runner.fetch(CompiledQuery(_LOOKUP, (name,), (None,)), read_only=True)
+    column: ColumnBase = Column[object](name, None)  # anything else: its JSON is already its value
+    if rows:
+        kind, base_type, names, types = cast(tuple[str, str, list[str], list[str]], tuple(rows[0]))
+        if kind == "d":
+            column = await _json_type(runner, base_type)
+        elif kind == "c":
+            fields = [(n, await _json_type(runner, t)) for n, t in zip(names, types, strict=True)]
+            column.json_fields = tuple(fields)
+    _JSON_TYPES[name] = column
+    return column

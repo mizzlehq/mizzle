@@ -12,7 +12,7 @@ import struct
 import uuid
 from collections.abc import AsyncGenerator, Callable, Mapping, Sequence
 from contextlib import aclosing
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from decimal import Decimal
 from typing import TypedDict, cast, override
 
@@ -132,6 +132,12 @@ def _from_json(column: ColumnBase, value: Json) -> object:
     """Turn a JSON value back into the column's Python type (before ``column.decode``)."""
     if value is None:
         return None
+    if column.json_type is not None:  # a domain or composite, as its type (Q4-6)
+        typed = _from_json(column.json_type, value)
+        return typed if column.json_decoder is None else column.json_decoder(typed)
+    if column.json_fields is not None:
+        values = _json_list(value, column.qualified_name)
+        return {n: _from_json(c, v) for (n, c), v in zip(column.json_fields, values, strict=True)}
     if column.item is not None:
         if not isinstance(value, list):
             raise QueryError(f"{column.qualified_name}: expected a JSON array, got {value!r}")
@@ -184,7 +190,8 @@ def _json_converter(column: ColumnBase) -> Converter | None:
     """What turns a non-NULL JSON value into the column's Python value (None: keep it)."""
     kind = column.accepts[0] if column.accepts else None
     plain = kind is None or kind in (int, str, bool) or column.enum is not None
-    if column.item is None and plain and column.json_decoder is None:
+    typed = column.json_decoder is not None or column.json_type is not None
+    if column.item is None and plain and not typed:
         return column.decoder  # JSON already has the right type; enums still convert
     return lambda value: column.decode(_from_json(column, cast(Json, value)))
 
@@ -238,19 +245,43 @@ class RelationalStatement(Node):
     # A WITH clause passed with db.with_(...): emitted before the SELECT (B9).
     ctes: tuple[Cte, ...] = ()
 
+    async def _typed(self, compiled: CompiledQuery) -> CompiledQuery:
+        """``compiled`` again once the nested domains and composites are looked up (Q4-6);
+        nesting adds no parameters, so the (bound) ones carry over."""
+        if not await _load_json_types(self.runner, self.plan):
+            return compiled
+        fresh = self.runner.compile(self)
+        return replace(fresh, params=compiled.params, placeholders=compiled.placeholders)
+
+
+async def _load_json_types(runner: Runner, plan: LoadPlan) -> bool:
+    """Look up the types of nested domain and composite columns; True if there are any."""
+    found = False
+    for _, _, child in plan.children:
+        for _, column in child.columns:
+            item: ColumnBase | None = column
+            while item is not None:
+                if item.json_load is not None:
+                    found = True
+                    if item.json_type is None:
+                        item.json_type = await item.json_load(runner)
+                item = item.item
+        found = await _load_json_types(runner, child) or found
+    return found
+
 
 @dataclass(frozen=True, eq=False)
 class RelationalSelect[T: Table](RelationalStatement, Executable[list[T]]):
     @override
     async def run_compiled(self, compiled: CompiledQuery) -> list[T]:
-        rows = await self.runner.fetch(compiled, read_only=True)
+        rows = await self.runner.fetch(await self._typed(compiled), read_only=True)
         decode = plan_decoder(self.plan)
         return cast(list[T], [decode(row) for row in rows])
 
     async def stream(self, batch_size: int = 1000) -> AsyncGenerator[T]:
         """Like ``Select.stream()``: rows from a server-side cursor, ``batch_size`` at a time."""
+        compiled = await self._typed(self._compile_for_run())
         decode = plan_decoder(self.plan)
-        compiled = self._compile_for_run()
         async with aclosing(self.runner.stream(compiled, batch_size, read_only=True)) as batches:
             async for batch in batches:
                 for row in batch:
@@ -261,7 +292,7 @@ class RelationalSelect[T: Table](RelationalStatement, Executable[list[T]]):
 class RelationalFirst[T: Table](RelationalStatement, Executable[T | None]):
     @override
     async def run_compiled(self, compiled: CompiledQuery) -> T | None:
-        rows = await self.runner.fetch(compiled, read_only=True)
+        rows = await self.runner.fetch(await self._typed(compiled), read_only=True)
         return cast(T, plan_decoder(self.plan)(rows[0])) if rows else None
 
 
