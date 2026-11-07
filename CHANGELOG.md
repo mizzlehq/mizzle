@@ -34,6 +34,19 @@
 - Removed `Database.listen()` and `notify()` (with `Notification`, `Reconnected` and
   `ListenerOverflow`). Use asyncpg's `add_listener` on a connection of your own.
 - Removed `copy_into()` and `copy_from()`. Use `insert_many()` for bulk loads.
+- **Breaking: a savepoint belongs to the task that opened it**, as nested transactions do in
+  Drizzle. Tasks started inside a savepoint can no longer use the transaction while it is
+  open (`QueryError`), so `asyncio.gather` of statements or savepoint blocks inside a
+  savepoint is refused. `gather` of statements (and `insert_many()`) on a transaction with
+  no savepoint open still works. Savepoint hooks are kept per savepoint: a refused or
+  rolled-back savepoint no longer drops or runs the hooks of a later one, and a savepoint
+  always ends (`RELEASE` / `ROLLBACK TO`) before a cancel that hit while it waited to end.
+- A raw `COMMIT AND CHAIN` / `ROLLBACK AND CHAIN` inside a transaction is no longer
+  detected (the check needed PL/pgSQL on every `COMMIT`). Do not send transaction control
+  as raw SQL; a plain `COMMIT` or `ROLLBACK` is still detected.
+- A malformed database URL with a user name or password no longer quotes any part of the
+  parser's message, which could hold a piece of the password (a password with both `'`
+  and `"`, or an unencoded `@`).
 
 ## 0.2.4
 

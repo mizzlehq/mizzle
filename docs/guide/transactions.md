@@ -46,9 +46,7 @@ async with db.transaction() as tx:
 transaction, on other connections.
 
 Statements on one `tx` never overlap, so `asyncio.gather` on it is safe; they run one
-after another. While a savepoint is open, only the code inside it (and tasks it starts) may
-use the transaction: a statement from another task would be undone with the savepoint, so
-it raises `QueryError` instead.
+after another. `insert_many()` in a `gather` is fine too.
 
 ```python
 async with db.transaction() as tx:
@@ -73,6 +71,21 @@ async with db.transaction() as tx:
     except CheckViolation:
         pass  # only the savepoint rolled back; the entry is still there
 ```
+
+A savepoint belongs to the task that opened it, as nested transactions do in Drizzle. While
+it is open, only that task (and code it awaits directly) may use the transaction: a
+statement from another task would be undone with the savepoint, so it raises `QueryError`
+at once, and the savepoint goes on. Tasks started inside a savepoint (`asyncio.gather`,
+`create_task`, a `TaskGroup`) count as other tasks, so `gather` of statements inside a
+savepoint, or of several savepoint blocks on one transaction, is refused rather than
+interleaved. Give each task its own `db.transaction()`, or await them one after another.
+
+Leave transaction control to the blocks: do not send `COMMIT`, `ROLLBACK`, `SAVEPOINT`,
+`RELEASE` or `ROLLBACK TO` (or `COMMIT AND CHAIN` / `ROLLBACK AND CHAIN`) as raw SQL
+through `sql()` or `execute()` inside a transaction. A plain `COMMIT` or `ROLLBACK` is
+detected (leaving the block raises `DatabaseError`); the `AND CHAIN` forms and raw
+savepoint commands are not, and the block can then report success for work that was not
+committed as one transaction.
 
 ### Side effects after commit
 
@@ -102,8 +115,10 @@ Two rules keep hook errors from confusing the outcome:
 - A cancel or timeout that arrives after `COMMIT`, while the connection goes back to the
   pool, still propagates, but the `after_commit` hooks run, the `after_rollback` hooks do
   not, and a note on the error says the transaction was committed. Do not retry it.
-- Savepoints on one transaction run one at a time, from the task that opened them. A
-  savepoint started from another task while one is open raises `QueryError`.
+- A savepoint cancelled while its `RELEASE` or `ROLLBACK TO` was running may or may not
+  have ended, so the transaction refuses further statements and `COMMIT` with
+  `QueryError`, and rolls back. A cancel that arrives while the savepoint waits to end is
+  held until it has ended, then raised.
 - A statement that fails aborts the whole transaction in PostgreSQL, even if you catch the
   error. Leaving the block then raises `DatabaseError` ("aborted the transaction"), the
   `after_rollback` hooks run, and nothing is committed. To go on after an expected failure,

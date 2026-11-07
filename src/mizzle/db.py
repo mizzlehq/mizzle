@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import contextvars
 import itertools
 import logging
 import math
@@ -65,11 +64,27 @@ log = logging.getLogger("mizzle")
 # Seconds a replica that failed to give a connection is skipped.
 _REPLICA_PAUSE = 30.0
 
-# Pushed onto Session._savepoints when the transaction ends: statements are refused.
-_ENDED = object()
-# Replaces a savepoint's marker when its ROLLBACK TO / RELEASE was cancelled before or
-# while it ran: its state is unknown, so the transaction refuses statements and COMMIT (R4-1).
-_BROKEN = object()
+_ENDED = (
+    "this transaction has ended; run the statement inside its "
+    "`async with db.transaction()` block, or on db"
+)
+_BROKEN = (
+    "a savepoint of this transaction was cancelled during its ROLLBACK TO / RELEASE, so "
+    "its state is unknown; the transaction must roll back"
+)
+_OUT_OF_ORDER = (
+    "a savepoint ended while one opened inside it was still open, so the state of the "
+    "transaction is unknown; it must roll back"
+)
+_OPEN_SAVEPOINT = (
+    "a savepoint opened by a task this block started is still open, so the block was "
+    "rolled back; await such tasks inside the block"
+)
+_OTHER_TASK = (
+    "another task has a savepoint open on this transaction; while it is open, only the "
+    "task that opened it may use the transaction. Await the savepoint first, or give "
+    "each task its own transaction"
+)
 _ISOLATION_LEVELS: tuple[IsolationLevel, ...] = (
     "read committed",
     "repeatable read",
@@ -77,27 +92,32 @@ _ISOLATION_LEVELS: tuple[IsolationLevel, ...] = (
 )
 
 
+type _Hook = Callable[[], Awaitable[None]]
+
+
 @final
-class _Marker:
-    """An open savepoint; knows its transaction, so a task holding a marker of a
-    savepoint that has ended is refused there and nowhere else (R4-3)."""
+class _Frame:
+    """A transaction (the first frame) or a savepoint in it: the task that opened it (None:
+    any task may use it) and the hooks of savepoints released inside it, which run when
+    it commits or rolls back."""
 
-    __slots__ = ("savepoints",)
+    __slots__ = ("commits", "owner", "rollbacks")
 
-    def __init__(self, savepoints: list[object]) -> None:
-        self.savepoints = savepoints
-
-
-_OPEN_SAVEPOINT = (
-    "a savepoint opened inside this block (by a task it started) is still open or was "
-    "interrupted, so the block was rolled back; await such tasks inside the block"
-)
+    def __init__(self, owner: asyncio.Task[object] | None) -> None:
+        self.owner = owner
+        self.commits: list[_Hook] = []
+        self.rollbacks: list[_Hook] = []
 
 
-_UNDONE = (
-    "an enclosing savepoint was rolled back while this one was open, which undid this one "
-    "too; await tasks that open savepoints inside the block that started them"
-)
+@final
+class _Tx:
+    """The state a transaction's sessions (its views) share."""
+
+    __slots__ = ("closed", "frames")
+
+    def __init__(self) -> None:
+        self.frames = [_Frame(None)]  # the transaction, then its open savepoints
+        self.closed: str | None = None  # why statements are refused
 
 
 def _timeout_ok(seconds: float | None) -> bool:
@@ -115,14 +135,6 @@ def _busy(driver: Driver) -> bool:
 def _commit_unknown(error: BaseException) -> bool:
     """Whether ``error``, raised while COMMIT was in flight, leaves its outcome unknown."""
     return isinstance(error, asyncio.CancelledError | DbConnectionError | QueryTimeout)
-
-
-# The savepoints the running code is inside of, innermost last (see Session._savepoints).
-# A stack, not one marker: code inside savepoints of two transactions still owns the
-# innermost one of each (R5-3).
-_SAVEPOINT: contextvars.ContextVar[tuple[_Marker, ...]] = contextvars.ContextVar(
-    "mizzle_savepoint", default=()
-)
 
 
 @dataclass(frozen=True)
@@ -219,17 +231,13 @@ class Session(QueryBuilder):
     _tags: Mapping[str, object]
     _conn: Connection | None
     _lock: asyncio.Lock
-    # Callbacks a savepoint registered, to run when the *outermost* transaction commits.
-    # A savepoint is released, not committed, so running them there fires a side effect for
-    # data the outer transaction can still roll back (R2).
-    _deferred: list[Callable[[], Awaitable[None]]]
-    # ``after_rollback`` hooks of savepoints that were released: they must run if the
-    # outermost transaction rolls back (their data is undone after all).
-    _rollbacks: list[Callable[[], Awaitable[None]]]
-    # A marker per open savepoint, innermost last. The code inside a savepoint (and tasks
-    # it starts) carries its marker in _SAVEPOINT; anything else would run inside a
-    # savepoint it does not own, and is refused (B39, C11).
-    _savepoints: list[object]
+    # Open savepoints and their hooks. A savepoint belongs to the task that opened it, as
+    # in Drizzle: while it is open, another task's statement would be undone with it, so
+    # it is refused (B39, C11).
+    _tx: _Tx
+    # False on insert_many's private view: its hidden savepoint holds the statement lock
+    # throughout, so a sibling task's statement waits instead of being refused (R5-2).
+    _owns_savepoints: bool = True
 
     def __init__(
         self,
@@ -263,9 +271,7 @@ class Session(QueryBuilder):
         # One connection runs one statement at a time; the lock lets asyncio.gather()
         # inside a transaction queue up instead of failing.
         self._lock = asyncio.Lock()
-        self._deferred = []
-        self._rollbacks = []
-        self._savepoints = []
+        self._tx = _Tx()
 
     # -- Runner protocol --------------------------------------------------------------
 
@@ -299,6 +305,7 @@ class Session(QueryBuilder):
                 )
                 async with aclosing(cursor) as batches:
                     while True:
+                        self._check_savepoint_owner()  # at once, not once the lock is free
                         async with self._lock:
                             self._check_savepoint_owner()
                             with self._span(query):
@@ -446,12 +453,13 @@ class Session(QueryBuilder):
         if self._conn is None:
             return await self._insert_rows(template, table, rows, batch_size, returning)
         # In a transaction, its hidden savepoint holds the statement lock from SAVEPOINT to
-        # RELEASE: a sibling task's statement (asyncio.gather) waits for it instead of being
-        # refused for landing in another task's savepoint (R5-2).
+        # RELEASE: a sibling task's statement (asyncio.gather) waits for it (R5-2).
+        self._check_savepoint_owner()
         async with self._lock:
             self._check_savepoint_owner()
             session = self._view()
             session._lock = asyncio.Lock()
+            session._owns_savepoints = False
             return await session._insert_rows(template, table, rows, batch_size, returning)
 
     async def _insert_rows[T: Table](
@@ -580,84 +588,39 @@ class Session(QueryBuilder):
         if self._conn is not None:
             if isolation is not None or readonly:
                 raise QueryError("isolation and readonly apply to the outermost transaction only")
-            # A rolled-back savepoint drops only what *it* queued: hooks queued by sibling
-            # savepoints that were already released stay (B2).
-            committed = len(self._deferred)
-            released = len(self._rollbacks)
-            started = False
+            frame = _Frame(asyncio.current_task() if self._owns_savepoints else None)
             savepoint = self._conn.transaction()
-            marker = _Marker(self._savepoints)
             with self._transaction_span(isolation):
+                # SAVEPOINT, RELEASE and ROLLBACK TO run under the statement lock, so they
+                # never overlap another task's statement (C11).
+                self._check_savepoint_owner()
+                async with self._lock:
+                    self._check_savepoint_owner()
+                    await savepoint.__aenter__()
+                    self._tx.frames.append(frame)
+                error: BaseException | None = None
                 try:
-                    # SAVEPOINT, RELEASE and ROLLBACK TO run under the statement lock, so
-                    # they never overlap a sibling task's statement (C11).
-                    async with self._lock:
-                        self._check_savepoint_owner()
-                        await savepoint.__aenter__()
-                        self._savepoints.append(marker)
-                    started = True
-                    token = _SAVEPOINT.set((*_SAVEPOINT.get(), marker))
-                    try:
-                        try:
-                            yield self
-                        finally:
-                            _SAVEPOINT.reset(token)
-                        # The marker stays until ROLLBACK TO / RELEASE ran: a sibling
-                        # task's statement queued for the lock would otherwise run inside
-                        # the savepoint and be undone with it (R1).
-                    except BaseException as exc:
-                        broken = False
-                        try:
-                            async with self._lock:
-                                if marker not in self._savepoints:
-                                    raise  # an enclosing savepoint's ROLLBACK TO undid it
-                                if not await savepoint.__aexit__(type(exc), exc, exc.__traceback__):
-                                    raise
-                        except asyncio.CancelledError as cancel:
-                            broken = cancel is not exc  # cancelled before / during ROLLBACK TO
-                            raise
-                        finally:
-                            self._end_marker(marker, broken)
-                    else:
-                        broken = False
-                        try:
-                            async with self._lock:
-                                if marker not in self._savepoints:
-                                    raise QueryError(_UNDONE)
-                                if self._savepoints[-1] is not marker:
-                                    # A task started inside still has a savepoint open (or
-                                    # one was interrupted): roll back, never release it (R4-2).
-                                    error = QueryError(_OPEN_SAVEPOINT)
-                                    await savepoint.__aexit__(QueryError, error, None)
-                                    raise error
-                                await savepoint.__aexit__(None, None, None)
-                        except asyncio.CancelledError:
-                            broken = True  # cancelled before / during RELEASE (R4-1)
-                            raise
-                        finally:
-                            self._end_marker(marker, broken)
+                    yield self
+                except BaseException as exc:
+                    error = exc
+                try:
+                    cancel = await self._end_savepoint(savepoint, frame, error)
                 except BaseException as original:
-                    del self._deferred[committed:]
                     # Savepoints released inside this one are undone with it: their
-                    # after_rollback hooks run now (B37). A savepoint that never started
-                    # (its transaction already ended) undid nothing, so none run (B39).
-                    hooks = self._rollbacks[released:]
-                    del self._rollbacks[released:]
-                    if after_rollback is not None:
-                        hooks.append(after_rollback)
-                    if started:
-                        await _run_rollback_hooks(hooks, original)
+                    # after_rollback hooks run now (B37); no after_commit hook ever does.
+                    hooks = [*frame.rollbacks, *([after_rollback] if after_rollback else [])]
+                    await _run_rollback_hooks(hooks, original)
                     raise
-            if after_commit is not None:
-                # Released, not committed: run it only when the outermost transaction commits.
-                self._deferred.append(after_commit)
-            if after_rollback is not None:
-                # ...and if the outer transaction rolls back instead (B6).
-                self._rollbacks.append(after_rollback)
+            # Released, not committed: its hooks run when the enclosing one ends (R2, B6).
+            parent = self._tx.frames[-1]
+            parent.commits += [*frame.commits, *([after_commit] if after_commit else [])]
+            parent.rollbacks += [*frame.rollbacks, *([after_rollback] if after_rollback else [])]
+            if cancel is not None:
+                raise cancel
             return
         driver = self._require_driver()
-        deferred: list[Callable[[], Awaitable[None]]] = []
-        rollbacks: list[Callable[[], Awaitable[None]]] = []
+        deferred: list[_Hook] = []
+        rollbacks: list[_Hook] = []
         started = committing = done = False
         with self._transaction_span(isolation):
             try:
@@ -674,8 +637,8 @@ class Session(QueryBuilder):
                         connection=conn,
                     )
                     tx._timeout = self._timeout
-                    deferred = tx._deferred
-                    rollbacks = tx._rollbacks
+                    deferred = tx._tx.frames[0].commits
+                    rollbacks = tx._tx.frames[0].rollbacks
                     block = conn.transaction(isolation, readonly)
                     await block.__aenter__()
                     started = True
@@ -685,20 +648,22 @@ class Session(QueryBuilder):
                         # COMMIT / ROLLBACK under the statement lock: a sibling task's
                         # statement may still be running (C11).
                         async with tx._lock:
-                            tx._savepoints.append(_ENDED)
+                            tx._tx.closed = _ENDED
                             if not await block.__aexit__(type(exc), exc, exc.__traceback__):
                                 raise
                     else:
                         async with tx._lock:
-                            still_open = bool(tx._savepoints)
+                            # A task's savepoint is still open (or one was interrupted):
+                            # committing would keep rows it may yet undo (R4-1, R4-2).
+                            refused = tx._tx.closed or (
+                                _OPEN_SAVEPOINT if len(tx._tx.frames) > 1 else None
+                            )
                             # From here on the transaction refuses statements: one sent
                             # after COMMIT would run in autocommit on this connection, or
                             # on a pooled connection someone else now uses (R3).
-                            tx._savepoints.append(_ENDED)
-                            if still_open:
-                                # A task's savepoint is still open (or was interrupted):
-                                # committing would keep rows it may yet undo (R4-1, R4-2).
-                                error = QueryError(_OPEN_SAVEPOINT)
+                            tx._tx.closed = _ENDED
+                            if refused is not None:
+                                error = QueryError(refused)
                                 await block.__aexit__(QueryError, error, None)
                                 raise error
                             committing = True
@@ -767,9 +732,7 @@ class Session(QueryBuilder):
         # Shared, so a view of a transaction still runs one statement at a time, and so
         # hooks registered through a view land in the transaction's queues (B3).
         view._lock = self._lock
-        view._deferred = self._deferred
-        view._rollbacks = self._rollbacks
-        view._savepoints = self._savepoints
+        view._tx = self._tx
         view._next_replica = self._next_replica
         view._replica_down = self._replica_down
         view._use_primary = self._use_primary
@@ -796,49 +759,65 @@ class Session(QueryBuilder):
 
     @asynccontextmanager
     async def _locked(self, conn: Connection) -> AsyncGenerator[Connection]:
+        self._check_savepoint_owner()  # at once, not once the lock is free
         async with self._lock:
             self._check_savepoint_owner()
             yield conn
 
-    def _end_marker(self, marker: _Marker, broken: bool) -> None:
-        if marker not in self._savepoints:
-            return  # undone already by an enclosing savepoint's ROLLBACK TO
-        at = self._savepoints.index(marker)
-        if broken:
-            self._savepoints[at] = _BROKEN
-        else:
-            # Its ROLLBACK TO / RELEASE also ended every savepoint opened inside it, a
-            # broken one included: their markers go too, or the transaction stayed
-            # refused for good (R5-4).
-            del self._savepoints[at:]
+    async def _end_savepoint(
+        self,
+        savepoint: AbstractAsyncContextManager[None],
+        frame: _Frame,
+        error: BaseException | None,
+    ) -> asyncio.CancelledError | None:
+        """ROLLBACK TO (after ``error``, which is raised again) or RELEASE ``savepoint``,
+        under the statement lock. This runs even when the task is cancelled while waiting
+        for the lock, never left to the garbage collector (R6-2); that cancel is returned,
+        to raise once done."""
+        tx = self._tx
+        cancel: asyncio.CancelledError | None = None
+        while True:
+            try:
+                await self._lock.acquire()
+                break
+            except asyncio.CancelledError as exc:
+                cancel = exc
+        try:
+            if tx.frames[-1] is not frame:  # e.g. an async generator left one open inside
+                tx.closed = _OUT_OF_ORDER
+                error = error or QueryError(_OUT_OF_ORDER)
+            try:
+                if error is None:
+                    await savepoint.__aexit__(None, None, None)
+                elif not await savepoint.__aexit__(type(error), error, error.__traceback__):
+                    raise error
+            except asyncio.CancelledError as exc:
+                if exc is not error:  # it may or may not have ended (R4-1)
+                    tx.closed = _BROKEN
+                raise
+            finally:
+                # Removed only now: a task queued for the lock must not run in the
+                # enclosing transaction while this savepoint is still open.
+                if frame in tx.frames:
+                    del tx.frames[tx.frames.index(frame) :]
+        except BaseException:
+            if cancel is not None:
+                raise cancel  # noqa: B904 - the cancel wins; the error is its context
+            raise
+        finally:
+            self._lock.release()
+        return cancel
 
     def _check_savepoint_owner(self) -> None:
         """Refuse a statement that would land in another task's savepoint: a rollback of
         that savepoint would undo it silently (C11). Refuse any statement once the
         transaction has ended (R3)."""
-        if self._savepoints and self._savepoints[-1] is _ENDED:
-            raise QueryError(
-                "this transaction has ended; run the statement inside its "
-                "`async with db.transaction()` block, or on db"
-            )
-        if _BROKEN in self._savepoints:
-            raise QueryError(
-                "a savepoint of this transaction was cancelled before its ROLLBACK TO / "
-                "RELEASE completed, so its state is unknown; the transaction must roll back"
-            )
-        mine = [m for m in _SAVEPOINT.get() if m.savepoints is self._savepoints]
-        current = mine[-1] if mine else None
-        if current is not None and current not in self._savepoints:
-            raise QueryError(  # R4-3
-                "the savepoint this task was started in has ended; its statements cannot "
-                "run in the transaction any more"
-            )
-        if self._savepoints and current is not self._savepoints[-1]:
-            raise QueryError(
-                "another task has a savepoint open on this transaction; while it is open, "
-                "only that task (and tasks it starts) may use the transaction. Await the "
-                "savepoint first, or give each task its own transaction"
-            )
+        tx = self._tx
+        if tx.closed is not None:
+            raise QueryError(tx.closed)
+        owner = tx.frames[-1].owner
+        if owner is not None and owner is not asyncio.current_task():
+            raise QueryError(_OTHER_TASK)
 
     @asynccontextmanager
     async def _replica_connection(
