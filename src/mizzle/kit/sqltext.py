@@ -75,31 +75,33 @@ def first_token(text: str) -> int:
     return n
 
 
+def _skip(text: str, i: int) -> int | None:
+    """The index just past the quoted string, quoted identifier, dollar-quoted body or
+    comment starting at ``i``, or None if none starts there."""
+    ch = text[i]
+    if ch in "'\"":
+        # E'...' (also e'...') has backslash escapes; a bare '...' does not.
+        escapes = ch == "'" and i > 0 and text[i - 1] in "Ee" and not _is_ident_char(text, i - 2)
+        return _skip_quoted(text, i, ch, escapes=escapes)
+    if ch == "$":
+        # ``a$b$`` is one identifier: a dollar quote only starts where a name cannot continue.
+        tag = None if _is_ident_char(text, i - 1) else _DOLLAR.match(text, i)
+        if tag is None:
+            return None
+        close = text.find(tag.group(0), i + len(tag.group(0)))
+        return len(text) if close == -1 else close + len(tag.group(0))
+    return _comment_end(text, i)
+
+
 def split_statements(text: str) -> list[str]:
     """Split SQL on top-level semicolons, honouring single/double quotes, dollar-quoted
     bodies and comments, so the console can run several statements in one go."""
     parts: list[str] = []
     start, i, n = 0, 0, len(text)
     while i < n:
-        ch = text[i]
-        if ch in "'\"":
-            # E'...' (also e'...') has backslash escapes; a bare '...' does not.
-            escapes = (
-                ch == "'" and i > 0 and text[i - 1] in "Ee" and not _is_ident_char(text, i - 2)
-            )
-            i = _skip_quoted(text, i, ch, escapes=escapes)
-        elif ch == "$":
-            # ``a$b$`` is one identifier: a dollar quote only starts where a name cannot
-            # continue.
-            tag = None if _is_ident_char(text, i - 1) else _DOLLAR.match(text, i)
-            if tag is None:
-                i += 1
-            else:
-                close = text.find(tag.group(0), i + len(tag.group(0)))
-                i = n if close == -1 else close + len(tag.group(0))
-        elif (end := _comment_end(text, i)) is not None:
+        if (end := _skip(text, i)) is not None:
             i = end
-        elif ch == ";":
+        elif text[i] == ";":
             parts.append(text[start:i])
             start = i = i + 1
         else:
@@ -125,25 +127,39 @@ _TRANSACTION_CONTROL = re.compile(
 )
 
 
-_ATOMIC = re.compile(r"\bBEGIN\s+ATOMIC\b", re.IGNORECASE)
-_ENDS = re.compile(r"\bEND\s*\Z", re.IGNORECASE)
-_END = re.compile(r"END\b", re.IGNORECASE)
-
-
 def transaction_control(text: str) -> str | None:
     """The first transaction-control statement in ``text`` (``COMMIT``...), or None.
 
     A SQL-standard function body (``BEGIN ATOMIC ... END``) holds semicolons outside any
-    quotes, so its statements and closing ``END`` are skipped, not read as control."""
-    atomic = False
-    for statement in split_statements(text):
-        body = statement[first_token(statement) :]
-        if atomic:
-            atomic = _END.match(body) is None  # the body ends at its own END
+    quotes, so its statements and closing ``END`` are skipped, not read as control. Words
+    are read only outside quotes and comments (K3), and a ``CASE ... END`` inside the body
+    does not close it (K2)."""
+    depth: int | None = None  # CASE nesting inside a BEGIN ATOMIC body; None outside one
+    start, prev, i, n = True, "", 0, len(text)
+    while i < n:
+        if (end := _skip(text, i)) is not None:
+            i = end
             continue
-        if _ATOMIC.search(body):
-            atomic = _ENDS.search(body) is None
+        ch = text[i]
+        if not _is_ident_char(text, i):
+            if ch == ";" and depth is None:
+                start = True
+            elif not ch.isspace():
+                start = False
+            i += 1
             continue
-        if (match := _TRANSACTION_CONTROL.match(body)) is not None:
+        j = i
+        while j < n and _is_ident_char(text, j):
+            j += 1
+        word = text[i:j].upper()
+        if depth is not None:
+            if word == "CASE":
+                depth += 1
+            elif word == "END":
+                depth = None if depth == 0 else depth - 1
+        elif start and (match := _TRANSACTION_CONTROL.match(text, i)) is not None:
             return match.group(0).upper()
+        elif word == "ATOMIC" and prev == "BEGIN":
+            depth = 0
+        start, prev, i = False, word, j
     return None

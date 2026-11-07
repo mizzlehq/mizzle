@@ -449,6 +449,7 @@ async def test_status_json_and_check(project: Path, capsys: pytest.CaptureFixtur
         "migrations": [],
         "applied": 0,
         "pending": 0,
+        "changed": [],
         "missing": [],
     }
     assert await cli("status", "--check") == 0
@@ -840,6 +841,11 @@ async def test_status_check_and_doctor_fail_when_a_migration_changed(
     capsys.readouterr()
     assert await cli("status", "--check") == 1
     capsys.readouterr()
+    # K13: an edited migration is still applied, and the JSON names it.
+    assert await cli("status", "--json") == 0
+    data = json.loads(capsys.readouterr().out)
+    assert data["applied"] == 1 and data["pending"] == 0
+    assert data["changed"] == [sql.parent.name]
     assert await cli("doctor") == 1
     assert "edited after they were applied" in capsys.readouterr().out
 

@@ -17,8 +17,9 @@ from mizzle.dialects.postgres import PostgresDialect
 from mizzle.dialects.postgres.ddl import normalize_default, normalize_type
 from mizzle.kit.config import load_config
 from mizzle.kit.diff import StrictRenames, diff
-from mizzle.kit.journal import BREAKPOINT, MigrationsDir, format_sql, parse_sql
+from mizzle.kit.journal import BREAKPOINT, Migration, MigrationsDir, format_sql, parse_sql
 from mizzle.kit.snapshot import build_snapshot
+from mizzle.kit.sqltext import transaction_control
 from tests.models import Posts, Users
 
 dialect = PostgresDialect()
@@ -326,3 +327,38 @@ def test_domain_with_one_check_stays_a_keyword() -> None:
     }
     source = render_schema_module(snapshot)
     assert "check=\"VALUE ~ '@'\"" in source
+
+
+@pytest.mark.parametrize(
+    ("sql", "expected"),
+    [
+        # K2: CASE ... END inside a BEGIN ATOMIC body does not close the body.
+        (
+            "CREATE FUNCTION f(x int) RETURNS int LANGUAGE sql BEGIN ATOMIC\n"
+            "  SELECT CASE WHEN x > 0 THEN 1 ELSE 0 END;\nEND;\nSELECT 1;",
+            None,
+        ),
+        (
+            "CREATE FUNCTION f() RETURNS int BEGIN ATOMIC SELECT CASE 1 WHEN 1 THEN 2 END; END;"
+            "\nCOMMIT;",
+            "COMMIT",
+        ),
+        # K3: "begin atomic" in a string, comment or quoted name hides nothing.
+        ("SELECT 'begin atomic';\nCOMMIT;", "COMMIT"),
+        ("-- begin atomic\nCOMMIT;", "COMMIT"),
+        ("/* begin atomic */ SELECT 1;\nCOMMIT;", "COMMIT"),
+        ('SELECT 1 AS "begin atomic";\nCOMMIT;', "COMMIT"),
+        ("SELECT $$begin atomic$$;\nCOMMIT;", "COMMIT"),
+    ],
+)
+def test_transaction_control_reads_atomic_bodies(sql: str, expected: str | None) -> None:
+    assert transaction_control(sql) == expected
+
+
+def test_migration_hash_ignores_crlf(tmp_path: Path) -> None:
+    # K12: a CRLF checkout of an applied migration must not look edited.
+    (tmp_path / "migration.sql").write_bytes(b"SELECT 1;\nSELECT 2;\n")
+    migration = Migration(index=1, name="0001_x", path=tmp_path)
+    lf = migration.hash()
+    (tmp_path / "migration.sql").write_bytes(b"SELECT 1;\r\nSELECT 2;\r\n")
+    assert migration.hash() == lf
