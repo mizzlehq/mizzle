@@ -258,3 +258,25 @@ def test_ipv6_loopback_link_is_bracketed(config: Config, no_ui: None) -> None:
         config, port=4983, read_only=False, open_browser=True, host="::1", token=token
     )
     assert [f"http://[::1]:4983/#token={token}"] == OPENED
+
+
+@pytest.mark.parametrize(
+    ("value", "base", "cell"),
+    [
+        # A text value under a type misread as signed (the type is a parsed name, e.g. a
+        # text domain shadowed by a numeric one of the same name) is still neutralised.
+        ("-2+3+cmd|' /C calc'!A0", "numeric", "'-2+3+cmd|' /C calc'!A0"),
+        ('=HYPERLINK("http://x")', "interval", '\'=HYPERLINK("http://x")'),
+        ("@SUM(1)", "money", "'@SUM(1)"),
+        # Real signed values keep their text (B19).
+        ("-5", "integer", "-5"),
+        ("-1.50", "numeric(10,2)", "-1.50"),
+        ("-1 days +02:00:00", "interval", "-1 days +02:00:00"),
+        ("@ 1 day ago", "interval", "@ 1 day ago"),
+        ("-$1,234.00", "money", "-$1,234.00"),
+        ("-infinity", "date", "-infinity"),
+        ("-Infinity", "numeric", "-Infinity"),
+    ],
+)
+def test_csv_cell_is_inert_even_if_the_type_is_misread(value: str, base: str, cell: str) -> None:
+    assert studio_server._cell(value, base) == cell

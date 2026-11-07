@@ -446,6 +446,14 @@ _SIGNED_TYPE = re.compile(
 )
 
 
+# What a signed value's text can hold: a sign or "@" (verbose interval), then letters,
+# digits, spaces and . , : $ + - and currency signs: "-5", "-1 days +02:00", "-$1.00",
+# "-infinity". No ( | ! " ' = ; & that a formula needs to call a function or DDE. The
+# column type comes from a parsed type name, so the text must look inert too: a text
+# column misread as numeric cannot pass "-2+3+cmd|' /C calc'!A0".
+_INERT_SIGNED = re.compile(r"[-+@][\w .,:$+\-€£¥₹]*")
+
+
 def _csv_safe(text: str) -> str:
     # The spreadsheet skips leading whitespace, so " =1+1" and "\n=cmd" are formulas too.
     risky = text.startswith(("\t", "\r")) or text.lstrip().startswith(_FORMULA_LEAD)
@@ -504,8 +512,9 @@ def _cell(value: object, base: str) -> str:
         return "true" if value else "false"
     if isinstance(value, dict | list):
         return json.dumps(value)  # starts with { or [, never a formula
-    if isinstance(value, str) and not (_SIGNED_TYPE.fullmatch(base) or _EXACT_TEXT.fullmatch(base)):
-        return _csv_safe(value)
+    if isinstance(value, str):
+        signed = _SIGNED_TYPE.fullmatch(base) or _EXACT_TEXT.fullmatch(base)
+        return value if signed and _INERT_SIGNED.fullmatch(value) else _csv_safe(value)
     return str(value)
 
 
