@@ -594,60 +594,152 @@ def alias(source: type[Table] | Cte, name: str, /) -> type[Table] | Cte:
 class Select[R](SelectBase, Executable[list[R]], SetOps[R]):
     """A SELECT whose rows are ``R`` (a table row, a tuple, or a dict)."""
 
+    # Join typing (Q3): the joined table may sit in any of up to 4 slots. An alias has its
+    # table's type, so a self-join cannot tell which slot is the joined one: every slot of
+    # that type is nullable then. ponytail: 5+ slots and 4-slot self-joins fall back to
+    # Self (nothing nulled); add overloads if those shapes show up.
+    @overload
+    def left_join[J: Table](
+        self: Select[tuple[J, J, J]], source: type[J], on: Condition
+    ) -> Select[tuple[J | None, J | None, J | None]]: ...
+    @overload
+    def left_join[J: Table](
+        self: Select[tuple[J, J]], source: type[J], on: Condition
+    ) -> Select[tuple[J | None, J | None]]: ...
     @overload
     def left_join[A, J: Table](  # type: ignore[overload-overlap]
-        self: Select[tuple[A, J]], source: type[J], on: Condition
-    ) -> Select[tuple[A, J | None]]: ...
+        self: Select[tuple[J, J, A]], source: type[J], on: Condition
+    ) -> Select[tuple[J | None, J | None, A]]: ...
     @overload
-    def left_join[A, B, J: Table](  # type: ignore[overload-overlap]
-        self: Select[tuple[A, B, J]], source: type[J], on: Condition
-    ) -> Select[tuple[A, B, J | None]]: ...
+    def left_join[A, J: Table](  # type: ignore[overload-overlap]
+        self: Select[tuple[J, A, J]], source: type[J], on: Condition
+    ) -> Select[tuple[J | None, A, J | None]]: ...
     @overload
-    def left_join[A, B, J: Table](  # type: ignore[overload-overlap]
-        self: Select[tuple[A, J, B]], source: type[J], on: Condition
-    ) -> Select[tuple[A, J | None, B]]: ...
+    def left_join[A, J: Table](  # type: ignore[overload-overlap]
+        self: Select[tuple[A, J, J]], source: type[J], on: Condition
+    ) -> Select[tuple[A, J | None, J | None]]: ...
     @overload
     def left_join[J: Table](
         self: Select[tuple[J]], source: type[J], on: Condition
     ) -> Select[tuple[J | None]]: ...
     @overload
-    def left_join[B, J: Table](
-        self: Select[tuple[J, B]], source: type[J], on: Condition
-    ) -> Select[tuple[J | None, B]]: ...
+    def left_join[A, J: Table](  # type: ignore[overload-overlap]
+        self: Select[tuple[J, A]], source: type[J], on: Condition
+    ) -> Select[tuple[J | None, A]]: ...
     @overload
-    def left_join[A, B, J: Table](
+    def left_join[A, J: Table](
+        self: Select[tuple[A, J]], source: type[J], on: Condition
+    ) -> Select[tuple[A, J | None]]: ...
+    @overload
+    def left_join[A, B, J: Table](  # type: ignore[overload-overlap]
         self: Select[tuple[J, A, B]], source: type[J], on: Condition
     ) -> Select[tuple[J | None, A, B]]: ...
+    @overload
+    def left_join[A, B, J: Table](  # type: ignore[overload-overlap]
+        self: Select[tuple[A, J, B]], source: type[J], on: Condition
+    ) -> Select[tuple[A, J | None, B]]: ...
+    @overload
+    def left_join[A, B, J: Table](
+        self: Select[tuple[A, B, J]], source: type[J], on: Condition
+    ) -> Select[tuple[A, B, J | None]]: ...
+    @overload
+    def left_join[A, B, C, J: Table](  # type: ignore[overload-overlap]
+        self: Select[tuple[J, A, B, C]], source: type[J], on: Condition
+    ) -> Select[tuple[J | None, A, B, C]]: ...
+    @overload
+    def left_join[A, B, C, J: Table](  # type: ignore[overload-overlap]
+        self: Select[tuple[A, J, B, C]], source: type[J], on: Condition
+    ) -> Select[tuple[A, J | None, B, C]]: ...
+    @overload
+    def left_join[A, B, C, J: Table](  # type: ignore[overload-overlap]
+        self: Select[tuple[A, B, J, C]], source: type[J], on: Condition
+    ) -> Select[tuple[A, B, J | None, C]]: ...
+    @overload
+    def left_join[A, B, C, J: Table](
+        self: Select[tuple[A, B, C, J]], source: type[J], on: Condition
+    ) -> Select[tuple[A, B, C, J | None]]: ...
     @overload
     def left_join(self, source: Source, on: Condition) -> Self: ...
     def left_join(self, source: Source, on: Condition) -> SelectBase:
         return self._join("LEFT", source, on)
 
     @overload
+    def right_join[J: Table](  # type: ignore[overload-overlap]  # pyright: ignore[reportOverlappingOverload]
+        self: Select[tuple[J, J, J]], source: type[J], on: Condition
+    ) -> Select[tuple[J | None, J | None, J | None]]: ...
+    @overload
+    def right_join[J: Table](  # type: ignore[overload-overlap]  # pyright: ignore[reportOverlappingOverload]
+        self: Select[tuple[J, J]], source: type[J], on: Condition
+    ) -> Select[tuple[J | None, J | None]]: ...
+    @overload
+    def right_join[A, J: Table](  # type: ignore[overload-overlap]
+        self: Select[tuple[J, J, A]], source: type[J], on: Condition
+    ) -> Select[tuple[J | None, J | None, A | None]]: ...
+    @overload
+    def right_join[A, J: Table](  # type: ignore[overload-overlap]
+        self: Select[tuple[J, A, J]], source: type[J], on: Condition
+    ) -> Select[tuple[J | None, A | None, J | None]]: ...
+    @overload
+    def right_join[A, J: Table](  # type: ignore[overload-overlap]
+        self: Select[tuple[A, J, J]], source: type[J], on: Condition
+    ) -> Select[tuple[A | None, J | None, J | None]]: ...
+    @overload
+    def right_join[A, J: Table](  # type: ignore[overload-overlap]
+        self: Select[tuple[J, A]], source: type[J], on: Condition
+    ) -> Select[tuple[J, A | None]]: ...
+    @overload
     def right_join[A, J: Table](
         self: Select[tuple[A, J]], source: type[J], on: Condition
     ) -> Select[tuple[A | None, J]]: ...
     @overload
+    def right_join[A, B, J: Table](  # type: ignore[overload-overlap]
+        self: Select[tuple[J, A, B]], source: type[J], on: Condition
+    ) -> Select[tuple[J, A | None, B | None]]: ...
+    @overload
+    def right_join[A, B, J: Table](  # type: ignore[overload-overlap]
+        self: Select[tuple[A, J, B]], source: type[J], on: Condition
+    ) -> Select[tuple[A | None, J, B | None]]: ...
+    @overload
     def right_join[A, B, J: Table](
         self: Select[tuple[A, B, J]], source: type[J], on: Condition
     ) -> Select[tuple[A | None, B | None, J]]: ...
+    @overload
+    def right_join[A, B, C, J: Table](  # type: ignore[overload-overlap]
+        self: Select[tuple[J, A, B, C]], source: type[J], on: Condition
+    ) -> Select[tuple[J, A | None, B | None, C | None]]: ...
+    @overload
+    def right_join[A, B, C, J: Table](  # type: ignore[overload-overlap]
+        self: Select[tuple[A, J, B, C]], source: type[J], on: Condition
+    ) -> Select[tuple[A | None, J, B | None, C | None]]: ...
+    @overload
+    def right_join[A, B, C, J: Table](  # type: ignore[overload-overlap]
+        self: Select[tuple[A, B, J, C]], source: type[J], on: Condition
+    ) -> Select[tuple[A | None, B | None, J, C | None]]: ...
+    @overload
+    def right_join[A, B, C, J: Table](
+        self: Select[tuple[A, B, C, J]], source: type[J], on: Condition
+    ) -> Select[tuple[A | None, B | None, C | None, J]]: ...
     @overload
     def right_join(self, source: Source, on: Condition) -> Self: ...
     def right_join(self, source: Source, on: Condition) -> SelectBase:
         return self._join("RIGHT", source, on)
 
     @overload
-    def full_join[A, J: Table](
-        self: Select[tuple[A, J]], source: type[J], on: Condition
-    ) -> Select[tuple[A | None, J | None]]: ...
+    def full_join[A](
+        self: Select[tuple[A]], source: Source, on: Condition
+    ) -> Select[tuple[A | None]]: ...
     @overload
-    def full_join[J: Table](
-        self: Select[tuple[J]], source: type[J], on: Condition
-    ) -> Select[tuple[J | None]]: ...
+    def full_join[A, B](
+        self: Select[tuple[A, B]], source: Source, on: Condition
+    ) -> Select[tuple[A | None, B | None]]: ...
     @overload
-    def full_join[A, B, J: Table](
-        self: Select[tuple[A, B, J]], source: type[J], on: Condition
-    ) -> Select[tuple[A | None, B | None, J | None]]: ...
+    def full_join[A, B, C](
+        self: Select[tuple[A, B, C]], source: Source, on: Condition
+    ) -> Select[tuple[A | None, B | None, C | None]]: ...
+    @overload
+    def full_join[A, B, C, D](
+        self: Select[tuple[A, B, C, D]], source: Source, on: Condition
+    ) -> Select[tuple[A | None, B | None, C | None, D | None]]: ...
     @overload
     def full_join(self, source: Source, on: Condition) -> Self: ...
     def full_join(self, source: Source, on: Condition) -> SelectBase:

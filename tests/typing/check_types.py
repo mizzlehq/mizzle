@@ -52,6 +52,19 @@ async def rows(qb: QueryBuilder, user: Users, post: Posts) -> None:
         await qb.select(Users.id, Users, Posts).from_(Users).right_join(Posts, on),
         list[tuple[int | None, Users | None, Posts]],
     )
+    # Q3: right/full join with the joined table first, and 4 slots.
+    assert_type(
+        await qb.select(Posts, Users).from_(Users).right_join(Posts, on),
+        list[tuple[Posts, Users | None]],
+    )
+    assert_type(
+        await qb.select(Posts, Users).from_(Users).full_join(Posts, on),
+        list[tuple[Posts | None, Users | None]],
+    )
+    assert_type(
+        await qb.select(Users, Users.id, Users.email, Posts).from_(Users).left_join(Posts, on),
+        list[tuple[Users, int, str, Posts | None]],
+    )
     assert_type(
         await qb.select({"n": count()}).from_(Users).where(eq(Users.id, 1)),
         list[dict[str, object]],
@@ -210,8 +223,11 @@ async def expressions(qb: QueryBuilder) -> None:
 
     manager = alias(Users, "manager")
     assert_type(manager.id, Column[int])
+    # Q3: manager has Users' type, so either Users slot may be the joined one.
     rows = await qb.select(Users, manager).from_(Users).left_join(manager, eq(manager.id, Users.id))
-    assert_type(rows, list[tuple[Users, Users | None]])
+    assert_type(rows, list[tuple[Users | None, Users | None]])
+    rows = await qb.select(manager, Users).from_(Users).right_join(manager, eq(manager.id, 1))
+    assert_type(rows, list[tuple[Users | None, Users | None]])
 
     union = qb.select(Users.id).from_(Users).union(qb.select(Posts.author_id).from_(Posts))
     assert_type(await union.order_by(Users.id).limit(5), list[tuple[int]])

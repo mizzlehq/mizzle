@@ -256,3 +256,25 @@ async def test_cte_columns_decode_under_snake_case(driver: PostgresDriver, pg_ur
     finally:
         async with driver.acquire() as conn:
             await conn.execute("DROP TABLE qc_camel; DROP TYPE lvl", [])
+
+
+async def test_alias_caches_returning_and_merge(db: Database) -> None:
+    # Q4: each alias() call made a new class, so the decoder/INSERT caches grew per call.
+    # Q6: returning() on an alias gave alias-class rows. Q7: MERGE INTO "boss" (no table).
+    from mizzle import alias
+    from mizzle.core.compiler import _INSERT_SQL  # pyright: ignore[reportPrivateUsage]
+    from mizzle.core.query.base import _ROW_DECODERS  # pyright: ignore[reportPrivateUsage]
+
+    sizes: list[tuple[int, int]] = []
+    for i in range(2):
+        boss = alias(Users, "boss")
+        [row] = await db.insert(boss).values({"email": f"{i}@x"}).returning()
+        assert type(row) is Users
+        await db.select(Users, boss).from_(Users).join(boss, eq(boss.id, Users.id))
+        sizes.append((len(_ROW_DECODERS), len(_INSERT_SQL)))
+    assert sizes[0] == sizes[1]
+    boss = alias(Users, "boss")
+    source = db.select(Users.id).from_(Users).subquery("src")
+    sid = source.c("id", int)
+    merge = db.merge(boss).using(source).on(eq(boss.id, sid)).when_matched_then_delete()
+    assert await merge == 2

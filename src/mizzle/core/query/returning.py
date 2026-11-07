@@ -9,6 +9,7 @@ from mizzle.core.compiler import CompiledQuery
 from mizzle.core.errors import QueryError
 from mizzle.core.query.base import Executable, Row, table_decoder
 from mizzle.core.schema.table import Table
+from mizzle.core.sql.alias import real_table
 from mizzle.core.sql.functions import column_of
 from mizzle.core.sql.nodes import Expr, ExprBase
 
@@ -107,8 +108,8 @@ class Returning[R](Executable[list[R]]):
     def decoder(self) -> Callable[[Row], object]:
         """A function that decodes one result row, built once per statement."""
         projection = self.projection
-        if projection is None:
-            return table_decoder(self.table)
+        if projection is None:  # rows of an alias decode into the real table (Q6)
+            return table_decoder(real_table(self.table))
         slots = tuple(projection.values()) if isinstance(projection, dict) else projection
         parts: list[Callable[[Row], object]] = []
         for index, slot in enumerate(slots):
