@@ -75,6 +75,19 @@ def test_array_elements_may_be_null() -> None:
     assert Model.model_validate_json(out.model_dump_json()).model_dump() == out.model_dump()
 
 
+def test_arrays_may_have_more_dimensions() -> None:
+    # Q6-5: mizzle writes and reads [[1, 2], [3, 4]]; select_model rejected it.
+    class Grid(Table, name="grid"):
+        id = serial().primary_key()
+        cells = array(integer())
+
+    Model = select_model(Grid)
+    out = Model.model_validate({"id": 1, "cells": [[1, 2], [3, None]]})
+    assert out.model_dump()["cells"] == [[1, 2], [3, None]]
+    assert Model.model_validate({"id": 1, "cells": [[[1]], [[None]]]})
+    assert _errors(Model, {"id": 1, "cells": [[1, "x"]]})
+
+
 def test_refine_exclude_and_name() -> None:
     Model = insert_model(
         Posts, refine={"title": pydantic.constr(min_length=3)}, exclude=["meta"], name="NewPost"

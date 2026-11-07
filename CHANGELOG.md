@@ -12,7 +12,13 @@
   guide. A vector column no longer creates the `vector` extension either.
 - `custom("type")` in `mizzle.pg`: a column of any other type (a domain, a composite, a
   range, `citext`, `box`, `app.my_type`...), its DDL type verbatim and its values `str` in
-  the type's text form (sent as text, read as the server prints it, nested rows too).
+  the type's text form (sent as text, read as the server prints it, nested rows too; an
+  array of them as `list[str]`). A select feeding a write (`from_select`, MERGE `using`)
+  or a subquery in a condition keeps the type; `distinct()` orders such a column by its
+  text.
+- A `Decimal` inside a json/jsonb value is written with its exact digits, and a value
+  JSON cannot hold names the reason (`Object of type set is not JSON serializable`).
+- `select_model` accepts multi-dimensional array values.
   `pull` writes every column of a type mizzle has no column type for as `custom(...)`.
 - `mizzle generate --custom` keeps the previous schema snapshot, so a custom migration can
   run before the tables that need what it creates; schema changes go into the next

@@ -2,6 +2,7 @@ import datetime
 import enum
 import ipaddress
 import uuid
+from collections.abc import AsyncGenerator
 from decimal import Decimal
 from typing import Any
 
@@ -285,3 +286,83 @@ async def test_custom_columns_read_and_write_the_types_text(
     finally:
         async with driver.acquire() as conn:
             await conn.execute(_CUS_DROP, [])
+
+
+class CusBox(Table, name="rel_cus_box"):
+    id = serial().primary_key()
+    span = custom("int4range")
+    rects = array(custom("box"))
+
+
+class CusCopy(Table, name="rel_cus_copy"):
+    id = serial().primary_key()
+    span = custom("int4range")
+
+
+@pytest.fixture
+async def cus_db(driver: PostgresDriver, pg_url: str) -> AsyncGenerator[Database]:
+    """Two rows of CusBox (one with a 2-D array) and an empty CusCopy."""
+    drop = "DROP TABLE IF EXISTS rel_cus_box, rel_cus_copy"
+    async with driver.acquire() as conn:
+        await conn.execute(
+            f"{drop}; CREATE TABLE rel_cus_box (id serial PRIMARY KEY, span int4range,"
+            " rects box[]); CREATE TABLE rel_cus_copy (id serial PRIMARY KEY, span int4range)",
+            [],
+        )
+    try:
+        async with await Database.connect(pg_url, schema=[CusBox, CusCopy]) as db:
+            await db.insert(CusBox).values(span="[1,3)", rects=_RECTS)
+            await db.insert(CusBox).values(span="[1,3)", rects=[["(1,1),(0,0)"]])
+            yield db
+    finally:
+        async with driver.acquire() as conn:
+            await conn.execute(drop, [])
+
+
+_RECTS = ["(1,1),(0,0)", "(3,3),(2,2)"]
+
+
+async def test_custom_array_reads_as_text(cus_db: Database) -> None:
+    # Q6-2: an array of custom() values read as asyncpg objects, but as text nested.
+    [ret] = await cus_db.insert(CusBox).values(rects=_RECTS).returning()
+    assert ret.rects == _RECTS
+    rows = await cus_db.select().from_(CusBox).order_by(CusBox.id)
+    assert [r.rects for r in rows] == [_RECTS, [["(1,1),(0,0)"]], _RECTS]
+
+
+async def test_query_root_reads_custom_as_text(cus_db: Database) -> None:
+    # Q6-1: db.query() root rows read custom() columns as asyncpg objects.
+    found = await cus_db.query(CusBox).find_first(order_by=CusBox.id)
+    assert found is not None and (found.span, found.rects) == ("[1,3)", _RECTS)
+    streamed = [r.span async for r in cus_db.query(CusBox).find_many().stream()]
+    assert streamed == ["[1,3)", "[1,3)"]
+
+
+async def test_distinct_orders_custom_by_its_output(cus_db: Database) -> None:
+    # Q6-3: SELECT DISTINCT col::text ... ORDER BY col was refused by PostgreSQL.
+    query = cus_db.select({"s": CusBox.span}).from_(CusBox).distinct()
+    assert await query.order_by(desc(CusBox.span)) == [{"s": "[1,3)"}]
+
+
+async def test_select_feeding_a_write_keeps_the_custom_type(
+    cus_db: Database, driver: PostgresDriver
+) -> None:
+    # Q6-4: the SELECT of an INSERT ... SELECT or a MERGE source read the column as text.
+    source = cus_db.select({"s": CusBox.span}).from_(CusBox)
+    assert await cus_db.insert(CusCopy).from_select([CusCopy.span], source) == 2
+    copied = await cus_db.select({"s": CusCopy.span}).from_(CusCopy)
+    assert copied == [{"s": "[1,3)"}, {"s": "[1,3)"}]
+    # A subquery in an expression compares as the type too.
+    found = await cus_db.select().from_(CusCopy).where(in_(CusCopy.span, source))
+    assert len(found) == 2
+    async with driver.acquire() as conn:
+        [version] = await conn.fetch("SHOW server_version_num", [])
+    if int(str(version[0])) >= 150000:  # MERGE
+        src = cus_db.select({"id": CusBox.id, "s": CusBox.span}).from_(CusBox).subquery("src")
+        merged = await (
+            cus_db.merge(CusCopy)
+            .using(src)
+            .on(eq(CusCopy.id, src.c("id", int)))
+            .when_matched_then_update({"span": src.c("s", str)})
+        )
+        assert merged == 2

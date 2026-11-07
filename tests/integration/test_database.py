@@ -1,6 +1,7 @@
 import asyncio
 import datetime
 import traceback
+from decimal import Decimal
 
 import pytest
 
@@ -142,6 +143,19 @@ async def test_server_data_error_hides_value(db: Database) -> None:
     with pytest.raises(DatabaseError, match="value hidden") as info:
         await db.execute(sql("select {}::text::role", "secret-x"))
     assert "secret-x" not in str(info.value)
+
+
+async def test_jsonb_decimal_keeps_its_digits(db: Database) -> None:
+    # Q6-6: a Decimal works in a jsonb DDL default; a runtime write failed (value hidden).
+    ann = await add_user(db, "ann")
+    meta = {"p": Decimal("1.10"), "q": [Decimal("12345678901234567890.5"), 1.5, "x"]}
+    await db.insert(Posts).values(author_id=ann.id, title="t", meta=meta)
+    rows = await db.execute(sql("select meta->>'p' as p, meta->'q'->>0 as q from posts"))
+    assert rows == [{"p": "1.10", "q": "12345678901234567890.5"}]
+    # A value JSON has no form for: the encoder's reason shows, the value does not.
+    with pytest.raises(DatabaseError, match="set is not JSON serializable") as info:
+        await db.insert(Posts).values(author_id=ann.id, title="t", meta={"s": {"secret"}})
+    assert "secret" not in str(info.value)
 
 
 async def test_bad_param_type_error_hides_value(db: Database) -> None:
