@@ -1549,3 +1549,36 @@ async def test_pull_keeps_index_order_and_collation_and_key_columns(
     assert indexes["ix_d"].get("expression") == "code DESC NULLS LAST, n NULLS FIRST"
     assert indexes["ix_c"].get("expression") == 'code COLLATE "C" text_pattern_ops'
     assert any("INCLUDE" in r.getMessage() for r in caplog.records)
+
+
+async def test_odd_literal_defaults_apply_and_show_no_drift(driver: PostgresDriver) -> None:
+    # C44: DEFAULT inf read as a column name. C45: interval and bytea defaults were refused.
+    import datetime
+    from decimal import Decimal
+
+    from mizzle.pg import bytea, double_precision, interval, numeric
+
+    @final
+    class Odd(Table, name="odd", schema="mg"):
+        id = integer().primary_key()
+        hi = double_precision().default(float("inf"))
+        lo = double_precision().default(float("-inf"))
+        nan = double_precision().default(float("nan"))
+        big = numeric().default(Decimal("Infinity"))
+        day = interval().default(datetime.timedelta(days=1))
+        back = interval().default(datetime.timedelta(days=-1, hours=1, microseconds=500))
+        zero = interval().default(datetime.timedelta())
+        raw = bytea().default(b"\x00\xff")
+
+    desired = snap([Odd])
+    await migrate(driver, empty_snapshot("postgresql"), desired)
+    [row] = await execute(driver, "INSERT INTO mg.odd (id) VALUES (1) RETURNING *")
+    assert row["hi"] == float("inf") and row["lo"] == float("-inf") and row["nan"] != row["nan"]
+    assert row["big"] == Decimal("Infinity")
+    assert row["day"] == datetime.timedelta(days=1)
+    assert row["back"] == datetime.timedelta(days=-1, hours=1, microseconds=500)
+    assert row["zero"] == datetime.timedelta() and row["raw"] == b"\x00\xff"
+    async with driver.acquire() as conn:
+        current = await dialect.introspect(conn, SCHEMAS)
+        expected = await dialect.normalize_snapshot(conn, desired)
+    assert diff(current, expected, normalized=True) == []

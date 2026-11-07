@@ -109,11 +109,11 @@ class Cte(Node):
                     return None if node is None else column_of(node)
                 for expr_node in projection:
                     column = column_of(expr_node)
-                    if column is not None and name in (column.attr, column.db_name()):
+                    if column is not None and name in _output_names(column):
                         return column
                 return None
-            for attr, column in query.table.__table__.columns.items():
-                if name in (attr, column.db_name()):
+            for column in query.table.__table__.columns.values():
+                if name in _output_names(column):
                     return column
             return None
         if isinstance(query.projection, dict):
@@ -125,11 +125,17 @@ class Cte(Node):
             else:
                 columns = (slot,)
             for item in columns:
-                if isinstance(item, ColumnBase) and name in (item.attr, item.db_name()):
+                if isinstance(item, ColumnBase) and name in _output_names(item):
                     return item
                 if isinstance(item, CteColumn) and item.name == name:
                     return column_of(item)
         return None
+
+
+def _output_names(column: ColumnBase) -> tuple[str, ...]:
+    """The names a column may have in a CTE's output: ``snake_case`` casing renames
+    ``userRole`` to ``user_role`` (C40)."""
+    return (column.attr, column.db_name(), column.db_name("snake_case"))
 
 
 def _hint_types(hint: object) -> list[type[object]] | None:

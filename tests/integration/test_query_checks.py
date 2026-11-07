@@ -207,3 +207,52 @@ async def test_container_operators_on_enum_arrays_and_ranges(
     finally:
         async with driver.acquire() as conn:
             await conn.execute("DROP SCHEMA qc_app CASCADE", [])
+
+
+async def test_writes_through_an_alias_and_union_order_by_a_dict_key(db: Database) -> None:
+    # C41: UPDATE/DELETE/INSERT on an alias wrote UPDATE "boss": relation does not exist.
+    # C42: a UNION of dict projections ordered by a column wrote ORDER BY "email".
+    from mizzle import alias, desc, lower
+
+    boss = alias(Users, "boss")
+    await db.insert(boss).values({"email": "b@x"})
+    await db.insert(Users).values({"email": "a@x"})
+    await db.update(boss).set({"bio": "hi"}).where(eq(boss.email, "b@x"))
+    assert await db.select(Users.bio).from_(Users).where(eq(Users.email, "b@x")) == [("hi",)]
+    left = db.select({"mail": Users.email}).from_(Users)
+    right = db.select({"mail": Users.email}).from_(Users)
+    rows = await left.union(right).order_by(desc(Users.email))
+    assert rows == [{"mail": "b@x"}, {"mail": "a@x"}]
+    rows = await left.union(right).order_by(lower(Users.email))
+    assert rows == [{"mail": "a@x"}, {"mail": "b@x"}]
+    await db.delete(boss).where(eq(boss.email, "b@x"))
+    assert await db.select(Users.email).from_(Users) == [("a@x",)]
+
+
+class Camel(Table, name="qc_camel"):
+    id = serial().primary_key()
+    userLevel = pg_enum(Lvl)  # camelCase on purpose: snake_case casing
+
+
+async def test_cte_columns_decode_under_snake_case(driver: PostgresDriver, pg_url: str) -> None:
+    # C40: with casing="snake_case" the CTE column user_level was not traced back to
+    # userLevel, so it came back as the label '2', not Lvl.HIGH.
+    async with driver.acquire() as conn:
+        await conn.execute(
+            "DROP TABLE IF EXISTS qc_camel; DROP TYPE IF EXISTS lvl; "
+            "CREATE TYPE lvl AS ENUM ('1', '2'); "
+            "CREATE TABLE qc_camel (id serial PRIMARY KEY, user_level lvl)",
+            [],
+        )
+    try:
+        async with await Database.connect(
+            pg_url, schema=[Camel], pool_size=1, casing="snake_case"
+        ) as db:
+            await db.insert(Camel).values({"userLevel": Lvl.HIGH})
+            c = db.select(Camel.id, Camel.userLevel).from_(Camel).cte("c")
+            assert await db.with_(c).select(c.c("user_level", Lvl)).from_(c) == [(Lvl.HIGH,)]
+            r = db.insert(Camel).values({"userLevel": Lvl.LOW}).returning().cte("r")
+            assert await db.with_(r).select(r.c("user_level", Lvl)).from_(r) == [(Lvl.LOW,)]
+    finally:
+        async with driver.acquire() as conn:
+            await conn.execute("DROP TABLE qc_camel; DROP TYPE lvl", [])

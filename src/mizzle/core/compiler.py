@@ -8,6 +8,7 @@ from __future__ import annotations
 import datetime
 import enum
 import json
+import math
 import uuid
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
@@ -116,6 +117,20 @@ class CompiledQuery:
         )
 
 
+def _interval_text(value: datetime.timedelta) -> str:
+    """``1 day 01:00:00``, ``-1 days +23:00:00``: PostgreSQL's own interval output."""
+    parts: list[str] = []
+    if value.days:
+        parts.append(f"{value.days} day" + ("" if value.days == 1 else "s"))
+    if value.seconds or value.microseconds or not parts:
+        hours, rest = divmod(value.seconds, 3600)
+        clock = f"{hours:02d}:{rest // 60:02d}:{rest % 60:02d}"
+        if value.microseconds:
+            clock += f".{value.microseconds:06d}".rstrip("0")
+        parts.append(("+" if value.days < 0 else "") + clock)
+    return " ".join(parts)
+
+
 def _plain_column(item: Node) -> bool:
     expr = item.expr if isinstance(item, OrderBy) else item
     return isinstance(expr, ColumnBase | CteColumn)
@@ -180,6 +195,8 @@ class Compiler:
         self._context = None
         self._scopes = []
         self._alias_count = 0
+        # id(column) -> its output name, while a UNION's ORDER BY renders (C42).
+        self._output_names: dict[int, str] = {}
 
     def compile(self, node: Node) -> CompiledQuery:
         self._params, self._placeholders, self._raw, self._locking = [], [], False, False
@@ -244,8 +261,20 @@ class Compiler:
                 # Quoted, so an IntEnum default on an enum column is its label '1' (B49); an
                 # untyped quoted literal still coerces to a number column.
                 return self.literal(str(cast(object, value.value)))
+            case float() if not math.isfinite(value):  # inf is a column name (C44)
+                return (
+                    "'NaN'" if math.isnan(value) else ("'-Infinity'" if value < 0 else "'Infinity'")
+                )
+            case Decimal() if not value.is_finite():
+                if value.is_snan():
+                    raise QueryError("cannot write a signaling NaN as an SQL literal")
+                return "'NaN'" if value.is_nan() else ("'-Infinity'" if value < 0 else "'Infinity'")
             case int() | float() | Decimal():
                 return str(value)
+            case datetime.timedelta():  # as PostgreSQL prints it, so defaults compare (C45)
+                return self.literal(_interval_text(value)) + "::interval"
+            case bytes():
+                return self.literal("\\x" + value.hex()) + "::bytea"
             case str():
                 return "'" + value.replace("'", "''") + "'"
             case datetime.date() | datetime.time() | uuid.UUID():
@@ -304,7 +333,8 @@ class Compiler:
         if node.table is None:
             raise QueryError(f"column {node.attr!r} is not attached to a table")
         if not self.qualify_columns:
-            return self.column_name(node)
+            name = self._output_names.get(id(node))
+            return self.column_name(node) if name is None else self.quote(name)
         for scope in reversed(self._scopes):
             if node.table in scope:
                 return f"{self.quote(scope[node.table])}.{self.column_name(node)}"
@@ -526,12 +556,22 @@ class Compiler:
             # expression of them needs the combined rows as a subquery.
             parts = ["SELECT * FROM (" + parts[0] + ') AS "_combined"']
         if node.order_by_:
-            # The combined result has only its output columns: refer to them by name.
+            # The combined result has only its output columns: refer to them by name. A
+            # column selected under a dict key is named by that key (C42).
+            from mizzle.core.query.select import CompoundBase  # import cycle at module level
+
+            first: SelectBase | CompoundBase = node
+            while isinstance(first, CompoundBase):
+                first = first.left
+            names = first.projection if isinstance(first.projection, dict) else {}
+            outputs = {id(e): key for key, e in names.items() if isinstance(e, ColumnBase)}
             qualify, self.qualify_columns = self.qualify_columns, False
+            saved, self._output_names = self._output_names, outputs
             try:
                 parts.append("ORDER BY " + ", ".join(self.visit(e) for e in node.order_by_))
             finally:
                 self.qualify_columns = qualify
+                self._output_names = saved
         if node.limit_ is not None:
             parts.append(f"LIMIT {self.count_value(node.limit_)}")
         if node.offset_ is not None:
@@ -552,10 +592,12 @@ class Compiler:
     def _select_text(self, node: SelectBase) -> str:
         # A nested SELECT (e.g. EXISTS in a UNION's ORDER BY) names its own tables again.
         qualify, self.qualify_columns = self.qualify_columns, self._qualify_default
+        saved, self._output_names = self._output_names, {}
         try:
             return self._select_body(node)
         finally:
             self.qualify_columns = qualify
+            self._output_names = saved
 
     def _note_write(self) -> None:
         """Mark the statement as a write; a subclass visitor (MERGE) calls this."""
@@ -719,9 +761,7 @@ class Compiler:
             )
         names = ", ".join(self.column_name(c) for c in node.source_columns)
         overriding = f" OVERRIDING {node.overriding} VALUE" if node.overriding else ""
-        text = (
-            f"INSERT INTO {self.table_name(node.table)} ({names}){overriding} {self.visit(source)}"
-        )
+        text = f"INSERT INTO {self.source(node.table)} ({names}){overriding} {self.visit(source)}"
         if node.conflict is not None:
             text += " " + self.on_conflict_clause(node.table, node.conflict)
         return text
@@ -729,7 +769,7 @@ class Compiler:
     def _insert_text(self, node: Insert[Table]) -> str:
         columns = node.table.__table__.columns
         used = [attr for attr in columns if any(attr in row for row in node.rows)]
-        head = f"INSERT INTO {self.table_name(node.table)}"
+        head = f"INSERT INTO {self.source(node.table)}"
         if not used and len(node.rows) == 1:
             text = f"{head} DEFAULT VALUES"
         else:
@@ -773,7 +813,7 @@ class Compiler:
             raise QueryError(f"update({node.table.__name__}) needs .set(...)")
         self._require_filter(node, "update")
         prefix = self._with_ctes(node.ctes)
-        text = f"UPDATE {self.table_name(node.table)} SET {self.set_list(node.table, node.values_)}"
+        text = f"UPDATE {self.source(node.table)} SET {self.set_list(node.table, node.values_)}"
         if node.from_sources:
             text += " FROM " + ", ".join(self.source(t) for t in node.from_sources)
         if node.where_ is not None:
@@ -784,7 +824,7 @@ class Compiler:
         self._writes = True
         self._require_filter(node, "delete")
         prefix = self._with_ctes(node.ctes)
-        text = f"DELETE FROM {self.table_name(node.table)}"
+        text = f"DELETE FROM {self.source(node.table)}"
         if node.using_:
             text += " USING " + ", ".join(self.source(t) for t in node.using_)
         if node.where_ is not None:
