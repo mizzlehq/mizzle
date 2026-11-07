@@ -6,11 +6,30 @@ from collections.abc import AsyncGenerator
 
 import pytest
 
-from mizzle import Database, eq, jsonb_build_object, placeholder
+from mizzle import Database, eq, jsonb_build_object, many, one, placeholder
 from mizzle.core.schema.table import Table
-from mizzle.core.schema.types import text
+from mizzle.core.schema.types import integer, text
 from mizzle.dialects.postgres.driver import PostgresDriver
-from mizzle.dialects.postgres.types import array, pg_enum, serial
+from mizzle.dialects.postgres.types import (
+    array,
+    box,
+    cidr,
+    circle,
+    daterange,
+    hstore,
+    int4multirange,
+    int4range,
+    line,
+    lseg,
+    numrange,
+    path,
+    pg_enum,
+    point,
+    polygon,
+    serial,
+    tstzrange,
+    varbit,
+)
 from tests.models import Users
 
 
@@ -89,3 +108,61 @@ async def test_array_functions_decode_enum_elements(things: Database) -> None:
         assert appended == [Lvl.LOW, Lvl.HIGH, Lvl.LOW]
         assert joined == [Lvl.LOW, Lvl.HIGH, Lvl.LOW, Lvl.HIGH]
         assert removed == [Lvl.HIGH]
+
+
+class Nest(Table, name="qc_nest"):
+    id = serial().primary_key()
+    kids = many(lambda: NestKid)
+
+
+class NestKid(Table, name="qc_nest_kid"):
+    id = serial().primary_key()
+    nest_id = integer().not_null().references(lambda: Nest.id)
+    ir = int4range()
+    nr = numrange()
+    tz = tstzrange()
+    dr = daterange()
+    mr = int4multirange()
+    net = cidr()
+    pt = point()
+    bx = box()
+    ln = line()
+    ls = lseg()
+    pa = path()
+    pg = polygon()
+    ci = circle()
+    bits = varbit()
+    hs = hstore()
+    nest = one(lambda: Nest, fields=lambda: [NestKid.nest_id], references=lambda: [Nest.id])
+
+
+async def test_nested_rows_decode_like_plain_rows(driver: PostgresDriver, pg_url: str) -> None:
+    # C30: in a nested (relational) row these came back as str (hstore as dict), while a
+    # plain select gives Range, IPv4Network, Point, BitString...
+    async with driver.acquire() as conn:
+        await conn.execute(
+            "CREATE EXTENSION IF NOT EXISTS hstore; "
+            "DROP TABLE IF EXISTS qc_nest_kid, qc_nest; "
+            "CREATE TABLE qc_nest (id serial PRIMARY KEY); "
+            "CREATE TABLE qc_nest_kid (id serial PRIMARY KEY, "
+            "nest_id int NOT NULL REFERENCES qc_nest, ir int4range, nr numrange, "
+            "tz tstzrange, dr daterange, mr int4multirange, net cidr, pt point, bx box, "
+            "ln line, ls lseg, pa path, pg polygon, ci circle, bits varbit, hs hstore); "
+            "INSERT INTO qc_nest DEFAULT VALUES; "
+            "INSERT INTO qc_nest_kid (nest_id, ir, nr, tz, dr, mr, net, pt, bx, ln, ls, pa, "
+            "pg, ci, bits, hs) VALUES (1, '[1,5)', '(1.25,2.5]', "
+            "'[2026-01-01 10:00+00,)', 'empty', '{[1,3),[5,7)}', '10.0.0.0/8', '(1.5,2)', "
+            "'(3,4),(1,2)', '{1,2,3}', '[(1,2),(3,4)]', '[(0,0),(1,1)]', "
+            "'((0,0),(1,0),(1,1))', '<(1,2),3>', B'0101', 'a=>1'), "
+            "(1, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, "
+            "NULL, NULL, NULL)",
+            [],
+        )
+    try:
+        async with await Database.connect(pg_url, schema=[Nest, NestKid], pool_size=2) as db:
+            plain = await db.query(NestKid).find_many(order_by=NestKid.id)
+            [parent] = await db.query(Nest).find_many(with_={"kids": True})
+            assert parent.kids == plain
+    finally:
+        async with driver.acquire() as conn:
+            await conn.execute("DROP TABLE qc_nest_kid, qc_nest", [])

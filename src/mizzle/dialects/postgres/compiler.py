@@ -22,6 +22,21 @@ if TYPE_CHECKING:
 MAX_PARAMS = 32767  # PostgreSQL wire protocol limit on bind parameters per statement
 
 
+_RANGES = frozenset({"int4range", "int8range", "numrange", "tsrange", "tstzrange", "daterange"})
+_AS_TEXT = frozenset(
+    {"cidr", "bit", "varbit", "point", "line", "lseg", "box", "path", "polygon", "circle", "hstore"}
+)
+
+
+def _range_parts(ref: str) -> str:
+    """A range as [lower, upper, lower_inc, upper_inc, empty]; the bounds as text, so a
+    numeric or timestamp bound is exact (C30)."""
+    return (
+        f"json_build_array(lower({ref})::text, upper({ref})::text, lower_inc({ref}), "
+        f"upper_inc({ref}), isempty({ref}))"
+    )
+
+
 class PostgresCompiler(Compiler):
     @override
     def param_marker(self, index: int, /) -> str:
@@ -121,6 +136,19 @@ class PostgresCompiler(Compiler):
                 f"ARRAY(SELECT {item} FROM unnest({ref}) WITH ORDINALITY AS x(v, n) ORDER BY x.n)"
             )
             return f"CASE WHEN {ref} IS NULL THEN NULL ELSE {elements} END"
+        base = column.sql_type.split("(", 1)[0]
+        if base in _RANGES:
+            return f"CASE WHEN {ref} IS NULL THEN NULL ELSE {_range_parts(ref)} END"
+        if base.endswith("multirange"):
+            parts = _range_parts("r.v")
+            return (
+                f"CASE WHEN {ref} IS NULL THEN NULL "
+                f"ELSE ARRAY(SELECT {parts} FROM unnest({ref}) AS r(v)) END"
+            )
+        if base in _AS_TEXT:
+            # JSON has no form for these (or, for hstore, one a plain select does not
+            # return): send the text, which the column's json_decoder parses (C30).
+            return f"{ref}::text"
         kind = column.accepts[0] if column.accepts else None
         if kind is float:
             # JSON prints floats per extra_float_digits (0 rounds to 15 digits) and float4 in

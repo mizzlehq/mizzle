@@ -79,6 +79,9 @@ class ColumnBase(ExprBase):
     enum: type[enum.Enum] | None
     enum_schema: str | None  # the enum type's schema; None: the default one
     item: ColumnBase | None
+    # Turns the JSON a relational query nests this column as back into its Python value,
+    # for types JSON cannot carry (ranges, geometry, cidr, bit strings).
+    json_decoder: Callable[[object], object] | None
     is_primary_key: bool
     is_unique: bool
     unique_name: str | None
@@ -121,6 +124,7 @@ class ColumnBase(ExprBase):
         self.enum = None
         self.enum_schema = None
         self.item = None  # element column of an array
+        self.json_decoder = None
         self.is_primary_key = False
         self.is_unique = False
         self.unique_name = None

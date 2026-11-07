@@ -136,6 +136,8 @@ def _from_json(column: ColumnBase, value: Json) -> object:
         if not isinstance(value, list):
             raise QueryError(f"{column.qualified_name}: expected a JSON array, got {value!r}")
         return [_from_json(column.item, v) for v in value]
+    if column.json_decoder is not None:  # a range, geometry, cidr, bit string (C30)
+        return column.json_decoder(value)
     kind = column.accepts[0] if column.accepts else None
     if kind is None or kind in (int, str, bool) or column.enum is not None:
         return value
@@ -182,7 +184,7 @@ def _json_converter(column: ColumnBase) -> Converter | None:
     """What turns a non-NULL JSON value into the column's Python value (None: keep it)."""
     kind = column.accepts[0] if column.accepts else None
     plain = kind is None or kind in (int, str, bool) or column.enum is not None
-    if column.item is None and plain:
+    if column.item is None and plain and column.json_decoder is None:
         return column.decoder  # JSON already has the right type; enums still convert
     return lambda value: column.decode(_from_json(column, cast(Json, value)))
 
