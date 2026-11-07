@@ -54,7 +54,7 @@ from starlette.types import ASGIApp
 
 from mizzle.core.errors import DatabaseError, MigrationError, MizzleError
 from mizzle.core.query.base import Row
-from mizzle.core.snapshot import ColumnSnap, Snapshot, TableSnap, key
+from mizzle.core.snapshot import ColumnSnap, EnumSnap, TableSnap
 from mizzle.dialects.base import Connection, Dialect, Driver
 from mizzle.dialects.postgres.ddl import SERIAL_TYPES, quote
 from mizzle.kit.config import Config
@@ -192,11 +192,14 @@ class Studio:
     schemas: list[str]
     read_only: bool
     driver: Driver | None = None
-    snapshot: Snapshot | None = field(default=None)
-    # "schema.table" -> column -> the type it behaves as (domains resolved by the server)
-    bases: dict[str, dict[str, str]] = field(default_factory=dict)
-    # "schema.table" -> its composite columns (and arrays of them): read-only in the grid
-    composites: dict[str, list[str]] = field(default_factory=dict)
+    # (schema, name) -> table. Not the snapshot's "schema.name" key: public."x.y" and
+    # "public.x".y share it, and one table's rows were read and deleted for the other (S6-1).
+    tables: dict[tuple[str, str], TableSnap] | None = None
+    enums: dict[str, EnumSnap] = field(default_factory=dict)
+    # (schema, table) -> column -> the type it behaves as (domains resolved by the server)
+    bases: dict[tuple[str, str], dict[str, str]] = field(default_factory=dict)
+    # (schema, table) -> its composite columns (and arrays of them): read-only in the grid
+    composites: dict[tuple[str, str], list[str]] = field(default_factory=dict)
     history: list[dict[str, object]] = field(default_factory=list)
     saved: dict[str, str] = field(default_factory=dict)
     state_path: Path | None = None
@@ -206,18 +209,23 @@ class Studio:
             raise StudioError("not connected", 503)
         return self.driver
 
-    async def load_snapshot(self, refresh: bool = False) -> Snapshot:
-        if self.snapshot is None or refresh:
+    async def load_snapshot(self, refresh: bool = False) -> dict[tuple[str, str], TableSnap]:
+        if self.tables is None or refresh:
             async with self.pool().acquire() as conn:
-                self.snapshot = await self.dialect.introspect(conn, self.schemas)
+                # One schema at a time: within one, the "schema.name" key cannot collide.
+                snapshots = [await self.dialect.introspect(conn, [s]) for s in self.schemas]
                 rows = await conn.fetch_dicts(_BASE_TYPES, [self.schemas])
+            self.tables = {
+                (t["schema"], t["name"]): t for s in snapshots for t in s["tables"].values()
+            }
+            self.enums = {k: e for s in snapshots for k, e in s["enums"].items()}
             self.bases, self.composites = {}, {}
             for row in rows:
-                k, column = key(str(row["schema"]), str(row["table"])), str(row["name"])
+                k, column = (str(row["schema"]), str(row["table"])), str(row["name"])
                 self.bases.setdefault(k, {})[column] = str(row["base"])
                 if row["composite"]:
                     self.composites.setdefault(k, []).append(column)
-        return self.snapshot
+        return self.tables
 
     async def table(
         self, schema: str, name: str, *, fresh: bool = False
@@ -225,14 +233,12 @@ class Studio:
         """The table and each column's base type (``_BASE_TYPES``). ``fresh`` re-reads the
         schema: a write built from a stale snapshot matched rows by a dropped key and cast
         values to a column's old type (S4-3)."""
-        snapshot = await self.load_snapshot(refresh=fresh)
-        table = snapshot["tables"].get(key(schema, name))
+        k = (schema, name)
+        table = (await self.load_snapshot(refresh=fresh)).get(k)
         if table is None and not fresh:
-            snapshot = await self.load_snapshot(refresh=True)
-            table = snapshot["tables"].get(key(schema, name))
+            table = (await self.load_snapshot(refresh=True)).get(k)
         if table is None:
             raise StudioError(f"unknown table {schema}.{name}", 404)
-        k = key(schema, name)
         return table, {
             c: self.bases.get(k, {}).get(c, t["type"]) for c, t in table["columns"].items()
         }
@@ -244,13 +250,13 @@ class Studio:
         table, base = await self.table(schema, name)
         async with self.pool().acquire() as conn:
             rows = await conn.fetch_dicts(_BASE_TYPES + " AND c.relname = $2", [[schema], name])
-        if {str(r["name"]): str(r["base"]) for r in rows} != self.bases.get(key(schema, name), {}):
+        if {str(r["name"]): str(r["base"]) for r in rows} != self.bases.get((schema, name), {}):
             return await self.table(schema, name, fresh=True)
         return table, base
 
     def read_only_columns(self, table: TableSnap) -> list[str]:
         """Composite columns: the grid shows them, but does not write them (S5-2)."""
-        composites = self.composites.get(key(table["schema"], table["name"]), [])
+        composites = self.composites.get((table["schema"], table["name"]), [])
         return [c for c in table["columns"] if c in composites]
 
     # -- query history and saved queries ----------------------------------------------
@@ -580,19 +586,31 @@ _ROW = "to_jsonb(t.*)::text"
 # doubles lost digits (1.50 -> 1.5) and turned big numbers inside JSON into strings, which
 # an edit then wrote back (S1, S3).
 _EXACT_TEXT = re.compile(r"(?:jsonb?|numeric)(?:\([^)]*\))?(?:\[\])*")
+_FLOAT = re.compile(r"(?:real|double precision)(?:\[\])*")
 # jsonb_build_object takes at most 100 arguments: 50 columns per call.
 _PAIRS = 50
 
 
 def _row_sql(base: Mapping[str, str]) -> str:
     """``_ROW`` with the json, jsonb and numeric columns (and arrays of them, and domains
-    over them: S4-5) as text."""
-    names = [name for name, t in base.items() if _EXACT_TEXT.fullmatch(t)]
-    if not names:
+    over them: S4-5) as text. So are the values to_jsonb changes: an array whose bounds do
+    not start at 1 ("[0:1]={5,6}" became [5, 6]) and a float's -0 (became 0), which saving
+    the cell unchanged then wrote back (S6-4)."""
+    pairs: list[str] = []
+    for name, t in base.items():
+        label, ref = "'" + name.replace("'", "''") + "'", f"t.{quote(name)}::text"
+        if _EXACT_TEXT.fullmatch(t):
+            pairs.append(f"{label}, {ref}")
+        elif t.endswith("[]") or _FLOAT.fullmatch(t):
+            changed = [f"{ref} LIKE '[%'"] if t.endswith("[]") else []
+            if _FLOAT.fullmatch(t):
+                changed.append(f"{ref} ~ '(^|[{{,])-0($|[,}}])'")
+            pairs.append(f"{label}, CASE WHEN {' OR '.join(changed)} THEN {ref} END")
+    if not pairs:
         return _ROW
-    pairs = ["'" + n.replace("'", "''") + f"', t.{quote(n)}::text" for n in names]
+    # A NULL here is stripped, leaving to_jsonb's own value (NULL, or the plain array).
     parts = [
-        "jsonb_build_object(" + ", ".join(pairs[i : i + _PAIRS]) + ")"
+        "jsonb_strip_nulls(jsonb_build_object(" + ", ".join(pairs[i : i + _PAIRS]) + "))"
         for i in range(0, len(pairs), _PAIRS)
     ]
     return "(" + " || ".join(["to_jsonb(t.*)", *parts]) + ")::text"
@@ -651,27 +669,27 @@ async def meta(studio: Studio, _request: Request) -> Response:
 
 
 async def tables(studio: Studio, _request: Request) -> Response:
-    snapshot = await studio.load_snapshot(refresh=True)
+    loaded = await studio.load_snapshot(refresh=True)
     # S4-9: which columns the grid may offer to sort by.
     listed: list[dict[str, object]] = []
-    for t in snapshot["tables"].values():
+    for t in loaded.values():
         _, base = await studio.table(t["schema"], t["name"])
         listed.append(
             {**t, "unsortable": _unsortable(base), "read_only": studio.read_only_columns(t)}
         )
-    return JSONResponse({"tables": listed, "enums": snapshot["enums"]})
+    return JSONResponse({"tables": listed, "enums": studio.enums})
 
 
 async def relationships(studio: Studio, _request: Request) -> Response:
     """Nodes and foreign-key edges for the ER diagram: enough to draw the schema without
     shipping the full snapshots."""
-    snapshot = await studio.load_snapshot(refresh=True)
+    loaded = await studio.load_snapshot(refresh=True)
     nodes = [
         {"schema": t["schema"], "name": t["name"], "columns": list(t["columns"])}
-        for t in snapshot["tables"].values()
+        for t in loaded.values()
     ]
     edges: list[dict[str, object]] = []
-    for table in snapshot["tables"].values():
+    for table in loaded.values():
         for fk in table["foreign_keys"].values():
             edges.append(
                 {
@@ -819,7 +837,9 @@ async def insert_row(studio: Studio, request: Request) -> Response:
     _writable(studio)
     table, base = await _table(studio, request, fresh=True)
     values = _object((await _body(request)).get("values", {}), "values")
-    _reject_composites(studio, table, values)
+    # S6-3: a new row may give a composite column as its text ("(1,2)"), cast by the server:
+    # a NOT NULL one could not be added at all.
+    _reject_composites(studio, table, values, text_ok=True)
     params: list[object] = []
     target = f"{_relation(table)} AS t"
     if values:
@@ -866,9 +886,13 @@ async def update_row(studio: Studio, request: Request) -> Response:
     return JSONResponse({"row": _row_json(cast(str, rows[0][0]))})
 
 
-def _reject_composites(studio: Studio, table: TableSnap, values: Mapping[str, object]) -> None:
-    if composite := [c for c in studio.read_only_columns(table) if c in values]:
-        raise StudioError(f"{composite[0]} is a composite column: change it with SQL")
+def _reject_composites(
+    studio: Studio, table: TableSnap, values: Mapping[str, object], *, text_ok: bool = False
+) -> None:
+    for c in studio.read_only_columns(table):
+        if c in values and not (text_ok and (values[c] is None or isinstance(values[c], str))):
+            hint = "give it as text, e.g. (1,2)" if text_ok else "change it with SQL"
+            raise StudioError(f"{c} is a composite column: {hint}")
 
 
 def _one_row(count: int) -> None:
@@ -1021,7 +1045,7 @@ async def run_sql(studio: Studio, request: Request) -> Response:
                     if any(_TX_CONTROL.match(s[first_token(s) :]) for s in statements):
                         await conn.execute("ROLLBACK", [])
                     # S4-3: the batch may have changed the schema.
-                    studio.snapshot = None
+                    studio.tables = None
     except MizzleError:
         studio.record_history(text, ok=False)
         raise
@@ -1052,11 +1076,9 @@ async def _current_table(studio: Studio, data: dict[str, object]) -> TableSnap |
     name = data.get(field)
     if not isinstance(schema, str) or not isinstance(name, str):
         return None
-    snapshot = await studio.load_snapshot()
-    current = snapshot["tables"].get(key(schema, name))
+    current = (await studio.load_snapshot()).get((schema, name))
     if current is None:
-        snapshot = await studio.load_snapshot(refresh=True)
-        current = snapshot["tables"].get(key(schema, name))
+        current = (await studio.load_snapshot(refresh=True)).get((schema, name))
     return current
 
 
@@ -1091,8 +1113,14 @@ async def ddl_apply(studio: Studio, request: Request) -> Response:
     statements = studio.dialect.render(steps)
     async with studio.pool().acquire() as conn:
         # S5-1: the rendered DDL leaves public names bare (as the migration kit does), so
-        # resolve them in public only, never in a "$user" schema or pg_temp first.
-        await conn.execute("SET search_path TO public, pg_temp", [])
+        # resolve them in public first, never in a "$user" schema or pg_temp. The rest of the
+        # role's path stays: an extension's function or an app schema's type is found by it
+        # (S6-2).
+        await conn.execute(
+            "SELECT set_config('search_path', concat_ws(', ', 'public', 'pg_temp', "
+            "nullif(current_setting('search_path'), '')), false)",
+            [],
+        )
         try:
             await apply_statements(conn, statements)
         finally:

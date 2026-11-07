@@ -13,7 +13,7 @@ function cardHeight(node: DiagramNode): number {
   return HEADER_H + node.columns.length * LINE_H + PAD
 }
 
-const nodeKey = (schema: string, name: string) => `${schema}.${name}`
+const nodeKey = (schema: string, name: string) => JSON.stringify([schema, name])
 
 /** A read-only map of the schema: one card per table, an arrow per foreign key. */
 export function RelationshipDiagram() {

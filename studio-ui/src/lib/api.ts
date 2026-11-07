@@ -226,7 +226,8 @@ export const api = {
     request<{ deleted: string }>("DELETE", `/api/queries/saved/${encodeURIComponent(name)}`),
 }
 
-export const tableKey = (t: TableInfo) => `${t.schema}.${t.name}`
+// S6-1: not "schema.name": public."x.y" and "public.x".y would share it.
+export const tableKey = (t: TableInfo) => JSON.stringify([t.schema, t.name])
 
 export function formatValue(value: unknown): string {
   if (value === null || value === undefined) return "NULL"
@@ -256,7 +257,13 @@ export function toDbText(column: Column, text: string): string {
   if (column.type.endsWith("[]")) {
     const trimmed = text.trim()
     if (trimmed.startsWith("[")) {
-      const parsed: unknown = JSON.parse(trimmed)
+      // Not JSON: the array's own text, "[0:1]={5,6}" with its bounds (S6-4).
+      let parsed: unknown
+      try {
+        parsed = JSON.parse(trimmed)
+      } catch {
+        return text
+      }
       if (Array.isArray(parsed)) return pgArrayLiteral(parsed)
     }
   }

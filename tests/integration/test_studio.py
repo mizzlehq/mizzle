@@ -35,6 +35,7 @@ def make_client(
     state_path: Path | None = None,
     basic_auth: tuple[str, str] | None = None,
     address: str = "testclient",
+    schemas: tuple[str, ...] = ("public",),
 ) -> TestClient:
     kwargs: dict[str, Any] = {}
     if static is not None:
@@ -46,7 +47,7 @@ def make_client(
     app = create_app(
         dialect=PostgresDialect(),
         url=pg_url,
-        schemas=["public"],
+        schemas=list(schemas),
         token=TOKEN,
         allowed_hosts={"testserver"},
         read_only=read_only,
@@ -138,8 +139,8 @@ _LEFTOVERS = (
     "drop table if exists st_notes, st_csv, st_types, st_num, st_dom, st_mod, st_many, st_json,"
     ' st_neg, "st/a", st_sdom, st_bad, st_head, st_tie, st_skip, st_domt, st_ck, st_tx, st_log,'
     " st_stale, st_kid, st_parent, st_part, st_sort, st_uskip, st_items, st_iv, st_sread,"
-    ' st_call, "st\nnl" cascade;'
-    ' drop sequence if exists st_seq; drop schema if exists "date" cascade;'
+    ' st_call, "st\nnl", "st_k.y", st_cins, st_rt cascade;'
+    ' drop sequence if exists st_seq; drop schema if exists "date", "public.st_k", st_app cascade;'
     ' drop domain if exists st_amt2, st_amt, st_span, st_basedom, "St Base Dom", st_dpair,'
     " st_dj, interval_st_label; drop type if exists st_pair, interval_st_unit;"
     " drop function if exists st_skip_fn(), st_logit(int), st_uskip_fn();"
@@ -1710,3 +1711,96 @@ def test_a_newline_in_a_table_name_is_routed(client: TestClient) -> None:
     disposition = export.headers["content-disposition"]
     assert 'filename="public.st_nl.csv"' in disposition
     assert "filename*=UTF-8''public.st%0Anl.csv" in disposition
+
+
+def test_tables_whose_dotted_names_collide_are_kept_apart(pg_url: str, client: TestClient) -> None:
+    # S6-1: Studio keyed tables by "schema.name", which public."st_k.y" and "public.st_k".y
+    # share: one table's rows were read and deleted for the other.
+    _sql(
+        client,
+        'create table public."st_k.y" (id int primary key, v text); '
+        """insert into public."st_k.y" values (1, 'public'); """
+        'create schema "public.st_k"; create table "public.st_k".y (id int primary key, v text); '
+        """insert into "public.st_k".y values (1, 'other')""",
+    )
+    with make_client(pg_url, schemas=("public", "public.st_k")) as both:
+        listed = both.get("/api/tables", headers=AUTH).json()["tables"]
+        assert {(t["schema"], t["name"]) for t in listed} >= {
+            ("public", "st_k.y"),
+            ("public.st_k", "y"),
+        }
+        first, second = "/api/tables/public/st_k.y/rows", "/api/tables/public.st_k/y/rows"
+        assert both.get(first, headers=AUTH).json()["rows"] == [{"id": 1, "v": "public"}]
+        assert both.get(second, headers=AUTH).json()["rows"] == [{"id": 1, "v": "other"}]
+        deleted = both.request("DELETE", first, json={"keys": [{"id": 1}]}, headers=AUTH)
+        assert deleted.json() == {"deleted": 1}
+    assert _query(client, 'select count(*) from public."st_k.y"') == [[0]]
+    assert _query(client, 'select v from "public.st_k".y') == [["other"]]
+
+
+def test_ddl_keeps_the_rest_of_the_search_path(pg_url: str, client: TestClient) -> None:
+    # S6-2: DDL ran with search_path "public, pg_temp" only, so a type (or an extension's
+    # function) found through the role's own path was "does not exist".
+    _sql(
+        client,
+        "create schema st_app; create type st_app.st_status as enum ('a', 'b'); "
+        "create table st_app.st_t (id int primary key)",
+    )
+    parts = urlsplit(pg_url)
+    query = "&".join(q for q in (parts.query, "search_path=st_app") if q)
+    with make_client(urlunsplit(parts._replace(query=query)), schemas=("st_app",)) as app:
+        column = {"name": "s", "type": "st_status"}
+        op = {"operation": "add_column", "schema": "st_app", "table": "st_t", "name": "s"}
+        applied = app.post("/api/ddl/apply", json={**op, "column": column}, headers=AUTH)
+        assert applied.status_code == 200, applied.text
+        for _ in range(5):  # the path is put back on the pooled connection
+            assert _query(app, "show search_path") == [["st_app"]]
+
+
+def test_a_new_row_takes_a_composite_as_text(client: TestClient) -> None:
+    # S6-3: a NOT NULL composite column was "required" in the Add row dialog, and refused.
+    _sql(
+        client,
+        "drop type if exists st_pair cascade; create type st_pair as (a int, b text); "
+        "create table st_cins (id int primary key, p st_pair not null, ps st_pair[])",
+    )
+    rows = "/api/tables/public/st_cins/rows"
+    values = {"id": 1, "p": "(1,x)", "ps": '{"(2,y)"}'}
+    added = client.post(rows, json={"values": values}, headers=AUTH)
+    assert added.status_code == 201, added.text
+    assert _query(client, "select p::text, ps::text from st_cins") == [["(1,x)", '{"(2,y)"}']]
+    as_json = client.post(rows, json={"values": {"id": 2, "p": {"a": 1}}}, headers=AUTH)
+    assert as_json.status_code == 400 and "composite" in as_json.text
+    changed = client.patch(rows, json={"key": {"id": 1}, "values": {"p": "(3,z)"}}, headers=AUTH)
+    assert changed.status_code == 400 and "composite" in changed.text
+
+
+@pytest.mark.parametrize(
+    ("decl", "literal"),
+    [
+        ("int[]", "'[0:1]={5,6}'"),
+        ("int[][]", "'[2:2][0:1]={{1,2}}'"),
+        ("text[]", """'[-1:0]={a,"b,c"}'"""),
+        ("int[]", "'{1,2}'"),
+        ("float8", "'-0'"),
+        ("real", "'-0'"),
+        ("float8[]", "'{-0,1.5}'"),
+    ],
+)
+def test_saving_a_cell_unchanged_keeps_it(client: TestClient, decl: str, literal: str) -> None:
+    # S6-4: the grid read every cell through to_jsonb, which drops an array's lower bounds
+    # and a float's sign of zero, so saving the cell unchanged changed it.
+    _sql(
+        client,
+        f"create table st_rt (id int primary key, c {decl}); "
+        f"insert into st_rt values (1, {literal})",
+    )
+    before = _query(client, "select c::text from st_rt")
+    [row] = _rows(client, "st_rt")
+    saved = client.patch(
+        "/api/tables/public/st_rt/rows",
+        json={"key": {"id": 1}, "values": {"c": row["c"]}},
+        headers=AUTH,
+    )
+    assert saved.status_code == 200, saved.text
+    assert _query(client, "select c::text from st_rt") == before
