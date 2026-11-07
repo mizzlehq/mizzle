@@ -15,6 +15,7 @@ from mizzle import (
     MizzleError,
     QueryError,
     eq,
+    in_,
     placeholder,
     sql,
 )
@@ -946,3 +947,115 @@ async def test_bad_pool_args_are_a_query_error(pg_url: str, args: dict[str, Any]
     # R11: asyncpg raised a bare ValueError.
     with pytest.raises(QueryError, match=r"Database.connect\(\) needs"):
         await Database.connect(pg_url, schema=[Users, Posts], **args)
+
+
+async def test_a_savepoint_cancelled_waiting_for_the_lock_breaks_the_transaction(
+    pg_url: str,
+) -> None:
+    # R4-1: cancelled while waiting for the lock to send ROLLBACK TO / RELEASE, the
+    # savepoint stayed open, its marker was dropped, and COMMIT kept its rows.
+    import asyncio
+
+    rolled: list[str] = []
+
+    async def ar() -> None:
+        rolled.append("sp")
+
+    async with await Database.connect(pg_url, schema=[Users, Posts], pool_size=1) as db:
+        for fail in (True, False):
+            rolled.clear()
+            with pytest.raises(QueryError, match="cancelled before its ROLLBACK TO"):
+                async with db.transaction() as tx:
+                    bg: asyncio.Task[Any] | None = None
+                    with pytest.raises((TimeoutError, RuntimeError)):
+                        async with asyncio.timeout(0.3), tx.transaction(after_rollback=ar) as sp:
+                            await sp.insert(Users).values({"email": "r41@x"})
+                            bg = asyncio.create_task(sp.execute(sql("SELECT pg_sleep(1)")))
+                            await asyncio.sleep(0.05)
+                            if fail:
+                                raise RuntimeError("savepoint body failed")
+                    assert bg is not None
+                    await bg
+                    await tx.insert(Users).values({"email": "r41b@x"})
+            assert rolled == ["sp"]
+            assert await db.select().from_(Users).where(in_(Users.email, ["r41@x", "r41b@x"])) == []
+
+
+async def test_commit_refuses_while_a_task_savepoint_is_open(pg_url: str) -> None:
+    # R4-2: COMMIT ran while a child task's savepoint was open: its rows were committed,
+    # then the child "rolled back" and its after_rollback ran.
+    import asyncio
+
+    async with await Database.connect(pg_url, schema=[Users, Posts], pool_size=2) as db:
+
+        async def child(tx: Any) -> None:
+            async with tx.transaction() as sp:
+                await sp.insert(Users).values({"email": "r42@x"})
+                await asyncio.sleep(0.3)
+                raise RuntimeError("undo")
+
+        task: asyncio.Task[None] | None = None
+        with pytest.raises(QueryError, match="still open"):
+            async with db.transaction() as tx:
+                task = asyncio.create_task(child(tx))
+                await asyncio.sleep(0.1)
+        assert task is not None
+        with pytest.raises(RuntimeError):
+            await task
+        assert await db.select().from_(Users).where(eq(Users.email, "r42@x")) == []
+
+
+async def test_a_task_started_in_a_rolled_back_savepoint_is_refused(pg_url: str) -> None:
+    # R4-3: the task's savepoint marker was gone, the list was empty, so the check
+    # passed and its write was committed with the outer transaction.
+    import asyncio
+
+    async with await Database.connect(pg_url, schema=[Users, Posts], pool_size=2) as db:
+        child: asyncio.Task[Any] | None = None
+        async with db.transaction() as tx:
+            with pytest.raises(RuntimeError):
+                async with tx.transaction() as sp:
+                    child = asyncio.ensure_future(sp.insert(Users).values({"email": "r43@x"}))
+                    raise RuntimeError("undo")
+            assert child is not None
+            with pytest.raises(QueryError, match="has ended"):
+                await child
+            async with db.transaction() as other:  # another transaction is not affected
+                await other.execute(sql("SELECT 1"))
+        assert await db.select().from_(Users).where(eq(Users.email, "r43@x")) == []
+
+
+async def test_raw_commit_or_rollback_inside_a_transaction_is_detected(pg_url: str) -> None:
+    # R4-4: a raw ROLLBACK / COMMIT ended the transaction unnoticed: success was reported
+    # (and after_commit ran), or a "rolled back" block kept its rows.
+    ran: list[str] = []
+
+    async def ac() -> None:
+        ran.append("commit")
+
+    async def ar() -> None:
+        ran.append("rollback")
+
+    async with await Database.connect(pg_url, schema=[Users, Posts], pool_size=1) as db:
+        with pytest.raises(DatabaseError, match="raw SQL"):
+            async with db.transaction(after_commit=ac, after_rollback=ar) as tx:
+                await tx.insert(Users).values({"email": "r44@x"})
+                await tx.execute(sql("ROLLBACK"))
+        assert ran == ["rollback"]
+        with pytest.raises(RuntimeError) as err:
+            async with db.transaction() as tx:
+                await tx.execute(sql("COMMIT"))
+                raise RuntimeError("undo")
+        assert any("raw SQL" in note for note in err.value.__notes__)
+        with pytest.raises(DatabaseError, match="raw SQL"):
+            async with db.transaction() as tx, tx.transaction() as sp:
+                await sp.execute(sql("COMMIT"))
+
+
+async def test_an_unknown_isolation_level_raises_query_error(pg_url: str) -> None:
+    # R4-5: a bare KeyError came from the driver's lookup.
+    async with await Database.connect(pg_url, schema=[Users, Posts]) as db:
+        for level in ("bogus", "read uncommitted"):
+            with pytest.raises(QueryError, match="serializable"):
+                async with db.transaction(level):  # pyright: ignore[reportArgumentType]
+                    pass
