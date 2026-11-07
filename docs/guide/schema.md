@@ -296,7 +296,10 @@ class Places(Table, name="places"):
 ```
 
 `await db.insert(Places).values(area="(2,2),(0,0)")`; reading it back gives
-`"(2,2),(0,0)"`. The domain, composite type or extension itself is not managed by mizzle:
+`"(2,2),(0,0)"`; an `array(custom("box"))` reads as a `list[str]`. mizzle casts to
+`text` only where rows reach Python: a select feeding `insert().from_select()` or
+`merge().using()`, or a subquery in a condition, keeps the type, and `select().distinct()`
+orders such a column by its text. The domain, composite type or extension itself is not managed by mizzle:
 create it in a custom migration (see
 [Not managed by mizzle](migrations.md#not-managed-by-mizzle)). `pull` writes every column of
 such a type as `custom(...)`.

@@ -16,6 +16,7 @@ from collections.abc import (
     Sequence,
 )
 from contextlib import asynccontextmanager
+from decimal import Decimal
 from typing import cast, final
 from urllib.parse import urlsplit
 
@@ -110,6 +111,9 @@ def map_error(exc: BaseException, sql: str, server: int | None = None) -> Mizzle
                 f"{type(exc).__name__}: a query parameter has the wrong type or cannot be "
                 "encoded (value hidden)"
             )
+            cause = exc.__cause__
+            if isinstance(cause, TypeError):  # names types, not values: "Object of type set
+                message += f": {cause}"  # is not JSON serializable" (Q6-6)
             return DatabaseError(message, sql=sql, original=exc)
         case asyncpg.PostgresError() if (exc.sqlstate or "").startswith("22"):
             # SQLSTATE class 22 (data exception) messages quote the bad value, e.g.
@@ -467,7 +471,29 @@ def _retryable(exc: BaseException) -> bool:
 
 
 def _json_text(value: object) -> str:
-    return value if isinstance(value, JsonText) else json.dumps(value)  # Q4-5
+    if isinstance(value, JsonText):  # Q4-5
+        return value
+    try:
+        return json.dumps(value)
+    except TypeError:  # a Decimal, or a value JSON has no form for
+        return _json_exact(value)
+
+
+def _json_exact(value: object) -> str:
+    """``json.dumps`` with a finite Decimal in its exact digits, as ``json_text`` writes a
+    DDL default (Q6-6). Anything else JSON has no form for still raises TypeError."""
+    match value:
+        case Decimal() if value.is_finite():
+            return format(value, "f")
+        case dict():
+            pairs = cast(dict[object, object], value).items()
+            keys = [(k if isinstance(k, str) else json.dumps(k), v) for k, v in pairs]
+            return "{" + ", ".join(f"{json.dumps(k)}: {_json_exact(v)}" for k, v in keys) + "}"
+        case list() | tuple():
+            items = cast(Sequence[object], value)
+            return "[" + ", ".join(_json_exact(v) for v in items) + "]"
+        case _:
+            return json.dumps(value)
 
 
 def _jsonb_encode(value: object) -> bytes:

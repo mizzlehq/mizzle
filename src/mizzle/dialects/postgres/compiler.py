@@ -13,6 +13,7 @@ from asyncpg import BitString, Line, Point
 
 from mizzle.core.compiler import CompiledQuery, Compiler, interval_text
 from mizzle.core.errors import QueryError
+from mizzle.core.schema.column import ColumnBase
 from mizzle.core.sql.alias import real_table
 from mizzle.core.sql.nodes import ExprBase, Node
 from mizzle.dialects.postgres.types import CustomColumn, JsonText
@@ -22,11 +23,18 @@ if TYPE_CHECKING:
     from mizzle.core.query.merge import Merge, MergeWhen
     from mizzle.core.query.relational import LoadPlan, RelationalStatement
     from mizzle.core.query.returning import Returning
-    from mizzle.core.schema.column import ColumnBase
     from mizzle.core.schema.relations import Link
     from mizzle.core.schema.table import Table
 
 MAX_PARAMS = 32767  # PostgreSQL wire protocol limit on bind parameters per statement
+
+
+def _custom_items(column: ColumnBase) -> bool:
+    """An array (of any depth) of custom() values."""
+    item = column.item
+    while item is not None and item.item is not None:
+        item = item.item
+    return isinstance(item, CustomColumn)
 
 
 _AS_TEXT = frozenset({"cidr", "bit", "varbit", "point", "line"})
@@ -236,14 +244,18 @@ class PostgresCompiler(Compiler):
             return marker
         if isinstance(column, CustomColumn):
             return f"{marker}::text::{column.sql_type}"  # sent as text, whatever the type
-        if isinstance(column.item, CustomColumn):  # = ANY(...) of custom values
+        if _custom_items(column):  # an array of them, or = ANY(...) of custom values
             return f"{marker}::text[]::{column.sql_type}"
         return marker
 
     @override
-    def output(self, node: Node) -> str:
-        text = self.visit(node)
-        return f"{text}::text" if isinstance(node, CustomColumn) else text  # read as text
+    def read_as(self, node: Node, text: str, /) -> str:
+        # custom() values reach Python as text, an array of them as text[] (Q6-2)
+        if isinstance(node, CustomColumn):
+            return f"{text}::text"
+        if isinstance(node, ColumnBase) and _custom_items(node):
+            return f"{text}::text[]"
+        return text
 
     @override
     def returning_clause(self, node: Returning[object], /) -> str:
@@ -414,7 +426,8 @@ class PostgresCompiler(Compiler):
         real = real_table(plan.table)
         self._scopes.append({plan.table: alias, real: alias})
         try:
-            columns = [self.visit(c) for _, c in plan.columns]
+            columns = [self.output(c) for _, c in plan.columns]  # (Q6-1)
+            self._unread()  # filters: their subqueries keep their types
             columns += [self._child(link, child, alias) for _, link, child in plan.children]
             text = f"SELECT {', '.join(columns)} FROM {self.table_name(real)} AS "
             text += self.quote(alias)

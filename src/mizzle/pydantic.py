@@ -25,8 +25,7 @@ from __future__ import annotations
 import re
 from collections.abc import Callable, Mapping, Sequence
 from decimal import Decimal
-from types import GenericAlias
-from typing import Annotated, Any, Literal, cast
+from typing import Annotated, Any, Literal, TypeAliasType, cast
 
 from asyncpg import BitString, Line, Point
 
@@ -41,6 +40,9 @@ from mizzle.core.schema.column import ColumnBase
 from mizzle.core.schema.table import Table
 
 type Mode = Literal["select", "insert", "update"]
+
+# An array value: items, NULLs and, in a multi-dimensional array, lists of them (Q6-5).
+type _Array[T] = list[T | _Array[T] | None]
 
 _VARCHAR = re.compile(r"(?:varchar|character varying)\((\d+)\)")
 _NUMERIC = re.compile(r"numeric\((\d+)(?:,\s*(\d+))?\)")
@@ -59,8 +61,9 @@ _NAN = Annotated[Decimal, pydantic.Field(allow_inf_nan=True), pydantic.AfterVali
 def column_type(column: ColumnBase) -> object:
     """The Python type a column holds (without ``None``), with length/precision limits."""
     if column.item is not None:
-        # list[item type | None]: any PostgreSQL array can hold NULL (Q5-7).
-        return GenericAlias(list, (cast(type[object], column_type(column.item)) | None,))
+        # Any PostgreSQL array can hold NULL (Q5-7), and have more dimensions (Q6-5).
+        array: TypeAliasType = _Array
+        return array[column_type(column.item)]
     if column.enum is not None:
         return column.enum
     if column.accepts is None:  # json / jsonb

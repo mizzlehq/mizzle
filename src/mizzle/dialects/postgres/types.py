@@ -383,10 +383,14 @@ def pg_enum[E: enum.Enum](
 
 class CustomColumn(Column[str | None]):
     """See ``custom``. The PostgreSQL compiler binds its values as ``$1::text::type`` and
-    selects it as ``col::text``."""
+    reads it as ``col::text`` (an array of them as ``text[]``) where rows reach Python: the
+    outermost select list or RETURNING, and CTEs and FROM subqueries feeding them. A subquery
+    in an expression or feeding a write keeps the type. ``SELECT DISTINCT`` orders it by its
+    text."""
 
-    # ponytail: a subquery selecting it (``IN (SELECT col ...)``) returns text too; compare
-    # with ``sql(...)`` there, or give the select an explicit cast, if the type needs it.
+    # ponytail: driver codecs (set_type_codec) would drop the casts, but they miss domains
+    # (sent as the base type), types created after connect, and change built-in types
+    # connection-wide.
 
 
 def custom(sql_type: str, name: str | None = None) -> CustomColumn:
