@@ -1713,29 +1713,31 @@ def test_a_newline_in_a_table_name_is_routed(client: TestClient) -> None:
     assert "filename*=UTF-8''public.st%0Anl.csv" in disposition
 
 
-def test_tables_whose_dotted_names_collide_are_kept_apart(pg_url: str, client: TestClient) -> None:
+def test_dotted_names_are_kept_apart_or_refused(pg_url: str, client: TestClient) -> None:
     # S6-1: Studio keyed tables by "schema.name", which public."st_k.y" and "public.st_k".y
-    # share: one table's rows were read and deleted for the other.
+    # share: one table's rows were read and deleted for the other. A dotted schema name is
+    # now refused (K6-9); a dotted table name still works on its own.
     _sql(
         client,
+        'drop table if exists public."st_k.y"; drop schema if exists "public.st_k" cascade; '
         'create table public."st_k.y" (id int primary key, v text); '
         """insert into public."st_k.y" values (1, 'public'); """
         'create schema "public.st_k"; create table "public.st_k".y (id int primary key, v text); '
         """insert into "public.st_k".y values (1, 'other')""",
     )
-    with make_client(pg_url, schemas=("public", "public.st_k")) as both:
-        listed = both.get("/api/tables", headers=AUTH).json()["tables"]
-        assert {(t["schema"], t["name"]) for t in listed} >= {
-            ("public", "st_k.y"),
-            ("public.st_k", "y"),
-        }
-        first, second = "/api/tables/public/st_k.y/rows", "/api/tables/public.st_k/y/rows"
-        assert both.get(first, headers=AUTH).json()["rows"] == [{"id": 1, "v": "public"}]
-        assert both.get(second, headers=AUTH).json()["rows"] == [{"id": 1, "v": "other"}]
-        deleted = both.request("DELETE", first, json={"keys": [{"id": 1}]}, headers=AUTH)
+    try:
+        with make_client(pg_url, schemas=("public", "public.st_k")) as both:
+            refused = both.get("/api/tables", headers=AUTH)
+        assert refused.status_code >= 400, refused.text
+        assert "names containing '.' are not supported" in refused.text
+        first = "/api/tables/public/st_k.y/rows"
+        assert client.get(first, headers=AUTH).json()["rows"] == [{"id": 1, "v": "public"}]
+        deleted = client.request("DELETE", first, json={"keys": [{"id": 1}]}, headers=AUTH)
         assert deleted.json() == {"deleted": 1}
-    assert _query(client, 'select count(*) from public."st_k.y"') == [[0]]
-    assert _query(client, 'select v from "public.st_k".y') == [["other"]]
+        assert _query(client, 'select count(*) from public."st_k.y"') == [[0]]
+        assert _query(client, 'select v from "public.st_k".y') == [["other"]]
+    finally:
+        _sql(client, 'drop table public."st_k.y"; drop schema "public.st_k" cascade')
 
 
 def test_ddl_keeps_the_rest_of_the_search_path(pg_url: str, client: TestClient) -> None:
@@ -1778,6 +1780,7 @@ def test_ddl_searches_pg_temp_last(client: TestClient, monkeypatch: pytest.Monke
     [path] = seen
     parts = [p.strip() for p in path.split(",")]
     assert parts[0] == "public" and parts[-1] == "pg_temp", path
+    _sql(client, "drop table st_tmp_last")
 
 
 def test_a_new_row_takes_a_composite_as_text(client: TestClient) -> None:
