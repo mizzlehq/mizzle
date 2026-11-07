@@ -1522,3 +1522,26 @@ async def test_doctor_and_push_compare_expressions(
             assert await cli("doctor") == 0, undo
         finally:
             await conn.close()
+
+
+async def test_unjournaled_folder_is_an_error(
+    project: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # (K5) a folder merged without its journal entry was skipped silently.
+    assert await cli("generate") == 0
+    (project / "migrations" / "0002_teammate").mkdir()
+    capsys.readouterr()
+    for command in ("generate", "migrate", "status", "check"):
+        assert await cli(command) == 1, command
+        captured = capsys.readouterr()
+        assert "0002_teammate" in captured.err + captured.out, command
+
+
+async def test_os_errors_are_clean_cli_errors(
+    project: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # (K10) no traceback for a missing --config or an unwritable --out.
+    assert await cli("--config", "missing.toml", "status") == 1
+    assert "missing.toml" in capsys.readouterr().err
+    assert await cli("typegen", "--out", str(project / "no" / "such" / "dir.py")) == 1
+    assert "error:" in capsys.readouterr().err

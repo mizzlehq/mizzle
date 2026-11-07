@@ -527,12 +527,6 @@ def cmd_squash(config: Config, args: Args) -> int:
     if len(migrations) == 1 and migrations[0].supersedes:
         print("Nothing to squash: the history is already one squashed migration.")
         return 0
-    if unlisted := directory.unlisted():
-        # A folder from a merged branch: squash must not delete SQL it does not know (B54).
-        raise MigrationError(
-            f"{', '.join(unlisted)} is not in the journal; run `mizzle check --fix` (or "
-            "remove the folder) before squashing"
-        )
     if hand := _hand_written(directory):
         raise MigrationError(
             f"squash would lose hand-written SQL in {', '.join(hand)} (a custom migration, "
@@ -705,7 +699,8 @@ def cmd_check(config: Config, args: Args) -> int:
     journal = directory.journal()
     names = [e["name"] for e in journal["entries"]]
     prev_id: str | None = None
-    for entry, migration in zip(journal["entries"], directory.migrations(), strict=True):
+    migrations = directory.migrations(unlisted_ok=True)  # reported below
+    for entry, migration in zip(journal["entries"], migrations, strict=True):
         if not migration.sql_path.exists() or not migration.snapshot_path.exists():
             problems.append(f"{migration.name}: migration.sql or snapshot.json is missing")
             continue
@@ -1100,7 +1095,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             return cmd_init(args)
         config = load_config(args.config)
         return args.func(config, args)
-    except MizzleError as exc:
+    except (MizzleError, OSError) as exc:  # OSError: missing --config, unwritable --out (K10)
         print(f"error: {exc}", file=sys.stderr)
         return 1
     except KeyboardInterrupt:

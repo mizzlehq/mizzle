@@ -1,4 +1,5 @@
 import copy
+import re
 from pathlib import Path
 
 import pytest
@@ -182,6 +183,31 @@ def test_pulled_names_cannot_inject_code() -> None:
     source = render_schema_module(snapshot)
     assert "\nimport os" not in source
     compile(source, "pulled.py", "exec")
+
+
+def test_pulled_class_names_are_unique_identifiers() -> None:
+    # (K9) T, t, t_, table/Table, none and 2fa need distinct, valid, non-shadowing classes.
+    from mizzle.kit.codegen import render_schema_module
+
+    snapshot = empty_snapshot("postgresql")
+    names = ["T", "t", "t_", "table", "Table", "none", "2fa"]
+    for name in names:
+        snapshot["tables"][f"public.{name}"] = {
+            "schema": "public",
+            "name": name,
+            "columns": {"a": {"name": "a", "type": "integer", "not_null": False, "default": None}},
+            "primary_key": None,
+            "uniques": {},
+            "checks": {},
+            "foreign_keys": {},
+            "indexes": {},
+        }
+    source = render_schema_module(snapshot)
+    exec(compile(source, "pulled.py", "exec"), {})
+    classes = re.findall(r"^class (\w+)\(Table, name='([^']*)'", source, re.M)
+    assert sorted(n for _, n in classes) == sorted(names)
+    assert len({c for c, _ in classes}) == len(names)
+    assert "Table" not in {c for c, _ in classes}
 
 
 def test_init_creates_config_schema_and_folder(tmp_path: Path) -> None:

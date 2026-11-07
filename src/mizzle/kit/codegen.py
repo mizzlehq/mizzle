@@ -8,7 +8,7 @@ import ipaddress
 import keyword
 import re
 import uuid
-from collections.abc import Mapping, Sequence
+from collections.abc import Collection, Mapping, Sequence
 
 from mizzle import pg
 from mizzle.core.schema.column import ColumnBase
@@ -97,6 +97,10 @@ def _identifier(name: str) -> str:
     return ident
 
 
+# Capitalized names the generated module imports; a class must not shadow them (K9).
+_RESERVED_CLASSES = {"Table", "View", "QueryBuilder", "Column", "Constraint", "Any"}
+
+
 def _class_name(name: str) -> str:
     # Upper-case only the first letter of each part: NotificationStatus stays as it is.
     parts = re.split(r"[^a-zA-Z0-9]+", name)
@@ -104,7 +108,16 @@ def _class_name(name: str) -> str:
     # A leading digit ("2e") or a capitalized keyword ("None") is not a class name (C26).
     if ident[0].isdigit():
         ident = f"T{ident}"
-    return f"{ident}_" if keyword.iskeyword(ident) else ident
+    reserved = keyword.iskeyword(ident) or ident in _RESERVED_CLASSES  # "table" (K9)
+    return f"{ident}_" if reserved else ident
+
+
+def _unique(cls: str, taken: Collection[str]) -> str:
+    """``cls``, or ``cls2``, ``cls3``... if taken: T, t and t_ all map to T (K9)."""
+    base, n = cls, 2
+    while cls in taken:
+        cls, n = f"{base}{n}", n + 1
+    return cls
 
 
 def _words(name: str) -> list[str]:
@@ -506,6 +519,7 @@ class _SchemaWriter:
             cls = _class_name(enum["name"])
             if cls in self.enum_classes.values():
                 cls = _class_name(f"{enum['schema']}_{enum['name']}")
+            cls = _unique(cls, self.enum_classes.values())
             sql_type = _type_ident(enum["name"])  # as format_type() prints it
             if enum["schema"] != "public":
                 sql_type = f"{_type_ident(enum['schema'])}.{sql_type}"
@@ -562,6 +576,7 @@ class _SchemaWriter:
             name = _class_name(table["name"])
             if name in self.table_classes.values() or name in self.enum_classes.values():
                 name = _class_name(f"{table['schema']}_{table['name']}")
+            name = _unique(name, {*self.table_classes.values(), *self.enum_classes.values()})
             self.table_classes[k] = name
             self.attrs[k] = {c: self.attr(c) for c in table["columns"]}
         self.add_relations()
@@ -677,6 +692,7 @@ class _SchemaWriter:
             cls = _class_name(view["name"])
             if cls in taken:
                 cls = _class_name(f"{view['schema']}_{view['name']}_view")
+            cls = _unique(cls, taken)
             taken.add(cls)
             tables_code.append(self.view(k, cls))
             owners.append((cls, view, {c: self.attr(c) for c in view["columns"]}))
