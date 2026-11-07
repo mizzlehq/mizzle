@@ -185,6 +185,34 @@ def requote_type(text: str, server_keywords: frozenset[str]) -> str:
     return f"{quote(schema) if schema in stale else schema}.{name}{dims}"
 
 
+# One printed function argument: [mode] [name] type [DEFAULT expr].
+_ARG = re.compile(
+    rf"(?P<head>(?:(?:IN|OUT|INOUT|VARIADIC) )?(?:(?:{_IDENT_PART}) )?)"
+    rf"(?P<type>{_TYPE_PATH.pattern})(?P<tail>(?: DEFAULT .*)?)",
+    re.DOTALL,
+)
+
+
+def requote_args(args: str, server_keywords: frozenset[str]) -> str:
+    """pg_get_function_arguments() text with each argument's type requoted (K4-25)."""
+
+    def one(arg: str) -> str:
+        match = _ARG.fullmatch(arg)
+        if match is None:  # a type of several words: never a keyword
+            return arg
+        return match["head"] + requote_type(match["type"], server_keywords) + match["tail"]
+
+    return ", ".join(one(a) for a in _split_args(args))
+
+
+def requote_returns(returns: str, server_keywords: frozenset[str]) -> str:
+    """pg_get_function_result() text with its types requoted (K4-25)."""
+    if returns.startswith("TABLE(") and returns.endswith(")"):
+        return f"TABLE({requote_args(returns[6:-1], server_keywords)})"
+    setof = "SETOF " if returns.startswith("SETOF ") else ""
+    return setof + requote_type(returns.removeprefix(setof), server_keywords)
+
+
 def normalize_type(sql_type: str) -> str:
     """``varchar(255)`` -> ``character varying(255)``, ``numeric(10, 2)`` -> ``numeric(10,2)``."""
     array = ""
@@ -967,21 +995,28 @@ def _restore_function_grants(schema: str, name: str, args: str) -> str:
     )
 
 
-def _without_defaults(args: str) -> str:
-    """Function arguments as DROP FUNCTION takes them: ``a integer DEFAULT 1`` -> ``a integer``."""
+def _split_args(args: str) -> list[str]:
+    """Function arguments split on their top-level commas."""
     parts: list[str] = []
-    depth, start, quoted = 0, 0, False
+    depth, start, quote_char = 0, 0, ""
     for i, ch in enumerate(args + ","):
-        if ch == "'":
-            quoted = not quoted
-        elif not quoted and ch in "([":
+        if quote_char:
+            quote_char = "" if ch == quote_char else quote_char
+        elif ch in "'\"":
+            quote_char = ch
+        elif ch in "([":
             depth += 1
-        elif not quoted and ch in ")]":
+        elif ch in ")]":
             depth -= 1
-        elif not quoted and depth == 0 and ch == ",":
+        elif depth == 0 and ch == ",":
             parts.append(args[start:i].strip())
             start = i + 1
-    return ", ".join(re.split(r" DEFAULT | = ", p, maxsplit=1)[0] for p in parts if p)
+    return [p for p in parts if p]
+
+
+def _without_defaults(args: str) -> str:
+    """Function arguments as DROP FUNCTION takes them: ``a integer DEFAULT 1`` -> ``a integer``."""
+    return ", ".join(re.split(r" DEFAULT | = ", p, maxsplit=1)[0] for p in _split_args(args))
 
 
 # A SQL-standard body (PostgreSQL 14+): written as is, not as a string.

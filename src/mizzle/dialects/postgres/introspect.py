@@ -49,6 +49,8 @@ from mizzle.dialects.postgres.ddl import (
     normalize_default,
     qualified,
     quote,
+    requote_args,
+    requote_returns,
     requote_type,
     sql_standard_body,
     type_ident,
@@ -666,6 +668,11 @@ def _requote_types(snapshot: Snapshot, server_keywords: frozenset[str]) -> None:
         domain["base_type"] = requote_type(domain["base_type"], server_keywords)
     for field in (f for c in snapshot.get("composites", {}).values() for f in c["fields"]):
         field["type"] = requote_type(field["type"], server_keywords)
+    if functions := snapshot.get("functions"):  # K4-25
+        for fn in functions.values():
+            fn["args"] = requote_args(fn["args"], server_keywords)
+            fn["returns"] = requote_returns(fn["returns"], server_keywords)
+        snapshot["functions"] = {function_key(f): f for f in functions.values()}
 
 
 async def _introspect(conn: Connection, schemas: Sequence[str], roles: Sequence[str]) -> Snapshot:
@@ -1129,6 +1136,8 @@ async def normalize_snapshot(conn: Connection, snapshot: Snapshot) -> Snapshot:
             await conn.execute("SET LOCAL check_function_bodies = off", [])
             await conn.execute("SET LOCAL TimeZone = 'UTC'", [])  # as introspect reads
             await _normalize(out, read_back, version)
+            rows = await conn.fetch_dicts(_SERVER_KEYWORDS, [])  # as introspect prints them
+            _requote_types(out, frozenset(str(r["word"]) for r in rows))
             raise _Undo
     except _Undo:
         pass

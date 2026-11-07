@@ -6,6 +6,7 @@ import copy
 import datetime as dt
 import enum
 import importlib.util
+import re
 import sys
 import uuid
 from collections.abc import AsyncGenerator, Callable, Mapping, Sequence
@@ -1827,6 +1828,64 @@ async def test_check_and_default_calling_a_sql_function_that_reads_a_table(
     await migrate(driver, v0, v2)
 
 
+def k6_function(returns: str) -> Function:
+    return function(
+        "k6f",
+        schema="mg",
+        returns=returns,
+        args="x integer",
+        volatility="immutable",
+        body="BEGIN RETURN x; END",
+    )
+
+
+def k6_table(kind: str) -> type[Table]:
+    """mg.k6t calling mg.k6f in a CHECK, a DEFAULT, an index, a partial index or a
+    generated column; "none" without it."""
+
+    @final
+    class K6(Table, name="k6t", schema="mg"):
+        a = integer()
+        b = integer().default(sql("mg.k6f(1)")) if kind == "default" else integer()
+
+        @classmethod
+        @override
+        def config(cls) -> list[Constraint]:
+            match kind:
+                case "check":
+                    return [check("k6t_ck", sql("mg.k6f(a) > 0"))]
+                case "index":
+                    return [index("k6t_ix").on(sql("mg.k6f(a)"))]
+                case "partial":
+                    return [index("k6t_px").on(cls.a).where(sql("mg.k6f(a) > 0"))]
+                case _:
+                    return []
+
+    if kind == "generated":
+        K6.__table__.columns["b"].computed = Computed(sql("mg.k6f(a)"))
+        K6.__table__.columns["b"].generated = True
+    return K6
+
+
+@pytest.mark.parametrize("kind", ["check", "default", "index", "partial", "generated"])
+@pytest.mark.parametrize("then", ["kept", "removed", "table dropped"])
+async def test_function_result_type_changes_under_its_callers(
+    driver: PostgresDriver, kind: str, then: str
+) -> None:
+    # K4-26: DROP FUNCTION (CREATE OR REPLACE cannot change the result type) came before the
+    # index or generated column calling it was dropped, or was not dropped at all.
+    v1 = snap([k6_table(kind)], [k6_function("integer")])
+    await migrate(driver, empty_snapshot("postgresql"), v1)
+    await execute(driver, "INSERT INTO mg.k6t (a) VALUES (3)")
+    tables = {"kept": [k6_table(kind)], "removed": [k6_table("none")], "table dropped": []}
+    await migrate(driver, v1, snap(tables[then], [k6_function("bigint")]))
+    if then != "table dropped":
+        [row] = await execute(driver, "SELECT a, b FROM mg.k6t")
+        assert row["a"] == 3
+        if kind in ("default", "generated"):
+            assert row["b"] in (1, 3)
+
+
 async def test_view_recreated_under_a_sql_standard_function(driver: PostgresDriver) -> None:
     # K4-20: a RETURN / BEGIN ATOMIC body depends on the view it reads, so DROP VIEW failed
     # when the view changed and the function did not.
@@ -2062,7 +2121,10 @@ _TYPED_DEFAULTS: dict[str, tuple[Callable[[], ColumnBase], _Check]] = {
         lambda: int4multirange().default(
             [Range(7, 8, upper_inc=True), Range(1, 3), Range(2, 5), Range(9, 10), Range(4, 4)]
         ),
-        None,
+        # Q4-19: written {[1,3)} in the CHECK as well
+        lambda v: cast(
+            Expr[bool], cast(object, sql("{} <> {}::int4multirange", v, [Range(2, 3), Range(1, 2)]))
+        ),
     ),
     "nummultirange": (
         lambda: nummultirange().default(
@@ -2075,7 +2137,7 @@ _TYPED_DEFAULTS: dict[str, tuple[Callable[[], ColumnBase], _Check]] = {
                 Range(Decimal(8), Decimal(9), lower_inc=False),
             ]
         ),
-        None,
+        lambda v: contains(v, [Range(Decimal(2), Decimal(3)), Range(Decimal(1), Decimal(2))]),
     ),
     "tstzmultirange": (
         lambda: tstzmultirange().default(
@@ -2152,6 +2214,11 @@ async def test_typed_defaults_and_check_literals_do_not_drift(
     current = await live(driver)
     # Compared as written too: the default is what PostgreSQL prints.
     assert diff(current, desired, compare_expressions=False) == []
+    # And so is each literal in the CHECK (Q4-19).
+    for name, ck in desired["tables"]["mg.q4_typed"]["checks"].items():
+        written = current["tables"]["mg.q4_typed"]["checks"][name]["expression"]
+        for literal in re.findall(r"'(?:[^']|'')*'", ck["expression"]):
+            assert literal in written
     # In any session TimeZone: the server prints a timestamptz constant in it (Q4-15).
     async with driver.acquire() as conn:
         await conn.execute("SET TimeZone = 'Asia/Dhaka'", [])
@@ -2184,6 +2251,45 @@ async def test_type_named_like_a_keyword_the_server_lacks(
     assert desired["tables"]["mg.k4_worded"]["columns"]["w"]["type"] == 'mg."k4_word"[]'
     await migrate(driver, empty_snapshot("postgresql"), desired)
     assert diff(await live(driver), desired, compare_expressions=False) == []
+
+
+async def test_function_types_named_like_a_keyword_the_server_lacks(
+    driver: PostgresDriver, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # K4-25: K4-22 for function argument and return types.
+    monkeypatch.setattr(ddl, "_KEYWORDS", ddl._KEYWORDS | {"k4_word"})
+
+    @final
+    class Worded(Table, name="k4_worded", schema="mg"):
+        id = integer().primary_key()
+        v = pg_enum(Q4Color, type_name="k4_word", schema="mg")
+
+    word = 'mg."k4_word"'
+    functions = [
+        function(
+            "k4_pick",
+            schema="mg",
+            args=f'v {word}, "x, y" {word}[], VARIADIC n integer[] DEFAULT ARRAY[1, 2]',
+            returns=f"SETOF {word}",
+            body="BEGIN RETURN NEXT v; END",
+        ),
+        function(
+            "k4_rows",
+            schema="mg",
+            args=word,
+            returns=f"TABLE(w {word}, n integer)",
+            body="BEGIN RETURN; END",
+        ),
+        function("k4_one", schema="mg", returns=word, body="BEGIN RETURN NULL; END"),
+    ]
+    desired = snap([Worded], objects=functions)
+    await migrate(driver, empty_snapshot("postgresql"), desired)
+    assert diff(await live(driver), desired, compare_expressions=False) == []
+    async with driver.acquire() as conn:
+        current = await dialect.introspect(conn, SCHEMAS)
+        normalized = await dialect.normalize_snapshot(conn, desired)
+    assert sorted(current.get("functions", {})) == sorted(normalized.get("functions", {}))
+    assert diff(current, normalized, normalized=True) == []
 
 
 def test_requote_type() -> None:

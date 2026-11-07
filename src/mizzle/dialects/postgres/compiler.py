@@ -301,7 +301,8 @@ class PostgresCompiler(Compiler):
             case Range():
                 return self.literal(_range_text(cast(_Range, value)))
             case list() if _all_ranges(cast(list[object], value)):  # a multirange
-                ranges = cast(list[_Range], value)
+                # Merged and sorted as PostgreSQL stores it, as a default is (Q4-19).
+                ranges = _merged(cast(list[Range[int]], value))
                 return self.literal("{" + ",".join(_range_text(r) for r in ranges) + "}")
             case ipaddress.IPv4Network() | ipaddress.IPv6Network():
                 return self.literal(str(value)) + "::cidr"
