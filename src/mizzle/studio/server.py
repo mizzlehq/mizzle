@@ -1113,12 +1113,13 @@ async def ddl_apply(studio: Studio, request: Request) -> Response:
     statements = studio.dialect.render(steps)
     async with studio.pool().acquire() as conn:
         # S5-1: the rendered DDL leaves public names bare (as the migration kit does), so
-        # resolve them in public first, never in a "$user" schema or pg_temp. The rest of the
-        # role's path stays: an extension's function or an app schema's type is found by it
-        # (S6-2).
+        # resolve them in public first, never in a "$user" schema. The rest of the role's
+        # path stays: an extension's function or an app schema's type is found by it (S6-2).
+        # pg_temp goes last: unlisted it is searched first, and a temporary table or type
+        # left on this pooled connection must not stand in for a real one.
         await conn.execute(
-            "SELECT set_config('search_path', concat_ws(', ', 'public', 'pg_temp', "
-            "nullif(current_setting('search_path'), '')), false)",
+            "SELECT set_config('search_path', concat_ws(', ', 'public', "
+            "nullif(current_setting('search_path'), ''), 'pg_temp'), false)",
             [],
         )
         try:

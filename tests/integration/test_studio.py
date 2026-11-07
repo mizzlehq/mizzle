@@ -1757,6 +1757,29 @@ def test_ddl_keeps_the_rest_of_the_search_path(pg_url: str, client: TestClient) 
             assert _query(app, "show search_path") == [["st_app"]]
 
 
+def test_ddl_searches_pg_temp_last(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    # Unlisted, pg_temp is searched first: a temporary table or type left on the pooled
+    # connection (the console can make one) would stand in for a real one during DDL.
+    seen: list[str] = []
+    from mizzle.kit.migrate import apply_statements as real
+
+    async def spy(conn: Any, statements: Any) -> None:
+        [row] = await conn.fetch("SELECT current_setting('search_path') AS p", [])
+        seen.append(row["p"])
+        await real(conn, statements)
+
+    monkeypatch.setattr(server, "apply_statements", spy)
+    _sql(client, "drop table if exists st_tmp_last; create table st_tmp_last (id int primary key)")
+    op = {"operation": "add_column", "schema": "public", "table": "st_tmp_last", "name": "n"}
+    applied = client.post(
+        "/api/ddl/apply", json={**op, "column": {"name": "n", "type": "integer"}}, headers=AUTH
+    )
+    assert applied.status_code == 200, applied.text
+    [path] = seen
+    parts = [p.strip() for p in path.split(",")]
+    assert parts[0] == "public" and parts[-1] == "pg_temp", path
+
+
 def test_a_new_row_takes_a_composite_as_text(client: TestClient) -> None:
     # S6-3: a NOT NULL composite column was "required" in the Add row dialog, and refused.
     _sql(
