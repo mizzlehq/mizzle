@@ -1767,6 +1767,138 @@ async def test_function_reading_a_view(driver: PostgresDriver) -> None:
     await migrate(driver, v1, snap([]))
 
 
+async def test_check_and_default_calling_a_sql_function_that_reads_a_table(
+    driver: PostgresDriver,
+) -> None:
+    # K4-19: the SQL body is checked at CREATE FUNCTION, so the function comes after the
+    # tables; the CHECK and DEFAULT calling it were inside CREATE TABLE, before it.
+    known = function(
+        "known_code",
+        schema="mg",
+        returns="boolean",
+        args="c text",
+        language="sql",
+        body="SELECT EXISTS (SELECT 1 FROM mg.banned WHERE code = c)",
+    )
+    first = function(
+        "first_code",
+        schema="mg",
+        returns="text",
+        language="sql",
+        body="SELECT min(code) FROM mg.banned",
+    )
+
+    @final
+    class Known(Table, name="known", schema="mg"):
+        code = text().default(sql("mg.first_code()"))
+
+        @classmethod
+        @override
+        def config(cls) -> list[Constraint]:
+            return [check("known_code_ok", sql("mg.known_code(code)"))]
+
+    @final
+    class Known2(Table, name="known", schema="mg"):
+        code = text().default(sql("mg.first_code()"))
+        more = text().default(sql("mg.first_code()"))
+
+        @classmethod
+        @override
+        def config(cls) -> list[Constraint]:
+            return [
+                check("known_code_ok", sql("mg.known_code(code)")),
+                check("known_more_ok", sql("mg.known_code(more)")),
+            ]
+
+    v1 = snap([Banned, Known], [known, first])
+    await migrate(driver, empty_snapshot("postgresql"), v1)
+    await migrate(driver, v1, v2 := snap([Banned, Known2], [known, first]))
+    await migrate(driver, v2, snap([Banned]))
+    # Functions new to a table that exists: ADD CHECK and ADD COLUMN come after them.
+    await execute(driver, "DROP SCHEMA mg CASCADE")
+
+    @final
+    class Known0(Table, name="known", schema="mg"):
+        code = text()
+
+    await migrate(driver, empty_snapshot("postgresql"), v0 := snap([Banned, Known0]))
+    await migrate(driver, v0, v2)
+
+
+async def test_view_recreated_under_a_sql_standard_function(driver: PostgresDriver) -> None:
+    # K4-20: a RETURN / BEGIN ATOMIC body depends on the view it reads, so DROP VIEW failed
+    # when the view changed and the function did not.
+    count = function(
+        "count_numbers",
+        schema="mg",
+        returns="bigint",
+        language="sql",
+        body="RETURN (SELECT count(*) FROM mg.k4numbers)",
+    )
+    total = function(
+        "total_numbers",
+        schema="mg",
+        returns="bigint",
+        language="sql",
+        body="BEGIN ATOMIC SELECT sum(n) FROM mg.k4numbers; END",
+    )
+
+    @final
+    class K4Numbers2(View, name="k4numbers", schema="mg"):
+        n = integer()
+
+        @classmethod
+        @override
+        def query(cls, db: QueryBuilder):
+            return sql("SELECT 2 AS n")
+
+    v1 = snap([K4Numbers], [count, total])
+    await migrate(driver, empty_snapshot("postgresql"), v1)
+    await migrate(driver, v1, snap([K4Numbers2], [count, total]))
+    [row] = await execute(driver, "SELECT mg.total_numbers() AS t")
+    assert row["t"] == 2
+
+
+async def test_column_type_change_recreates_the_checks_and_indexes_using_it(
+    driver: PostgresDriver,
+) -> None:
+    # K4-21: PostgreSQL rewrites `c_c >= 0` as `(c_c)::numeric >= (0)::numeric` when c_c
+    # becomes bigint, so the next diff dropped and added the check again, forever.
+    from mizzle.pg import numeric
+
+    @final
+    class Beta(Table, name="beta", schema="mg"):
+        id = integer().primary_key()
+        c_c = numeric()
+
+        @classmethod
+        @override
+        def config(cls) -> list[Constraint]:
+            return [
+                check("beta_c_c", sql("c_c >= 0")),
+                index("beta_part").on(cls.id).where(sql("c_c > 1")),
+                index("beta_expr").on(sql("(c_c + 2)")),
+            ]
+
+    @final
+    class Beta2(Table, name="beta", schema="mg"):
+        id = integer().primary_key()
+        c_c = bigint()
+
+        @classmethod
+        @override
+        def config(cls) -> list[Constraint]:
+            return [
+                check("beta_c_c", sql("c_c >= 0")),
+                index("beta_part").on(cls.id).where(sql("c_c > 1")),
+                index("beta_expr").on(sql("(c_c + 2)")),
+            ]
+
+    v1 = snap([Beta])
+    await migrate(driver, empty_snapshot("postgresql"), v1)
+    await migrate(driver, v1, snap([Beta2]))
+
+
 class K4Mood(enum.Enum):
     HAPPY = "happy"
 
