@@ -19,6 +19,7 @@ from typing import cast
 
 from mizzle.core.errors import MigrationError
 from mizzle.core.naming import Casing
+from mizzle.core.schema.column import ColumnBase
 from mizzle.core.schema.constraints import Role
 from mizzle.core.schema.objects import (
     Composite,
@@ -110,7 +111,8 @@ class Config:
         return tables
 
     def load_objects(self) -> list[SchemaObject]:
-        """The extensions, functions, triggers, roles and domains the schema modules expose,
+        """The extensions, functions, triggers, roles, domains, composites and standalone
+        ``pg_enum(...)`` enum types the schema modules expose,
         also inside a top-level list or tuple (``exts = [extension("hstore"), ...]``)."""
         candidates: list[object] = []
         for value in self._members():
@@ -119,13 +121,17 @@ class Config:
             else:
                 candidates.append(value)
         objects: list[SchemaObject] = []
+        enums: list[ColumnBase] = []  # pg_enum(...) on its own (K4-5); == builds SQL, so `is`
         for value in candidates:
-            if (
+            if isinstance(value, ColumnBase):
+                if value.enum is not None and all(value is not e for e in enums):
+                    enums.append(value)
+            elif (
                 isinstance(value, Extension | Function | Trigger | Role | Domain | Composite)
                 and value not in objects
             ):
                 objects.append(value)
-        return objects
+        return [*objects, *enums]
 
 
 def load_toml(path: Path) -> dict[str, object]:

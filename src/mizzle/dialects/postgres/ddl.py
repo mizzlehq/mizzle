@@ -117,6 +117,28 @@ _TYPE_ALIASES = {
     "varbit": "bit varying",
 }
 _PLAIN_IDENT = re.compile(r"[a-z_][a-z0-9_$]*")
+# Keywords quote_ident()/format_type() quote (K4-8): PostgreSQL 18's pg_get_keywords()
+# where catcode <> 'U'; older servers have a few less (json_table, merge_action).
+_KEYWORDS = frozenset(
+    """
+    all analyse analyze and any array as asc asymmetric authorization between bigint
+    binary bit boolean both case cast char character check coalesce collate collation
+    column concurrently constraint create cross current_catalog current_date
+    current_role current_schema current_time current_timestamp current_user dec decimal
+    default deferrable desc distinct do else end except exists extract false fetch float
+    for foreign freeze from full grant greatest group grouping having ilike in initially
+    inner inout int integer intersect interval into is isnull join json json_array
+    json_arrayagg json_exists json_object json_objectagg json_query json_scalar
+    json_serialize json_table json_value lateral leading least left like limit localtime
+    localtimestamp merge_action national natural nchar none normalize not notnull null
+    nullif numeric offset on only or order out outer overlaps overlay placing position
+    precision primary real references returning right row select session_user setof
+    similar smallint some substring symmetric system_user table tablesample then time
+    timestamp to trailing treat trim true union unique user using values varchar
+    variadic verbose when where window with xmlattributes xmlconcat xmlelement xmlexists
+    xmlforest xmlnamespaces xmlparse xmlpi xmlroot xmlserialize xmltable
+    """.split()  # noqa: SIM905
+)
 # A type name is dotted parts, each plain or quoted: ::"App"."Mood" too (K4-4).
 _TYPE_PART = r'(?:"(?:[^"]|"")+"|[a-z_][a-z0-9_ ]*)'
 _TRAILING_CAST = re.compile(rf"::{_TYPE_PART}(?:\.{_TYPE_PART})*(?:\(\d+(?:,\s*\d+)?\))?(?:\[\])*$")
@@ -139,7 +161,7 @@ def truncate_name(name: str) -> str:
 
 def type_ident(name: str) -> str:
     """A type name as format_type() prints it: quoted only when necessary."""
-    return name if _PLAIN_IDENT.fullmatch(name) else quote(name)
+    return name if _PLAIN_IDENT.fullmatch(name) and name not in _KEYWORDS else quote(name)
 
 
 def normalize_type(sql_type: str) -> str:
