@@ -274,6 +274,10 @@ def _assert_same(nested: object, plain: object) -> None:
         assert got.keys() == want.keys()
         for key, value in want.items():
             _assert_same(got[key], value)
+    elif isinstance(plain, Range):  # bounds of the same type too, not just equal
+        assert nested == plain
+        for end in ("lower", "upper"):
+            _assert_same(getattr(nested, end), getattr(plain, end))
     else:
         assert nested == plain
 
@@ -354,6 +358,7 @@ async def test_nested_domain_types_are_looked_up_per_database(
 class RngOwner(Table, name="rel_rng_owner"):
     id = serial().primary_key()
     rows = many(lambda: RngRow)
+    kinds = many(lambda: RngKind)
 
 
 class RngRow(Table, name="rel_rng_row"):
@@ -369,14 +374,72 @@ class RngRow(Table, name="rel_rng_row"):
     )
 
 
+# Q4-20: a custom range over any subtype nests like a plain select reads it.
+_SUBTYPES = {
+    "f8": ("float8", "'[1.1,0.30000000000000004e1)'"),
+    "f4": ("float4", "'[1.1,2.5]'"),
+    "txt": ("text", """'[a,"b c")'"""),
+    "tm": ("time", "'[10:00:00.5,12:30)'"),
+    "iv": ("interval", "'[1 day 02:00:00.000001,1 mon)'"),
+    "ip": ("inet", "'(10.0.0.1,10.0.0.9]'"),
+    "tz": ("timestamptz", "'[2020-01-01 00:00:00.123+00,)'"),
+    "i4": ("int4", "'[1,5]'"),
+}
+
+
+class RngKind(Table, name="rel_rng_kind"):
+    id = serial().primary_key()
+    owner_id = integer().not_null()
+    f8 = pg_domain("rel_rng_f8")
+    f8_dom = pg_domain("rel_rng_f8_dom")
+    f8_multi = pg_domain("rel_rng_f8_multi")
+    f8_arr = pg_domain("rel_rng_f8[]")
+    f8_multis = pg_domain("rel_rng_f8_multi[]")
+    f4 = pg_domain("rel_rng_f4")
+    txt = pg_domain("rel_rng_txt")
+    txt_multi = pg_domain("rel_rng_txt_multi")
+    tm = pg_domain("rel_rng_tm")
+    iv = pg_domain("rel_rng_iv")
+    ip = pg_domain("rel_rng_ip")
+    tz = pg_domain("rel_rng_tz")
+    i4 = pg_domain("rel_rng_i4")
+    owner = one(
+        lambda: RngOwner, fields=lambda: [RngKind.owner_id], references=lambda: [RngOwner.id]
+    )
+
+
 async def test_nested_custom_range_and_its_domain_decode_like_a_plain_select(
     driver: PostgresDriver, pg_url: str
 ) -> None:
     # Q4-16: a domain over a user-defined range came back as its text in a nested row.
     drop = (
-        "DROP TABLE IF EXISTS rel_rng_row, rel_rng_owner; DROP DOMAIN IF EXISTS rel_rng_dom;"
-        " DROP TYPE IF EXISTS rel_rng"
+        "DROP TABLE IF EXISTS rel_rng_row, rel_rng_kind, rel_rng_owner;"
+        " DROP DOMAIN IF EXISTS rel_rng_dom, rel_rng_f8_dom; DROP TYPE IF EXISTS rel_rng"
+        + "".join(f", rel_rng_{k}" for k in _SUBTYPES)
     )
+    kinds = "".join(
+        f"CREATE TYPE rel_rng_{k} AS RANGE (subtype = {t},"
+        f" multirange_type_name = rel_rng_{k}_multi);"
+        for k, (t, _) in _SUBTYPES.items()
+    )
+    kinds += """
+    CREATE DOMAIN rel_rng_f8_dom AS rel_rng_f8;
+    CREATE TABLE rel_rng_kind (id serial PRIMARY KEY, owner_id int NOT NULL, f8 rel_rng_f8,
+      f8_dom rel_rng_f8_dom, f8_multi rel_rng_f8_multi, f8_arr rel_rng_f8[],
+      f8_multis rel_rng_f8_multi[], f4 rel_rng_f4, txt rel_rng_txt,
+      txt_multi rel_rng_txt_multi, tm rel_rng_tm, iv rel_rng_iv, ip rel_rng_ip, tz rel_rng_tz,
+      i4 rel_rng_i4);
+    INSERT INTO rel_rng_kind (owner_id) VALUES (1);
+    """
+    values = {k: v for k, (_, v) in _SUBTYPES.items()} | {
+        "f8_dom": "'(,-2.5e-7]'",
+        "f8_multi": "'{[1,2),[3.25,4]}'",
+        "f8_arr": """'{"[0.1,0.2)",NULL,empty}'""",
+        "f8_multis": """'{"{[1,2)}","{[3,4),[5,6)}"}'""",
+        "txt_multi": """'{[a,b),["x y",z]}'""",
+    }
+    kinds += f"INSERT INTO rel_rng_kind (owner_id, {', '.join(values)})"
+    kinds += f" VALUES (1, {', '.join(values.values())});"
     ddl = """
     CREATE TYPE rel_rng AS RANGE (subtype = numeric, multirange_type_name = rel_rng_multi);
     CREATE DOMAIN rel_rng_dom AS rel_rng;
@@ -389,7 +452,7 @@ async def test_nested_custom_range_and_its_domain_decode_like_a_plain_select(
       (1, NULL, NULL, NULL, NULL, NULL);
     """
     async with driver.acquire() as conn:
-        await conn.execute(drop + ";" + ddl, [])
+        await conn.execute(drop + ";" + ddl + kinds, [])
     try:
         async with await Database.connect(pg_url) as db:
             plain = await db.select().from_(RngRow).order_by(RngRow.id)
@@ -397,6 +460,12 @@ async def test_nested_custom_range_and_its_domain_decode_like_a_plain_select(
             assert isinstance(owner.rows[0].dom, Range)
             for got, want in zip(owner.rows, plain, strict=True):
                 for attr in ("dom", "plain", "multi", "doms", "ranges"):
+                    _assert_same(getattr(got, attr), getattr(want, attr))
+            plain_kinds = await db.select().from_(RngKind).order_by(RngKind.id)
+            [owner] = await db.query(RngOwner).find_many(with_={"kinds": {"order_by": RngKind.id}})
+            assert isinstance(owner.kinds[1].f8, Range)
+            for got, want in zip(owner.kinds, plain_kinds, strict=True):
+                for attr in values:
                     _assert_same(getattr(got, attr), getattr(want, attr))
     finally:
         async with driver.acquire() as conn:

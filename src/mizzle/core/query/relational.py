@@ -147,6 +147,10 @@ def _from_json(column: ColumnBase, value: Json) -> object:
     if column.json_fields is not None:
         values = _json_list(value, column.qualified_name)
         return {n: _from_json(c, v) for (n, c), v in zip(column.json_fields, values, strict=True)}
+    if column.json_range is not None and column.json_decoder is not None:  # Q4-20
+        lower, upper, *flags = _json_list(value, column.qualified_name)
+        bounds = [_from_json(column.json_range, b) for b in (lower, upper)]
+        return column.json_decoder([*bounds, *flags])
     if column.item is not None:
         if not isinstance(value, list):
             raise QueryError(f"{column.qualified_name}: expected a JSON array, got {value!r}")

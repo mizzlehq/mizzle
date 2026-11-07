@@ -88,6 +88,7 @@ class ColumnBase(ExprBase):
     json_type: ColumnBase | None
     json_load: Callable[[Runner], Awaitable[ColumnBase]] | None
     json_fields: tuple[tuple[str, ColumnBase], ...] | None  # a composite's fields, in order
+    json_range: ColumnBase | None  # a user-defined range's subtype: its bounds nest like it
     is_primary_key: bool
     is_unique: bool
     unique_name: str | None
@@ -134,6 +135,7 @@ class ColumnBase(ExprBase):
         self.json_type = None
         self.json_load = None
         self.json_fields = None
+        self.json_range = None
         self.is_primary_key = False
         self.is_unique = False
         self.unique_name = None

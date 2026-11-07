@@ -34,6 +34,9 @@ _AS_TEXT = frozenset(
 )
 
 
+_ENDS = ("lower", "upper")
+
+
 def _range_parts(ref: str) -> str:
     """A range as [lower, upper, lower_inc, upper_inc, empty]; the bounds as text, so a
     numeric or timestamp bound is exact (C30). to_json gives ISO dates whatever the
@@ -441,11 +444,17 @@ class PostgresCompiler(Compiler):
             item = self.json_value("x.v", column.item)
             if item == "x.v":
                 return ref  # elements are exact in JSON already
-            # Convert each element, keeping order and NULL arrays (ARRAY(...) is never NULL).
+            # Convert each element, keeping order and NULL arrays (ARRAY(...) is never NULL);
+            # as json, so elements that nest as arrays (multiranges) may differ in length.
             elements = (
-                f"ARRAY(SELECT {item} FROM unnest({ref}) WITH ORDINALITY AS x(v, n) ORDER BY x.n)"
+                f"ARRAY(SELECT to_json({item}) FROM unnest({ref}) WITH ORDINALITY AS x(v, n)"
+                " ORDER BY x.n)"
             )
             return f"CASE WHEN {ref} IS NULL THEN NULL ELSE {elements} END"
+        if column.json_range is not None:  # a user-defined range: bounds as its subtype's
+            lower, upper = (self.json_value(f"{e}({ref})", column.json_range) for e in _ENDS)
+            parts = f"{lower}, {upper}, lower_inc({ref}), upper_inc({ref}), isempty({ref})"
+            return f"CASE WHEN {ref} IS NULL THEN NULL ELSE json_build_array({parts}) END"
         base = column.sql_type.split("(", 1)[0]
         if base in _RANGES:
             return f"CASE WHEN {ref} IS NULL THEN NULL ELSE {_range_parts(ref)} END"

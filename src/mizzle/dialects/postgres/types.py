@@ -11,7 +11,7 @@ import struct
 import uuid as _uuid
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from decimal import Decimal
-from typing import Protocol, cast, override, runtime_checkable
+from typing import Protocol, Self, cast, override, runtime_checkable
 
 from asyncpg import (
     BitString,
@@ -671,16 +671,21 @@ _LOOKUP = (
     " WHERE t.oid IN (r.rngtypid, r.rngmultitypid))"
     " FROM pg_type t WHERE t.oid = to_regtype($1)"
 )
-# A user-defined range (or multirange) nests like the built-in one of its subtype (Q4-16).
-# ponytail: other subtypes (float8, text...) still nest as the range's text.
-_RANGE_OF = {
-    "integer": "int4range",
-    "bigint": "int8range",
-    "numeric": "numrange",
-    "timestamp without time zone": "tsrange",
-    "timestamp with time zone": "tstzrange",
-    "date": "daterange",
-}
+
+
+class _Bound(Protocol):  # what asyncpg's Range takes: any subtype's value
+    @override
+    def __eq__(self, other: object, /) -> bool: ...
+    def __lt__(self, other: Self, /) -> bool: ...
+    def __gt__(self, other: Self, /) -> bool: ...
+
+
+def _range_of_parts(value: object) -> object:
+    """A user-defined range from its decoded [lower, upper, lower_inc, upper_inc, empty]."""
+    lower, upper, lower_inc, upper_inc, empty = cast("list[_Bound | None]", value)
+    if empty:
+        return Range[_Bound](empty=True)
+    return Range(lower, upper, lower_inc=bool(lower_inc), upper_inc=bool(upper_inc))
 
 
 async def _json_type(runner: Runner, type_text: str) -> ColumnBase:
@@ -704,9 +709,10 @@ async def _json_type(runner: Runner, type_text: str) -> ColumnBase:
         elif kind == "c":
             fields = [(n, await _json_type(runner, t)) for n, t in zip(names, types, strict=True)]
             column.json_fields = tuple(fields)
-        elif (builtin := _RANGE_OF.get(subtype or "")) is not None:
-            column = _JSON_BASES[
-                builtin.replace("range", "multirange") if kind == "m" else builtin
-            ]()
+        elif subtype is not None:  # a user-defined range or multirange (Q4-16, Q4-20)
+            column = _json(Column[object](name, None), _range_of_parts)
+            column.json_range = await _json_type(runner, subtype)
+            if kind == "m":
+                column = column.array_column()  # nests like an array of its ranges
     runner.json_types[name] = column
     return column
