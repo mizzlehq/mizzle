@@ -604,6 +604,10 @@ def _diff_partitions(old: TableSnap, new: TableSnap, plan: _Plan) -> None:
             plan.drop_partitions.append(DropPartition(schema, pname))
 
 
+# A type's size or precision: ``(40)``, ``(10, 2)``.
+_TYPMOD = re.compile(r"\(\s*\d+\s*(?:,\s*-?\d+\s*)?\)")
+
+
 def _diff_table(
     old: TableSnap,
     new: TableSnap,
@@ -712,11 +716,13 @@ def _diff_table(
 
     # A type change makes PostgreSQL store the checks and index expressions using the column
     # with casts (`(c)::numeric >= (0)::numeric`): drop them first and add them again after
-    # it, as written (K4-21).
+    # it, as written (K4-21). Not when only the size changes (varchar(40) -> varchar(64)):
+    # the expression reads the same, and adding a check again scans the whole table.
     if retyped := [
         c
         for c, col in new["columns"].items()
-        if c in old["columns"] and old["columns"][c]["type"] != col["type"]
+        if c in old["columns"]
+        and _TYPMOD.sub("", old["columns"][c]["type"]) != _TYPMOD.sub("", col["type"])
     ]:
         old = copy.copy(old)
         stale = [n for n, c in old["checks"].items() if _mentions(c["expression"], retyped)]

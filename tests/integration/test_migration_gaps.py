@@ -2242,6 +2242,37 @@ async def test_column_type_change_recreates_the_checks_and_indexes_using_it(
     await migrate(driver, v1, snap([Beta2]))
 
 
+async def test_a_wider_column_keeps_its_checks_and_indexes(driver: PostgresDriver) -> None:
+    # K4-21 dropped and added again every check and index on a retyped column, also for
+    # varchar(40) -> varchar(64): the expression reads the same, and the added check scans
+    # the whole table.
+    from mizzle.pg import numeric, varchar
+
+    def gamma(size: int) -> type[Table]:
+        @final
+        class Gamma(Table, name="gamma", schema="mg"):
+            id = integer().primary_key()
+            slug = varchar(size)
+            price = numeric(size // 2, 2)
+
+            @classmethod
+            @override
+            def config(cls) -> list[Constraint]:
+                return [
+                    check("gamma_slug", sql("slug ~ '^[a-z]+$'")),
+                    check("gamma_price", sql("price >= 0")),
+                    index("gamma_part").on(cls.id).where(sql("price > 1")),
+                ]
+
+        return Gamma
+
+    v1, v2 = snap([gamma(40)]), snap([gamma(64)])
+    steps = diff(v1, v2)
+    assert [type(s).__name__ for s in steps] == ["AlterColumnType", "AlterColumnType"], steps
+    await migrate(driver, empty_snapshot("postgresql"), v1)
+    await migrate(driver, v1, v2)
+
+
 class K4Mood(enum.Enum):
     HAPPY = "happy"
 
