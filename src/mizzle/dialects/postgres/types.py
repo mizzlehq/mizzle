@@ -666,31 +666,47 @@ _FIELDS = (
 _LOOKUP = (
     "SELECT t.typtype::text, format_type(t.typbasetype, t.typtypmod),"
     f" ARRAY(SELECT a.attname::text {_FIELDS}),"
-    f" ARRAY(SELECT format_type(a.atttypid, a.atttypmod) {_FIELDS})"
+    f" ARRAY(SELECT format_type(a.atttypid, a.atttypmod) {_FIELDS}),"
+    " (SELECT format_type(r.rngsubtype, NULL) FROM pg_range r"
+    " WHERE t.oid IN (r.rngtypid, r.rngmultitypid))"
     " FROM pg_type t WHERE t.oid = to_regtype($1)"
 )
-# ponytail: per process, by type name; a database where the name is another type needs a
-# new process.
-_JSON_TYPES: dict[str, ColumnBase] = {}
+# A user-defined range (or multirange) nests like the built-in one of its subtype (Q4-16).
+# ponytail: other subtypes (float8, text...) still nest as the range's text.
+_RANGE_OF = {
+    "integer": "int4range",
+    "bigint": "int8range",
+    "numeric": "numrange",
+    "timestamp without time zone": "tsrange",
+    "timestamp with time zone": "tstzrange",
+    "date": "daterange",
+}
 
 
 async def _json_type(runner: Runner, type_text: str) -> ColumnBase:
-    """A column that nests and reads like ``type_text`` (as ``format_type`` prints it)."""
+    """A column that nests and reads like ``type_text`` (as ``format_type`` prints it).
+    Looked up once per database: the same name can be another type in another (Q4-17)."""
     if type_text.endswith("[]"):
         return (await _json_type(runner, type_text[:-2])).array_column()
     name = re.sub(r"\(.*?\)", "", type_text)  # numeric(10,2), timestamp(3) with time zone
     if (base := _JSON_BASES.get(name)) is not None:
         return base()
-    if (known := _JSON_TYPES.get(name)) is not None:
+    if (known := runner.json_types.get(name)) is not None:
         return known
     rows = await runner.fetch(CompiledQuery(_LOOKUP, (name,), (None,)), read_only=True)
     column: ColumnBase = Column[object](name, None)  # anything else: its JSON is already its value
     if rows:
-        kind, base_type, names, types = cast(tuple[str, str, list[str], list[str]], tuple(rows[0]))
+        kind, base_type, names, types, subtype = cast(
+            tuple[str, str, list[str], list[str], str | None], tuple(rows[0])
+        )
         if kind == "d":
             column = await _json_type(runner, base_type)
         elif kind == "c":
             fields = [(n, await _json_type(runner, t)) for n, t in zip(names, types, strict=True)]
             column.json_fields = tuple(fields)
-    _JSON_TYPES[name] = column
+        elif (builtin := _RANGE_OF.get(subtype or "")) is not None:
+            column = _JSON_BASES[
+                builtin.replace("range", "multirange") if kind == "m" else builtin
+            ]()
+    runner.json_types[name] = column
     return column

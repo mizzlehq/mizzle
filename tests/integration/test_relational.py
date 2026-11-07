@@ -7,7 +7,7 @@ from decimal import Decimal
 from typing import Any, cast
 
 import pytest
-from asyncpg import Record
+from asyncpg import Range, Record
 
 from mizzle import Database, QueryError, RelationNotLoaded, Table, desc, eq, gt, like, sql
 from mizzle.core.schema.relations import many, one
@@ -300,3 +300,104 @@ async def test_nested_domains_and_composites_decode_like_a_plain_select(
     finally:
         async with driver.acquire() as conn:
             await conn.execute(_DOM_DROP, [])
+
+
+class TenOwner(Table, name="rel_ten_owner"):
+    id = serial().primary_key()
+    rows = many(lambda: TenRow)
+
+
+class TenRow(Table, name="rel_ten_row"):
+    id = serial().primary_key()
+    owner_id = integer().not_null()
+    amt = pg_domain("rel_ten_amt")
+    pair = pg_composite("rel_ten_pair")
+    owner = one(
+        lambda: TenOwner, fields=lambda: [TenRow.owner_id], references=lambda: [TenOwner.id]
+    )
+
+
+async def test_nested_domain_types_are_looked_up_per_database(
+    driver: PostgresDriver, pg_url: str
+) -> None:
+    # Q4-17: the looked-up types were cached per process by name, so a second database
+    # where the name is another type (int vs numeric, other composite fields) decoded wrong.
+    ddl = (
+        "CREATE SCHEMA {s}; CREATE DOMAIN {s}.rel_ten_amt AS {t};"
+        " CREATE TYPE {s}.rel_ten_pair AS (a {t}, b {t});"
+        " CREATE TABLE {s}.rel_ten_owner (id serial PRIMARY KEY);"
+        " CREATE TABLE {s}.rel_ten_row (id serial PRIMARY KEY, owner_id int NOT NULL,"
+        "  amt {s}.rel_ten_amt, pair {s}.rel_ten_pair);"
+        " INSERT INTO {s}.rel_ten_owner DEFAULT VALUES;"
+        " INSERT INTO {s}.rel_ten_row (owner_id, amt, pair) VALUES (1, 2, ROW(3, 4));"
+    )
+    drop = "DROP SCHEMA IF EXISTS rel_ten_a, rel_ten_b CASCADE"
+    async with driver.acquire() as conn:
+        await conn.execute(drop, [])
+        await conn.execute(ddl.format(s="rel_ten_a", t="int"), [])
+        await conn.execute(ddl.format(s="rel_ten_b", t="numeric(10,2)"), [])
+    try:
+        for schema, want in (("rel_ten_a", 2), ("rel_ten_b", Decimal("2.00"))):
+            settings = {"search_path": schema}
+            async with await Database.connect(pg_url, server_settings=settings) as db:
+                plain = await db.select().from_(TenRow)
+                [owner] = await db.query(TenOwner).find_many(with_={"rows": True})
+                for got, row in zip(owner.rows, plain, strict=True):
+                    _assert_same(got.amt, row.amt)
+                    _assert_same(got.pair, row.pair)
+                    _assert_same(got.amt, want)
+    finally:
+        async with driver.acquire() as conn:
+            await conn.execute(drop, [])
+
+
+class RngOwner(Table, name="rel_rng_owner"):
+    id = serial().primary_key()
+    rows = many(lambda: RngRow)
+
+
+class RngRow(Table, name="rel_rng_row"):
+    id = serial().primary_key()
+    owner_id = integer().not_null()
+    dom = pg_domain("rel_rng_dom")
+    plain = pg_domain("rel_rng")  # a custom range column, typed by lookup too
+    multi = pg_domain("rel_rng_multi")
+    doms = pg_domain("rel_rng_dom[]")
+    ranges = pg_domain("rel_rng[]")
+    owner = one(
+        lambda: RngOwner, fields=lambda: [RngRow.owner_id], references=lambda: [RngOwner.id]
+    )
+
+
+async def test_nested_custom_range_and_its_domain_decode_like_a_plain_select(
+    driver: PostgresDriver, pg_url: str
+) -> None:
+    # Q4-16: a domain over a user-defined range came back as its text in a nested row.
+    drop = (
+        "DROP TABLE IF EXISTS rel_rng_row, rel_rng_owner; DROP DOMAIN IF EXISTS rel_rng_dom;"
+        " DROP TYPE IF EXISTS rel_rng"
+    )
+    ddl = """
+    CREATE TYPE rel_rng AS RANGE (subtype = numeric, multirange_type_name = rel_rng_multi);
+    CREATE DOMAIN rel_rng_dom AS rel_rng;
+    CREATE TABLE rel_rng_owner (id serial PRIMARY KEY);
+    CREATE TABLE rel_rng_row (id serial PRIMARY KEY, owner_id int NOT NULL, dom rel_rng_dom,
+      plain rel_rng, multi rel_rng_multi, doms rel_rng_dom[], ranges rel_rng[]);
+    INSERT INTO rel_rng_owner DEFAULT VALUES;
+    INSERT INTO rel_rng_row (owner_id, dom, plain, multi, doms, ranges) VALUES
+      (1, '[1.10,2.25)', '(,3.5]', '{[1,2),[3.5,4]}', '{"[0.1,0.2)",NULL}', '{empty}'),
+      (1, NULL, NULL, NULL, NULL, NULL);
+    """
+    async with driver.acquire() as conn:
+        await conn.execute(drop + ";" + ddl, [])
+    try:
+        async with await Database.connect(pg_url) as db:
+            plain = await db.select().from_(RngRow).order_by(RngRow.id)
+            [owner] = await db.query(RngOwner).find_many(with_={"rows": {"order_by": RngRow.id}})
+            assert isinstance(owner.rows[0].dom, Range)
+            for got, want in zip(owner.rows, plain, strict=True):
+                for attr in ("dom", "plain", "multi", "doms", "ranges"):
+                    _assert_same(getattr(got, attr), getattr(want, attr))
+    finally:
+        async with driver.acquire() as conn:
+            await conn.execute(drop, [])

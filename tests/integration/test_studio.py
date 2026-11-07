@@ -132,10 +132,27 @@ def test_split_statements_handles_quotes_and_comments() -> None:
     assert split_statements("-- only a comment") == []
 
 
+# What tests using ``client`` create; dropped after each one, so later runs (the kit's
+# fuzz tests) do not see it as drift (K4-23).
+_LEFTOVERS = (
+    "drop table if exists st_notes, st_csv, st_types, st_num, st_dom, st_mod, st_many, st_json,"
+    ' st_neg, "st/a", st_sdom, st_bad, st_head, st_tie, st_skip, st_domt, st_ck, st_tx, st_log,'
+    " st_stale, st_kid, st_parent, st_part, st_sort, st_uskip cascade;"
+    ' drop sequence if exists st_seq; drop schema if exists "date" cascade;'
+    ' drop domain if exists st_amt2, st_amt, st_span, st_basedom, "St Base Dom", st_dpair,'
+    " st_dj; drop type if exists st_pair;"
+    " drop function if exists st_skip_fn(), st_logit(int), st_uskip_fn()"
+)
+
+
 @pytest.fixture
 def client(pg_url: str, driver: PostgresDriver) -> Iterator[TestClient]:
     with make_client(pg_url) as c:
-        yield c
+        try:
+            yield c
+        finally:
+            response = c.post("/api/sql", json={"sql": _LEFTOVERS}, headers=AUTH)
+            assert response.status_code == 200, response.text
 
 
 def test_requires_token_and_host(client: TestClient) -> None:
@@ -758,13 +775,17 @@ async def test_export_filename_survives_odd_table_names(
         await conn.execute('CREATE TABLE public."café" (id int)', [])
         # The identifier contains a literal double quote: doubled inside a quoted name.
         await conn.execute('CREATE TABLE public."q""uote" (id int)', [])
-    with make_client(pg_url) as client:
-        latin = client.get("/api/tables/public/café/export", headers=AUTH)
-        assert latin.status_code == 200
-        assert "filename*=UTF-8''public.caf%C3%A9.csv" in latin.headers["content-disposition"]
-        quoted = client.get("/api/tables/public/q%22uote/export", headers=AUTH)
-        assert quoted.status_code == 200
-        assert 'filename="public.q_uote.csv"' in quoted.headers["content-disposition"]
+    try:
+        with make_client(pg_url) as client:
+            latin = client.get("/api/tables/public/café/export", headers=AUTH)
+            assert latin.status_code == 200
+            assert "filename*=UTF-8''public.caf%C3%A9.csv" in latin.headers["content-disposition"]
+            quoted = client.get("/api/tables/public/q%22uote/export", headers=AUTH)
+            assert quoted.status_code == 200
+            assert 'filename="public.q_uote.csv"' in quoted.headers["content-disposition"]
+    finally:
+        async with driver.acquire() as conn:
+            await conn.execute('DROP TABLE IF EXISTS public."café", public."q""uote"', [])
 
 
 def test_export_has_no_row_cap(pg_url: str, driver: PostgresDriver) -> None:
@@ -873,14 +894,18 @@ async def test_a_column_named_like_the_row_alias(pg_url: str, driver: PostgresDr
             [],
         )
     base = "/api/tables/public/alias_clash"
-    with make_client(pg_url) as client:
-        created = client.post(f"{base}/rows", json={"values": {"t": "x"}}, headers=AUTH)
-        assert created.status_code in (200, 201), created.text
-        listed = client.get(f"{base}/rows", headers=AUTH)
-        assert listed.status_code == 200, listed.text
-        exported = client.get(f"{base}/export", params={"format": "json"}, headers=AUTH)
-        assert exported.status_code == 200
-        assert [row["t"] for row in exported.json()] == ["x"]
+    try:
+        with make_client(pg_url) as client:
+            created = client.post(f"{base}/rows", json={"values": {"t": "x"}}, headers=AUTH)
+            assert created.status_code in (200, 201), created.text
+            listed = client.get(f"{base}/rows", headers=AUTH)
+            assert listed.status_code == 200, listed.text
+            exported = client.get(f"{base}/export", params={"format": "json"}, headers=AUTH)
+            assert exported.status_code == 200
+            assert [row["t"] for row in exported.json()] == ["x"]
+    finally:
+        async with driver.acquire() as conn:
+            await conn.execute("DROP TABLE public.alias_clash", [])
 
 
 def test_a_web_page_cannot_lock_out_a_local_studio(
