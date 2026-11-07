@@ -37,6 +37,7 @@ from mizzle.core.errors import (
     AfterRollbackError,
     MizzleError,
     QueryError,
+    QueryTimeout,
     SerializationFailure,
 )
 from mizzle.core.errors import ConnectionError as DbConnectionError
@@ -231,7 +232,10 @@ class Session(QueryBuilder):
         if batch_size < 1:
             raise QueryError("stream() needs batch_size >= 1")
         safe = query.session_safe
-        with self._logged(query):
+        # Traced per batch, not around the loop: a span made current here stayed current in
+        # the caller between batches and after a break, and its token was reset from
+        # another context when the generator was finalized (C16).
+        with self._logged(query, trace=False):
             if self._conn is not None:
                 # Locked per batch, not for the whole loop: its body may run other
                 # statements in the same transaction.
@@ -242,7 +246,8 @@ class Session(QueryBuilder):
                     while True:
                         async with self._lock:
                             self._check_savepoint_owner()
-                            batch = await anext(batches, None)
+                            with self._span(query):
+                                batch = await anext(batches, None)
                         if batch is None:
                             return
                         yield batch
@@ -257,10 +262,14 @@ class Session(QueryBuilder):
                         query.sql, query.params, batch_size, self._timeout, session_safe=safe
                     )
                     async with aclosing(cursor) as batches:
-                        async for batch in batches:
+                        while True:
+                            with self._span(query):
+                                batch = await anext(batches, None)
+                            if batch is None:
+                                return
                             yield batch
-            except DbConnectionError:
-                await self._after_lost_connection(query, False)  # never resumed mid-stream
+            except DbConnectionError as lost:
+                await self._after_lost_connection(query, False, lost)  # never resumed mid-stream
                 raise
 
     # -- public API -------------------------------------------------------------------
@@ -285,8 +294,8 @@ class Session(QueryBuilder):
             try:
                 async with self._connection() as conn:
                     return await conn.executemany(compiled.sql, params, self._timeout)
-            except DbConnectionError:
-                await self._after_lost_connection(compiled, False)
+            except DbConnectionError as lost:
+                await self._after_lost_connection(compiled, False, lost)
                 raise
 
     async def explain(self, statement: Node, *, analyze: bool = False) -> list[dict[str, object]]:
@@ -363,8 +372,8 @@ class Session(QueryBuilder):
                     return await conn.copy_records(
                         info.name, info.schema, names, records, self._timeout
                     )
-            except DbConnectionError:
-                await self._after_lost_connection(compiled, False)
+            except DbConnectionError as lost:
+                await self._after_lost_connection(compiled, False, lost)
                 raise
 
     async def copy_from(
@@ -398,8 +407,8 @@ class Session(QueryBuilder):
                         self._timeout,
                         session_safe=compiled.session_safe,
                     )
-            except DbConnectionError:
-                await self._after_lost_connection(compiled, False)
+            except DbConnectionError as lost:
+                await self._after_lost_connection(compiled, False, lost)
                 raise
 
     @overload
@@ -560,12 +569,15 @@ class Session(QueryBuilder):
             CompiledQuery("SELECT pg_notify($1, $2)", (channel, payload), (None, None)), "execute"
         )
 
-    async def ping(self) -> bool:
+    async def ping(self, timeout: float = 5.0) -> bool:
         """``True`` when the database answers a trivial query, ``False`` when it cannot be
-        reached. For readiness probes; runs ``SELECT 1`` on the primary."""
+        reached or does not answer within ``timeout`` seconds. For readiness probes; runs
+        ``SELECT 1`` on the primary. A hung server returns False instead of raising or
+        waiting forever (C17)."""
         try:
-            await self._call(CompiledQuery("SELECT 1", (), ()), "execute")
-        except DbConnectionError:
+            async with asyncio.timeout(timeout):
+                await self._call(CompiledQuery("SELECT 1", (), ()), "execute")
+        except (DbConnectionError, QueryTimeout, TimeoutError):
             return False
         return True
 
@@ -860,16 +872,16 @@ class Session(QueryBuilder):
             try:
                 async with self._connection(read_only) as conn:
                     return await self._send(conn, query, kind)
-            except DbConnectionError:
-                if not await self._after_lost_connection(query, read_only):
+            except DbConnectionError as lost:
+                if not await self._after_lost_connection(query, read_only, lost):
                     raise
             return await self._retry_read(query, kind, read_only)
         with self._logged(query):
             try:
                 async with self._connection(read_only) as conn:
                     return await self._send(conn, query, kind)
-            except DbConnectionError:
-                if not await self._after_lost_connection(query, read_only):
+            except DbConnectionError as lost:
+                if not await self._after_lost_connection(query, read_only, lost):
                     raise
             return await self._retry_read(query, kind, read_only)
 
@@ -889,12 +901,12 @@ class Session(QueryBuilder):
             yield
 
     @contextmanager
-    def _logged(self, query: CompiledQuery) -> Generator[None]:
+    def _logged(self, query: CompiledQuery, *, trace: bool = True) -> Generator[None]:
         """Time the block; trace it, log slow queries and pass a QueryEvent to the logger."""
         if self._logger is None and self._slow_query_ms is None and self._tracer is None:
             yield
             return
-        with self._span(query):
+        with self._span(query) if trace else nullcontext():
             start = time.perf_counter()
             error: BaseException | None = None
             try:
@@ -921,15 +933,19 @@ class Session(QueryBuilder):
                     except Exception:
                         log.exception("mizzle query logger raised")
 
-    async def _after_lost_connection(self, query: CompiledQuery, read_only: bool) -> bool:
+    async def _after_lost_connection(
+        self, query: CompiledQuery, read_only: bool, error: DbConnectionError
+    ) -> bool:
         """Handle a lost connection; return whether the statement may run again.
 
         The usual cause is a server restart, failover or idle timeout, which kills every
         pooled connection, so all of them are replaced. A plain read outside a transaction
         can safely run again; writes and raw SQL never do, as they may have taken effect.
+        A connection that could not be opened (too many connections) leaves the pool alone:
+        replacing healthy connections then only made it worse (C12).
         """
-        if self._conn is not None:
-            return False  # inside a transaction: the caller must retry the transaction
+        if self._conn is not None or not error.lost:
+            return False  # in a transaction the caller must retry the whole transaction
         for driver in (self._driver, *self._replicas):
             if driver is not None:
                 await driver.expire_connections()
@@ -1185,9 +1201,9 @@ class Database(Session):
         a real network). Use ``"always"`` if triggers or database functions change session
         settings themselves (``SET`` or ``set_config(..., false)`` without LOCAL, session
         advisory locks, ``LISTEN``), because mizzle cannot see inside them; the reset then
-        (and the ``on_connect`` hook with it) runs on every release. Neither mode drops temp
-        tables or ``PREPARE``d statements: the reset is ``RESET ALL``, advisory unlock,
-        ``UNLISTEN *`` and ``CLOSE ALL``."""
+        (and the ``on_connect`` hook with it) runs on every release. The reset is ``RESET ALL``,
+        advisory unlock, ``UNLISTEN *``, ``CLOSE ALL`` and ``DISCARD TEMP``; ``PREPARE``d
+        statements survive it."""
         dialect = dialect_for_url(url)
         for replica in replicas:
             if dialect_for_url(replica).name != dialect.name:

@@ -22,6 +22,7 @@ from collections.abc import (
 from contextlib import asynccontextmanager
 from decimal import Decimal
 from typing import TYPE_CHECKING, Literal, Self, cast, final
+from urllib.parse import urlsplit
 
 import asyncpg
 from asyncpg import exceptions as pg
@@ -99,8 +100,10 @@ def map_error(exc: BaseException, sql: str, server: int | None = None) -> Mizzle
             )
         case pg.SerializationError() | pg.DeadlockDetectedError():
             return SerializationFailure(exc.message, sql=sql, original=exc)
-        case pg.QueryCanceledError():  # statement_timeout on the server
+        case pg.QueryCanceledError() if "timeout" in exc.message:  # statement_timeout
             return QueryTimeout(exc.message, sql=sql, original=exc)
+        case pg.QueryCanceledError():  # pg_cancel_backend or a client cancel: not a timeout
+            return DatabaseError(exc.message, sql=sql, original=exc)
         case TimeoutError():  # client-side timeout; asyncpg cancels the statement
             return QueryTimeout("query timed out", sql=sql, original=exc)
         case pg.PostgresConnectionError() | pg.ConnectionDoesNotExistError() | OSError():
@@ -725,6 +728,10 @@ class _PoolConnection(asyncpg.Connection):
             reset = self.take_dirty()
             if reset:
                 await self.execute(self.get_reset_query())
+        if reset:
+            # asyncpg's reset keeps temp tables, so their rows reached the next user of the
+            # connection (C14). Not DEALLOCATE ALL: asyncpg's statement cache needs its own.
+            await self.execute("DISCARD TEMP")
         hook = self._mizzle_on_connect
         if hook is not None and reset:
             await hook(PostgresConnection(self))
@@ -794,8 +801,11 @@ class _Acquire:
         start = time.perf_counter()
         try:
             self._conn = await self._pool.acquire()
-        except (OSError, asyncpg.PostgresError) as exc:
-            raise DbConnectionError(f"could not acquire a connection: {exc}") from exc
+        except (OSError, asyncpg.PostgresError, asyncpg.InterfaceError) as exc:
+            # InterfaceError: "pool is closed", for a view kept after Database.close() (C18).
+            error = DbConnectionError(f"could not acquire a connection: {exc}")
+            error.lost = False  # the pooled connections are fine (C12)
+            raise error from exc
         self._driver.last_acquire_ms = (time.perf_counter() - start) * 1000
         self._wrapper = PostgresConnection(self._conn)
         return self._wrapper
@@ -822,6 +832,15 @@ class _Acquire:
                 # A reset or on_connect hook that fails on a live connection is.
                 level = logging.DEBUG if closed else logging.WARNING
                 log.log(level, "mizzle: could not return a connection to the pool", exc_info=True)
+
+
+def _malformed(url: str, exc: Exception) -> DbConnectionError:
+    """A malformed database URL as a clean, permanent error (C18), never with its password."""
+    password = re.search(r"://[^/@]*?:([^@/]+)@", url)
+    message = str(exc).replace(password.group(1), "***") if password else str(exc)
+    error = DbConnectionError(f"the database URL is malformed: {message}")
+    error.retryable = False
+    return error
 
 
 def _is_closed(conn: asyncpg.Connection | PoolConnectionProxy) -> bool:
@@ -869,6 +888,10 @@ class PostgresDriver:
                 await on_connect(PostgresConnection(conn))
 
         try:
+            _ = urlsplit(url).port  # a bad port or IPv6 address raises here, before connecting
+        except ValueError as exc:
+            raise _malformed(url, exc) from None
+        try:
             pool = await asyncpg.create_pool(
                 url,
                 min_size=pool_min_size,
@@ -883,6 +906,8 @@ class PostgresDriver:
                 # after a dirty statement) or every time ("always"), and re-runs on_connect.
                 reset=_reset_connection,
             )
+        except asyncpg.ClientConfigurationError as exc:  # a bad option, such as sslmode
+            raise _malformed(url, exc) from None
         except (OSError, asyncpg.PostgresError) as exc:
             # The URL is left out on purpose: it may contain a password.
             error = DbConnectionError(f"could not connect: {type(exc).__name__}: {exc}")

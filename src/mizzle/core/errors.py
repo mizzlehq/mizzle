@@ -71,9 +71,12 @@ class ConnectionError(DatabaseError):
     """A connection could not be opened or was lost.
 
     ``retryable`` is False when trying again cannot help (bad credentials, unknown database,
-    an unsupported feature), so a caller's retry loop can fail fast instead of waiting."""
+    an unsupported feature), so a caller's retry loop can fail fast instead of waiting.
+    ``lost`` is False when no connection was opened (the pool could not hand one out):
+    the pooled connections are then fine and are kept."""
 
     retryable: bool = True
+    lost: bool = True
 
 
 class QueryTimeout(DatabaseError):

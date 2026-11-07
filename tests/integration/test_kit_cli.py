@@ -886,7 +886,7 @@ async def test_malformed_url_and_missing_template_are_clean_errors(
     monkeypatch.setenv("DATABASE_URL", kit_url + "?sslmode=bogus")
     capsys.readouterr()
     assert await cli("info") == 1
-    assert "error: cannot connect" in capsys.readouterr().err
+    assert "error: the database URL is malformed" in capsys.readouterr().err
 
     monkeypatch.setenv("DATABASE_URL", kit_url)
     capsys.readouterr()

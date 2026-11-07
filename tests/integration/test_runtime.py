@@ -8,8 +8,17 @@ from typing import Any
 
 import pytest
 
-from mizzle import ConnectionError, Database, DatabaseError, QueryError, eq, placeholder, sql
-from mizzle.dialects.base import Connection
+from mizzle import (
+    ConnectionError,
+    Database,
+    DatabaseError,
+    MizzleError,
+    QueryError,
+    eq,
+    placeholder,
+    sql,
+)
+from mizzle.dialects.base import Connection, IsolationLevel
 from mizzle.dialects.postgres import PostgresDialect
 from mizzle.dialects.postgres.driver import PostgresDriver
 from tests.models import Posts, Users
@@ -656,3 +665,143 @@ async def test_no_rollback_hook_when_the_transaction_never_began(
             async with db.transaction(after_rollback=ar):
                 pass
     assert ran == []
+
+
+async def test_reset_drops_temp_tables(pg_url: str) -> None:
+    # C14: asyncpg's reset keeps temp tables, so their rows reached the next user.
+    for mode in ("always", "auto"):
+        async with await Database.connect(
+            pg_url, schema=[Users, Posts], pool_size=1, reset_connections=mode
+        ) as db:
+            async with db.transaction() as tx:
+                await tx.execute(sql("CREATE TEMP TABLE c14 (x int)"))
+                await tx.execute(sql("INSERT INTO c14 VALUES (42)"))
+            with pytest.raises(DatabaseError, match="c14"):
+                await db.execute(sql("SELECT x FROM c14"))
+
+
+async def test_ping_returns_false_when_the_server_hangs(
+    pg_url: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # C17: a hung server made ping() raise QueryTimeout, or wait forever without one.
+    import asyncio
+
+    async with await Database.connect(pg_url, schema=[Users, Posts], pool_size=1) as db:
+        assert await db.ping() is True
+
+        async def hang(*_args: object) -> None:
+            await asyncio.sleep(60)
+
+        monkeypatch.setattr(db, "_call", hang)
+        assert await db.ping(timeout=0.1) is False
+
+
+async def test_a_failed_acquire_keeps_the_pool(
+    pg_url: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # C12: one "too many connections" closed every healthy pooled connection.
+    import asyncpg
+
+    from mizzle import ConnectionError as DbConnectionError
+
+    async with await Database.connect(pg_url, schema=[Users, Posts], pool_size=1) as db:
+        [before] = await db.execute(sql("SELECT pg_backend_pid() AS pid"))
+
+        async def too_many(*_args: object, **_kw: object) -> object:
+            raise asyncpg.TooManyConnectionsError("sorry, too many clients already")
+
+        monkeypatch.setattr(asyncpg.Pool, "acquire", too_many)
+        with pytest.raises(DbConnectionError, match="could not acquire"):
+            await db.execute(sql("SELECT 1"))
+        monkeypatch.undo()
+        [after] = await db.execute(sql("SELECT pg_backend_pid() AS pid"))
+        assert after == before  # the healthy connection was kept
+
+
+async def test_stream_does_not_leave_its_span_current(pg_url: str) -> None:
+    # C16: the stream's span stayed current in the caller between batches and after a
+    # break, and finalizing the generator reset its token from another context.
+    import asyncio
+    import contextvars
+    import gc
+    from collections.abc import Generator
+    from contextlib import contextmanager
+
+    current: contextvars.ContextVar[str | None] = contextvars.ContextVar("span", default=None)
+    parents: list[tuple[str, str | None]] = []
+
+    class Tracer:
+        @contextmanager
+        def statement(
+            self,
+            sql: str,
+            params: tuple[object, ...] | None,
+            tags: Mapping[str, object],
+        ) -> Generator[object]:
+            parents.append((sql[:20], current.get()))
+            token = current.set(sql[:20])
+            try:
+                yield
+            finally:
+                current.reset(token)
+
+        @contextmanager
+        def transaction(self, isolation: IsolationLevel | None = None) -> Generator[object]:
+            yield
+
+    loop_errors: list[object] = []
+    asyncio.get_running_loop().set_exception_handler(lambda _l, ctx: loop_errors.append(ctx))
+    async with await Database.connect(
+        pg_url, schema=[Users, Posts], pool_size=2, tracer=Tracer()
+    ) as db:
+        query = db.compile(sql("SELECT generate_series(1, 50) AS g"))
+        n = 0
+        async for _batch in db.stream(query, 10):
+            assert current.get() is None  # nothing current while the caller runs
+            await db.execute(sql("SELECT 1"))
+            n += 1
+            if n == 2:
+                break
+        await asyncio.sleep(0.05)
+        gc.collect()
+        await asyncio.sleep(0.05)
+    assert current.get() is None
+    assert ("SELECT 1", None) in parents  # the caller's query is not a child of the stream
+    assert loop_errors == []
+
+
+async def test_wrong_error_types_are_mizzle_errors(pg_url: str) -> None:
+    # C18: an admin cancel was a QueryTimeout, a view kept after close() raised a raw
+    # asyncpg InterfaceError, and a malformed URL a raw ValueError.
+    import asyncio
+
+    from mizzle import ConnectionError as DbConnectionError
+    from mizzle.core.errors import QueryTimeout
+
+    async with await Database.connect(pg_url, schema=[Users, Posts], pool_size=2) as db:
+
+        async def cancel_the_sleeper() -> None:
+            await asyncio.sleep(0.3)
+            await db.execute(
+                sql(
+                    "SELECT pg_cancel_backend(pid) FROM pg_stat_activity "
+                    "WHERE query LIKE 'SELECT pg_sleep(5)%' AND pid <> pg_backend_pid()"
+                )
+            )
+
+        canceller = asyncio.create_task(cancel_the_sleeper())
+        with pytest.raises(DatabaseError, match="user request") as caught:
+            await db.execute(sql("SELECT pg_sleep(5)"))
+        assert not isinstance(caught.value, QueryTimeout)
+        await canceller
+
+    view = db.primary
+    await db.close()
+    with pytest.raises(MizzleError):
+        await view.execute(sql("SELECT 1"))
+
+    with pytest.raises(DbConnectionError, match="malformed") as bad:
+        await Database.connect(
+            "postgresql://u:secretpw@localhost:badport/db", schema=[Users, Posts]
+        )
+    assert "secretpw" not in str(bad.value)
