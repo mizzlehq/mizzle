@@ -36,6 +36,7 @@ from mizzle.kit.journal import (
 )
 from mizzle.kit.migrate import (
     apply_statements,
+    baseline_present,
     history_complete,
     partial_squash_message,
     pending_migrations,
@@ -46,7 +47,6 @@ from mizzle.kit.migrate import (
     superseded_names,
 )
 from mizzle.kit.snapshot import build_snapshot
-from mizzle.kit.sqltext import transaction_control
 
 log = logging.getLogger("mizzle")
 
@@ -318,7 +318,7 @@ def _migrate_dry_run(config: Config, args: Args, directory: MigrationsDir) -> in
     """Print the SQL ``migrate`` would run, without touching the database. It makes the same
     tamper, missing-on-disk and ordering checks, so a run that would fail fails here too."""
 
-    async def plan(driver: Driver, dialect: Dialect) -> list[Migration]:
+    async def plan(driver: Driver, dialect: Dialect) -> list[tuple[Migration, bool]]:
         async with driver.acquire() as conn:
             try:
                 applied = await dialect.applied_migrations(conn, config.migrations_schema)
@@ -327,15 +327,20 @@ def _migrate_dry_run(config: Config, args: Args, directory: MigrationsDir) -> in
                     applied = {}
                 else:
                     raise
-        return pending_migrations(directory.migrations(), applied, args.to)
+            pending = pending_migrations(directory.migrations(), applied, args.to)
+            # A baseline migrate would only record prints no SQL (K4-18).
+            return [(m, await baseline_present(conn, dialect, m)) for m in pending]
 
     pending = asyncio.run(_with_driver(config, plan))
     if not pending:
         print("Database is up to date.")
         return 0
-    for migration in pending:
+    for migration, recorded in pending:
         print(f"-- {migration.name}")
-        print(migration.sql().rstrip())
+        if recorded:
+            print("-- record baseline: the database has its objects, so nothing runs")
+        else:
+            print(migration.sql().rstrip())
     print(f"\n{len(pending)} pending migration(s); nothing was applied (--dry-run).")
     return 0
 
@@ -401,7 +406,7 @@ def cmd_reset(config: Config, args: Args) -> int:
     # does not drop, so it fails the second time) could leave the database half reset.
     hand = _hand_written(directory)
     for migration in migrations:
-        if word := transaction_control(migration.sql()):
+        if word := migration.transaction_control():
             # Every migration runs inside reset's transaction; a COMMIT in one ended it, so
             # the drops stayed while reset reported a rollback (B52).
             raise MigrationError(
@@ -684,7 +689,11 @@ _CUSTOM_HASH = hashlib.sha256(format_sql([], CUSTOM_HEADER).encode()).hexdigest(
 def _edited(entry: JournalEntry, migration: Migration) -> bool:
     """A generated migration whose SQL changed after generate. A --custom one is meant to be
     written after generate (an old journal marks it only by its empty-template hash)."""
-    return not migration.custom and entry["hash"] not in (migration.hash(), _CUSTOM_HASH)
+    return (
+        not migration.custom
+        and entry["hash"] != _CUSTOM_HASH
+        and not migration.matches(entry["hash"])
+    )
 
 
 def _hand_written(directory: MigrationsDir) -> list[str]:
@@ -723,10 +732,8 @@ def cmd_check(config: Config, args: Args) -> int:
                 "(two branches generated migrations from the same parent?)"
             )
         prev_id = snapshot["id"]
-    if config.out.exists():
-        for folder in sorted(p for p in config.out.iterdir() if p.is_dir() and p.name != "meta"):
-            if folder.name not in names:
-                problems.append(f"{folder.name}: folder is not in meta/journal.json")
+    for name in directory.unlisted():  # migration-named folders only (K4-11)
+        problems.append(f"{name}: folder is not in meta/journal.json")
     for w in warnings:
         print(f"warning: {w}")
     for p in problems:
@@ -773,7 +780,7 @@ def cmd_status(config: Config, args: Args) -> int:
             state = "unknown"
         elif migration.name in applied:
             state = "applied"
-            if applied[migration.name] != migration.hash():
+            if not migration.matches(applied[migration.name]):
                 state = "changed"
                 changed.append(migration.name)
         elif squash_adopted(migration, applied):
@@ -860,7 +867,7 @@ def cmd_info(config: Config, args: Args) -> int:
     superseded = superseded_names(migrations)
     known = {m.name for m in migrations} | superseded
     missing = [name for name in applied if name not in known]
-    changed = [m.name for m in migrations if m.name in applied and applied[m.name] != m.hash()]
+    changed = [m.name for m in migrations if m.name in applied and not m.matches(applied[m.name])]
 
     def in_effect(migration: Migration) -> bool:
         return migration.name in applied or squash_adopted(migration, applied)

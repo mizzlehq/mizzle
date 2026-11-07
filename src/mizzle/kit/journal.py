@@ -21,6 +21,7 @@ from typing import NotRequired, TypedDict, cast
 from mizzle.core.errors import MigrationError
 from mizzle.core.snapshot import Snapshot, empty_snapshot
 from mizzle.core.steps import Statement
+from mizzle.kit.sqltext import transaction_control
 
 BREAKPOINT = "-- mizzle:breakpoint"
 NO_TRANSACTION = "-- mizzle:no-transaction"
@@ -89,14 +90,28 @@ class Migration:
         return self.path / "snapshot.json"
 
     def sql(self) -> str:
-        return self._read(self.sql_path).decode("utf-8")
+        # LF line endings, as hash() reads them: a CRLF checkout must not put \r into
+        # function bodies (K4-7).
+        return self._read(self.sql_path).decode("utf-8").replace("\r\n", "\n")
 
     def hash(self) -> str:
         # A CRLF checkout hashes as the LF file did, so it does not look edited (K12).
         return hashlib.sha256(self._read(self.sql_path).replace(b"\r\n", b"\n")).hexdigest()
 
+    def matches(self, digest: str) -> bool:
+        """Whether a stored hash is this file's: the LF hash, or the raw-bytes hash an older
+        mizzle stored for a CRLF file (K4-16)."""
+        return (
+            digest == self.hash() or digest == hashlib.sha256(self._read(self.sql_path)).hexdigest()
+        )
+
     def statements(self) -> list[Statement]:
         return parse_sql(self.sql())
+
+    def transaction_control(self) -> str | None:
+        """The first COMMIT, BEGIN... in the migration. Each statement is read on its own:
+        a breakpoint ends one even without a ';' before it (K4-17)."""
+        return next((w for s in self.statements() if (w := transaction_control(s.sql))), None)
 
     def snapshot(self) -> Snapshot:
         return cast(Snapshot, load_json(self.snapshot_path, self._read(self.snapshot_path)))
@@ -273,7 +288,8 @@ class MigrationsDir:
         return sorted(
             p.name
             for p in self.root.iterdir()
-            if p.is_dir() and p.name != "meta" and p.name not in listed
+            # Only migration-named folders: .cache or __pycache__ is not one (K4-11).
+            if p.is_dir() and _INDEX.match(p.name) and p.name not in listed
         )
 
     def clear(self) -> None:

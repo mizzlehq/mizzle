@@ -4,13 +4,12 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable, Mapping, Sequence
+from typing import cast
 
 from mizzle.core.errors import MigrationError, MigrationTampered
-from mizzle.core.snapshot import Snapshot
 from mizzle.core.steps import Statement
 from mizzle.dialects.base import Connection, Dialect, Driver
 from mizzle.kit.journal import BASELINE, Migration, MigrationsDir
-from mizzle.kit.sqltext import transaction_control
 
 log = logging.getLogger("mizzle")
 
@@ -124,7 +123,7 @@ def pending_migrations(
     pending: list[Migration] = []
     for migration in migrations:
         if migration.name in applied:
-            if applied[migration.name] != migration.hash():
+            if not migration.matches(applied[migration.name]):
                 raise MigrationTampered(
                     f"{migration.name}/migration.sql changed after it was applied; "
                     "restore it and put the change in a new migration"
@@ -139,7 +138,7 @@ def pending_migrations(
             )
         if target_index is not None and migration.index > target_index:
             continue
-        if word := transaction_control(migration.sql()):
+        if word := migration.transaction_control():
             # It would commit part of the migration and then record it as applied; reset
             # refuses such a history too (C28).
             raise MigrationError(
@@ -151,13 +150,40 @@ def pending_migrations(
     return pending
 
 
-async def _has_objects(conn: Connection, dialect: Dialect, snapshot: Snapshot) -> bool:
-    """Whether the database already has a pulled baseline's tables, views and enums."""
+# The kinds of object a pulled baseline creates in its schemas (K4-1).
+_BASELINE_KINDS = ("tables", "views", "enums", "domains", "composites", "functions")
+
+
+async def baseline_present(conn: Connection, dialect: Dialect, migration: Migration) -> bool:
+    """Whether ``migration`` is a pulled baseline whose objects the database already has, so
+    migrate only records it (K7). One whose objects are all missing runs; one with only some
+    of them is refused, naming what is missing (K4-1)."""
+    if not migration.sql().startswith(BASELINE):
+        return False
+    snapshot = migration.snapshot()
     live = await dialect.introspect(conn, [dialect.default_schema, *snapshot["schemas"]])
-    return (
-        set(snapshot["tables"]) <= set(live["tables"])
-        and set(snapshot.get("views", {})) <= set(live.get("views", {}))
-        and set(snapshot["enums"]) <= set(live["enums"])
+    want = cast(Mapping[str, Mapping[str, object]], snapshot)
+    have = cast(Mapping[str, Mapping[str, object]], live)
+    found = False
+    missing: list[str] = []
+    # Extensions are CREATE ... IF NOT EXISTS and may be preinstalled: they count as
+    # missing, never as found.
+    for kind in (*_BASELINE_KINDS, "extensions"):
+        for name in want.get(kind, {}):
+            if name in have.get(kind, {}):
+                found = found or kind != "extensions"
+            else:
+                missing.append(f"{kind[:-1]} {name}")
+    if not missing:
+        return True
+    if not found:
+        return False
+    shown = ", ".join(missing[:10]) + (
+        f" and {len(missing) - 10} more" if len(missing) > 10 else ""
+    )
+    raise MigrationError(
+        f"{migration.name} is a pulled baseline, but the database has only part of it "
+        f"(missing {shown}); create the missing objects, or run it on an empty database"
     )
 
 
@@ -195,9 +221,7 @@ async def run_migrations(
                     on_apply(migration)
                 record = dialect.record_migration(schema, migration.name, migration.hash())
                 statements = migration.statements()
-                if migration.sql().startswith(BASELINE) and await _has_objects(
-                    conn, dialect, migration.snapshot()
-                ):
+                if await baseline_present(conn, dialect, migration):
                     statements = []  # pulled from this database: only recorded (K7)
                 await apply_statements(conn, statements, record)
                 done.append(migration.name)

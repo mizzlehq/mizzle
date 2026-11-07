@@ -1,4 +1,5 @@
 import copy
+import hashlib
 import re
 from pathlib import Path
 
@@ -19,6 +20,7 @@ from mizzle.dialects.postgres.ddl import normalize_default, normalize_type
 from mizzle.kit.config import load_config
 from mizzle.kit.diff import StrictRenames, diff
 from mizzle.kit.journal import BREAKPOINT, Migration, MigrationsDir, format_sql, parse_sql
+from mizzle.kit.migrate import pending_migrations
 from mizzle.kit.snapshot import build_snapshot
 from mizzle.kit.sqltext import transaction_control
 from tests.models import Posts, Users
@@ -35,6 +37,9 @@ dialect = PostgresDialect()
         ("'x'::character varying", "'x'"),
         ("'{}'::jsonb", "'{}'"),
         ("('2'::numeric)", "2"),
+        ('\'happy\'::"App"."Mood"', "'happy'"),  # K4-4
+        ("'happy'::app.\"Mood\"", "'happy'"),
+        ("'happy'::\"App\".mood", "'happy'"),
         (None, None),
     ],
 )
@@ -388,3 +393,36 @@ def test_migration_hash_ignores_crlf(tmp_path: Path) -> None:
     lf = migration.hash()
     (tmp_path / "migration.sql").write_bytes(b"SELECT 1;\r\nSELECT 2;\r\n")
     assert migration.hash() == lf
+
+
+def test_crlf_migration_sql_and_old_hash(tmp_path: Path) -> None:
+    # K4-7: sql() gives LF, so a function body does not keep \r.
+    raw = b"CREATE FUNCTION f() RETURNS int LANGUAGE sql AS $$\r\nSELECT 1\r\n$$;\r\n"
+    (tmp_path / "migration.sql").write_bytes(raw)
+    migration = Migration(index=1, name="0001_x", path=tmp_path)
+    assert "\r" not in migration.sql()
+    # K4-16: a hash an older mizzle stored (sha256 of the CRLF bytes) still matches.
+    old = hashlib.sha256(raw).hexdigest()
+    assert pending_migrations([migration], {"0001_x": old}) == []
+    with pytest.raises(MigrationError):
+        pending_migrations([migration], {"0001_x": "0" * 64})
+
+
+def test_commit_after_a_breakpoint_is_transaction_control(tmp_path: Path) -> None:
+    # K4-17: no ';' before the breakpoint, so the COMMIT did not start a statement.
+    sql = (
+        "INSERT INTO t VALUES (1)\n-- mizzle:breakpoint\nCOMMIT\n"
+        "-- mizzle:breakpoint\nINSERT INTO t VALUES (1)\n"
+    )
+    (tmp_path / "migration.sql").write_text(sql)
+    migration = Migration(index=1, name="0001_x", path=tmp_path)
+    with pytest.raises(MigrationError, match="contains COMMIT"):
+        pending_migrations([migration], {})
+
+
+def test_non_migration_folders_are_not_unlisted(tmp_path: Path) -> None:
+    # K4-11: .cache or __pycache__ in migrations/ blocked every command.
+    directory = MigrationsDir(tmp_path, "postgresql")
+    for name in (".cache", "__pycache__", "meta", "0001_merged"):
+        (tmp_path / name).mkdir()
+    assert directory.unlisted() == ["0001_merged"]

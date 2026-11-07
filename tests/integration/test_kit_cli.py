@@ -1,6 +1,7 @@
 """End-to-end tests of the `mizzle` CLI against a fresh database per test."""
 
 import asyncio
+import hashlib
 import importlib
 import json
 import shutil
@@ -574,6 +575,84 @@ async def test_pull_baseline_creates_tables_on_an_empty_database(
     await conn.close()
     assert await cli("migrate") == 0
     assert await columns(kit_url, "users") == ["id", "email", "name", "role", "created_at"]
+
+
+async def execute(url: str, sql: str) -> None:
+    conn = await asyncpg.connect(url)
+    try:
+        await conn.execute(sql)
+    finally:
+        await conn.close()
+
+
+async def _pull_fresh(project: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    fresh = project / "fresh"
+    fresh.mkdir()
+    module = f"fresh_{uuid.uuid4().hex[:8]}"
+    (fresh / "mizzle.toml").write_text(f'schema = "{module}"\nout = "migrations"\n')
+    monkeypatch.chdir(fresh)
+    assert await cli("pull") == 0
+
+
+async def test_pull_baseline_checks_every_object_kind(
+    project: Path, kit_url: str, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # K4-1: functions and domains were not checked; a DB missing them only recorded it.
+    await execute(
+        kit_url,
+        "CREATE DOMAIN posint AS integer CHECK (VALUE > 0); CREATE TABLE t (n posint); "
+        "CREATE FUNCTION one() RETURNS integer LANGUAGE sql AS 'SELECT 1'",
+    )
+    await _pull_fresh(project, monkeypatch)
+    # K4-18: dry-run on the source database shows the record, not the CREATE statements.
+    capsys.readouterr()
+    assert await cli("migrate", "--dry-run") == 0
+    out = capsys.readouterr().out
+    assert "record baseline" in out and "CREATE TABLE" not in out
+    await execute(kit_url, "DROP FUNCTION one()")
+    assert await cli("migrate") == 1
+    assert "missing function" in capsys.readouterr().err
+    await execute(kit_url, "DROP SCHEMA public CASCADE; CREATE SCHEMA public")
+    assert await cli("migrate") == 0  # nothing there: the baseline runs
+    assert await fetchval(kit_url, "SELECT one()") == 1
+
+
+async def test_pull_baseline_without_tables_runs_on_an_empty_database(
+    project: Path, kit_url: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # K4-1: a baseline with no tables, views or enums was recorded on any database.
+    await execute(kit_url, "CREATE FUNCTION one() RETURNS integer LANGUAGE sql AS 'SELECT 1'")
+    await _pull_fresh(project, monkeypatch)
+    await execute(kit_url, "DROP FUNCTION one()")
+    assert await cli("migrate") == 0
+    assert await fetchval(kit_url, "SELECT one()") == 1
+
+
+async def test_crlf_migration_applied_by_an_older_mizzle(
+    project: Path, kit_url: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # K4-16: the stored hash is sha256 of the CRLF bytes; migrate and status accept it.
+    assert await cli("generate") == 0
+    sql = next(project.glob("migrations/0001_*/migration.sql"))
+    sql.write_bytes(sql.read_bytes().replace(b"\n", b"\r\n"))
+    assert await cli("migrate") == 0
+    raw = hashlib.sha256(sql.read_bytes()).hexdigest()
+    await execute(kit_url, f"UPDATE __mizzle_migrations SET hash = '{raw}'")
+    assert await cli("migrate") == 0
+    capsys.readouterr()
+    assert await cli("status") == 0
+    assert "changed" not in capsys.readouterr().out
+
+
+async def test_non_migration_folders_are_ignored(
+    project: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # K4-11: .cache or __pycache__ blocked every command; check called it unlisted.
+    assert await cli("generate") == 0
+    (project / "migrations" / ".cache").mkdir()
+    (project / "migrations" / "__pycache__").mkdir()
+    assert await cli("migrate") == 0
+    assert await cli("check") == 0
 
 
 async def test_pull_warns_about_what_it_skips(
