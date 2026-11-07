@@ -81,7 +81,7 @@ class ColumnBase(ExprBase):
     enum_schema: str | None  # the enum type's schema; None: the default one
     item: ColumnBase | None
     # Turns the JSON a relational query nests this column as back into its Python value,
-    # for types JSON cannot carry (ranges, geometry, cidr, bit strings).
+    # for types JSON cannot carry (point, line, cidr, bit strings).
     json_decoder: Callable[[object], object] | None
     # A domain or composite: how its nested JSON is built and read (its base type, or its
     # fields), looked up by json_load before a relational query nests it (Q4-6).

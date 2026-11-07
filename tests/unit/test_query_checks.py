@@ -22,7 +22,7 @@ from mizzle.core.schema.types import (
 )
 from mizzle.core.sql.operators import eq
 from mizzle.dialects.postgres.driver import _needs_newer_server
-from mizzle.dialects.postgres.types import array, int4range, pg_enum, serial
+from mizzle.dialects.postgres.types import array, pg_enum, point, serial
 from tests.models import Users
 
 
@@ -42,7 +42,7 @@ class Kinds(Table, name="kinds"):
     amount = numeric(10, 2).not_null()
     day = date().not_null()
     at = timestamp().not_null()
-    span = int4range()
+    span = point()
     level = pg_enum(Level)
     tag = text().not_null().default_fn(lambda: f"t{next(_ticket)}")
 
@@ -247,10 +247,10 @@ def test_sql_with_a_lone_brace_is_a_query_error() -> None:
 
 
 def test_ddl_literals_arrays_and_postgres_types() -> None:
-    # Q11: a list is an array, not JSON text. Q12: inet, cidr, ranges, bits, geometry.
+    # Q11: a list is an array, not JSON text. Q12: inet, cidr, bits, geometry.
     import ipaddress
 
-    from asyncpg import BitString, Box, LineSegment, Point, Range
+    from asyncpg import BitString, Line, Point
 
     from mizzle.dialects.postgres.ddl import compiler
 
@@ -258,11 +258,9 @@ def test_ddl_literals_arrays_and_postgres_types() -> None:
     assert c.literal([1, "a"]) == "ARRAY[1, 'a']" and c.literal([]) == "'{}'"
     assert c.literal(ipaddress.ip_address("10.0.0.1")) == "'10.0.0.1'::inet"
     assert c.literal(ipaddress.ip_network("10.0.0.0/8")) == "'10.0.0.0/8'::cidr"
-    assert c.literal(Range(1, 5)) == "'[1,5)'" and c.literal([Range(1, 2)]) == "'{[1,2)}'"
     assert c.literal(BitString.from_int(5, length=4)) == "'0101'::varbit"
     assert c.literal(Point(1, 2.5)) == "'(1,2.5)'::point"
-    assert c.literal(Box((0, 0), (2, 3))) == "'(2,3),(0,0)'::box"
-    assert c.literal(LineSegment((0, 0), (1, 1))) == "'[(0,0),(1,1)]'::lseg"
+    assert c.literal(Line(1, -1, 0)) == "'{1,-1,0}'::line"
 
 
 def test_json_scalar_defaults_are_json_text() -> None:

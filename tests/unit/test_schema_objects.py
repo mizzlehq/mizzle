@@ -38,34 +38,17 @@ from mizzle.pg import (
     bigint,
     bit,
     boolean,
-    box,
     cidr,
-    circle,
-    citext,
-    daterange,
-    hstore,
-    int4multirange,
-    int4range,
-    int8range,
     integer,
     line,
-    lseg,
-    ltree,
     macaddr,
     macaddr8,
-    money,
-    numrange,
-    path,
     point,
-    polygon,
     serial,
     text,
     timestamp,
-    tstzmultirange,
-    tstzrange,
     varbit,
     vector,
-    xml,
 )
 
 dialect = PostgresDialect()
@@ -623,57 +606,6 @@ def test_unlogged_and_storage_sql_and_pull(tmp_path: Path) -> None:
 
 
 @final
-class Spans(Table, name="spans"):
-    id = integer().primary_key()
-    ints = int4range()
-    big = int8range()
-    nums = numrange()
-    stamps = tstzrange()
-    days = daterange()
-    multi = int4multirange()
-    stampmulti = tstzmultirange()
-
-
-def test_range_and_multirange_types_sql_snapshot_and_pull(tmp_path: Path) -> None:
-    original = snap([Spans], objects=[])
-    columns = original["tables"]["public.spans"]["columns"]
-    assert columns["ints"]["type"] == "int4range"
-    assert columns["big"]["type"] == "int8range"
-    assert columns["nums"]["type"] == "numrange"
-    assert columns["stamps"]["type"] == "tstzrange"
-    assert columns["days"]["type"] == "daterange"
-    assert columns["multi"]["type"] == "int4multirange"
-    assert columns["stampmulti"]["type"] == "tstzmultirange"
-
-    create = next(s for s in sqls(empty_snapshot("postgresql"), original) if "CREATE TABLE" in s)
-    assert '"ints" int4range' in create
-    assert '"nums" numrange' in create
-    assert '"stamps" tstzrange' in create
-    assert '"days" daterange' in create
-    assert '"multi" int4multirange' in create
-
-    source = render_schema_module(original)
-    assert "int4range()" in source
-    assert "numrange()" in source
-    assert "tstzmultirange()" in source
-
-    path = tmp_path / "pulled_ranges.py"
-    path.write_text(source)
-    spec = importlib.util.spec_from_file_location("pulled_ranges", path)
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    sys.modules["pulled_ranges"] = module
-    spec.loader.exec_module(module)
-    members = list(vars(module).values())
-    tables = [
-        v
-        for v in members
-        if isinstance(v, type) and issubclass(v, Table) and "__table__" in vars(v)
-    ]
-    assert diff(original, build_snapshot(tables, dialect)) == []
-
-
-@final
 class Reserved(Table, name="reserved"):
     id = serial().primary_key()
     room = text().not_null()
@@ -751,18 +683,8 @@ class Assorted(Table, name="assorted"):
     mac8 = macaddr8()
     flags = bit(4)
     variable = varbit(8)
-    doc = xml()
-    amount = money()
     pt = point()
     ln = line()
-    seg = lseg()
-    rect = box()
-    trace = path()
-    area = polygon()
-    disc = circle()
-    attrs = hstore()
-    label = citext()
-    tree = ltree()
     embeddings = array(vector(3))
 
 
@@ -774,18 +696,8 @@ def test_more_column_types_sql_snapshot_and_pull(tmp_path: Path) -> None:
     assert columns["mac8"]["type"] == "macaddr8"
     assert columns["flags"]["type"] == "bit(4)"
     assert columns["variable"]["type"] == "bit varying(8)"
-    assert columns["doc"]["type"] == "xml"
-    assert columns["amount"]["type"] == "money"
     assert columns["pt"]["type"] == "point"
     assert columns["ln"]["type"] == "line"
-    assert columns["seg"]["type"] == "lseg"
-    assert columns["rect"]["type"] == "box"
-    assert columns["trace"]["type"] == "path"
-    assert columns["area"]["type"] == "polygon"
-    assert columns["disc"]["type"] == "circle"
-    assert columns["attrs"]["type"] == "hstore"
-    assert columns["label"]["type"] == "citext"
-    assert columns["tree"]["type"] == "ltree"
     assert columns["embeddings"]["type"] == "vector(3)[]"
     assert original.get("extensions") == {"vector": {"name": "vector"}}  # vector[] needs pgvector
 

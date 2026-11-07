@@ -9,7 +9,7 @@ from collections.abc import Iterable, Sequence
 from decimal import Decimal
 from typing import TYPE_CHECKING, cast, override
 
-from asyncpg import BitString, Box, Circle, Line, LineSegment, Path, Point, Range
+from asyncpg import BitString, Line, Point
 
 from mizzle.core.compiler import CompiledQuery, Compiler, interval_text
 from mizzle.core.errors import QueryError
@@ -28,21 +28,10 @@ if TYPE_CHECKING:
 MAX_PARAMS = 32767  # PostgreSQL wire protocol limit on bind parameters per statement
 
 
-_RANGES = frozenset({"int4range", "int8range", "numrange", "tsrange", "tstzrange", "daterange"})
-_AS_TEXT = frozenset(
-    {"cidr", "bit", "varbit", "point", "line", "lseg", "box", "path", "polygon", "circle", "hstore"}
-)
+_AS_TEXT = frozenset({"cidr", "bit", "varbit", "point", "line"})
 
 
 _ENDS = ("lower", "upper")
-
-
-def _range_parts(ref: str) -> str:
-    """A range as [lower, upper, lower_inc, upper_inc, empty]; the bounds as text, so a
-    numeric or timestamp bound is exact (C30). to_json gives ISO dates whatever the
-    session's DateStyle, which ::text follows (Q13)."""
-    lower, upper = (f"to_json({end}({ref})) #>> '{{}}'" for end in ("lower", "upper"))
-    return f"json_build_array({lower}, {upper}, lower_inc({ref}), upper_inc({ref}), isempty({ref}))"
 
 
 def _num(value: float) -> str:
@@ -55,107 +44,11 @@ def _point(point: Sequence[float]) -> str:
 
 
 def _quoted(text: str, special: str, quote: str = '""') -> str:
-    """An element of an array, range or composite as PostgreSQL prints it: quoted when
+    """An element of an array or composite as PostgreSQL prints it: quoted when
     needed, with a quote inside as ``quote`` (an array's is backslashed)."""
     if text and not any(ch in special or ch.isspace() for ch in text):
         return text
     return '"' + text.replace("\\", "\\\\").replace('"', quote) + '"'
-
-
-type _Range = Range[int] | Range[Decimal] | Range[datetime.date]
-
-
-def _all_ranges(values: list[object]) -> bool:
-    return bool(values) and all(isinstance(v, Range) for v in values)
-
-
-def _range_text(value: _Range) -> str:
-    """As PostgreSQL prints it: '(' at an unbounded end, 'empty' for [1,1) (Q4-4)."""
-    lower, upper = value.lower, value.upper
-    point = lower is not None and lower == upper and not (value.lower_inc and value.upper_inc)
-    if value.isempty or point:
-        return "empty"
-    low = "(" if lower is None else ("[" if value.lower_inc else "(") + _bound(lower)
-    high = ")" if upper is None else _bound(upper) + ("]" if value.upper_inc else ")")
-    return f"{low},{high}"
-
-
-def _bound(value: object) -> str:
-    return _quoted(pg_text(value), '"\\()[],')
-
-
-_DISCRETE = frozenset(
-    {"int4range", "int8range", "daterange", "int4multirange", "int8multirange", "datemultirange"}
-)
-
-
-def _step[V: (int, datetime.date)](value: V) -> V:
-    return value + 1 if isinstance(value, int) else value + datetime.timedelta(days=1)
-
-
-def _canonical[V: (int, datetime.date)](value: Range[V]) -> Range[V]:
-    """[lower, upper) as PostgreSQL stores a discrete range: [1,5] is [1,6) (Q4-4)."""
-    lower, upper = value.lower, value.upper
-    if value.isempty:
-        return value
-    if lower is not None and not value.lower_inc:
-        lower = _step(lower)
-    if upper is not None and value.upper_inc:
-        upper = _step(upper)
-    if lower is not None and upper is not None and lower >= upper:
-        return Range(empty=True)
-    return Range(lower, upper, lower_inc=lower is not None, upper_inc=False)
-
-
-def _is_empty[V: (int, Decimal, datetime.date)](value: Range[V]) -> bool:
-    lower, upper = value.lower, value.upper
-    return value.isempty or (
-        lower is not None and lower == upper and not (value.lower_inc and value.upper_inc)
-    )
-
-
-def _merged[V: (int, Decimal, datetime.date)](ranges: list[Range[V]]) -> list[Range[V]]:
-    """A multirange as PostgreSQL stores it: sorted, without empty ranges, overlapping or
-    adjacent ones merged: {[1,3),[2,5)} is {[1,5)}, {[1,2],(2,3)} is {[1,3)} (Q4-14)."""
-    out: list[Range[V]] = []
-    for r in sorted(
-        (r for r in ranges if not _is_empty(r)),
-        key=lambda r: (r.lower is not None, r.lower, not r.lower_inc),
-    ):
-        last = out[-1] if out else None
-        if last is None or not (
-            last.upper is None
-            or r.lower is None
-            or r.lower < last.upper
-            or (r.lower == last.upper and (r.lower_inc or last.upper_inc))
-        ):
-            out.append(r)
-            continue
-        upper, upper_inc = r.upper, r.upper_inc
-        if last.upper is None or (
-            upper is not None and (upper, upper_inc) <= (last.upper, last.upper_inc)
-        ):
-            upper, upper_inc = last.upper, last.upper_inc
-        out[-1] = Range(last.lower, upper, lower_inc=last.lower_inc, upper_inc=upper_inc)
-    return out
-
-
-def canonical_ranges(value: object, sql_type: str) -> object:
-    """``value`` with each range of a discrete range type (an array or multirange of one
-    too) in PostgreSQL's canonical form, a numrange [1,5] as it is; a multirange's ranges
-    then merged and sorted as PostgreSQL stores them."""
-    discrete = sql_type.removesuffix("[]") in _DISCRETE
-    if isinstance(value, Range):
-        one = cast(Range[int], value)
-        return _canonical(one) if discrete else one
-    if not isinstance(value, list):
-        return value
-    items = cast(list[object], value)
-    if discrete:
-        items = [_canonical(cast(Range[int], v)) if isinstance(v, Range) else v for v in items]
-    if sql_type.endswith("multirange") and _all_ranges(items):
-        return _merged(cast(list[Range[int]], items))
-    return items
 
 
 def _trim_fraction(text: str) -> str:
@@ -256,8 +149,6 @@ def pg_text(value: object) -> str:
             return "\\x" + value.hex()
         case datetime.date() | datetime.time():
             return temporal_text(value)
-        case Range():
-            return _range_text(cast(_Range, value))
         case BitString():  # without the spaces as_string() puts every 8 bits (Q4-10)
             return value.as_string().replace(" ", "")
         case list():
@@ -277,16 +168,6 @@ def _geometry_text(value: object) -> str | None:
             return _point(value)
         case Line():
             return "{" + ",".join(_num(n) for n in value) + "}"
-        case LineSegment():
-            return f"[{_point(value[0])},{_point(value[1])}]"
-        case Box():  # PostgreSQL keeps the upper right corner first
-            (x1, y1), (x2, y2) = value
-            return f"{_point((max(x1, x2), max(y1, y2)))},{_point((min(x1, x2), min(y1, y2)))}"
-        case Path():  # and Polygon, always closed
-            points = ",".join(_point(p) for p in cast(Iterable[Point], value))
-            return f"({points})" if value.is_closed else f"[{points}]"
-        case Circle():
-            return f"<{_point(value[0])},{_num(value[1])}>"
         case _:
             return None
 
@@ -298,15 +179,8 @@ class PostgresCompiler(Compiler):
 
     @override
     def literal(self, value: object) -> str:
-        # Quoted text cast to the type, as for interval and bytea (Q12). A range takes its
-        # type from context: its Python value does not say int4range or int8range.
+        # Quoted text cast to the type, as for interval and bytea (Q12).
         match value:
-            case Range():
-                return self.literal(_range_text(cast(_Range, value)))
-            case list() if _all_ranges(cast(list[object], value)):  # a multirange
-                # Merged and sorted as PostgreSQL stores it, as a default is (Q4-19).
-                ranges = _merged(cast(list[Range[int]], value))
-                return self.literal("{" + ",".join(_range_text(r) for r in ranges) + "}")
             case ipaddress.IPv4Network() | ipaddress.IPv6Network():
                 return self.literal(str(value)) + "::cidr"
             case (
@@ -322,14 +196,12 @@ class PostgresCompiler(Compiler):
                 geometry = _geometry_text(value)
                 if geometry is None:
                     return super().literal(value)
-                name = "lseg" if isinstance(value, LineSegment) else type(value).__name__.lower()
-                return f"{self.literal(geometry)}::{name}"
+                return f"{self.literal(geometry)}::{type(value).__name__.lower()}"
 
     @override
     def column_literal(self, column: ColumnBase, value: object) -> str:
         # As PostgreSQL prints it back, so a default compares equal (Q4-4, Q4-7, Q4-11); an
         # array as '{a}', which takes the column's type where ARRAY['a'] is text[] (Q4-1).
-        value = canonical_ranges(value, column.sql_type)
         if value is None:
             return "NULL"
         if column.sql_type in ("json", "jsonb"):  # JSON text, even 5 (Q10)
@@ -446,7 +318,7 @@ class PostgresCompiler(Compiler):
             if item == "x.v":
                 return ref  # elements are exact in JSON already
             # Convert each element, keeping order and NULL arrays (ARRAY(...) is never NULL);
-            # as json, so elements that nest as arrays (multiranges) may differ in length.
+            # as json, so elements that nest as arrays may differ in length.
             elements = (
                 f"ARRAY(SELECT to_json({item}) FROM unnest({ref}) WITH ORDINALITY AS x(v, n)"
                 " ORDER BY x.n)"
@@ -457,17 +329,9 @@ class PostgresCompiler(Compiler):
             parts = f"{lower}, {upper}, lower_inc({ref}), upper_inc({ref}), isempty({ref})"
             return f"CASE WHEN {ref} IS NULL THEN NULL ELSE json_build_array({parts}) END"
         base = column.sql_type.split("(", 1)[0]
-        if base in _RANGES:
-            return f"CASE WHEN {ref} IS NULL THEN NULL ELSE {_range_parts(ref)} END"
-        if base.endswith("multirange"):
-            parts = _range_parts("r.v")
-            return (
-                f"CASE WHEN {ref} IS NULL THEN NULL "
-                f"ELSE ARRAY(SELECT {parts} FROM unnest({ref}) AS r(v)) END"
-            )
         if base in _AS_TEXT:
-            # JSON has no form for these (or, for hstore, one a plain select does not
-            # return): send the text, which the column's json_decoder parses (C30).
+            # JSON has no form for these: send the text, which the column's json_decoder
+            # parses (C30).
             return f"{ref}::text"
         kind = column.accepts[0] if column.accepts else None
         if kind is float:

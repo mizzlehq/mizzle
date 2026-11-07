@@ -140,7 +140,7 @@ BENCH_CLIENTS=50 BENCH_POOL=8 uv run ...  # the concurrent run
 
 Joins, subqueries, CTEs, window functions, `UNION`, `CASE` and typed SQL functions;
 identity, generated and auto-updated columns; pgvector and full-text search; views, row-level
-security, roles, functions and triggers in migrations; streaming, `COPY`, `LISTEN`/`NOTIFY`;
+security, roles, functions and triggers in migrations; streaming and batched inserts;
 read replicas, timeouts and retries. See the
 [changelog](https://github.com/mizzlehq/mizzle/blob/main/CHANGELOG.md) for examples.
 

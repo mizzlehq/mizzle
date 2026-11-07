@@ -24,12 +24,11 @@ from __future__ import annotations
 
 import re
 from collections.abc import Callable, Mapping, Sequence
-from datetime import date
 from decimal import Decimal
 from types import GenericAlias
 from typing import Annotated, Any, Literal, cast
 
-from asyncpg import BitString, Box, Circle, Line, LineSegment, Path, Point, Polygon, Range
+from asyncpg import BitString, Line, Point
 
 try:
     import pydantic
@@ -70,10 +69,6 @@ def column_type(column: ColumnBase) -> object:
         return Annotated[list[float], pydantic.Field(min_length=size, max_length=size)]
     if column.sql_type.startswith("sparsevec("):
         return dict[int, float]
-    if column.accepts == (list,) and (decode := column.json_decoder) is not None:
-        # a multirange: a list of Range fields, each parsed like one range of it (Q4-9)
-        one = _pydantic_type(Range, lambda v: cast(list[object], decode([v]))[0])
-        return GenericAlias(list, (one,))
     base = column.accepts[0]
     if base is str and (m := _VARCHAR.fullmatch(column.sql_type)):
         return Annotated[str, pydantic.Field(max_length=int(m.group(1)))]
@@ -95,17 +90,11 @@ def column_type(column: ColumnBase) -> object:
 
 def _json_form(value: object) -> object:
     """A value as JSON, in the form its column's json_decoder reads back: the form a
-    relational query nests it as (Q14). Lists cover multiranges and arrays (Q4-9)."""
+    relational query nests it as (Q14). Lists cover arrays (Q4-9)."""
     match value:
-        case Range():
-            r = cast("Range[int | Decimal | date]", value)
-            return [_json_form(r.lower), _json_form(r.upper), r.lower_inc, r.upper_inc, r.isempty]
         case BitString():
             return value.as_string().replace(" ", "")  # spaced every 4 bits (Q4-10)
-        case Path():  # not a tuple; the brackets keep it open or closed (Q4-13)
-            points = ",".join(f"({x},{y})" for x, y in value.points)
-            return f"({points})" if value.is_closed else f"[{points}]"
-        case list() | tuple():  # Point, Box, Line, LineSegment, Circle are tuples
+        case list() | tuple():  # Point and Line are tuples
             return [_json_form(v) for v in cast(Sequence[object], value)]
         case _:
             return cast(object, to_jsonable_python(value))
@@ -113,21 +102,15 @@ def _json_form(value: object) -> object:
 
 # The JSON type each special value dumps to, which its field parses back (Q14, Q4-13).
 _JSON_FORMS: dict[type, type] = {
-    Range: list,
     BitString: str,
-    Path: str,
-    Polygon: str,
     Point: list,
     Line: list,
-    LineSegment: list,
-    Box: list,
-    Circle: list,
 }
 
 
 def _pydantic_type(kind: type, parse: Callable[[object], object] | None) -> object:
     """``kind``, or an isinstance check when pydantic has no schema for it (asyncpg's
-    Range, geometry, BitString): such fields accept those objects as they are, and also
+    Point, Line, BitString): such fields accept those objects as they are, and also
     their JSON form (``_json_form``) when the column can parse it."""
     try:
         pydantic.TypeAdapter(kind)

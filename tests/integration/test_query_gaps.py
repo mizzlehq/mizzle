@@ -240,10 +240,9 @@ async def test_overriding_identity_values(db: Database, driver: PostgresDriver) 
     try:
         with pytest.raises(QueryError, match="overriding_system_value"):
             await db.insert(Tickets).values(id=10, label="x")
-        # The bulk paths cannot override: the error says what to use instead.
-        for bulk in (db.insert_many, db.copy_into):
-            with pytest.raises(QueryError, match=r"overriding_system_value\(\), or make"):
-                await bulk(Tickets, [{"id": 5, "label": "x"}])
+        # The bulk path cannot override: the error says what to use instead.
+        with pytest.raises(QueryError, match=r"overriding_system_value\(\), or make"):
+            await db.insert_many(Tickets, [{"id": 5, "label": "x"}])
         await db.insert(Tickets).values(id=10, label="a").overriding_system_value()
         await db.insert(Tickets).values([{"id": 99, "label": "b"}]).overriding_user_value()
         await db.insert(Tickets).values(label="c")

@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import cast, final, override
 
 import pytest
-from asyncpg import BitString, Point, Range
+from asyncpg import BitString, Point
 
 from mizzle import (
     Constraint,
@@ -30,7 +30,6 @@ from mizzle import (
     domain,
     eq,
     exclusion,
-    extension,
     function,
     grant,
     index,
@@ -64,43 +63,25 @@ from mizzle.pg import (
     array,
     bigint,
     bit,
-    box,
     bytea,
     char,
     cidr,
-    circle,
-    citext,
     date,
-    daterange,
-    hstore,
-    int4multirange,
-    int4range,
     integer,
     interval,
     jsonb,
     line,
-    lseg,
-    ltree,
     macaddr,
     macaddr8,
-    money,
-    nummultirange,
-    numrange,
-    path,
     pg_composite,
     pg_domain,
     pg_enum,
     point,
-    polygon,
     smallint,
     text,
     timestamp,
-    tsrange,
-    tstzmultirange,
-    tstzrange,
     varbit,
     varchar,
-    xml,
 )
 from tests.integration.test_generated_columns import server_version
 
@@ -793,18 +774,18 @@ async def test_char_types_round_trip(driver: PostgresDriver, tmp_path: Path) -> 
 
 @final
 class Bookings(Table, name="bookings", schema="mg"):
-    during = tsrange().not_null()
+    spot = point().not_null()
     status = text().not_null()
 
     @classmethod
     @override
     def config(cls) -> list[Constraint]:
-        # A range key needs no extra operator class, so the test needs no btree_gist.
+        # A point key needs no extra operator class, so the test needs no btree_gist.
         return [
             # Written the way a person writes it: no outer parens, no ::text casts.
             check("bookings_status_valid", sql("status <> ''"), not_valid=True),
             exclusion(
-                (cls.during, "&&"),
+                (cls.spot, "~="),
                 name="bookings_no_overlap",
                 using="gist",
                 where=sql("status = 'active'"),
@@ -1034,43 +1015,7 @@ async def test_exclusion_constraints_round_trip(driver: PostgresDriver, tmp_path
     await assert_pull_round_trip(driver, tmp_path)
 
 
-# -- range and multirange types ------------------------------------------------------------
-
-
-@final
-class Spans(Table, name="spans", schema="mg"):
-    id = integer().primary_key()
-    ints = int4range()
-    nums = numrange()
-    stamps = tstzrange()
-    days = daterange()
-    multi = int4multirange()
-
-
-async def test_range_types_round_trip(driver: PostgresDriver, tmp_path: Path) -> None:
-    await migrate(driver, empty_snapshot("postgresql"), snap([Spans]))
-    columns = (await live(driver))["tables"]["mg.spans"]["columns"]
-    assert columns["ints"]["type"] == "int4range"
-    assert columns["nums"]["type"] == "numrange"
-    assert columns["stamps"]["type"] == "tstzrange"
-    assert columns["days"]["type"] == "daterange"
-    assert columns["multi"]["type"] == "int4multirange"
-
-    await execute(
-        driver,
-        "INSERT INTO mg.spans (id, ints, nums, stamps, days, multi) VALUES "
-        "(1, '[1,5)', '(1.5,2.5)', '[2020-01-01,2020-02-01)', "
-        "'[2020-01-01,2020-02-01)', '{[1,3),[5,9)}')",
-    )
-    [row] = await execute(driver, "SELECT ints, multi FROM mg.spans")
-    ints = cast("Range[int]", row["ints"])
-    multi = cast("list[Range[int]]", row["multi"])
-    assert (ints.lower, ints.upper, ints.lower_inc, ints.upper_inc) == (1, 5, True, False)
-    assert [r.lower for r in multi] == [1, 5]
-    await assert_pull_round_trip(driver, tmp_path)
-
-
-# -- more column types: network, bit, xml, money, geometric, extension types ----------------
+# -- more column types: network, bit, geometric ---------------------------------------------
 
 
 @final
@@ -1081,25 +1026,12 @@ class Assorted(Table, name="assorted", schema="mg"):
     mac8 = macaddr8()
     flags = bit(4)
     variable = varbit(8)
-    doc = xml()
-    amount = money()
     pt = point()
     ln = line()
-    seg = lseg()
-    rect = box()
-    trace = path()
-    area = polygon()
-    disc = circle()
-    attrs = hstore()
-    label = citext()
-    tree = ltree()
-
-
-EXTENSIONS: list[SchemaObject] = [extension("hstore"), extension("citext"), extension("ltree")]
 
 
 async def test_more_column_types_round_trip(driver: PostgresDriver, tmp_path: Path) -> None:
-    await migrate(driver, empty_snapshot("postgresql"), snap([Assorted], EXTENSIONS))
+    await migrate(driver, empty_snapshot("postgresql"), snap([Assorted]))
     columns = (await live(driver))["tables"]["mg.assorted"]["columns"]
     expected = {
         "net": "cidr",
@@ -1107,41 +1039,23 @@ async def test_more_column_types_round_trip(driver: PostgresDriver, tmp_path: Pa
         "mac8": "macaddr8",
         "flags": "bit(4)",
         "variable": "bit varying(8)",
-        "doc": "xml",
-        "amount": "money",
         "pt": "point",
         "ln": "line",
-        "seg": "lseg",
-        "rect": "box",
-        "trace": "path",
-        "area": "polygon",
-        "disc": "circle",
-        "attrs": "hstore",
-        "label": "citext",
-        "tree": "ltree",
     }
     assert {name: columns[name]["type"] for name in expected} == expected
 
     await execute(
         driver,
-        "INSERT INTO mg.assorted (id, net, mac, mac8, flags, variable, doc, amount, pt, ln, seg, "
-        "rect, trace, area, disc, attrs, label, tree) VALUES "
+        "INSERT INTO mg.assorted (id, net, mac, mac8, flags, variable, pt, ln) VALUES "
         "(1, '10.0.0.0/8', '08:00:2b:01:02:03', '08:00:2b:01:02:03:04:05', B'1010', B'1010', "
-        "'<a/>', '12.34', '(1,2)', '{1,2,3}', '[(1,2),(3,4)]', '(1,2),(3,4)', '[(1,2),(3,4)]', "
-        "'((1,2),(3,4),(5,6))', '<(1,2),3>', 'a=>1', 'Hello', 'a.b')",
+        "'(1,2)', '{1,2,3}')",
     )
-    [row] = await execute(
-        driver, "SELECT net, mac, mac8, flags, variable, doc, attrs, label, tree FROM mg.assorted"
-    )
+    [row] = await execute(driver, "SELECT net, mac, mac8, flags, variable FROM mg.assorted")
     assert str(row["net"]) == "10.0.0.0/8"
     assert row["mac"] == "08:00:2b:01:02:03"
     assert row["mac8"] == "08:00:2b:01:02:03:04:05"
     assert "1010" in str(row["flags"])
     assert "1010" in str(row["variable"])
-    assert row["doc"] == "<a/>"
-    assert '"a"=>"1"' in cast(str, row["attrs"])
-    assert row["label"] == "Hello"
-    assert row["tree"] == "a.b"
     await assert_pull_round_trip(driver, tmp_path)
 
 
@@ -1598,11 +1512,10 @@ async def test_odd_literal_defaults_apply_and_show_no_drift(driver: PostgresDriv
 
 
 async def test_json_scalar_and_postgres_type_defaults_apply(driver: PostgresDriver) -> None:
-    # Q10: DEFAULT 5 on jsonb. Q12: inet, cidr, range, bit and geometry defaults refused.
+    # Q10: DEFAULT 5 on jsonb. Q12: inet, cidr, bit and geometry defaults refused.
     import ipaddress
 
-    from asyncpg import BitString, Box, Point
-    from asyncpg import Range as R
+    from asyncpg import BitString, Line, Point
 
     from mizzle.pg import inet, jsonb
 
@@ -1613,17 +1526,15 @@ async def test_json_scalar_and_postgres_type_defaults_apply(driver: PostgresDriv
         s = jsonb[str]().default("x")
         ip = inet().default(ipaddress.ip_address("10.0.0.1"))
         net = cidr().default(ipaddress.ip_network("10.0.0.0/8"))
-        span = int4range().default(R(1, 5))
-        spans = int4multirange().default([R(1, 2), R(4, 6)])
         bits = bit(4).default(BitString.from_int(5, length=4))
         vbits = varbit().default(BitString.from_int(3, length=3))
         at = point().default(Point(1, 2.5))
-        area = box().default(Box((0, 0), (2, 3)))
+        edge = line().default(Line(1, -1, 0))
 
     desired = snap([Typed])
     await migrate(driver, empty_snapshot("postgresql"), desired)
     [row] = await execute(driver, "INSERT INTO mg.typed (id) VALUES (1) RETURNING *")
-    assert row["n"] == 5 and row["s"] == "x" and row["span"] == R(1, 5)
+    assert row["n"] == 5 and row["s"] == "x" and row["edge"] == Line(1, -1, 0)
     assert str(row["ip"]) == "10.0.0.1" and str(row["net"]) == "10.0.0.0/8"
     assert row["bits"] == BitString.from_int(5, length=4) and row["at"] == Point(1, 2.5)
 
@@ -2365,59 +2276,6 @@ _TYPED_DEFAULTS: dict[str, tuple[Callable[[], ColumnBase], _Check]] = {
         lambda v: contains(v, [[1, "x"]]),
     ),
     "bytea[]": (lambda: array(bytea()).default([b"\x00a"]), lambda v: contains(v, [b"\x00a"])),
-    "int4range": (
-        lambda: int4range().default(Range(1, 5, lower_inc=False, upper_inc=True)),
-        lambda v: eq(v, Range(2, 6)),
-    ),
-    "daterange": (
-        lambda: daterange().default(Range(_D1, _D5, upper_inc=True)),
-        lambda v: eq(v, Range(_D1, _D5, upper_inc=True)),
-    ),
-    "tstzrange": (
-        lambda: tstzrange().default(Range(dt.datetime(2020, 1, 1, tzinfo=_UTC5), None)),
-        lambda v: eq(v, Range(dt.datetime(2019, 12, 31, 19, tzinfo=dt.UTC), None)),
-    ),
-    "tsrange": (
-        lambda: tsrange().default(Range(dt.datetime(2020, 1, 1, 0, 0, 0, 500000), None)),
-        lambda v: eq(v, Range(dt.datetime(2020, 1, 1, 0, 0, 0, 500000), None)),
-    ),
-    "int4range[]": (
-        lambda: array(int4range()).default([Range(1, 2), Range(3, 5, upper_inc=True)]),
-        lambda v: contains(v, [Range(1, 2), Range(3, 6)]),
-    ),
-    # Q4-14: stored sorted, overlapping and adjacent ranges merged.
-    "int4multirange": (
-        lambda: int4multirange().default(
-            [Range(7, 8, upper_inc=True), Range(1, 3), Range(2, 5), Range(9, 10), Range(4, 4)]
-        ),
-        # Q4-19: written {[1,3)} in the CHECK as well
-        lambda v: cast(
-            Expr[bool], cast(object, sql("{} <> {}::int4multirange", v, [Range(2, 3), Range(1, 2)]))
-        ),
-    ),
-    "nummultirange": (
-        lambda: nummultirange().default(
-            [
-                Range(Decimal(1), Decimal(3)),
-                Range(Decimal(2), Decimal(5), upper_inc=True),
-                Range(Decimal(5), Decimal(6), lower_inc=False),
-                Range(Decimal(-1), Decimal(0), upper_inc=True),
-                Range(Decimal(7), Decimal(8), lower_inc=False),
-                Range(Decimal(8), Decimal(9), lower_inc=False),
-            ]
-        ),
-        lambda v: contains(v, [Range(Decimal(2), Decimal(3)), Range(Decimal(1), Decimal(2))]),
-    ),
-    "tstzmultirange": (
-        lambda: tstzmultirange().default(
-            [
-                Range(dt.datetime(2020, 1, 2, tzinfo=_UTC5), dt.datetime(2020, 1, 3, tzinfo=_UTC5)),
-                Range(_T0, dt.datetime(2020, 1, 1, 19, tzinfo=dt.UTC)),
-                Range(None, dt.datetime(2019, 1, 1, tzinfo=dt.UTC)),
-            ]
-        ),
-        None,
-    ),
     "timestamptz": (
         lambda: timestamp(tz=True).default(dt.datetime(2020, 1, 1, tzinfo=_UTC5)),
         lambda v: eq(v, dt.datetime(2019, 12, 31, 19, tzinfo=dt.UTC)),
@@ -2459,7 +2317,7 @@ async def test_typed_defaults_and_check_literals_do_not_drift(
     driver: PostgresDriver, kind: str
 ) -> None:
     # Q4-1 varchar[]/enum[]/date[] literals were text[]; Q4-2 CAST(ARRAY[1, 2] AS jsonb);
-    # Q4-4 ranges and Q4-7 jsonb defaults drifted; Q4-11 array elements were Python repr;
+    # Q4-7 jsonb defaults drifted; Q4-11 array elements were Python repr;
     # Q4-12 composite defaults were ARRAY[...] or JSON.
     make, condition = _TYPED_DEFAULTS[kind]
     column = make()

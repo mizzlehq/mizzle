@@ -535,8 +535,8 @@ upserted = await db.insert_many(
 )  # list[Users]
 ```
 
-`on_conflict` is an insert without values; every batch gets its conflict clause. For
-millions of rows, `db.copy_into()` is faster (see [Bulk and streaming](bulk.md)).
+`on_conflict` is an insert without values; every batch gets its conflict clause (see
+[Bulk and streaming](bulk.md)).
 
 ## Update and delete
 
@@ -652,5 +652,5 @@ found = await (
 - `websearch_to_tsquery` takes search-box syntax (`"a phrase" or -word`) and never fails
   on bad input.
 - `ts_rank_cd` also rewards matching words that are close together.
-- For speed, store the vector in a generated `tsvector()` column with a GIN index (see
-  [Schema](schema.md#identity-and-generated-columns)).
+- For speed, store the vector in a generated `custom("tsvector")` column with a GIN index
+  (see [Schema](schema.md#identity-and-generated-columns)).

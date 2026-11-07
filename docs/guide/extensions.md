@@ -72,16 +72,16 @@ PostgreSQL, so declare their extension yourself:
 
 ```python
 from mizzle import extension
-from mizzle.pg import citext, hstore, ltree
+from mizzle.pg import custom
 
 exts = [extension("hstore"), extension("citext"), extension("ltree")]
 
 
 @final
 class Document(Table):
-    labels = hstore()
-    slug = citext()
-    path = ltree()
+    labels = custom("hstore")
+    slug = custom("citext")
+    path = custom("ltree")
 ```
 
 Without the `extension(...)` entry the migration fails with
@@ -190,8 +190,6 @@ async with db.transaction() as tx:
 
 ## Notes
 
-- `copy_into` loads tables with vector columns through `insert_many`, since vectors have no
-  binary COPY format here. See [Bulk and streaming](bulk.md).
 - `mizzle.pydantic` models check a vector's length: `vector(3)` accepts exactly 3 floats.
   See [Integrations](integrations.md#pydantic-models).
 - [examples/shop](https://github.com/mizzlehq/mizzle/tree/main/examples/shop) keeps its

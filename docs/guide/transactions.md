@@ -244,10 +244,9 @@ Messages never include your values: the server's detail line
 | `SerializationFailure` | A serialization conflict (`40001`) or a deadlock (`40P01`). Safe to retry: use `db.retry`. |
 | `QueryTimeout` | The statement ran longer than its timeout and was cancelled. |
 | `ConnectionError` | No connection could be made or taken from the pool, or the connection was lost. A plain read is retried once on a new connection first; writes and raw SQL are never retried. |
-| `QueryError` | A query cannot be built: `update`/`delete` without `.where()` (use `.all_rows()` to mean every row), `retry()` or `listen()` inside a transaction, isolation on a nested transaction, `batch_size < 1`... |
+| `QueryError` | A query cannot be built: `update`/`delete` without `.where()` (use `.all_rows()` to mean every row), `retry()` inside a transaction, isolation on a nested transaction, `batch_size < 1`... |
 | `RelationNotLoaded` | You read a relation the query did not load: add it to `with_`. |
 | `SchemaError` | A table definition is invalid, for example a table class with no columns. Raised when the class is defined. |
-| `ListenerOverflow` | A `listen()` consumer fell `max_queue` notifications behind. See [Bulk and streaming](bulk.md#listen-and-notify). |
 | `MigrationError` | The migration kit cannot go on: applied migrations missing on disk, a migration out of order, `push` without `--force` off a terminal... |
 | `MigrationLockTimeout` | `migrate` waited longer than `--lock-timeout` for another run's lock. |
 | `MigrationTampered` | A `migration.sql` changed after it was applied. |

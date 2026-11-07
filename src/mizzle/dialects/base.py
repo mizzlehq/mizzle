@@ -5,19 +5,16 @@ Adding a database means a new ``dialects/<name>/`` package that implements them.
 
 from __future__ import annotations
 
-import os
 from collections.abc import (
     AsyncGenerator,
-    AsyncIterator,
     Awaitable,
     Callable,
-    Iterable,
     Mapping,
     Sequence,
 )
 from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass
-from typing import BinaryIO, Literal, Protocol
+from typing import Literal, Protocol
 
 from mizzle.core.compiler import Compiler
 from mizzle.core.naming import Casing
@@ -33,29 +30,6 @@ type IsolationLevel = Literal["read committed", "repeatable read", "serializable
 # named with func(), direct connection use. "always": after every use (see Database.connect
 # for the one case "auto" cannot see).
 type ResetMode = Literal["always", "auto"]
-type CopyFormat = Literal["csv", "text", "binary"]
-# What a listener does when ``max_queue`` notifications wait unread: "raise" ends the
-# iteration with ListenerOverflow, "drop_oldest" discards the oldest one (with a warning).
-type Overflow = Literal["raise", "drop_oldest", "block"]
-# Where copy_from() writes: a file path, a binary file, or an async function given each chunk.
-type CopyOutput = str | os.PathLike[str] | BinaryIO | Callable[[bytes], Awaitable[None]]
-
-
-@dataclass(frozen=True)
-class Notification:
-    """A ``NOTIFY`` received by ``db.listen()``."""
-
-    channel: str
-    payload: str
-    pid: int  # server process ID of the session that sent it
-    data: object = None  # the payload run through ``listen(decoder=...)``; None otherwise
-
-
-@dataclass(frozen=True)
-class Reconnected:
-    """Yielded by ``db.listen(..., reconnect=True)`` after the connection was lost and
-    LISTEN started again on a new one. Notifications sent in between were missed: reload
-    whatever state they would have told you about."""
 
 
 @dataclass(frozen=True)
@@ -117,47 +91,6 @@ class Connection(Protocol):
         """Rows in batches from a server-side cursor; only inside a transaction."""
         ...
 
-    async def copy_records(
-        self,
-        table: str,
-        schema: str | None,
-        columns: Sequence[str],
-        records: Iterable[Sequence[object]],
-        timeout: float | None = None,
-    ) -> int:
-        """Bulk load with COPY; returns the number of rows."""
-        ...
-
-    async def copy_out(
-        self,
-        sql: str,
-        params: Sequence[object],
-        output: CopyOutput,
-        format: CopyFormat,
-        header: bool,
-        timeout: float | None = None,
-        *,
-        session_safe: bool = False,
-    ) -> int:
-        """``COPY (sql) TO`` ``output``; returns the number of rows."""
-        ...
-
-    def listen(
-        self,
-        channels: Sequence[str],
-        max_queue: int | None = None,
-        overflow: Overflow = "raise",
-        probe: Callable[[str], Awaitable[None]] | None = None,
-        pooler_session_mode: bool = False,
-        decoder: Callable[[str], object] | None = None,
-    ) -> AbstractAsyncContextManager[AsyncIterator[Notification]]:
-        """LISTEN until the context exits. The iterator raises ConnectionError if the
-        connection is lost. Behind a pooler it raises unless ``pooler_session_mode``; then
-        ``probe(channel)`` sends a notification from another connection to check that
-        notifications reach this one. ``decoder`` (e.g. ``json.loads``) decodes each payload
-        into ``Notification.data``."""
-        ...
-
 
 class Driver(Protocol):
     """A connection pool."""
@@ -170,10 +103,6 @@ class Driver(Protocol):
     async def close(self) -> None: ...
     async def expire_connections(self) -> None:
         """Replace every pooled connection (idle ones now, busy ones when released)."""
-        ...
-
-    async def notify_unpooled(self, channel: str, payload: str = "") -> None:
-        """``pg_notify`` on a short-lived connection outside the pool."""
         ...
 
 

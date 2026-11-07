@@ -10,20 +10,9 @@ import re
 import struct
 import uuid as _uuid
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from decimal import Decimal
 from typing import Protocol, Self, cast, override, runtime_checkable
 
-from asyncpg import (
-    BitString,
-    Box,
-    Circle,
-    Line,
-    LineSegment,
-    Path,
-    Point,
-    Polygon,
-    Range,
-)
+from asyncpg import BitString, Line, Point, Range
 
 from mizzle.core.compiler import CompiledQuery
 from mizzle.core.errors import QueryError
@@ -85,46 +74,13 @@ def time(
 
 
 # -- values nested in relational queries (C30) --------------------------------------
-# JSON cannot carry these types: the compiler sends a range as its parts and the others as
-# their text, and these turn that back into the value a plain select returns.
+# JSON cannot carry these types: the compiler sends their text, and these turn it back
+# into the value a plain select returns.
 
 
 def _json[T](column: Column[T], decoder: Callable[[object], object]) -> Column[T]:
     column.json_decoder = decoder
     return column
-
-
-def _moment[D: _dt.date](kind: type[D]) -> Callable[[str], D]:
-    def parse(text: str) -> D:
-        if text in ("infinity", "-infinity"):  # as asyncpg reads them
-            return cast(D, kind.max if text == "infinity" else kind.min)  # max is typed date
-        return kind.fromisoformat(text)
-
-    return parse
-
-
-def _range_json[V: (int, Decimal, _dt.date)](
-    bound: Callable[[str], V],
-) -> Callable[[object], object]:
-    def decode(value: object) -> object:
-        lower, upper, lower_inc, upper_inc, empty = cast("list[object]", value)
-        if empty:
-            return Range[V](empty=True)
-        return Range[V](
-            None if lower is None else bound(str(lower)),
-            None if upper is None else bound(str(upper)),
-            lower_inc=bool(lower_inc),
-            upper_inc=bool(upper_inc),
-        )
-
-    return decode
-
-
-def _multirange_json[V: (int, Decimal, _dt.date)](
-    bound: Callable[[str], V],
-) -> Callable[[object], object]:
-    one = _range_json(bound)
-    return lambda value: [one(v) for v in cast("list[object]", value)]
 
 
 _NUMBER = re.compile(r"[^\s(),<>\[\]{}]+")
@@ -134,79 +90,9 @@ def _numbers(value: object) -> list[float]:
     return [float(n) for n in cast("list[str]", _NUMBER.findall(str(value)))]
 
 
-def _points(value: object) -> list[tuple[float, float]]:
-    n = _numbers(value)
-    return [(n[i], n[i + 1]) for i in range(0, len(n), 2)]
-
-
 def _bits(value: object) -> BitString:
     text = str(value)
     return BitString.from_int(int(text, 2) if text else 0, length=len(text))
-
-
-def _circle(value: object) -> Circle:
-    x, y, radius = _numbers(value)
-    return Circle(Point(x, y), radius)
-
-
-def int4range(name: str | None = None) -> Column[Range[int] | None]:
-    """A discrete ``integer`` range, ``[1,5)``. Values read and write as ``asyncpg.Range``."""
-    return _json(Column("int4range", (Range,), name), _range_json(int))
-
-
-def int8range(name: str | None = None) -> Column[Range[int] | None]:
-    """A discrete ``bigint`` range. Values read and write as ``asyncpg.Range``."""
-    return _json(Column("int8range", (Range,), name), _range_json(int))
-
-
-def numrange(name: str | None = None) -> Column[Range[Decimal] | None]:
-    """A continuous ``numeric`` range. Values read and write as ``asyncpg.Range``."""
-    return _json(Column("numrange", (Range,), name), _range_json(Decimal))
-
-
-def tsrange(name: str | None = None) -> Column[Range[_dt.datetime] | None]:
-    """A ``timestamp without time zone`` range. Values read and write as ``asyncpg.Range``."""
-    return _json(Column("tsrange", (Range,), name), _range_json(_moment(_dt.datetime)))
-
-
-def tstzrange(name: str | None = None) -> Column[Range[_dt.datetime] | None]:
-    """A ``timestamp with time zone`` range. Values read and write as ``asyncpg.Range``."""
-    return _json(Column("tstzrange", (Range,), name), _range_json(_moment(_dt.datetime)))
-
-
-def daterange(name: str | None = None) -> Column[Range[_dt.date] | None]:
-    """A ``date`` range. Values read and write as ``asyncpg.Range``."""
-    return _json(Column("daterange", (Range,), name), _range_json(_moment(_dt.date)))
-
-
-def int4multirange(name: str | None = None) -> Column[list[Range[int]] | None]:
-    """A set of disjoint ``int4range`` values, read and written as a list of ``Range``."""
-    return _json(Column("int4multirange", (list,), name), _multirange_json(int))
-
-
-def int8multirange(name: str | None = None) -> Column[list[Range[int]] | None]:
-    """A set of disjoint ``int8range`` values, read and written as a list of ``Range``."""
-    return _json(Column("int8multirange", (list,), name), _multirange_json(int))
-
-
-def nummultirange(name: str | None = None) -> Column[list[Range[Decimal]] | None]:
-    """A set of disjoint ``numrange`` values, read and written as a list of ``Range``."""
-    return _json(Column("nummultirange", (list,), name), _multirange_json(Decimal))
-
-
-def tsmultirange(name: str | None = None) -> Column[list[Range[_dt.datetime]] | None]:
-    """A set of disjoint ``tsrange`` values, read and written as a list of ``Range``."""
-    return _json(Column("tsmultirange", (list,), name), _multirange_json(_moment(_dt.datetime)))
-
-
-def tstzmultirange(name: str | None = None) -> Column[list[Range[_dt.datetime]] | None]:
-    """A set of disjoint ``tstzrange`` values, read and written as a list of ``Range``."""
-    return _json(Column("tstzmultirange", (list,), name), _multirange_json(_moment(_dt.datetime)))
-
-
-def datemultirange(name: str | None = None) -> Column[list[Range[_dt.date]] | None]:
-    """A set of disjoint ``daterange`` values, read and written as a list of ``Range``."""
-    return _json(Column("datemultirange", (list,), name), _multirange_json(_moment(_dt.date)))
 
 
 def cidr(name: str | None = None) -> Column[IPAddress | None]:
@@ -242,16 +128,6 @@ def varbit(length: int | None = None, name: str | None = None) -> Column[BitStri
     )
 
 
-def xml(name: str | None = None) -> Column[str | None]:
-    """An XML document, read and written as text."""
-    return Column("xml", (str,), name)
-
-
-def money(name: str | None = None) -> Column[str | None]:
-    """A currency amount (locale-formatted, e.g. ``$12.34``), read and written as text."""
-    return Column("money", (str,), name)
-
-
 def point(name: str | None = None) -> Column[Point | None]:
     """A geometric point. Values read and write as ``asyncpg.Point``."""
     return _json(Column("point", (Point,), name), lambda v: Point(*_numbers(v)))
@@ -260,50 +136,6 @@ def point(name: str | None = None) -> Column[Point | None]:
 def line(name: str | None = None) -> Column[Line | None]:
     """An infinite geometric line. Values read and write as ``asyncpg.Line``."""
     return _json(Column("line", (Line,), name), lambda v: Line(*_numbers(v)))
-
-
-def lseg(name: str | None = None) -> Column[LineSegment | None]:
-    """A finite line segment. Values read and write as ``asyncpg.LineSegment``."""
-    return _json(Column("lseg", (LineSegment,), name), lambda v: LineSegment(*_points(v)))
-
-
-def box(name: str | None = None) -> Column[Box | None]:
-    """A rectangular box. Values read and write as ``asyncpg.Box``."""
-    return _json(Column("box", (Box,), name), lambda v: Box(*_points(v)))
-
-
-def path(name: str | None = None) -> Column[Path | None]:
-    """A geometric path. Values read and write as ``asyncpg.Path``."""
-    return _json(
-        Column("path", (Path,), name),
-        lambda v: Path(*_points(v), is_closed=str(v).startswith("(")),
-    )
-
-
-def polygon(name: str | None = None) -> Column[Polygon | None]:
-    """A closed geometric polygon. Values read and write as ``asyncpg.Polygon``."""
-    return _json(Column("polygon", (Polygon,), name), lambda v: Polygon(*_points(v)))
-
-
-def circle(name: str | None = None) -> Column[Circle | None]:
-    """A geometric circle. Values read and write as ``asyncpg.Circle``."""
-    return _json(Column("circle", (Circle,), name), _circle)
-
-
-def hstore(name: str | None = None) -> Column[str | None]:
-    """An ``hstore`` key/value map (needs the ``hstore`` extension), read and written as
-    text: ``'"a"=>"1"'``."""
-    return Column("hstore", (str,), name)
-
-
-def citext(name: str | None = None) -> Column[str | None]:
-    """A case-insensitive string (needs the ``citext`` extension), read and written as text."""
-    return Column("citext", (str,), name)
-
-
-def ltree(name: str | None = None) -> Column[str | None]:
-    """A label-tree path (needs the ``ltree`` extension), read and written as text."""
-    return Column("ltree", (str,), name)
 
 
 def inet(name: str | None = None) -> Column[IPAddress | None]:
@@ -343,17 +175,6 @@ class json[T](_JsonColumn[T]):
 
     def __init__(self, name: str | None = None) -> None:
         super().__init__("json", None, name)
-
-
-def tsvector(name: str | None = None) -> Column[str | None]:
-    """Full-text search document, read and written as text (``'cat':1 'sat':2``).
-    Usually generated: ``tsvector().generated_always_as(sql("to_tsvector('english', body)"))``."""
-    return Column("tsvector", (str,), name)
-
-
-def tsquery(name: str | None = None) -> Column[str | None]:
-    """Full-text search query, read and written as text (``'cat' & 'sat'``)."""
-    return Column("tsquery", (str,), name)
 
 
 @runtime_checkable
@@ -639,24 +460,6 @@ _JSON_BASES: dict[str, Callable[[], ColumnBase]] = {
     "bit varying": varbit,
     "point": point,
     "line": line,
-    "lseg": lseg,
-    "box": box,
-    "path": path,
-    "polygon": polygon,
-    "circle": circle,
-    "hstore": hstore,
-    "int4range": int4range,
-    "int8range": int8range,
-    "numrange": numrange,
-    "tsrange": tsrange,
-    "tstzrange": tstzrange,
-    "daterange": daterange,
-    "int4multirange": int4multirange,
-    "int8multirange": int8multirange,
-    "nummultirange": nummultirange,
-    "tsmultirange": tsmultirange,
-    "tstzmultirange": tstzmultirange,
-    "datemultirange": datemultirange,
 }
 
 _FIELDS = (

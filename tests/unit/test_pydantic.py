@@ -111,20 +111,19 @@ def test_include_is_an_allowlist() -> None:
 
 
 def test_models_accept_every_value_the_column_holds() -> None:
-    # C35: inet/cidr were IPv4-only; Range, Point, Box and BitString broke schema building.
+    # C35: inet/cidr were IPv4-only; Point, Line and BitString broke schema building.
     import ipaddress
 
-    from asyncpg import BitString, Box, Point, Range
+    from asyncpg import BitString, Line, Point
 
-    from mizzle.pg import box, cidr, inet, int4range, point, varbit
+    from mizzle.pg import cidr, inet, line, point, varbit
 
     class Net(Table, name="net"):
         id = serial().primary_key()
         ip = inet().not_null()
         net = cidr()
-        r = int4range()
         p = point()
-        b = box()
+        b = line()
         bits = varbit()
 
     Model = select_model(Net)
@@ -134,7 +133,6 @@ def test_models_accept_every_value_the_column_holds() -> None:
                 "id": 1,
                 "ip": ip,
                 "net": "2001:db8::/32",
-                "r": None,
                 "p": None,
                 "b": None,
                 "bits": None,
@@ -145,16 +143,15 @@ def test_models_accept_every_value_the_column_holds() -> None:
             "id": 1,
             "ip": ipaddress.ip_interface("10.1.2.3/24"),
             "net": ipaddress.ip_network("10.0.0.0/8"),
-            "r": Range(1, 5),
             "p": Point(1, 2),
-            "b": Box((0, 0), (1, 1)),
+            "b": Line(1, -1, 0),
             "bits": BitString.from_int(5, 3),
         }
     )
-    assert row.model_dump()["r"] == Range(1, 5)
+    assert row.model_dump()["p"] == Point(1, 2)
     with pytest.raises(pydantic.ValidationError):
         Model.model_validate(
-            {"id": 1, "ip": "::1", "net": None, "r": "[1,5)", "p": None, "b": None, "bits": None}
+            {"id": 1, "ip": "::1", "net": None, "p": "(1,2)", "b": None, "bits": None}
         )
     insert_model(Net).model_validate({"ip": "::1"})
 
@@ -172,30 +169,18 @@ def test_dict_composites_write_and_validate() -> None:
     assert row.model_dump()["at"] == {"city": "Oslo"}
 
 
-def test_ranges_and_bit_strings_round_trip_json() -> None:
-    # Q14: Range and BitString had no serializer and no JSON input form.
-    import datetime
+def test_geometry_and_bit_strings_round_trip_json() -> None:
+    # Q14: BitString had no serializer and no JSON input form.
+    from asyncpg import BitString, Point
 
-    from asyncpg import BitString, Range
+    from mizzle.pg import point, varbit
 
-    from mizzle.pg import daterange, numrange, varbit
-
-    class Spans(Table, name="spans"):
+    class Spots(Table, name="spots"):
         id = serial().primary_key()
-        days = daterange()
-        nums = numrange()
+        at = point()
         bits = varbit()
 
-    Model = select_model(Spans)
-    row = Model(
-        id=1,
-        days=Range(datetime.date(2026, 1, 1), None),
-        nums=Range(Decimal("1.25"), Decimal("2.5"), upper_inc=True),
-        bits=BitString.from_int(5, 4),
-    )
+    Model = select_model(Spots)
+    row = Model(id=1, at=Point(1.5, -2), bits=BitString.from_int(5, 4))
     assert Model.model_validate_json(row.model_dump_json()) == row
     assert row.model_dump(mode="json")["bits"] == "0101"
-    empty = Model(id=1, days=Range(empty=True), nums=None, bits=None)
-    assert Model.model_validate_json(empty.model_dump_json()).model_dump()["days"] == Range(
-        empty=True
-    )

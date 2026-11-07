@@ -98,11 +98,6 @@ class AfterRollbackError(MizzleError):
     lost (it is attached as the context of the original)."""
 
 
-class ListenerOverflow(MizzleError):
-    """A ``listen()`` consumer fell ``max_queue`` notifications behind (``overflow="raise"``);
-    later notifications were not kept."""
-
-
 class MigrationError(MizzleError):
     pass
 
