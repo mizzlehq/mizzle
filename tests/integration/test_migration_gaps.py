@@ -1478,3 +1478,25 @@ async def test_a_sub_partitioned_partition_is_reported(
         snapshot = await live(driver)
     assert snapshot["tables"]["mg.sp"].get("partitions", {}).keys() == {"sp_eu"}
     assert any("mg.sp_eu is itself partitioned" in r.getMessage() for r in caplog.records)
+
+
+async def test_an_identity_added_to_a_column_with_rows_starts_after_them(
+    driver: PostgresDriver,
+) -> None:
+    # C29: the new sequence started at 1, so the next insert hit a duplicate key.
+    @final
+    class Plain(Table, name="ids", schema="mg"):
+        id = integer().primary_key()
+        note = text()
+
+    @final
+    class Identity(Table, name="ids", schema="mg"):
+        id = integer().primary_key().generated_by_default_as_identity()
+        note = text()
+
+    v1 = snap([Plain])
+    await migrate(driver, empty_snapshot("postgresql"), v1)
+    await execute(driver, "INSERT INTO mg.ids (id, note) VALUES (1, 'a'), (2, 'b')")
+    await migrate(driver, v1, snap([Identity]))
+    [row] = await execute(driver, "INSERT INTO mg.ids (note) VALUES ('c') RETURNING id")
+    assert row["id"] == 3

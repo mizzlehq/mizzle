@@ -497,7 +497,20 @@ def _alter_identity(step: AlterColumnIdentity, sql_type: str) -> str:
     if new is None:
         return f"{col} DROP IDENTITY"
     if old is None:
-        return f"{col} ADD {_identity(new, sql_type)}"
+        add = f"{col} ADD {_identity(new, sql_type)}"
+        if new["increment"] < 0:
+            return add
+        # The sequence starts at START even when the column holds rows already, so the
+        # next insert hit a duplicate key (C29). Move it past the largest value.
+        table = qualified(step.schema, step.table)
+        name = quote(step.column)
+        sequence = "pg_get_serial_sequence('" + table.replace("'", "''") + "', '"
+        sequence += step.column.replace("'", "''") + "')"
+        return (
+            f"{add};\nSELECT setval({sequence}, "
+            f"greatest(coalesce(max({name}) + 1, {new['start']}), {new['start']}), false) "
+            f"FROM {table}"
+        )
     actions: list[str] = []
     if old["always"] != new["always"]:
         actions.append(f"SET GENERATED {'ALWAYS' if new['always'] else 'BY DEFAULT'}")
@@ -585,7 +598,8 @@ def _alter_type(step: AlterColumnType) -> str:
         f"ALTER TABLE {qualified(step.schema, step.table)} ALTER COLUMN {col} "
         f"SET DATA TYPE {step.new_type}{collate}"
     )
-    return text if step.generated else f"{text} USING {col}::{step.new_type}"
+    cast = f"{col}::text::{step.new_type}" if step.via_text else f"{col}::{step.new_type}"
+    return text if step.generated else f"{text} USING {cast}"
 
 
 def _create_domain(domain: DomainSnap) -> str:
@@ -620,7 +634,12 @@ def render_step(step: Step) -> Statement:
                 f"CREATE TYPE {qualified(enum['schema'], enum['name'])} AS ENUM ({values})"
             )
         case AddEnumValue(schema=schema, name=name, value=value, after=after, before=before):
-            text = f"ALTER TYPE {qualified(schema, name)} ADD VALUE '{value.replace("'", "''")}'"
+            # IF NOT EXISTS: it commits on its own, so a migration that fails later must
+            # be able to run again (C22).
+            text = (
+                f"ALTER TYPE {qualified(schema, name)} ADD VALUE IF NOT EXISTS "
+                f"'{value.replace("'", "''")}'"
+            )
             if after is not None:
                 text += f" AFTER '{after.replace("'", "''")}'"
             elif before is not None:

@@ -96,7 +96,7 @@ class Migration:
         return parse_sql(self.sql())
 
     def snapshot(self) -> Snapshot:
-        return cast(Snapshot, json.loads(self._read(self.snapshot_path)))
+        return cast(Snapshot, load_json(self.snapshot_path, self._read(self.snapshot_path)))
 
     def _read(self, path: Path) -> bytes:
         try:
@@ -133,6 +133,17 @@ def _parse_entry(raw: object, source: Path) -> JournalEntry:
     raise MigrationError(f"{source}: malformed journal entry {raw!r}")
 
 
+def load_json(path: Path, data: bytes) -> object:
+    """JSON from a migrations file; a broken one (a merge conflict left in it) is a clean
+    MigrationError naming the file, not a traceback (C27)."""
+    try:
+        return cast(object, json.loads(data))
+    except ValueError as exc:
+        raise MigrationError(
+            f"{path} is not valid JSON ({exc}); fix it (look for merge conflict markers)"
+        ) from None
+
+
 def _schema(snapshot: Snapshot) -> dict[str, object]:
     """A snapshot without its identity: what the schema is, not where it sits."""
     return {k: v for k, v in snapshot.items() if k not in ("id", "prev_id")}
@@ -165,7 +176,7 @@ class MigrationsDir:
     def journal(self) -> Journal:
         if not self.journal_path.exists():
             return Journal(version=JOURNAL_VERSION, dialect=self.dialect, entries=[])
-        raw = cast(object, json.loads(self.journal_path.read_text(encoding="utf-8")))
+        raw = load_json(self.journal_path, self.journal_path.read_bytes())
         if not isinstance(raw, dict):
             raise MigrationError(f"{self.journal_path}: expected a JSON object")
         data = cast(dict[str, object], raw)  # JSON object: string keys
@@ -294,7 +305,7 @@ class MigrationsDir:
         for names in on_disk.values():
             path = self.root / names[0] / "snapshot.json"
             if path.exists():
-                snap = cast(Snapshot, json.loads(path.read_text(encoding="utf-8")))
+                snap = cast(Snapshot, load_json(path, path.read_bytes()))
                 snapshots[snap["id"]] = snap
         empty = empty_snapshot(self.dialect)
         no_snapshot: list[str] = []  # folders whose snapshot.json is gone

@@ -581,7 +581,13 @@ def _diff_partitions(old: TableSnap, new: TableSnap, plan: _Plan) -> None:
             plan.drop_partitions.append(DropPartition(schema, pname))
 
 
-def _diff_table(old: TableSnap, new: TableSnap, plan: _Plan, compare_expressions: bool) -> None:
+def _diff_table(
+    old: TableSnap,
+    new: TableSnap,
+    plan: _Plan,
+    compare_expressions: bool,
+    enums: frozenset[str] | None = None,
+) -> None:
     schema, name = new["schema"], new["name"]
     _diff_partitions(old, new, plan)
     if rebuilt := [
@@ -633,6 +639,7 @@ def _diff_table(old: TableSnap, new: TableSnap, plan: _Plan, compare_expressions
                     column["type"],
                     generated="generated" in before,
                     collation=column.get("collation"),
+                    via_text=before["type"].removesuffix("[]") in (enums or ()),
                 )
             )
         old_generated, new_generated = before.get("generated"), column.get("generated")
@@ -780,6 +787,9 @@ def diff(
     plan = _Plan()
     plan.schemas = [CreateSchema(s) for s in new["schemas"] if s not in old["schemas"]]
     _diff_enums(old, new, plan)
+    # Columns of these types change type through text (C23). A type in the default schema
+    # may be spelled without it, so the bare name counts too.
+    enum_names = frozenset(old["enums"]) | frozenset(e["name"] for e in old["enums"].values())
     _diff_domains(old, new, plan, compare_expressions)
     _diff_composites(old, new, plan)
     old_tables = _apply_renames(old, new, resolve, plan)
@@ -805,7 +815,7 @@ def diff(
                 for fk in table["foreign_keys"].values()
             ]
         else:
-            _diff_table(before, table, plan, compare_expressions)
+            _diff_table(before, table, plan, compare_expressions, enum_names)
         _diff_grants(table, before.get("grants", {}) if before else {}, plan, compare_expressions)
         _diff_comments(before if before is not None else _empty_like(table), table, plan)
 

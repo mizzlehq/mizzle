@@ -9,6 +9,7 @@ from mizzle.core.errors import MigrationError, MigrationTampered
 from mizzle.core.steps import Statement
 from mizzle.dialects.base import Connection, Dialect, Driver
 from mizzle.kit.journal import Migration, MigrationsDir
+from mizzle.kit.sqltext import transaction_control
 
 log = logging.getLogger("mizzle")
 
@@ -137,6 +138,14 @@ def pending_migrations(
             )
         if target_index is not None and migration.index > target_index:
             continue
+        if word := transaction_control(migration.sql()):
+            # It would commit part of the migration and then record it as applied; reset
+            # refuses such a history too (C28).
+            raise MigrationError(
+                f"{migration.name} contains {word}: each migration runs in one transaction, "
+                "so leave transaction control out (use -- mizzle:no-transaction for a "
+                "statement that cannot run in a transaction)"
+            )
         pending.append(migration)
     return pending
 

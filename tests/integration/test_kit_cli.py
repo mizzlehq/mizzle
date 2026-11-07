@@ -1251,10 +1251,16 @@ async def test_reset_refuses_transaction_control_in_a_migration(
     assert await cli("generate") == 0
     assert await cli("generate", "--custom", "--name", "tx") == 0
     custom = next(project.glob("migrations/0002_tx/migration.sql"))
-    custom.write_text(
-        custom.read_text() + "BEGIN;\nINSERT INTO users (email) VALUES ('x@y.z');\nCOMMIT;\n"
-    )
+    header = custom.read_text()
+    custom.write_text(header + "BEGIN;\nINSERT INTO users (email) VALUES ('x@y.z');\nCOMMIT;\n")
+    # C28: migrate refuses it too (it would commit part of the migration).
+    capsys.readouterr()
+    assert await cli("migrate") == 1
+    assert "0002_tx contains BEGIN" in capsys.readouterr().err
+    # A history an older version applied: reset still refuses it.
+    custom.write_text(header + "INSERT INTO users (email) VALUES ('x@y.z');\n")
     assert await cli("migrate") == 0
+    custom.write_text(header + "BEGIN;\nINSERT INTO users (email) VALUES ('x@y.z');\nCOMMIT;\n")
     database = kit_url.rsplit("/", 1)[-1]
     capsys.readouterr()
     assert await cli("reset", "--force", "--database", database) == 1
@@ -1352,3 +1358,62 @@ async def test_a_missing_migration_file_is_a_clean_error(
         capsys.readouterr()
         assert await cli(*args) == 1
         assert "migration.sql is missing" in capsys.readouterr().err
+
+
+async def test_drop_refuses_an_adopted_squash(
+    project: Path, kit_url: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # C21: drop deleted a squash the database had adopted: the only copy of the history.
+    assert await cli("generate") == 0
+    assert await cli("migrate") == 0
+    assert await cli("squash") == 0
+    capsys.readouterr()
+    assert await cli("drop") == 1
+    assert "already applied" in capsys.readouterr().err
+    assert len(MigrationsDir(project / "migrations", "postgresql").migrations()) == 1
+
+
+async def test_a_column_can_change_from_one_enum_to_another(
+    project: Path, kit_url: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # C23: USING "role"::user_role failed: there is no cast between two enum types.
+    assert await cli("generate") == 0
+    assert await cli("migrate") == 0
+    await fetchval(kit_url, "INSERT INTO users (email, role) VALUES ('a@b.c', 'admin')")
+    rewrite_schema(
+        project, V1.replace("pg_enum(Role)", 'pg_enum(Role, type_name="user_role")'), monkeypatch
+    )
+    assert await cli("generate", "--allow-data-loss") == 0
+    assert await cli("migrate") == 0
+    assert await fetchval(kit_url, "SELECT role::text FROM users") == "admin"
+    assert await fetchval(kit_url, "SELECT pg_typeof(role)::text FROM users") == "user_role"
+
+
+async def test_broken_migration_files_are_clean_errors(
+    project: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # C27: merge-conflict markers in journal.json or a bad mizzle.toml gave a traceback.
+    assert await cli("generate") == 0
+    journal = project / "migrations" / "meta" / "journal.json"
+    text = journal.read_text()
+    journal.write_text("<<<<<<< HEAD\n" + text)
+    capsys.readouterr()
+    assert await cli("status") == 1
+    assert "is not valid JSON" in capsys.readouterr().err
+    journal.write_text(text)
+    (project / "mizzle.toml").write_text('schema = "x\n')
+    assert await cli("status") == 1
+    assert "is not valid TOML" in capsys.readouterr().err
+
+
+async def test_status_shows_applied_migrations_missing_on_disk(
+    project: Path, kit_url: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # C29: with an empty migrations folder status said only "No migrations.".
+    assert await cli("generate") == 0
+    assert await cli("migrate") == 0
+    name = MigrationsDir(project / "migrations", "postgresql").migrations()[0].name
+    shutil.rmtree(project / "migrations")
+    capsys.readouterr()
+    assert await cli("status", "--check") == 1
+    assert f"{name}  applied but missing on disk" in capsys.readouterr().out

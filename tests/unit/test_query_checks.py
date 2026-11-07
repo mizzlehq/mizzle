@@ -205,3 +205,24 @@ def test_two_any_lists_never_share_a_parameter(qb: QueryBuilder) -> None:
             qb.delete(Kinds).where(or_(eq(Kinds.id, any_([1])), eq(Kinds.n, any_([99])))).to_sql()
         )
         assert params == ([1], [99]), sql
+
+
+def test_a_placeholder_value_is_encoded_by_its_column(qb: QueryBuilder) -> None:
+    # C33: in insert().values() and update().set() a placeholder skipped the column's
+    # encoder, so an IntEnum was sent as 2 to a text enum.
+    from mizzle import placeholder
+
+    insert = qb.insert(Kinds).values(
+        {
+            "n": 1,
+            "flag": True,
+            "ratio": 1.0,
+            "amount": 1,
+            "day": datetime.date(2026, 1, 1),
+            "at": datetime.datetime(2026, 1, 1),
+            "level": placeholder("p"),
+        }
+    )
+    assert "2" in insert.prepare().compiled.bind({"p": Level.HIGH}).params
+    update = qb.update(Kinds).set({"level": placeholder("p")}).where(eq(Kinds.id, 1))
+    assert "2" in update.prepare().compiled.bind({"p": Level.HIGH}).params

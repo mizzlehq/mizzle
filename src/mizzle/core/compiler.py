@@ -10,7 +10,7 @@ import enum
 import json
 import uuid
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from decimal import Decimal
 from typing import TYPE_CHECKING, cast
 
@@ -292,6 +292,10 @@ class Compiler:
 
     def value(self, column: ColumnBase, value: object) -> str:
         """A value written into a column (INSERT / UPDATE SET)."""
+        if isinstance(value, Placeholder) and value.column is None:
+            # Encoded by the column it fills, as in where(): an IntEnum or vector value
+            # was sent raw (C33).
+            value = replace(value, column=column)
         return self.visit(value) if isinstance(value, Node) else self.bind(column.encode(value))
 
     # -- expressions ------------------------------------------------------------------

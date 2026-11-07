@@ -281,6 +281,8 @@ class AlterColumnType(Step):
     new_type: str
     generated: bool = False  # a generated column: recomputed, so no USING cast
     collation: str | None = None  # keep the column's COLLATE across the type change
+    # Cast through text: there is no direct cast from an enum to another type (C23).
+    via_text: bool = False
 
     @property
     @override

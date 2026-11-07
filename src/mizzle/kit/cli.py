@@ -222,10 +222,13 @@ def cmd_generate(config: Config, args: Args) -> int:
     if not steps:
         print("No schema changes.")
         return 0
+    # Rendered first: a change that needs a custom migration is refused before the data-loss
+    # prompt asks you to confirm it (C29).
+    statements = dialect.render(steps)
     _guard_data_loss(steps, args.allow_data_loss)
     header = "".join(f"-- {s.describe()}\n" for s in steps)
     name = args.name or steps[0].describe()
-    migration = directory.write(name, dialect.render(steps), current, header)
+    migration = directory.write(name, statements, current, header)
     print(f"Created {migration.sql_path} ({len(steps)} changes)")
     types_path = _types_path(config)
     if types_path.exists():
@@ -761,10 +764,11 @@ def cmd_status(config: Config, args: Args) -> int:
                 }
             )
         )
-    elif not migrations:
+    elif not migrations and not missing:
         print("No migrations.")
     else:
-        width = max(len(m.name) for m in migrations)
+        # Also with no migrations on disk: applied ones missing there are shown (C29).
+        width = max((len(n) for n in [*(m.name for m in migrations), *missing]), default=0)
         labels = {
             "unknown": "unknown (set the database URL to compare)",
             "pending": "pending",
@@ -871,7 +875,10 @@ def cmd_drop(config: Config, args: Args) -> int:
                 await dialect.ensure_migrations_table(conn, config.migrations_schema)
                 return await dialect.applied_migrations(conn, config.migrations_schema)
 
-        if latest.name in asyncio.run(_with_driver(config, applied)):
+        done = asyncio.run(_with_driver(config, applied))
+        # A squash the database adopted is applied too, though its own name is not recorded:
+        # dropping it deleted the only copy of the history (C21).
+        if latest.name in done or squash_adopted(latest, done):
             raise MigrationError(f"{latest.name} is already applied; write a new migration instead")
     elif not args.force:
         raise MigrationError(

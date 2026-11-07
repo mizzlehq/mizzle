@@ -128,6 +128,14 @@ class Config:
         return objects
 
 
+def load_toml(path: Path) -> dict[str, object]:
+    """A TOML file; a broken one is a clean MigrationError naming it (C27)."""
+    try:
+        return tomllib.loads(path.read_text(encoding="utf-8"))
+    except tomllib.TOMLDecodeError as exc:
+        raise MigrationError(f"{path} is not valid TOML: {exc}") from None
+
+
 def _str(data: dict[str, object], name: str, default: str, source: Path) -> str:
     value = data.get(name, default)
     if not isinstance(value, str):
@@ -199,17 +207,17 @@ def load_config(path: Path | None = None, cwd: Path | None = None) -> Config:
     """
     cwd = cwd or Path.cwd()
     if path is not None:
-        data: dict[str, object] = tomllib.loads(path.read_text(encoding="utf-8"))
+        data: dict[str, object] = load_toml(path)
         if path.name == "pyproject.toml":
             data = _table(_table(data.get("tool", {}), path).get("mizzle", {}), path)
         return _from_mapping(path.parent.resolve(), data, path)
     for directory in [cwd]:
         own = directory / "mizzle.toml"
         if own.exists():
-            return _from_mapping(directory, tomllib.loads(own.read_text(encoding="utf-8")), own)
+            return _from_mapping(directory, load_toml(own), own)
         pyproject = directory / "pyproject.toml"
         if pyproject.exists():
-            document: dict[str, object] = tomllib.loads(pyproject.read_text(encoding="utf-8"))
+            document: dict[str, object] = load_toml(pyproject)
             tool = _table(document.get("tool", {}), pyproject)
             if "mizzle" in tool:
                 return _from_mapping(directory, _table(tool["mizzle"], pyproject), pyproject)

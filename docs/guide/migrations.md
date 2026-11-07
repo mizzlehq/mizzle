@@ -102,6 +102,18 @@ UPDATE users SET full_name = initcap(full_name);
 UPDATE posts SET body = trim(body);
 ```
 
+Each migration runs in one transaction, so do not write `BEGIN`, `COMMIT` or `ROLLBACK`:
+`migrate` refuses a migration that does. A statement that cannot run in a transaction
+(`CREATE INDEX CONCURRENTLY`) goes in its own chunk, marked `-- mizzle:no-transaction`:
+
+```sql
+-- mizzle:breakpoint
+-- mizzle:no-transaction
+CREATE INDEX CONCURRENTLY posts_body_idx ON posts (body);
+```
+
+Such a chunk cannot be rolled back if a later statement fails, so keep it last.
+
 `check` does not warn about edits to custom migrations. `mizzle drop` deletes the latest
 migration if it has not been applied yet.
 

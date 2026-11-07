@@ -1613,8 +1613,8 @@ def test_regressions_found_by_fuzzing() -> None:
         s.sql for s in migration(snapshot_of(Spec(["happy", "sad"], moods)), snapshot_of(grown))
     ]
     assert sqls == [
-        """ALTER TYPE "fz_mood" ADD VALUE 'it''s' BEFORE 'happy'""",
-        """ALTER TYPE "fz_mood" ADD VALUE 'glad' AFTER 'it''s'""",
+        """ALTER TYPE "fz_mood" ADD VALUE IF NOT EXISTS 'it''s' BEFORE 'happy'""",
+        """ALTER TYPE "fz_mood" ADD VALUE IF NOT EXISTS 'glad' AFTER 'it''s'""",
     ]
 
     # Long generated names keep their suffix, so a unique and a foreign key on the same

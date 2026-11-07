@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import keyword
-import tomllib
 from pathlib import Path
+from typing import cast
 
 from mizzle.core.errors import MigrationError
+from mizzle.kit.config import load_toml
 
 STARTER_SCHEMA = '''"""Database schema. Edit it, then run `mizzle generate` and `mizzle migrate`."""
 
@@ -71,9 +72,9 @@ def init_project(
 
     own = root / "mizzle.toml"
     pyproject = root / "pyproject.toml"
-    has_tool_section = pyproject.exists() and "mizzle" in tomllib.loads(
-        pyproject.read_text(encoding="utf-8")
-    ).get("tool", {})
+    has_tool_section = pyproject.exists() and "mizzle" in cast(
+        "dict[str, object]", load_toml(pyproject).get("tool", {})
+    )
     if (own.exists() or has_tool_section) and not force:
         where = own.name if own.exists() else "pyproject.toml [tool.mizzle]"
         raise MigrationError(f"mizzle is already set up ({where}); pass --force to replace it")
