@@ -1,0 +1,9 @@
+{
+  "version": 1,
+  "dialect": "postgresql",
+  "id": "6f362014-737d-4da4-a2cd-76b247faa5a4",
+  "prev_id": null,
+  "schemas": [],
+  "enums": {},
+  "tables": {}
+}

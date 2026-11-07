@@ -11,7 +11,7 @@ import struct
 import uuid as _uuid
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from decimal import Decimal
-from typing import Protocol, Self, cast, override, runtime_checkable
+from typing import Protocol, cast, override, runtime_checkable
 
 from asyncpg import (
     BitString,
@@ -25,11 +25,8 @@ from asyncpg import (
     Range,
 )
 
-from mizzle.core.compiler import CompiledQuery
 from mizzle.core.errors import QueryError
 from mizzle.core.naming import snake_case
-from mizzle.core.query.base import Runner
-from mizzle.core.schema import types as _core
 from mizzle.core.schema.column import Column, ColumnBase
 from mizzle.core.sql.nodes import Expr, Node, Param, TypedOperation
 
@@ -399,8 +396,9 @@ _VECTOR_VALUES: tuple[type[object], ...] = (list, tuple, SupportsToList)
 
 
 def vector(dimensions: int, name: str | None = None) -> Column[list[float] | None]:
-    """A pgvector ``vector(n)`` (float4 values; needs the ``vector`` extension, which
-    migrations create). Write a list, a tuple or a numpy array of floats; reads give lists."""
+    """A pgvector ``vector(n)`` (float4 values; needs the ``vector`` extension: create it
+    in a custom migration). Write a list, a tuple or a numpy array of floats; reads give
+    lists."""
     return Column(
         f"vector({dimensions})", _VECTOR_VALUES, name, encoder=_vector_text, decoder=_FLOAT4
     )
@@ -562,157 +560,16 @@ def pg_enum[E: enum.Enum](
     return column
 
 
-def pg_domain[T](
-    type_name: str,
-    py_type: type[T] | None = None,
-    name: str | None = None,
-    *,
-    schema: str | None = None,
-) -> Column[T | None]:
-    """A column of a PostgreSQL domain. ``py_type`` is the Python type values decode to
-    (``str`` for a text domain); declare the domain itself with ``mizzle.domain``. Give
-    ``schema`` when the domain lives outside the database's default schema."""
-    sql_type = type_name if schema in (None, "public") else f"{schema}.{type_name}"
-    decoder: Callable[[object], object] | None = None
-    if py_type is not None:
-        convert = cast(Callable[[object], object], py_type)
-        # asyncpg already reads a date/UUID/... domain as that type; date(date) fails (Q1).
-        decoder = lambda v: v if isinstance(v, py_type) else convert(v)  # noqa: E731
-    column: Column[T | None] = Column(
-        sql_type, (py_type,) if py_type is not None else None, name, decoder=decoder
-    )
-    column.json_load = lambda runner: _json_type(runner, sql_type)  # its base type (Q4-6)
-    return column
+class CustomColumn(Column[str | None]):
+    """See ``custom``. The PostgreSQL compiler binds its values as ``$1::text::type`` and
+    selects it as ``col::text``."""
+
+    # ponytail: a subquery selecting it (``IN (SELECT col ...)``) returns text too; compare
+    # with ``sql(...)`` there, or give the select an explicit cast, if the type needs it.
 
 
-def _composite_json(py_type: type | None) -> Callable[[object], object]:
-    """A composite nested in a relational row arrives as a dict of its fields (Q2, Q4-6):
-    keep it by name, like asyncpg's Record, unless ``py_type`` wants positional values."""
-
-    def parse(value: object) -> object:
-        fields = cast(dict[str, object], value)
-        if py_type is None or issubclass(py_type, Mapping):
-            return fields
-        return tuple(fields.values())
-
-    return parse
-
-
-def pg_composite[T](
-    type_name: str,
-    py_type: type[T] | None = None,
-    name: str | None = None,
-    *,
-    schema: str | None = None,
-) -> Column[T | None]:
-    """A column of a PostgreSQL composite type; declare the type with ``mizzle.composite``.
-    asyncpg reads a composite as an ``asyncpg.Record`` (fields by name) and writes a tuple of
-    field values in order or a dict by field name; pass ``py_type`` (``tuple`` or ``dict``,
-    say) to decode to that instead. Give ``schema`` when the type lives outside the
-    database's default schema. In a relational (nested) row it is a dict by field name."""
-    sql_type = type_name if schema in (None, "public") else f"{schema}.{type_name}"
-    # dict too: the form py_type=dict reads back must be writable (Q9).
-    column: Column[T | None] = Column(sql_type, (tuple, dict), name, decoder=py_type)
-    column.json_load = lambda runner: _json_type(runner, sql_type)  # its field types (Q4-6)
-    return _json(column, _composite_json(py_type))
-
-
-# -- domains and composites nested in relational queries (Q4-6) ------------------------
-# JSON carries a numeric as a float, a timestamp as a string...: a domain is nested like
-# its base type and a composite field by field, both looked up in the database once.
-
-_JSON_BASES: dict[str, Callable[[], ColumnBase]] = {
-    "numeric": _core.numeric,
-    "real": _core.real,
-    "double precision": _core.double_precision,
-    "date": _core.date,
-    "timestamp without time zone": _core.timestamp,
-    "timestamp with time zone": lambda: _core.timestamp(tz=True),
-    "time without time zone": time,
-    "time with time zone": lambda: time(tz=True),
-    "interval": interval,
-    "uuid": uuid,
-    "bytea": bytea,
-    "inet": inet,
-    "cidr": cidr,
-    "bit": bit,
-    "bit varying": varbit,
-    "point": point,
-    "line": line,
-    "lseg": lseg,
-    "box": box,
-    "path": path,
-    "polygon": polygon,
-    "circle": circle,
-    "hstore": hstore,
-    "int4range": int4range,
-    "int8range": int8range,
-    "numrange": numrange,
-    "tsrange": tsrange,
-    "tstzrange": tstzrange,
-    "daterange": daterange,
-    "int4multirange": int4multirange,
-    "int8multirange": int8multirange,
-    "nummultirange": nummultirange,
-    "tsmultirange": tsmultirange,
-    "tstzmultirange": tstzmultirange,
-    "datemultirange": datemultirange,
-}
-
-_FIELDS = (
-    "FROM pg_attribute a WHERE a.attrelid = t.typrelid AND a.attnum > 0"
-    " AND NOT a.attisdropped ORDER BY a.attnum"
-)
-_LOOKUP = (
-    "SELECT t.typtype::text, format_type(t.typbasetype, t.typtypmod),"
-    f" ARRAY(SELECT a.attname::text {_FIELDS}),"
-    f" ARRAY(SELECT format_type(a.atttypid, a.atttypmod) {_FIELDS}),"
-    " (SELECT format_type(r.rngsubtype, NULL) FROM pg_range r"
-    " WHERE t.oid IN (r.rngtypid, r.rngmultitypid))"
-    " FROM pg_type t WHERE t.oid = to_regtype($1)"
-)
-
-
-class _Bound(Protocol):  # what asyncpg's Range takes: any subtype's value
-    @override
-    def __eq__(self, other: object, /) -> bool: ...
-    def __lt__(self, other: Self, /) -> bool: ...
-    def __gt__(self, other: Self, /) -> bool: ...
-
-
-def _range_of_parts(value: object) -> object:
-    """A user-defined range from its decoded [lower, upper, lower_inc, upper_inc, empty]."""
-    lower, upper, lower_inc, upper_inc, empty = cast("list[_Bound | None]", value)
-    if empty:
-        return Range[_Bound](empty=True)
-    return Range(lower, upper, lower_inc=bool(lower_inc), upper_inc=bool(upper_inc))
-
-
-async def _json_type(runner: Runner, type_text: str) -> ColumnBase:
-    """A column that nests and reads like ``type_text`` (as ``format_type`` prints it).
-    Looked up once per database: the same name can be another type in another (Q4-17)."""
-    if type_text.endswith("[]"):
-        return (await _json_type(runner, type_text[:-2])).array_column()
-    name = re.sub(r"\(.*?\)", "", type_text)  # numeric(10,2), timestamp(3) with time zone
-    if (base := _JSON_BASES.get(name)) is not None:
-        return base()
-    if (known := runner.json_types.get(name)) is not None:
-        return known
-    rows = await runner.fetch(CompiledQuery(_LOOKUP, (name,), (None,)), read_only=True)
-    column: ColumnBase = Column[object](name, None)  # anything else: its JSON is already its value
-    if rows:
-        kind, base_type, names, types, subtype = cast(
-            tuple[str, str, list[str], list[str], str | None], tuple(rows[0])
-        )
-        if kind == "d":
-            column = await _json_type(runner, base_type)
-        elif kind == "c":
-            fields = [(n, await _json_type(runner, t)) for n, t in zip(names, types, strict=True)]
-            column.json_fields = tuple(fields)
-        elif subtype is not None:  # a user-defined range or multirange (Q4-16, Q4-20)
-            column = _json(Column[object](name, None), _range_of_parts)
-            column.json_range = await _json_type(runner, subtype)
-            if kind == "m":
-                column = column.array_column()  # nests like an array of its ranges
-    runner.json_types[name] = column
-    return column
+def custom(sql_type: str, name: str | None = None) -> CustomColumn:
+    """A column of a type mizzle has no column type for: ``sql_type`` is its DDL type,
+    verbatim (``"citext"``, ``"box"``, ``"int4range"``, ``"my_domain"``, ``"app.my_type"``).
+    Values are ``str`` in the type's text form, as PostgreSQL prints it."""
+    return CustomColumn(sql_type, (str,), name)

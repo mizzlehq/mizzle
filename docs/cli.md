@@ -84,7 +84,9 @@ mizzle pull --out db/legacy.py --force
 mizzle pull --update              # another app owns the schema: follow it
 ```
 
-Reads tables, enums, views, relations, row-level security and triggers from the database.
+Reads tables, enums, views, relations, row-level security and policies from the database,
+and warns about what mizzle does not manage (functions, triggers, extensions, grants...),
+which it leaves out ([Not managed by mizzle](guide/migrations.md#not-managed-by-mizzle)).
 `--update` rewrites your schema module and records the database's changes as a migration
 that runs nothing ([Following a schema another app owns](guide/migrations.md#following-a-schema-another-app-owns)).
 

@@ -7,7 +7,7 @@ Supabase-style policies:
 ```python
 from typing import final, override
 
-from mizzle import Constraint, Table, eq, grant, rls, sql
+from mizzle import Constraint, Table, eq, rls, sql
 from mizzle.pg import integer, text, timestamp, uuid
 from mizzle.supabase import ANON, AUTHENTICATED, auth_uid, crud_policy
 
@@ -25,8 +25,6 @@ class Notes(Table, name="notes"):
     def config(cls) -> list[Constraint]:
         return [
             rls(),
-            grant(["select", "insert", "update", "delete"], to=[AUTHENTICATED]),
-            grant("select", to=[ANON]),
             *crud_policy(
                 "notes_owner",
                 to=[AUTHENTICATED],
@@ -110,8 +108,8 @@ models in a FastAPI app.
 `mizzle.supabase` has what Supabase projects need for row-level security:
 
 - `ANON`, `AUTHENTICATED`, `SERVICE_ROLE`, `POSTGRES`, `SUPABASE_AUTH_ADMIN`: Supabase's
-  roles, as `role(..., existing=True)`. Migrations use them in policies and grants but
-  never create or change them.
+  roles, as `role(..., existing=True)`. Migrations use them in policies but never create
+  or change them.
 - `auth_uid()`, `auth_jwt()`, `auth_role()`: `(select auth.uid())` and friends, for
   policy conditions. The subquery makes PostgreSQL evaluate them once per statement
   instead of once per row, as Supabase recommends.
@@ -129,9 +127,10 @@ CREATE POLICY "notes_owner_insert" ON "notes" AS PERMISSIVE FOR INSERT TO "authe
 CREATE POLICY "notes_owner_update" ON "notes" AS PERMISSIVE FOR UPDATE TO "authenticated" USING ("owner_id" = (select auth.uid())) WITH CHECK ("owner_id" = (select auth.uid()));
 CREATE POLICY "notes_owner_delete" ON "notes" AS PERMISSIVE FOR DELETE TO "authenticated" USING ("owner_id" = (select auth.uid()));
 CREATE POLICY "notes_public_select" ON "notes" AS PERMISSIVE FOR SELECT TO "anon" USING ("public" = 'yes');
-GRANT SELECT ON "notes" TO "anon";
-GRANT DELETE, INSERT, SELECT, UPDATE ON "notes" TO "authenticated";
 ```
+
+Grants are not managed by mizzle (Supabase grants its roles on new tables by default); add
+any others in a custom migration (`GRANT SELECT ON notes TO anon;`).
 
 Your server connects as a role that bypasses RLS (`postgres`, or the table owner). To run
 queries as a signed-in user, do what Supabase's API does: set the JWT claims and the role

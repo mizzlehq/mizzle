@@ -1,8 +1,7 @@
-"""Snapshots, diffs and SQL for grants, overloads, trigger kinds, moves, rebuilt columns,
+"""Snapshots, diffs and SQL for moves, rebuilt columns,
 identity options and long generated names (no database)."""
 
 import copy
-import sys
 from pathlib import Path
 from typing import final, override
 
@@ -10,32 +9,20 @@ import pytest
 
 from mizzle import (
     Constraint,
-    QueryBuilder,
     QueryError,
     SchemaError,
     Table,
-    View,
-    composite,
-    domain,
-    exclusion,
-    extension,
-    function,
-    grant,
     index,
     make_interval,
-    partition,
     sql,
 )
-from mizzle import trigger as make_trigger
 from mizzle.core.errors import MigrationError
 from mizzle.core.snapshot import Snapshot, empty_snapshot
 from mizzle.dialects.postgres import PostgresDialect
-from mizzle.dialects.postgres.ddl import _without_defaults
 from mizzle.kit.cli import main
-from mizzle.kit.config import Config
 from mizzle.kit.diff import StrictRenames, diff, no_renames
 from mizzle.kit.snapshot import build_snapshot
-from mizzle.pg import bit, integer, pg_composite, pg_domain, text
+from mizzle.pg import bit, integer, text
 from mizzle.studio.ddl import build_steps, statement_rows
 
 dialect = PostgresDialect()
@@ -66,137 +53,6 @@ def test_long_generated_names_never_collide_and_are_stable() -> None:
     assert all(n.endswith(("_key", "_pkey")) for n in names)
     again = build_snapshot([table(a), table(b)], dialect)
     assert diff(snap, again) == []  # stable
-
-
-def test_grants() -> None:
-    @final
-    class Docs(Table, name="docs"):
-        id = integer()
-
-        @classmethod
-        @override
-        def config(cls) -> list[Constraint]:
-            return [
-                grant(["select", "insert"], to=["reader", "public"]),
-                grant("all", to=["admin"]),
-            ]
-
-    snap = build_snapshot([Docs], dialect)
-    assert snap["tables"]["public.docs"].get("grants") == {
-        "reader": ["insert", "select"],
-        "public": ["insert", "select"],
-        "admin": ["all"],
-    }
-    assert sqls(empty_snapshot("postgresql"), snap)[1:] == [
-        'GRANT ALL ON "docs" TO "admin"',
-        'GRANT INSERT, SELECT ON "docs" TO PUBLIC',
-        'GRANT INSERT, SELECT ON "docs" TO "reader"',
-    ]
-    fewer = copy.deepcopy(snap)
-    fewer["tables"]["public.docs"]["grants"] = {"reader": ["select"]}
-    assert sqls(snap, fewer) == [
-        'REVOKE ALL ON "docs" FROM "admin"',
-        'REVOKE INSERT, SELECT ON "docs" FROM PUBLIC',
-        'REVOKE INSERT ON "docs" FROM "reader"',
-    ]
-    # Against a live database (push), roles the schema does not name are left alone.
-    assert diff(snap, fewer, compare_expressions=False) != []
-    assert all(s.role == "reader" for s in diff(snap, fewer, compare_expressions=False))  # pyright: ignore[reportAttributeAccessIssue]
-    with pytest.raises(SchemaError, match="unknown privileges"):
-        grant(["read"], to=["x"])  # pyright: ignore[reportArgumentType]
-
-
-def test_function_overloads_and_options() -> None:
-    one = function("f", returns="integer", language="sql", args="a integer", body="RETURN a")
-    two = function(
-        "f",
-        returns="integer",
-        language="sql",
-        args="a integer, b integer DEFAULT 1",
-        body="SELECT a + b",
-        strict=True,
-        leakproof=True,
-        parallel="safe",
-        cost=3,
-        settings={"search_path": "public, pg_temp"},
-    )
-
-    @final
-    class T(Table, name="t"):
-        id = integer()
-
-    snap = build_snapshot([T], dialect, objects=[one, two])
-    assert list(snap.get("functions", {})) == [
-        "public.f(a integer)",
-        "public.f(a integer, b integer DEFAULT 1)",
-    ]
-    statements = sqls(empty_snapshot("postgresql"), snap)
-    # (K1) functions come before the tables
-    assert 'FUNCTION "f"(a integer) RETURNS integer LANGUAGE sql\nRETURN a' in statements[0]
-    assert (
-        "LANGUAGE sql STRICT LEAKPROOF PARALLEL SAFE COST 3 SET search_path = public, pg_temp "
-        "AS $mizzle$SELECT a + b$mizzle$"
-    ) in statements[1]
-    only_two = build_snapshot([T], dialect, objects=[two])
-    assert sqls(snap, only_two) == ['DROP FUNCTION "f"(a integer)']
-    assert _without_defaults("a integer, b text DEFAULT 'x, y', c int[] DEFAULT '{1,2}'") == (
-        "a integer, b text, c int[]"
-    )
-    # Snapshots written before overloads were keyed "schema.name": nothing changes.
-    old = copy.deepcopy(only_two)
-    old["functions"] = {"public.f": next(iter(only_two.get("functions", {}).values()))}
-    assert diff(old, only_two) == []
-
-
-@final
-class Items(Table, name="items"):
-    id = integer()
-    name = text()
-    price = integer()
-
-
-@final
-class Names(View, name="names"):
-    id = integer()
-
-    @classmethod
-    @override
-    def query(cls, db: QueryBuilder):
-        return db.select(Items.id).from_(Items)
-
-
-fn = function("t", returns="trigger", body="BEGIN RETURN NEW; END")
-
-
-def test_trigger_kinds() -> None:
-    triggers = [
-        make_trigger(
-            "upd", on=Items, execute=fn, events=["update"], update_of=[Items.price, Items.name]
-        ),
-        make_trigger(
-            "log",
-            on=Items,
-            execute=fn,
-            timing="after",
-            events=["insert"],
-            for_each="statement",
-            new_table="added",
-        ),
-        make_trigger("ins", on=Names, execute=fn, timing="instead of", events=["insert"]),
-    ]
-    snap = build_snapshot([Items, Names], dialect, objects=triggers)
-    statements = sqls(empty_snapshot("postgresql"), snap)
-    assert 'BEFORE UPDATE OF "name", "price" ON "items" FOR EACH ROW' in "\n".join(statements)
-    assert 'AFTER INSERT ON "items" REFERENCING NEW TABLE AS "added" FOR EACH STATEMENT' in (
-        "\n".join(statements)
-    )
-    assert 'INSTEAD OF INSERT ON "names" FOR EACH ROW' in "\n".join(statements)
-    with pytest.raises(SchemaError, match="INSTEAD OF"):
-        build_snapshot(
-            [Items], dialect, objects=[make_trigger("x", on=Items, execute=fn, timing="instead of")]
-        )
-    with pytest.raises(SchemaError, match="update_of"):
-        make_trigger("x", on=Items, execute=fn, events=["insert"], update_of=[Items.price])
 
 
 def test_table_moves_use_the_rename_resolver() -> None:
@@ -309,47 +165,6 @@ def test_identity_options() -> None:
     assert default_id.get("identity") == {"always": True, "start": 1, "increment": 1}
 
 
-def test_renamed_column_used_by_a_trigger_changes_type() -> None:
-    """Found by fuzzing: the old snapshot names the column as before the rename, and the
-    trigger (UPDATE OF it) must still be dropped before its type changes."""
-
-    def items(name: str, sql_type: str) -> type[Table]:
-        column = integer() if sql_type == "integer" else text()
-        return type("I", (Table,), {name: column, "__module__": __name__}, name="items")
-
-    old_t, new_t = items("price", "integer"), items("cost", "text")
-    old = build_snapshot(
-        [old_t],
-        dialect,
-        objects=[
-            make_trigger(
-                "t",
-                on=old_t,
-                execute=fn,
-                events=["update"],
-                update_of=[old_t.__table__.columns["price"]],
-            )
-        ],
-    )
-    new = build_snapshot(
-        [new_t],
-        dialect,
-        objects=[
-            make_trigger(
-                "t",
-                on=new_t,
-                execute=fn,
-                events=["update"],
-                update_of=[new_t.__table__.columns["cost"]],
-            )
-        ],
-    )
-    steps = [s.describe() for s in diff(old, new, StrictRenames({"items.price": "cost"}))]
-    assert steps.index("drop trigger t on items") < steps.index(
-        "change type of items.cost from integer to text"
-    )
-
-
 def test_table_dropped_before_one_reusing_its_index_names() -> None:
     """Found by fuzzing: a rename without the resolver (--no-renames) creates the new table
     with the old one's index name, so the old table must be gone first."""
@@ -445,204 +260,10 @@ def test_keyword_default_in_an_older_snapshot_is_not_a_change() -> None:
 # -- domains -------------------------------------------------------------------------------
 
 
-def test_domains_render_create_drop_and_reject_changes() -> None:
-    email = domain(
-        "email",
-        as_="text",
-        not_null=True,
-        default="'x'::text",
-        check="VALUE ~ '@'",
-        collation="C",
-    )
-
-    @final
-    class Users(Table, name="users"):
-        id = integer().primary_key()
-        email = pg_domain("email", str)
-
-    v1 = build_snapshot([Users], dialect, objects=[email])
-    assert v1.get("domains") == {
-        "public.email": {
-            "schema": "public",
-            "name": "email",
-            "base_type": "text",
-            "not_null": True,
-            "default": "'x'",
-            "checks": ["VALUE ~ '@'"],
-            "collation": "C",
-        }
-    }
-    assert v1["tables"]["public.users"]["columns"]["email"]["type"] == "email"
-
-    statements = dialect.render(diff(empty_snapshot("postgresql"), v1))
-    assert statements[0].sql == (
-        "CREATE DOMAIN \"email\" AS text COLLATE \"C\" DEFAULT 'x' NOT NULL CHECK (VALUE ~ '@')"
-    )
-    assert diff(v1, v1) == []
-
-    steps = diff(v1, build_snapshot([], dialect))
-    assert [s.describe() for s in steps] == ["drop table users", "drop domain email"]
-
-    # A definition change is not expressible: it needs a hand-written migration.
-    changed = domain("email", as_="integer")
-    v2 = build_snapshot([], dialect, objects=[changed])
-    with pytest.raises(MigrationError, match="domain email"):
-        diff(v1, v2)
-
-    # push (compare_expressions=False) tolerates reformatted CHECK text, but not a change.
-    retexted = domain(
-        "email",
-        as_="text",
-        not_null=True,
-        default="'x'::text",
-        check="VALUE <> ''",
-        collation="C",
-    )
-    v3 = build_snapshot([Users], dialect, objects=[retexted])
-    assert diff(v1, v3, compare_expressions=False) == []
-    with pytest.raises(MigrationError, match="domain email"):
-        diff(v1, v3)
-
-
-def test_domain_in_another_schema_qualifies_the_column() -> None:
-    @final
-    class T(Table, name="t", schema="app"):
-        d = pg_domain("email", str, schema="app")
-
-    snap = build_snapshot([T], dialect, objects=[domain("email", as_="text", schema="app")])
-    assert set(snap.get("domains", {})) == {"app.email"}
-    assert snap["tables"]["app.t"]["columns"]["d"]["type"] == "app.email"
-
-
 # -- partitions ----------------------------------------------------------------------------
 
 
-def _measurements(key: str, parts: list[tuple[str, str]]) -> type[Table]:
-    @final
-    class M(Table, name="measurements", partition_by=key):
-        id = integer()
-        logged_at = text()
-
-        @classmethod
-        @override
-        def config(cls) -> list[Constraint]:
-            return [partition(n, for_values=b) for n, b in parts]
-
-    return M
-
-
-P2026 = ("measurements_2026", "FOR VALUES FROM ('2026-01-01') TO ('2027-01-01')")
-P_DEF = ("measurements_def", "DEFAULT")
-
-
-def test_partitions_render_create_and_drop() -> None:
-    v1 = build_snapshot([_measurements("RANGE (logged_at)", [P2026, P_DEF])], dialect)
-    table = v1["tables"]["public.measurements"]
-    assert table.get("partition_by") == "RANGE (logged_at)"
-    assert table.get("partitions") == {P2026[0]: P2026[1], P_DEF[0]: P_DEF[1]}
-
-    sql = sqls(empty_snapshot("postgresql"), v1)
-    assert sql[0] == (
-        'CREATE TABLE "measurements" (\n    "id" integer,\n    "logged_at" text\n) '
-        "PARTITION BY RANGE (logged_at)"
-    )
-    assert sql[1] == (
-        'CREATE TABLE "measurements_2026" PARTITION OF "measurements" '
-        "FOR VALUES FROM ('2026-01-01') TO ('2027-01-01')"
-    )
-    assert sql[2] == 'CREATE TABLE "measurements_def" PARTITION OF "measurements" DEFAULT'
-    assert diff(v1, v1) == []
-
-    # Removing the table takes its partitions along: no separate drop.
-    steps = diff(v1, build_snapshot([], dialect))
-    assert [s.describe() for s in steps] == ["drop table measurements"]
-
-    # A partition added and one dropped on a table that stays.
-    p2027 = ("measurements_2027", "FOR VALUES FROM ('2027-01-01') TO ('2028-01-01')")
-    v2 = build_snapshot([_measurements("RANGE (logged_at)", [P2026, p2027])], dialect)
-    steps = diff(v1, v2)
-    assert [s.describe() for s in steps] == [
-        "create partition measurements_2027 of measurements",
-        "drop partition measurements_def",
-    ]
-    assert dialect.render(steps)[0].sql == (
-        'CREATE TABLE "measurements_2027" PARTITION OF "measurements" '
-        "FOR VALUES FROM ('2027-01-01') TO ('2028-01-01')"
-    )
-    assert dialect.render(steps)[1].sql == 'DROP TABLE "measurements_def"'
-
-    # A moved bound and a changed key are not expressible in place.
-    moved = ("measurements_2026", "FOR VALUES FROM ('2020-01-01') TO ('2021-01-01')")
-    with pytest.raises(MigrationError, match="bound of partition"):
-        diff(v1, build_snapshot([_measurements("RANGE (logged_at)", [moved, P_DEF])], dialect))
-    with pytest.raises(MigrationError, match="partition key"):
-        diff(v1, build_snapshot([_measurements("RANGE (id)", [P2026, P_DEF])], dialect))
-
-
-def test_partition_needs_partition_by() -> None:
-    @final
-    class Bad(Table, name="bad"):
-        id = integer()
-
-        @classmethod
-        @override
-        def config(cls) -> list[Constraint]:
-            return [partition("bad_1", for_values="DEFAULT")]
-
-    with pytest.raises(SchemaError, match="partition_by"):
-        build_snapshot([Bad], dialect)
-
-
 # -- composite types -----------------------------------------------------------------------
-
-
-def test_composites_render_create_drop_and_reject_changes() -> None:
-    caddr = composite("caddr", [("street", "varchar(40)"), ("city", "text"), ("zip", "integer")])
-
-    @final
-    class Users(Table, name="users"):
-        id = integer().primary_key()
-        home = pg_composite("caddr", dict)
-
-    v1 = build_snapshot([Users], dialect, objects=[caddr])
-    assert v1.get("composites") == {
-        "public.caddr": {
-            "schema": "public",
-            "name": "caddr",
-            "fields": [
-                {"name": "street", "type": "character varying(40)"},
-                {"name": "city", "type": "text"},
-                {"name": "zip", "type": "integer"},
-            ],
-        }
-    }
-    assert v1["tables"]["public.users"]["columns"]["home"]["type"] == "caddr"
-
-    statements = dialect.render(diff(empty_snapshot("postgresql"), v1))
-    assert statements[0].sql == (
-        'CREATE TYPE "caddr" AS ("street" character varying(40), "city" text, "zip" integer)'
-    )
-    assert diff(v1, v1) == []
-
-    # A composite is dropped after the table that uses it.
-    steps = diff(v1, build_snapshot([], dialect))
-    assert [s.describe() for s in steps] == ["drop table users", "drop type caddr"]
-
-    # Changing its fields needs a custom migration.
-    changed = composite("caddr", [("street", "varchar(40)"), ("city", "text")])
-    v2 = build_snapshot([Users], dialect, objects=[changed])
-    with pytest.raises(MigrationError, match="composite type caddr"):
-        diff(v1, v2)
-
-
-def test_pg_composite_decodes_and_accepts_tuples() -> None:
-    column = pg_composite("caddr", dict, name="home")
-    assert column.sql_type == "caddr"
-    assert column.decode({"city": "x"}) == {"city": "x"}
-    column.validate(("street", "city", 1))
-    with pytest.raises(QueryError, match="expects tuple"):
-        column.validate("nope")
-    assert pg_composite("addr", schema="app").sql_type == "app.addr"
 
 
 # -- studio DDL (allow-listed) -------------------------------------------------------------
@@ -792,36 +413,6 @@ def test_storage_options_cannot_break_out_of_the_with_clause() -> None:
         sqls(empty_snapshot("postgresql"), build_snapshot([Bad], dialect))
 
 
-def test_exclusion_operators_cannot_break_out_of_the_constraint() -> None:
-    @final
-    class Room(Table, name="room"):
-        slot = integer().not_null()
-
-        @classmethod
-        @override
-        def config(cls) -> list[Constraint]:
-            return [exclusion((cls.slot, "=); DROP TABLE victim; --"), name="bad")]
-
-    with pytest.raises(SchemaError, match="exclusion operator"):
-        sqls(empty_snapshot("postgresql"), build_snapshot([Room], dialect))
-
-
-@pytest.mark.parametrize("operator", ["--", "--x", "/*", "*/", "&&/*"])
-def test_exclusion_operators_reject_comment_starts(operator: str) -> None:
-    # B24: these match the operator-character pattern but become comments in the SQL.
-    @final
-    class Note(Table, name="note"):
-        slot = integer().not_null()
-
-        @classmethod
-        @override
-        def config(cls) -> list[Constraint]:
-            return [exclusion((cls.slot, operator), name="bad")]
-
-    with pytest.raises(SchemaError, match="exclusion operator"):
-        sqls(empty_snapshot("postgresql"), build_snapshot([Note], dialect))
-
-
 def test_make_interval_rejects_values_that_are_not_numbers() -> None:
     assert make_interval(days=7) is not None
     with pytest.raises(QueryError, match="must be an int"):
@@ -857,15 +448,6 @@ def test_changing_a_collated_column_keeps_the_collation() -> None:
     )
 
 
-def test_composites_are_created_after_the_composites_they_use() -> None:
-    inner = composite("z_inner", [("a", "integer")])
-    outer = composite("a_outer", [("inner", "z_inner")])
-    snap = build_snapshot([], dialect, objects=[outer, inner])  # declared out of order
-    creates = [s for s in sqls(empty_snapshot("postgresql"), snap) if s.startswith("CREATE TYPE")]
-    assert creates[0].startswith('CREATE TYPE "z_inner"')
-    assert creates[1].startswith('CREATE TYPE "a_outer"')
-
-
 def test_storage_option_keys_and_bools_are_normalized() -> None:
     @final
     class Cache(Table, name="cache", storage={"FillFactor": 70, "autovacuum_enabled": False}):
@@ -878,33 +460,6 @@ def test_storage_option_keys_and_bools_are_normalized() -> None:
 def test_bit_without_a_length_is_bit_one() -> None:
     assert bit().sql_type == "bit(1)"
     assert bit(4).sql_type == "bit(4)"
-
-
-def test_a_partitioned_table_cannot_be_unlogged() -> None:
-    @final
-    class P(Table, name="p", partition_by="RANGE (at)", unlogged=True):
-        at = text()
-
-    with pytest.raises(SchemaError, match="cannot be unlogged"):
-        build_snapshot([P], dialect)
-
-
-def test_schema_objects_in_a_list_or_tuple_are_collected(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    # D4: `exts = [extension("hstore"), ...]` (as the docs show) must not be ignored.
-    module = "d4_schema_objects"
-    (tmp_path / f"{module}.py").write_text(
-        "from mizzle import extension\n"
-        'exts = [extension("hstore"), extension("citext")]\n'
-        'more = (extension("ltree"),)\n'
-        'single = extension("hstore")\n'
-        'unrelated = [1, "x"]\n'
-    )
-    monkeypatch.syspath_prepend(tmp_path)
-    monkeypatch.delitem(sys.modules, module, raising=False)
-    config = Config(root=tmp_path, schema=[module], out=tmp_path / "migrations")
-    assert config.load_objects() == [extension("hstore"), extension("citext"), extension("ltree")]
 
 
 def test_typegen_help_mentions_row_types(capsys: pytest.CaptureFixture[str]) -> None:
@@ -946,12 +501,24 @@ def test_a_journal_entry_cannot_name_a_folder_outside_migrations(tmp_path: Path)
     assert (tmp_path / "victim").is_dir()
 
 
-def test_an_extension_declared_twice_with_different_options_is_refused() -> None:
-    # Two declarations (top level and in a list) silently kept the last one.
-    from mizzle.kit.snapshot import build_snapshot
+def test_schema_objects_in_a_list_or_tuple_are_collected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # D4: `roles = [role("a"), ...]` must not be ignored.
+    import sys
 
-    same = [extension("hstore"), extension("hstore")]
-    assert "hstore" in build_snapshot([], dialect, objects=same).get("extensions", {})
-    clash = [extension("hstore"), extension("hstore", schema="ext")]
-    with pytest.raises(SchemaError, match=r"hstore.*declared twice"):
-        build_snapshot([], dialect, objects=clash)
+    from mizzle import role
+    from mizzle.kit.config import Config
+
+    module = "d4_schema_objects"
+    (tmp_path / f"{module}.py").write_text(
+        "from mizzle import role\n"
+        'roles = [role("d4_a"), role("d4_b")]\n'
+        'more = (role("d4_c"),)\n'
+        'single = role("d4_a")\n'
+        'unrelated = [1, "x"]\n'
+    )
+    monkeypatch.syspath_prepend(tmp_path)
+    monkeypatch.delitem(sys.modules, module, raising=False)
+    config = Config(root=tmp_path, schema=[module], out=tmp_path / "migrations")
+    assert config.load_objects() == [role("d4_a"), role("d4_b"), role("d4_c")]

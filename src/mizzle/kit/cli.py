@@ -230,7 +230,11 @@ def cmd_generate(config: Config, args: Args) -> int:
         if args.sql:  # --sql writes nothing, not even a --custom folder
             print(header.rstrip())
             return 0
-        migration = directory.write(args.name or "custom", [], current, header, custom=True)
+        # The schema as it was: changes to it still go into the next generated migration
+        # (a custom migration may have to run before them: extensions, functions).
+        kept = copy.deepcopy(previous)
+        kept["id"], kept["prev_id"] = current["id"], prev_id
+        migration = directory.write(args.name or "custom", [], kept, header, custom=True)
         print(f"Created {migration.sql_path}")
         return 0
     steps = _diff_with_renames(previous, current, args, dialect)
@@ -362,7 +366,7 @@ def _url_target(url: str) -> tuple[str, str]:
 
 def _managed_only(live: Snapshot, managed: Snapshot) -> Snapshot:
     """The part of ``live`` that mizzle manages: objects named in ``managed``. Reset drops
-    this, never an unmanaged table, view, extension or function in the same schema."""
+    this, never an unmanaged table, view or enum in the same schema."""
     out = copy.deepcopy(live)
     tables = live.get("tables", {})
     out["tables"] = {k: v for k, v in tables.items() if k in managed.get("tables", {})}
@@ -370,14 +374,6 @@ def _managed_only(live: Snapshot, managed: Snapshot) -> Snapshot:
     out["views"] = {k: v for k, v in views.items() if k in managed.get("views", {})}
     enums = live.get("enums", {})
     out["enums"] = {k: v for k, v in enums.items() if k in managed.get("enums", {})}
-    domains = live.get("domains", {})
-    out["domains"] = {k: v for k, v in domains.items() if k in managed.get("domains", {})}
-    composites = live.get("composites", {})
-    out["composites"] = {k: v for k, v in composites.items() if k in managed.get("composites", {})}
-    functions = live.get("functions", {})
-    out["functions"] = {k: v for k, v in functions.items() if k in managed.get("functions", {})}
-    extensions = live.get("extensions", {})
-    out["extensions"] = {k: v for k, v in extensions.items() if k in managed.get("extensions", {})}
     return out
 
 
@@ -641,7 +637,7 @@ def cmd_pull(config: Config, args: Args) -> int:
     async def run(driver: Driver, dialect: Dialect) -> Snapshot:
         async with driver.acquire() as conn:
             for what in await dialect.skipped_objects(conn, config.schema_filter):
-                print(f"warning: pull skips {what} (not supported)", file=sys.stderr)  # (K8)
+                print(f"warning: pull skips {what} (not managed by mizzle)", file=sys.stderr)
             return await dialect.introspect(conn, config.schema_filter)
 
     snapshot = asyncio.run(_with_driver(config, run))

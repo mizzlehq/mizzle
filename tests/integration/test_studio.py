@@ -1452,9 +1452,19 @@ def test_array_and_composite_keys_and_cells(client: TestClient, decl: str) -> No
     rows = "/api/tables/public/st_ck/rows"
     [row] = _rows(client, "st_ck")
     assert isinstance(row["k"], list | dict)
-    updated = client.patch(
-        rows, json={"key": {"k": row["k"]}, "values": {"v": "b", "c": row["c"]}}, headers=AUTH
-    )
+    # S5-2: a composite column (or an array of them) is shown, not written.
+    composite = decl != "int[]"
+    [listed] = [
+        t for t in client.get("/api/tables", headers=AUTH).json()["tables"] if t["name"] == "st_ck"
+    ]
+    assert listed["read_only"] == (["k", "c"] if composite else [])
+    values = {"v": "b"} if composite else {"v": "b", "c": row["c"]}
+    if composite:
+        refused = client.patch(
+            rows, json={"key": {"k": row["k"]}, "values": {"c": row["c"]}}, headers=AUTH
+        )
+        assert refused.status_code == 400 and "composite" in refused.text
+    updated = client.patch(rows, json={"key": {"k": row["k"]}, "values": values}, headers=AUTH)
     assert updated.status_code == 200, updated.text
     assert updated.json()["row"]["v"] == "b" and updated.json()["row"]["c"] == row["c"]
     deleted = client.request("DELETE", rows, json={"keys": [{"k": row["k"]}]}, headers=AUTH)

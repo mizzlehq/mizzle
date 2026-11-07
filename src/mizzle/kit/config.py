@@ -21,17 +21,12 @@ from mizzle.core.errors import MigrationError
 from mizzle.core.naming import Casing
 from mizzle.core.schema.column import ColumnBase
 from mizzle.core.schema.constraints import Role
-from mizzle.core.schema.objects import (
-    Composite,
-    Domain,
-    Extension,
-    Function,
-    SchemaObject,
-    Trigger,
-)
 from mizzle.core.schema.table import Table
 from mizzle.dialects.base import Dialect
 from mizzle.dialects.postgres import PostgresDialect
+
+# A module-level pg_enum(...) column declares an enum type no table uses (K4-5).
+type SchemaObject = Role | ColumnBase
 
 _KEYS = {
     "schema",
@@ -111,9 +106,8 @@ class Config:
         return tables
 
     def load_objects(self) -> list[SchemaObject]:
-        """The extensions, functions, triggers, roles, domains, composites and standalone
-        ``pg_enum(...)`` enum types the schema modules expose,
-        also inside a top-level list or tuple (``exts = [extension("hstore"), ...]``)."""
+        """The roles and standalone ``pg_enum(...)`` enum types the schema modules expose,
+        also inside a top-level list or tuple (``roles = [role("reader"), ...]``)."""
         candidates: list[object] = []
         for value in self._members():
             if isinstance(value, list | tuple):
@@ -126,10 +120,7 @@ class Config:
             if isinstance(value, ColumnBase):
                 if value.enum is not None and all(value is not e for e in enums):
                     enums.append(value)
-            elif (
-                isinstance(value, Extension | Function | Trigger | Role | Domain | Composite)
-                and value not in objects
-            ):
+            elif isinstance(value, Role) and value not in objects:
                 objects.append(value)
         return [*objects, *enums]
 

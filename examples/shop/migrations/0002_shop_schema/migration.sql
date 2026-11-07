@@ -1,14 +1,8 @@
 -- create role shop_support
 -- create schema shop_audit
--- create schema auth
--- create extension pg_trgm
--- create extension pgcrypto
 -- create enum user_role
 -- create enum order_status
 -- create enum audit_action
--- create function uid
--- create function log_change
--- create function price_changed
 -- create table users
 -- create table stores
 -- create table products
@@ -49,57 +43,15 @@
 -- create policy reviews_owner_delete on reviews
 -- create policy notifications_own on notifications
 -- create policy notifications_support on notifications
--- create trigger stores_audit on stores
--- create trigger products_price_changed on products
--- create trigger orders_audit on orders
--- grant select on orders to shop_authenticated
--- grant delete, insert, select, update on reviews to shop_authenticated
--- grant select, update on notifications to shop_authenticated
--- grant select on notifications to shop_support
--- grant select on audit_log to shop_support
--- grant select on product_ratings to shop_authenticated
 DO $mizzle$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'shop_support') THEN CREATE ROLE "shop_support"; END IF; ALTER ROLE "shop_support" NOLOGIN NOCREATEDB NOCREATEROLE INHERIT; END $mizzle$;
 -- mizzle:breakpoint
 CREATE SCHEMA IF NOT EXISTS "shop_audit";
--- mizzle:breakpoint
-CREATE SCHEMA IF NOT EXISTS "auth";
--- mizzle:breakpoint
-CREATE EXTENSION IF NOT EXISTS pg_trgm;
--- mizzle:breakpoint
-CREATE EXTENSION IF NOT EXISTS pgcrypto;
 -- mizzle:breakpoint
 CREATE TYPE "user_role" AS ENUM ('customer', 'seller', 'admin');
 -- mizzle:breakpoint
 CREATE TYPE "order_status" AS ENUM ('pending', 'paid', 'shipped', 'cancelled');
 -- mizzle:breakpoint
 CREATE TYPE "shop_audit"."audit_action" AS ENUM ('insert', 'update', 'delete');
--- mizzle:breakpoint
-CREATE OR REPLACE FUNCTION "auth"."uid"() RETURNS uuid LANGUAGE sql STABLE AS $mizzle$SELECT nullif(current_setting('request.jwt.claims', true)::jsonb ->> 'sub', '')::uuid$mizzle$;
--- mizzle:breakpoint
-CREATE OR REPLACE FUNCTION "shop_audit"."log_change"() RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $mizzle$
-BEGIN
-  INSERT INTO shop_audit.audit_log (table_name, action, row_id, data)
-  VALUES (
-    TG_TABLE_NAME,
-    lower(TG_OP)::shop_audit.audit_action,
-    CASE WHEN TG_OP = 'DELETE' THEN OLD.id::text ELSE NEW.id::text END,
-    CASE WHEN TG_OP = 'DELETE' THEN to_jsonb(OLD) ELSE to_jsonb(NEW) END
-  );
-  RETURN NULL;
-END
-$mizzle$;
--- mizzle:breakpoint
-CREATE OR REPLACE FUNCTION "price_changed"() RETURNS trigger LANGUAGE plpgsql AS $mizzle$
-BEGIN
-  PERFORM pg_notify('shop_price', json_build_object(
-    'product_id', NEW.id, 'old', OLD.price, 'new', NEW.price)::text);
-  INSERT INTO notifications (user_id, kind, payload)
-  SELECT s.owner_id, 'price_changed',
-         jsonb_build_object('product_id', NEW.id, 'old', OLD.price, 'new', NEW.price)
-  FROM stores s WHERE s.id = NEW.store_id;
-  RETURN NULL;
-END
-$mizzle$;
 -- mizzle:breakpoint
 CREATE TABLE "users" (
     "id" uuid NOT NULL DEFAULT gen_random_uuid(),
@@ -270,21 +222,3 @@ CREATE POLICY "reviews_owner_delete" ON "reviews" AS PERMISSIVE FOR DELETE TO "s
 CREATE POLICY "notifications_own" ON "notifications" AS PERMISSIVE FOR ALL TO "shop_authenticated" USING ("user_id" = (select auth.uid()));
 -- mizzle:breakpoint
 CREATE POLICY "notifications_support" ON "notifications" AS PERMISSIVE FOR SELECT TO "shop_support" USING (true);
--- mizzle:breakpoint
-CREATE TRIGGER "stores_audit" AFTER INSERT OR DELETE ON "stores" FOR EACH ROW EXECUTE FUNCTION "shop_audit"."log_change"();
--- mizzle:breakpoint
-CREATE TRIGGER "products_price_changed" AFTER UPDATE OF "price" ON "products" FOR EACH ROW WHEN (OLD.price IS DISTINCT FROM NEW.price) EXECUTE FUNCTION "price_changed"();
--- mizzle:breakpoint
-CREATE TRIGGER "orders_audit" AFTER INSERT OR DELETE OR UPDATE ON "orders" FOR EACH ROW EXECUTE FUNCTION "shop_audit"."log_change"();
--- mizzle:breakpoint
-GRANT SELECT ON "orders" TO "shop_authenticated";
--- mizzle:breakpoint
-GRANT DELETE, INSERT, SELECT, UPDATE ON "reviews" TO "shop_authenticated";
--- mizzle:breakpoint
-GRANT SELECT, UPDATE ON "notifications" TO "shop_authenticated";
--- mizzle:breakpoint
-GRANT SELECT ON "notifications" TO "shop_support";
--- mizzle:breakpoint
-GRANT SELECT ON "shop_audit"."audit_log" TO "shop_support";
--- mizzle:breakpoint
-GRANT SELECT ON "product_ratings" TO "shop_authenticated";

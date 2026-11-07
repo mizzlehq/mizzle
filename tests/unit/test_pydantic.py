@@ -159,19 +159,6 @@ def test_models_accept_every_value_the_column_holds() -> None:
     insert_model(Net).model_validate({"ip": "::1"})
 
 
-def test_dict_composites_write_and_validate() -> None:
-    # Q9: pg_composite(name, dict) read dicts but only accepted tuples (writes and models).
-    from mizzle.pg import pg_composite
-
-    class Home(Table, name="home"):
-        id = serial().primary_key()
-        at = pg_composite("addr", dict)
-
-    Home.at.validate({"city": "Oslo"})
-    row = select_model(Home).model_validate({"id": 1, "at": {"city": "Oslo"}})
-    assert row.model_dump()["at"] == {"city": "Oslo"}
-
-
 def test_ranges_and_bit_strings_round_trip_json() -> None:
     # Q14: Range and BitString had no serializer and no JSON input form.
     import datetime

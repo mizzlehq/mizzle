@@ -1,4 +1,4 @@
-"""Extensions, views, row-level security and triggers: snapshot, diff and SQL."""
+"""Views and row-level security: snapshot, diff and SQL."""
 
 import importlib.util
 import sys
@@ -16,18 +16,13 @@ from mizzle import (
     check,
     count,
     eq,
-    exclusion,
-    extension,
     foreign_key,
-    function,
     policy,
     rls,
     sql,
-    trigger,
     unique,
     unique_index,
 )
-from mizzle.core.schema.objects import SchemaObject
 from mizzle.core.snapshot import Snapshot, empty_snapshot
 from mizzle.dialects.postgres import PostgresDialect
 from mizzle.kit.codegen import render_schema_module, render_types_module
@@ -42,11 +37,7 @@ from mizzle.pg import (
     cidr,
     circle,
     citext,
-    daterange,
     hstore,
-    int4multirange,
-    int4range,
-    int8range,
     integer,
     line,
     lseg,
@@ -54,15 +45,12 @@ from mizzle.pg import (
     macaddr,
     macaddr8,
     money,
-    numrange,
     path,
     point,
     polygon,
     serial,
     text,
     timestamp,
-    tstzmultirange,
-    tstzrange,
     varbit,
     vector,
     xml,
@@ -126,22 +114,11 @@ class Emails(View, name="emails"):  # a view over a view
         return sql("SELECT email FROM active_users")
 
 
-trgm = extension("pg_trgm")
-touch = function("touch", returns="trigger", body="BEGIN NEW.updated_at = now(); RETURN NEW; END")
-users_touch = trigger(
-    "users_touch",
-    on=Users,
-    execute=touch,
-    events=["update"],
-    when=sql("OLD.* IS DISTINCT FROM NEW.*"),
-)
-
 TABLES: list[type[Table]] = [Users, Emails, ActiveUsers, Counts]
-OBJECTS: list[SchemaObject] = [trgm, touch, users_touch]
 
 
-def snap(tables: list[type[Table]] = TABLES, objects: list[SchemaObject] = OBJECTS) -> Snapshot:
-    return build_snapshot(tables, dialect, objects=objects)
+def snap(tables: list[type[Table]] = TABLES) -> Snapshot:
+    return build_snapshot(tables, dialect)
 
 
 def described(old: Snapshot, new: Snapshot, compare_expressions: bool = True) -> list[str]:
@@ -164,27 +141,15 @@ def test_snapshot() -> None:
         "using": "owner = current_user",
         "with_check": None,
     }
-    assert users.get("triggers", {})["users_touch"] == {
-        "name": "users_touch",
-        "timing": "before",
-        "events": ["update"],
-        "for_each": "row",
-        "function": "public.touch",
-        "when": "OLD.* IS DISTINCT FROM NEW.*",
-    }
     views = s.get("views", {})
     assert views["public.active_users"]["definition"] == (
         'SELECT "users"."id", "users"."email" FROM "users" WHERE "users"."active" = true'
     )
     assert list(views["public.user_counts"].get("indexes", {})) == ["user_counts_active"]
-    assert s.get("extensions") == {"pg_trgm": {"name": "pg_trgm"}}
-    assert s.get("functions", {})["public.touch()"]["returns"] == "trigger"
 
 
 def test_create_order_and_sql() -> None:
     assert described(empty_snapshot("postgresql"), snap()) == [
-        "create extension pg_trgm",
-        "create function touch",  # before the tables: a CHECK or DEFAULT may call it (K1)
         "create table users",
         "create view active_users",
         "create materialized view user_counts",
@@ -193,38 +158,27 @@ def test_create_order_and_sql() -> None:
         "enable row level security on users",
         "create policy own on users",
         "create policy add on users",
-        "create trigger users_touch on users",
     ]
     statements = sqls(empty_snapshot("postgresql"), snap())
-    assert statements[0] == "CREATE EXTENSION IF NOT EXISTS pg_trgm"
-    assert statements[1] == (
-        'CREATE OR REPLACE FUNCTION "touch"() RETURNS trigger LANGUAGE plpgsql '
-        "AS $mizzle$BEGIN NEW.updated_at = now(); RETURN NEW; END$mizzle$"
-    )
-    assert 'CREATE MATERIALIZED VIEW "user_counts" AS\nSELECT' in statements[4]
-    assert statements[7:] == [
+    assert 'CREATE MATERIALIZED VIEW "user_counts" AS\nSELECT' in statements[2]
+    assert statements[5:] == [
         'ALTER TABLE "users" ENABLE ROW LEVEL SECURITY, NO FORCE ROW LEVEL SECURITY',
         'CREATE POLICY "own" ON "users" AS PERMISSIVE FOR SELECT TO "anon", "app" '
         "USING (owner = current_user)",
         'CREATE POLICY "add" ON "users" AS PERMISSIVE FOR INSERT TO PUBLIC '
         "WITH CHECK (owner = current_user)",
-        'CREATE TRIGGER "users_touch" BEFORE UPDATE ON "users" FOR EACH ROW '
-        'WHEN (OLD.* IS DISTINCT FROM NEW.*) EXECUTE FUNCTION "touch"()',
     ]
     assert diff(snap(), snap()) == []
 
 
 def test_drop_order_is_reversed() -> None:
     assert described(snap(), empty_snapshot("postgresql")) == [
-        "drop trigger users_touch on users",
         "drop policy own on users",
         "drop policy add on users",
         "drop view emails",
         "drop materialized view user_counts",
         "drop view active_users",
         "drop table users",
-        "drop function touch",  # after the tables (K1)
-        "drop extension pg_trgm",
     ]
 
 
@@ -251,7 +205,7 @@ def test_changed_view_recreates_views_that_use_it() -> None:
     ]
 
 
-def test_dropped_column_recreates_views_policies_and_triggers_using_it() -> None:
+def test_dropped_column_recreates_views_and_policies_using_it() -> None:
     @final
     class Users2(Table, name="users"):  # owner and active are gone
         id = serial().primary_key()
@@ -272,9 +226,8 @@ def test_dropped_column_recreates_views_policies_and_triggers_using_it() -> None
         def query(cls, db: QueryBuilder):
             return db.select(Users2.id).from_(Users2)
 
-    touch2 = trigger("users_touch", on=Users2, execute=touch, events=["update"])
-    old = snap([Users, ActiveUsers], [touch, users_touch])
-    new = snap([Users2, AllUsers], [touch, touch2])
+    old = snap([Users, ActiveUsers])
+    new = snap([Users2, AllUsers])
     assert described(old, new) == [
         "drop policy own on users",  # its USING reads owner
         "drop policy add on users",
@@ -285,29 +238,7 @@ def test_dropped_column_recreates_views_policies_and_triggers_using_it() -> None
         "create view active_users",
         "restore privileges of active_users",
         "create policy own on users",
-        # A whole-row WHEN (OLD.*) does not block dropping a column: replaced in place.
-        "replace trigger users_touch on users",
     ]
-
-
-def test_function_changes() -> None:
-    body = function("touch", returns="trigger", body="BEGIN RETURN NEW; END")
-    new_trigger = trigger("users_touch", on=Users, execute=body, events=["update"])
-    assert described(snap(objects=[users_touch]), snap(objects=[new_trigger])) == [
-        "create function touch",  # CREATE OR REPLACE
-        "replace trigger users_touch on users",  # WHEN removed
-    ]
-    args = function("touch", returns="trigger", body="BEGIN RETURN NEW; END", args="x integer")
-    moved = trigger("users_touch", on=Users, execute=args, events=["update"])
-    assert described(snap(objects=[new_trigger]), snap(objects=[moved])) == [
-        "drop trigger users_touch on users",
-        "create function touch",  # another overload: both exist for a moment (K1)
-        "create trigger users_touch on users",
-        "drop function touch",
-    ]
-    assert sqls(snap(objects=[new_trigger]), snap(objects=[moved]))[3] == (
-        'DROP FUNCTION "touch"()'
-    )
 
 
 def test_policy_changes() -> None:
@@ -324,16 +255,16 @@ def test_policy_changes() -> None:
 
         return U
 
-    base = snap([users(policy("p", using=sql("owner = current_user")))], [])
-    changed = snap([users(policy("p", to=["anon"], using=sql("true")))], [])
+    base = snap([users(policy("p", using=sql("owner = current_user")))])
+    changed = snap([users(policy("p", to=["anon"], using=sql("true")))])
     assert described(base, changed) == ["change policy p on users"]
     assert sqls(base, changed) == ['ALTER POLICY "p" ON "users" TO "anon" USING (true)']
-    restrictive = snap([users(policy("p", as_="restrictive", using=sql("true")))], [])
+    restrictive = snap([users(policy("p", as_="restrictive", using=sql("true")))])
     assert described(base, restrictive) == ["drop policy p on users", "create policy p on users"]
-    checked = snap([users(policy("p", with_check=sql("true")))], [])
+    checked = snap([users(policy("p", with_check=sql("true")))])
     assert described(base, checked) == ["drop policy p on users", "create policy p on users"]
-    assert described(base, snap([users()], [])) == ["drop policy p on users"]
-    forced = snap([users(rls(force=True))], [])
+    assert described(base, snap([users()])) == ["drop policy p on users"]
+    forced = snap([users(rls(force=True))])
     assert described(base, forced) == [
         "drop policy p on users",
         "enable row level security on users",
@@ -341,40 +272,6 @@ def test_policy_changes() -> None:
     assert sqls(forced, base)[0] == (
         'ALTER TABLE "users" DISABLE ROW LEVEL SECURITY, NO FORCE ROW LEVEL SECURITY'
     )
-
-
-def test_extensions() -> None:
-    plain = snap([Users], [trgm])
-    pinned = snap([Users], [extension("pg_trgm", schema="ext", version="1.6")])
-    assert sqls(plain, pinned) == [
-        'CREATE SCHEMA IF NOT EXISTS "ext"',
-        'ALTER EXTENSION pg_trgm SET SCHEMA "ext"',
-        "ALTER EXTENSION pg_trgm UPDATE TO '1.6'",
-    ]
-    assert sqls(empty_snapshot("postgresql"), pinned)[:2] == [
-        'CREATE SCHEMA IF NOT EXISTS "ext"',
-        """CREATE EXTENSION IF NOT EXISTS pg_trgm SCHEMA "ext" VERSION '1.6'""",
-    ]
-    # Undeclared extensions a live database has (push) are left alone.
-    none = snap([Users], [])
-    assert described(plain, none) == ["drop extension pg_trgm"]
-    assert described(plain, none, compare_expressions=False) == []
-    assert diff(plain, none)[0].data_loss
-    # What the schema does not pin is not compared.
-    live = snap([Users], [extension("pg_trgm", schema="public", version="1.6")])
-    assert diff(live, plain) == []
-
-
-def test_vector_columns_need_the_extension() -> None:
-    @final
-    class Docs(Table, name="docs"):
-        id = serial().primary_key()
-        embedding = vector(3)
-
-    s = build_snapshot([Docs], dialect)
-    assert s.get("extensions") == {"vector": {"name": "vector"}}
-    explicit = build_snapshot([Docs], dialect, objects=[extension("vector", schema="ext")])
-    assert explicit.get("extensions") == {"vector": {"name": "vector", "schema": "ext"}}
 
 
 def test_mistakes_are_reported() -> None:
@@ -401,12 +298,6 @@ def test_mistakes_are_reported() -> None:
 
     with pytest.raises(SchemaError, match="must define query"):
         build_snapshot([NoQuery], dialect)
-    on_view = trigger("t", on=ActiveUsers, execute=touch)
-    with pytest.raises(SchemaError, match="INSTEAD OF"):
-        build_snapshot([Users, ActiveUsers], dialect, objects=[on_view])
-    with pytest.raises(SchemaError, match="declared twice"):
-        other = function("touch", returns="trigger", body="BEGIN RETURN NULL; END")
-        build_snapshot([Users], dialect, objects=[touch, other])
 
 
 def test_typegen_skips_views() -> None:
@@ -430,8 +321,7 @@ def test_pull_round_trip(tmp_path: Path) -> None:
         for v in members
         if isinstance(v, type) and issubclass(v, Table) and "__table__" in vars(v)
     ]
-    objects = [v for v in members if isinstance(v, type(trgm) | type(touch) | type(users_touch))]
-    assert diff(original, build_snapshot(tables, dialect, objects=objects)) == []
+    assert diff(original, build_snapshot(tables, dialect)) == []
 
 
 @final
@@ -464,7 +354,7 @@ class Curve(Table, name="curve"):
 
 
 def test_constraint_modifiers_sql() -> None:
-    statements = sqls(empty_snapshot("postgresql"), snap([RefPk, Curve], objects=[]))
+    statements = sqls(empty_snapshot("postgresql"), snap([RefPk, Curve]))
     create = next(s for s in statements if s.startswith('CREATE TABLE "curve"'))
     assert 'CONSTRAINT "curve_pkey" PRIMARY KEY ("id") DEFERRABLE INITIALLY DEFERRED' in create
     assert 'CONSTRAINT "curve_pair_key" UNIQUE NULLS NOT DISTINCT ("pair") DEFERRABLE' in create
@@ -480,7 +370,7 @@ def test_constraint_modifiers_sql() -> None:
 
 
 def test_constraint_modifiers_snapshot_and_pull(tmp_path: Path) -> None:
-    original = snap([RefPk, Curve], objects=[])
+    original = snap([RefPk, Curve])
     curve = original["tables"]["public.curve"]
     assert curve["primary_key"] is not None
     assert curve["primary_key"].get("deferrable") and curve["primary_key"].get("initially_deferred")
@@ -517,7 +407,7 @@ class Annotated(Table, name="annotated", comment="a well-documented table"):
 
 
 def test_comments_sql_and_pull(tmp_path: Path) -> None:
-    original = snap([Annotated], objects=[])
+    original = snap([Annotated])
     table = original["tables"]["public.annotated"]
     assert table.get("comment") == "a well-documented table"
     assert table["columns"]["id"].get("comment") == "the primary id"
@@ -555,7 +445,7 @@ class Collated(Table, name="collated"):
 
 
 def test_column_collation_sql_and_pull(tmp_path: Path) -> None:
-    original = snap([Collated], objects=[])
+    original = snap([Collated])
     columns = original["tables"]["public.collated"]["columns"]
     assert columns["label"].get("collation") == "C"
     assert "collation" not in columns["plain"]
@@ -593,7 +483,7 @@ class Unlogged(Table, name="unlogged", unlogged=True, storage={"fillfactor": 70}
 
 
 def test_unlogged_and_storage_sql_and_pull(tmp_path: Path) -> None:
-    original = snap([Unlogged], objects=[])
+    original = snap([Unlogged])
     table = original["tables"]["public.unlogged"]
     assert table.get("unlogged") is True
     assert table.get("options") == {"fillfactor": "70"}
@@ -612,127 +502,6 @@ def test_unlogged_and_storage_sql_and_pull(tmp_path: Path) -> None:
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     sys.modules["pulled_unlogged"] = module
-    spec.loader.exec_module(module)
-    members = list(vars(module).values())
-    tables = [
-        v
-        for v in members
-        if isinstance(v, type) and issubclass(v, Table) and "__table__" in vars(v)
-    ]
-    assert diff(original, build_snapshot(tables, dialect)) == []
-
-
-@final
-class Spans(Table, name="spans"):
-    id = integer().primary_key()
-    ints = int4range()
-    big = int8range()
-    nums = numrange()
-    stamps = tstzrange()
-    days = daterange()
-    multi = int4multirange()
-    stampmulti = tstzmultirange()
-
-
-def test_range_and_multirange_types_sql_snapshot_and_pull(tmp_path: Path) -> None:
-    original = snap([Spans], objects=[])
-    columns = original["tables"]["public.spans"]["columns"]
-    assert columns["ints"]["type"] == "int4range"
-    assert columns["big"]["type"] == "int8range"
-    assert columns["nums"]["type"] == "numrange"
-    assert columns["stamps"]["type"] == "tstzrange"
-    assert columns["days"]["type"] == "daterange"
-    assert columns["multi"]["type"] == "int4multirange"
-    assert columns["stampmulti"]["type"] == "tstzmultirange"
-
-    create = next(s for s in sqls(empty_snapshot("postgresql"), original) if "CREATE TABLE" in s)
-    assert '"ints" int4range' in create
-    assert '"nums" numrange' in create
-    assert '"stamps" tstzrange' in create
-    assert '"days" daterange' in create
-    assert '"multi" int4multirange' in create
-
-    source = render_schema_module(original)
-    assert "int4range()" in source
-    assert "numrange()" in source
-    assert "tstzmultirange()" in source
-
-    path = tmp_path / "pulled_ranges.py"
-    path.write_text(source)
-    spec = importlib.util.spec_from_file_location("pulled_ranges", path)
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    sys.modules["pulled_ranges"] = module
-    spec.loader.exec_module(module)
-    members = list(vars(module).values())
-    tables = [
-        v
-        for v in members
-        if isinstance(v, type) and issubclass(v, Table) and "__table__" in vars(v)
-    ]
-    assert diff(original, build_snapshot(tables, dialect)) == []
-
-
-@final
-class Reserved(Table, name="reserved"):
-    id = serial().primary_key()
-    room = text().not_null()
-    slot = integer().not_null()
-
-    @classmethod
-    @override
-    def config(cls) -> list[Constraint]:
-        return [
-            exclusion(
-                (cls.room, "="),
-                (cls.slot, "="),
-                name="reserved_booked",
-                using="btree",
-                deferrable=True,
-                initially_deferred=True,
-            ),
-            exclusion(
-                (sql("lower(room)"), "="),
-                name="reserved_lower_room",
-                using="btree",
-                where=sql("slot > 0"),
-            ),
-        ]
-
-
-def test_exclusion_constraints_sql_snapshot_and_pull(tmp_path: Path) -> None:
-    original = snap([Reserved], objects=[])
-    exclusions = original["tables"]["public.reserved"].get("exclusions", {})
-    booked = exclusions["reserved_booked"]
-    assert booked["method"] == "btree"
-    assert booked.get("deferrable") and booked.get("initially_deferred")
-    assert [(e.get("column"), e["operator"]) for e in booked["elements"]] == [
-        ("room", "="),
-        ("slot", "="),
-    ]
-    lower = exclusions["reserved_lower_room"]
-    assert lower["elements"][0].get("expression") == "lower(room)"
-    assert lower.get("where") == "slot > 0"
-
-    create = next(s for s in sqls(empty_snapshot("postgresql"), original) if "CREATE TABLE" in s)
-    assert (
-        'CONSTRAINT "reserved_booked" EXCLUDE USING btree ("room" WITH =, "slot" WITH =) '
-        "DEFERRABLE INITIALLY DEFERRED" in create
-    )
-    assert 'CONSTRAINT "reserved_lower_room" EXCLUDE USING btree (lower(room) WITH =)' in create
-    assert "WHERE (slot > 0)" in create
-
-    source = render_schema_module(original)
-    assert "exclusion(" in source
-    assert "using='btree'" in source
-    assert "where=sql('slot > 0')" in source
-
-    path = tmp_path / "pulled_exclusion.py"
-    path.write_text(source)
-    spec = importlib.util.spec_from_file_location("pulled_exclusion", path)
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    sys.modules["pulled_exclusion"] = module
     spec.loader.exec_module(module)
     members = list(vars(module).values())
     tables = [
@@ -767,7 +536,7 @@ class Assorted(Table, name="assorted"):
 
 
 def test_more_column_types_sql_snapshot_and_pull(tmp_path: Path) -> None:
-    original = snap([Assorted], objects=[])
+    original = snap([Assorted])
     columns = original["tables"]["public.assorted"]["columns"]
     assert columns["net"]["type"] == "cidr"
     assert columns["mac"]["type"] == "macaddr"
@@ -787,7 +556,6 @@ def test_more_column_types_sql_snapshot_and_pull(tmp_path: Path) -> None:
     assert columns["label"]["type"] == "citext"
     assert columns["tree"]["type"] == "ltree"
     assert columns["embeddings"]["type"] == "vector(3)[]"
-    assert original.get("extensions") == {"vector": {"name": "vector"}}  # vector[] needs pgvector
 
     create = next(s for s in sqls(empty_snapshot("postgresql"), original) if "CREATE TABLE" in s)
     assert '"flags" bit(4)' in create

@@ -15,6 +15,7 @@ from mizzle.core.compiler import CompiledQuery, Compiler, interval_text
 from mizzle.core.errors import QueryError
 from mizzle.core.sql.alias import real_table
 from mizzle.core.sql.nodes import ExprBase, Node
+from mizzle.dialects.postgres.types import CustomColumn
 
 if TYPE_CHECKING:
     from mizzle.core.query.insert import OnConflict
@@ -32,9 +33,6 @@ _RANGES = frozenset({"int4range", "int8range", "numrange", "tsrange", "tstzrange
 _AS_TEXT = frozenset(
     {"cidr", "bit", "varbit", "point", "line", "lseg", "box", "path", "polygon", "circle", "hstore"}
 )
-
-
-_ENDS = ("lower", "upper")
 
 
 def _range_parts(ref: str) -> str:
@@ -55,7 +53,7 @@ def _point(point: Sequence[float]) -> str:
 
 
 def _quoted(text: str, special: str, quote: str = '""') -> str:
-    """An element of an array, range or composite as PostgreSQL prints it: quoted when
+    """An element of an array or range as PostgreSQL prints it: quoted when
     needed, with a quote inside as ``quote`` (an array's is backslashed)."""
     if text and not any(ch in special or ch.isspace() for ch in text):
         return text
@@ -231,18 +229,13 @@ def array_text(values: Sequence[object]) -> str:
     return "{" + ",".join(item(v) for v in values) + "}"
 
 
-def _composite_text(fields: Sequence[object]) -> str:
-    """``(1.5,usd)``: a composite's fields in order; NULL is nothing (Q4-12)."""
-    return "(" + ",".join("" if v is None else _quoted(pg_text(v), '"\\(),') for v in fields) + ")"
-
-
 def pg_text(value: object) -> str:
     """``value`` in its type's text form, as PostgreSQL prints it (Q4-4, Q4-11, Q4-12)."""
     geometry = _geometry_text(value)
     if geometry is not None:
         return geometry
     match value:
-        case bool():  # as in an array or a composite
+        case bool():  # as in an array
             return "t" if value else "f"
         case enum.Enum():
             return pg_text(cast(object, value.value))
@@ -262,8 +255,6 @@ def pg_text(value: object) -> str:
             return value.as_string().replace(" ", "")
         case list():
             return array_text(cast(list[object], value))
-        case tuple():
-            return _composite_text(cast(tuple[object, ...], value))
         case dict():
             return json_text(cast(object, value))
         case _:
@@ -339,11 +330,6 @@ class PostgresCompiler(Compiler):
             if column.item.sql_type in ("json", "jsonb"):  # a list item is JSON, not a dimension
                 items = [None if v is None else json_text(v) for v in items]
             return self.literal(array_text(items))
-        if column.accepts == (tuple, dict):  # a composite: '(1.5,usd)' (Q4-12)
-            if isinstance(value, dict):  # by field name: the field order is the database's
-                fields = self.literal(json_text(cast(object, value)))
-                return f"jsonb_populate_record(NULL::{column.sql_type}, {fields}::jsonb)"
-            return f"{self.literal(pg_text(value))}::{column.sql_type}"  # not a record
         if isinstance(value, datetime.date | datetime.time):
             return self.literal(temporal_text(value))
         return self.literal(value)
@@ -359,17 +345,32 @@ class PostgresCompiler(Compiler):
         return compiled
 
     @override
+    def typed_param(self, column: ColumnBase | None, marker: str, /) -> str:
+        if column is None or self.inline_literals:
+            return marker
+        if isinstance(column, CustomColumn):
+            return f"{marker}::text::{column.sql_type}"  # sent as text, whatever the type
+        if isinstance(column.item, CustomColumn):  # = ANY(...) of custom values
+            return f"{marker}::text[]::{column.sql_type}"
+        return marker
+
+    @override
+    def output(self, node: Node) -> str:
+        text = self.visit(node)
+        return f"{text}::text" if isinstance(node, CustomColumn) else text  # read as text
+
+    @override
     def returning_clause(self, node: Returning[object], /) -> str:
         projection = node.projection
         if projection is None:
             exprs: Iterable[ExprBase] = node.table.__table__.columns.values()
-            return "RETURNING " + ", ".join(self.visit(expr) for expr in exprs)
+            return "RETURNING " + ", ".join(self.output(expr) for expr in exprs)
         if isinstance(projection, dict):
             # A named projection: alias each expression, or a CTE over it cannot name
             # the output (``m.c("c", ...)`` -> column m.c does not exist).
-            items = [f"{self.visit(e)} AS {self.quote(k)}" for k, e in projection.items()]
+            items = [f"{self.output(e)} AS {self.quote(k)}" for k, e in projection.items()]
             return "RETURNING " + ", ".join(items)
-        return "RETURNING " + ", ".join(self.visit(expr) for expr in projection)
+        return "RETURNING " + ", ".join(self.output(expr) for expr in projection)
 
     def visit_Merge(self, node: Merge[Table]) -> str:
         self._note_write()
@@ -433,14 +434,8 @@ class PostgresCompiler(Compiler):
     # Types JSON cannot carry exactly are cast so Python can restore them losslessly.
 
     def json_value(self, ref: str, column: ColumnBase) -> str:
-        if column.json_type is not None:  # a domain or composite, as its type (Q4-6)
-            return self.json_value(ref, column.json_type)
-        if column.json_fields is not None:
-            # num_nulls: a composite whose fields are all NULL IS NULL, yet is a value.
-            fields = ", ".join(
-                self.json_value(f"({ref}).{self.quote(n)}", c) for n, c in column.json_fields
-            )
-            return f"CASE WHEN num_nulls({ref}) = 1 THEN NULL ELSE json_build_array({fields}) END"
+        if isinstance(column, CustomColumn):
+            return f"{ref}::text"
         if column.item is not None:
             item = self.json_value("x.v", column.item)
             if item == "x.v":
@@ -452,10 +447,6 @@ class PostgresCompiler(Compiler):
                 " ORDER BY x.n)"
             )
             return f"CASE WHEN {ref} IS NULL THEN NULL ELSE {elements} END"
-        if column.json_range is not None:  # a user-defined range: bounds as its subtype's
-            lower, upper = (self.json_value(f"{e}({ref})", column.json_range) for e in _ENDS)
-            parts = f"{lower}, {upper}, lower_inc({ref}), upper_inc({ref}), isempty({ref})"
-            return f"CASE WHEN {ref} IS NULL THEN NULL ELSE json_build_array({parts}) END"
         base = column.sql_type.split("(", 1)[0]
         if base in _RANGES:
             return f"CASE WHEN {ref} IS NULL THEN NULL ELSE {_range_parts(ref)} END"

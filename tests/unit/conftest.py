@@ -6,7 +6,6 @@ import pytest
 from mizzle.core.compiler import CompiledQuery
 from mizzle.core.query.base import Row
 from mizzle.core.query.builder import QueryBuilder
-from mizzle.core.schema.column import ColumnBase
 from mizzle.core.sql.nodes import Node
 from mizzle.dialects.postgres.compiler import PostgresCompiler
 
@@ -19,7 +18,6 @@ class FakeRunner:
         self.rowcount = 0
         self.executed: list[CompiledQuery] = []
         self.read_only: list[bool] = []
-        self.json_types: dict[str | ColumnBase, ColumnBase] = {}
 
     def compile(self, node: Node) -> CompiledQuery:
         return PostgresCompiler().compile(node)

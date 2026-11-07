@@ -9,13 +9,8 @@ from typing import Literal, override
 from mizzle.core.snapshot import (
     CheckSnap,
     ColumnSnap,
-    CompositeSnap,
-    DomainSnap,
     EnumSnap,
-    ExclusionSnap,
-    ExtensionSnap,
     ForeignKeySnap,
-    FunctionSnap,
     GeneratedSnap,
     IdentitySnap,
     IndexSnap,
@@ -23,12 +18,11 @@ from mizzle.core.snapshot import (
     PrimaryKeySnap,
     RoleSnap,
     TableSnap,
-    TriggerSnap,
     UniqueSnap,
     ViewSnap,
 )
 
-type ConstraintKind = Literal["primary_key", "unique", "check", "foreign_key", "exclusion"]
+type ConstraintKind = Literal["primary_key", "unique", "check", "foreign_key"]
 
 _TEXT = ("text", "character varying")
 _INTS = ("smallint", "integer", "bigint")
@@ -117,68 +111,6 @@ class DropEnum(Step):
 
 
 @dataclass(frozen=True)
-class CreateDomain(Step):
-    domain: DomainSnap
-
-    @override
-    def describe(self) -> str:
-        return f"create domain {self.domain['name']}"
-
-
-@dataclass(frozen=True)
-class DropDomain(Step):
-    schema: str
-    name: str
-
-    @override
-    def describe(self) -> str:
-        return f"drop domain {self.name}"
-
-
-@dataclass(frozen=True)
-class DropDomainChecks(Step):
-    """Drop a domain's CHECKs and DEFAULT, which call a function about to be dropped (and
-    maybe created again); ``AddDomainChecks`` puts them back (K4-27)."""
-
-    schema: str
-    name: str
-
-    @override
-    def describe(self) -> str:
-        return f"drop checks of domain {self.name}"
-
-
-@dataclass(frozen=True)
-class AddDomainChecks(Step):
-    """The CHECKs and DEFAULT of ``domain``, once the functions they call exist (K4-27)."""
-
-    domain: DomainSnap
-
-    @override
-    def describe(self) -> str:
-        return f"add checks to domain {self.domain['name']}"
-
-
-@dataclass(frozen=True)
-class CreateComposite(Step):
-    composite: CompositeSnap
-
-    @override
-    def describe(self) -> str:
-        return f"create type {self.composite['name']}"
-
-
-@dataclass(frozen=True)
-class DropComposite(Step):
-    schema: str
-    name: str
-
-    @override
-    def describe(self) -> str:
-        return f"drop type {self.name}"
-
-
-@dataclass(frozen=True)
 class CreateTable(Step):
     """Columns, primary key, uniques and checks. Indexes and foreign keys are separate steps."""
 
@@ -202,35 +134,6 @@ class DropTable(Step):
     @override
     def describe(self) -> str:
         return f"drop table {self.name}"
-
-
-@dataclass(frozen=True)
-class CreatePartition(Step):
-    """``CREATE TABLE name PARTITION OF parent bound``."""
-
-    schema: str
-    parent: str
-    name: str
-    bound: str  # as PostgreSQL prints it: "FOR VALUES FROM (...) TO (...)" or "DEFAULT"
-
-    @override
-    def describe(self) -> str:
-        return f"create partition {self.name} of {self.parent}"
-
-
-@dataclass(frozen=True)
-class DropPartition(Step):
-    schema: str
-    name: str
-
-    @property
-    @override
-    def data_loss(self) -> bool:
-        return True
-
-    @override
-    def describe(self) -> str:
-        return f"drop partition {self.name}"
 
 
 @dataclass(frozen=True)
@@ -266,20 +169,6 @@ class AddColumn(Step):
     @override
     def describe(self) -> str:
         return f"add column {self.table}.{self.column['name']}"
-
-
-@dataclass(frozen=True)
-class CheckColumnFreed(Step):
-    """Stop the migration if a column made plain still depends on a function (PostgreSQL
-    14 keeps that after DROP EXPRESSION): dropping the function would drop the column."""
-
-    schema: str
-    table: str
-    name: str
-
-    @override
-    def describe(self) -> str:
-        return f"check {self.table}.{self.name} no longer depends on a function"
 
 
 @dataclass(frozen=True)
@@ -505,17 +394,6 @@ class AddCheck(Step):
 
 
 @dataclass(frozen=True)
-class AddExclusion(Step):
-    schema: str
-    table: str
-    exclusion: ExclusionSnap
-
-    @override
-    def describe(self) -> str:
-        return f"add exclusion {self.exclusion['name']}"
-
-
-@dataclass(frozen=True)
 class AddForeignKey(Step):
     schema: str
     table: str
@@ -610,63 +488,6 @@ class DropRole(Step):
 
 
 @dataclass(frozen=True)
-class CreateExtension(Step):
-    extension: ExtensionSnap
-
-    @override
-    def describe(self) -> str:
-        return f"create extension {self.extension['name']}"
-
-
-@dataclass(frozen=True)
-class AlterExtension(Step):
-    name: str
-    schema: str | None = None  # move to this schema
-    version: str | None = None  # update to this version
-
-    @override
-    def describe(self) -> str:
-        what = f"schema {self.schema}" if self.schema is not None else f"version {self.version}"
-        return f"change extension {self.name} {what}"
-
-
-@dataclass(frozen=True)
-class DropExtension(Step):
-    name: str
-
-    @property
-    @override
-    def data_loss(self) -> bool:
-        return True
-
-    @override
-    def describe(self) -> str:
-        return f"drop extension {self.name}"
-
-
-@dataclass(frozen=True)
-class CreateFunction(Step):
-    """``CREATE OR REPLACE FUNCTION``."""
-
-    function: FunctionSnap
-
-    @override
-    def describe(self) -> str:
-        return f"create function {self.function['name']}"
-
-
-@dataclass(frozen=True)
-class DropFunction(Step):
-    schema: str
-    name: str
-    args: str
-
-    @override
-    def describe(self) -> str:
-        return f"drop function {self.name}"
-
-
-@dataclass(frozen=True)
 class CreateView(Step):
     view: ViewSnap
 
@@ -690,12 +511,10 @@ class DropView(Step):
 @dataclass(frozen=True)
 class SaveGrants(Step):
     """Remember the privileges, owner and comment of a view about to be dropped and
-    created again (they go with the view), for ``RestoreGrants``. With ``args``: of that
-    function (a new function can be run by PUBLIC, and is owned by whoever creates it)."""
+    created again (they go with the view), for ``RestoreGrants``."""
 
     schema: str
     name: str
-    args: str | None = None
 
     @override
     def describe(self) -> str:
@@ -707,25 +526,10 @@ class RestoreGrants(Step):
     schema: str
     name: str
     materialized: bool
-    args: str | None = None  # a function's (see SaveGrants)
 
     @override
     def describe(self) -> str:
         return f"restore privileges of {self.name}"
-
-
-@dataclass(frozen=True)
-class GrantPrivileges(Step):
-    schema: str
-    table: str  # a table or a view
-    role: str  # "public": everyone
-    privileges: tuple[str, ...]
-    revoke: bool = False
-
-    @override
-    def describe(self) -> str:
-        what, to = ("revoke", "from") if self.revoke else ("grant", "to")
-        return f"{what} {', '.join(self.privileges)} on {self.table} {to} {self.role}"
 
 
 @dataclass(frozen=True)
@@ -773,30 +577,6 @@ class DropPolicy(Step):
     @override
     def describe(self) -> str:
         return f"drop policy {self.name} on {self.table}"
-
-
-@dataclass(frozen=True)
-class CreateTrigger(Step):
-    schema: str
-    table: str
-    trigger: TriggerSnap
-    replace: bool = False  # CREATE OR REPLACE (PostgreSQL 14+)
-
-    @override
-    def describe(self) -> str:
-        what = "replace" if self.replace else "create"
-        return f"{what} trigger {self.trigger['name']} on {self.table}"
-
-
-@dataclass(frozen=True)
-class DropTrigger(Step):
-    schema: str
-    table: str
-    name: str
-
-    @override
-    def describe(self) -> str:
-        return f"drop trigger {self.name} on {self.table}"
 
 
 @dataclass(frozen=True)

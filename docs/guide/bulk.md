@@ -143,7 +143,7 @@ async with db.transaction() as tx:
 `db.listen(*channels)` holds one pooled connection until the block exits and yields
 `Notification(channel, payload, pid)`. `db.notify(channel, payload)` runs `pg_notify`
 with the payload as a bind parameter. A trigger can send them too: `PERFORM pg_notify(...)`
-in a [function](migrations.md#functions). Call `listen()` on `db`, not on a transaction:
+in a trigger function ([custom migration](migrations.md#not-managed-by-mizzle)). Call `listen()` on `db`, not on a transaction:
 there it raises `QueryError`.
 
 ### Lost connections

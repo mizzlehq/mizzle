@@ -12,41 +12,22 @@ from mizzle.core.naming import Casing
 from mizzle.core.schema.column import ColumnBase, Identity, ReferentialAction
 from mizzle.core.schema.constraints import (
     Check,
-    Exclusion,
     ForeignKey,
-    Grant,
     Index,
-    Partition,
     Policy,
     PrimaryKey,
     Role,
     RowLevelSecurity,
     UniqueConstraint,
 )
-from mizzle.core.schema.objects import (
-    Composite,
-    Domain,
-    Extension,
-    Function,
-    SchemaObject,
-    Trigger,
-)
 from mizzle.core.schema.table import Table, validate_tables
 from mizzle.core.schema.view import View
 from mizzle.core.snapshot import (
     CheckSnap,
     ColumnSnap,
-    CompositeFieldSnap,
-    CompositeSnap,
-    DomainSnap,
     EnumSnap,
-    ExclusionElementSnap,
-    ExclusionSnap,
-    ExtensionSnap,
     ForeignKeySnap,
-    FunctionSnap,
     GeneratedSnap,
-    GrantsSnap,
     IdentitySnap,
     IndexSnap,
     PolicySnap,
@@ -55,17 +36,15 @@ from mizzle.core.snapshot import (
     RoleSnap,
     Snapshot,
     TableSnap,
-    TriggerSnap,
     UniqueSnap,
     ViewSnap,
-    default_cost,
     empty_snapshot,
-    function_key,
     key,
     sequence_defaults,
 )
 from mizzle.db import Session
 from mizzle.dialects.base import Dialect
+from mizzle.kit.config import SchemaObject
 
 
 def build_snapshot(
@@ -76,8 +55,7 @@ def build_snapshot(
     prev_id: str | None = None,
     objects: Sequence[SchemaObject] = (),
 ) -> Snapshot:
-    """``tables`` may include views; ``objects`` are extensions, functions, triggers and
-    roles."""
+    """``tables`` may include views; ``objects`` are roles and standalone enum types."""
     validate_tables(tables, casing)
     snapshot = empty_snapshot(dialect.name, str(uuid.uuid4()))
     snapshot["prev_id"] = prev_id
@@ -120,8 +98,6 @@ def build_snapshot(
             snap["unlogged"] = True
         if info.storage:
             snap["options"] = dict(info.storage)
-        if info.partition_by is not None:
-            snap["partition_by"] = info.partition_by
         for column in info.columns.values():
             cname = column.db_name(casing)
             if column.enum is not None:
@@ -242,34 +218,6 @@ def build_snapshot(
                     if constraint.not_valid:
                         c["not_valid"] = True
                     snap["checks"][constraint.name] = c
-                case Exclusion():
-                    elements: list[ExclusionElementSnap] = []
-                    colnames: list[str] = []
-                    for elem_key, operator in constraint.elements:
-                        if isinstance(elem_key, ColumnBase):
-                            cname = elem_key.db_name(casing)
-                            colnames.append(cname)
-                            elements.append(ExclusionElementSnap(operator=operator, column=cname))
-                        else:
-                            elements.append(
-                                ExclusionElementSnap(
-                                    operator=operator,
-                                    expression=dialect.expression(elem_key, casing),
-                                )
-                            )
-                    derived = f"{tname}_{'_'.join(colnames)}_excl" if colnames else f"{tname}_excl"
-                    excl = ExclusionSnap(
-                        name=constraint.name or trunc(derived),
-                        method=constraint.method,
-                        elements=elements,
-                    )
-                    if constraint.predicate is not None:
-                        excl["where"] = dialect.expression(constraint.predicate, casing)
-                    if constraint.deferrable:
-                        excl["deferrable"] = True
-                    if constraint.initially_deferred:
-                        excl["initially_deferred"] = True
-                    snap.setdefault("exclusions", {})[excl["name"]] = excl
                 case Policy():
                     snap.setdefault("policies", {})[constraint.name] = _policy(
                         constraint, dialect, casing
@@ -279,12 +227,6 @@ def build_snapshot(
                 case RowLevelSecurity():
                     if constraint.enabled or constraint.force:
                         snap["rls"] = RlsSnap(enabled=constraint.enabled, force=constraint.force)
-                case Grant():
-                    _add_grant(snap.setdefault("grants", {}), constraint)
-                    for declared in constraint.declared_roles:
-                        _add_role(snapshot, declared)
-                case Partition():
-                    snap.setdefault("partitions", {})[constraint.name] = constraint.for_values
 
         if pk := snap["primary_key"]:  # CREATE TABLE drops a UNIQUE that repeats the key
             snap["uniques"] = {
@@ -292,69 +234,14 @@ def build_snapshot(
             }
         add_schema(schema)
         snapshot["tables"][key(schema, tname)] = snap
-        for column in info.columns.values():  # e.g. vector columns need pgvector
-            if (needed := dialect.type_extension(column.sql_type)) is not None:
-                snapshot.setdefault("extensions", {}).setdefault(needed, ExtensionSnap(name=needed))
 
-    declared_exts: dict[str, ExtensionSnap] = {}
-    for obj in [*objects, *(o.execute for o in objects if isinstance(o, Trigger))]:
+    for obj in objects:
         match obj:
             case Role():
                 _add_role(snapshot, obj)
-            case Extension():
-                ext = ExtensionSnap(name=obj.name)
-                if obj.schema is not None:  # created with it (see render)
-                    ext["schema"] = obj.schema
-                if obj.version is not None:
-                    ext["version"] = obj.version
-                # Two declarations that disagree silently kept the last one. One a column
-                # type implied (no options) may be replaced by the declared one.
-                if declared_exts.get(obj.name, ext) != ext:
-                    raise SchemaError(
-                        f"extension {obj.name!r} is declared twice with different options"
-                    )
-                declared_exts[obj.name] = ext
-                snapshot.setdefault("extensions", {})[obj.name] = ext
-            case Function():
-                fn = _function(obj, default_schema)
-                functions = snapshot.setdefault("functions", {})
-                existing = functions.get(function_key(fn))
-                if existing is not None and existing != fn:
-                    raise SchemaError(f"function {fn['name']!r} is declared twice")
-                functions[function_key(fn)] = fn
-                add_schema(fn["schema"])
-            case Domain():
-                _add_domain(snapshot, obj, default_schema, dialect)
-            case Composite():
-                _add_composite(snapshot, obj, default_schema, dialect)
             case ColumnBase():  # pg_enum(...) on its own: the enum type (K4-5)
                 _add_enum(snapshot, obj.enum_schema or default_schema, obj)
                 add_schema(obj.enum_schema or default_schema)
-            case Trigger():
-                k = key(schema_of(obj.on), obj.on.__table__.name)
-                on = snapshot["tables"].get(k) or snapshot.get("views", {}).get(k)
-                if on is None:
-                    raise SchemaError(
-                        f"trigger {obj.name!r} is on {obj.on.__name__}, which is not a table "
-                        "or view in the schema"
-                    )
-                _check_trigger(obj)
-                when = obj.when
-                trg = TriggerSnap(
-                    name=obj.name,
-                    timing=obj.timing,
-                    events=list(obj.events),
-                    for_each=obj.for_each,
-                    function=key(obj.execute.schema or default_schema, obj.execute.name),
-                    when=dialect.expression(when, casing) if when is not None else None,
-                )
-                if obj.update_of:
-                    trg["columns"] = sorted(c.db_name(casing) for c in obj.update_of)
-                if obj.old_table is not None:
-                    trg["old_table"] = obj.old_table
-                if obj.new_table is not None:
-                    trg["new_table"] = obj.new_table
-                on.setdefault("triggers", {})[obj.name] = trg
     _imply_deferrable(snapshot)
     return snapshot
 
@@ -372,23 +259,6 @@ def _imply_deferrable(snapshot: Snapshot) -> None:
         for fk in table["foreign_keys"].values():
             if fk.get("initially_deferred"):
                 fk["deferrable"] = True
-        for excl in table.get("exclusions", {}).values():
-            if excl.get("initially_deferred"):
-                excl["deferrable"] = True
-
-
-def _check_trigger(trigger: Trigger) -> None:
-    on = trigger.on
-    on_view = issubclass(on, View)
-    if issubclass(on, View) and on.__materialized__:
-        raise SchemaError(f"trigger {trigger.name!r}: materialized views cannot have triggers")
-    if on_view and trigger.for_each == "row" and trigger.timing != "instead of":
-        raise SchemaError(
-            f"trigger {trigger.name!r} is on view {trigger.on.__name__}: row triggers on a view "
-            "are INSTEAD OF (timing='instead of'); BEFORE/AFTER ones are FOR EACH STATEMENT"
-        )
-    if not on_view and trigger.timing == "instead of":
-        raise SchemaError(f"trigger {trigger.name!r}: INSTEAD OF triggers are for views")
 
 
 def _index(constraint: Index, dialect: Dialect, casing: Casing | None) -> IndexSnap:
@@ -430,30 +300,6 @@ def _policy(policy: Policy, dialect: Dialect, casing: Casing | None) -> PolicySn
     )
 
 
-def _function(fn: Function, default_schema: str) -> FunctionSnap:
-    snap = FunctionSnap(
-        schema=fn.schema or default_schema,
-        name=fn.name,
-        args=fn.args,
-        returns=fn.returns,
-        language=fn.language,
-        body=fn.body,
-        volatility=fn.volatility,
-        security_definer=fn.security_definer,
-    )
-    if fn.strict:
-        snap["strict"] = True
-    if fn.leakproof:
-        snap["leakproof"] = True
-    if fn.parallel != "unsafe":
-        snap["parallel"] = fn.parallel
-    if fn.cost is not None and fn.cost != default_cost(fn.language):
-        snap["cost"] = float(fn.cost)
-    if fn.settings:
-        snap["settings"] = dict(fn.settings)
-    return snap
-
-
 def _identity(identity: Identity, sql_type: str) -> IdentitySnap:
     increment = identity.increment or 1
     low, high = sequence_defaults(sql_type, increment)
@@ -470,12 +316,6 @@ def _identity(identity: Identity, sql_type: str) -> IdentitySnap:
     default_start = low if increment > 0 else high
     snap["start"] = identity.start if identity.start is not None else default_start
     return snap
-
-
-def _add_grant(grants: GrantsSnap, grant: Grant) -> None:
-    for role in grant.roles:
-        privileges = {*grants.get(role, []), *grant.privileges}
-        grants[role] = ["all"] if "all" in privileges else sorted(privileges)
 
 
 def _truncate(name: str, dialect: Dialect) -> str:
@@ -515,15 +355,8 @@ def _add_view(
             name=name, type=dialect.column_type(column), not_null=False, default=None
         )
     for constraint in view.config():
-        if isinstance(constraint, Grant):
-            _add_grant(snap.setdefault("grants", {}), constraint)
-            for declared in constraint.declared_roles:
-                _add_role(snapshot, declared)
-            continue
         if not isinstance(constraint, Index) or not view.__materialized__:
-            raise SchemaError(
-                f"{view.__name__}.config(): views take grants, and indexes on materialized views"
-            )
+            raise SchemaError(f"{view.__name__}.config(): only materialized views take indexes")
         snap.setdefault("indexes", {})[constraint.name] = _index(constraint, dialect, casing)
     snapshot.setdefault("views", {})[key(schema, info.name)] = snap
 
@@ -541,52 +374,6 @@ def _add_enum(snapshot: Snapshot, schema: str, column: ColumnBase) -> None:
     if existing is not None and existing["values"] != values:
         raise SchemaError(f"enum type {name!r} is declared twice with different values")
     snapshot["enums"][key(schema, name)] = EnumSnap(schema=schema, name=name, values=values)
-
-
-def _add_domain(snapshot: Snapshot, obj: Domain, default_schema: str, dialect: Dialect) -> None:
-    schema = obj.schema or default_schema
-    snap = DomainSnap(
-        schema=schema,
-        name=obj.name,
-        base_type=dialect.normalize_type(obj.base_type),
-    )
-    if obj.not_null:
-        snap["not_null"] = True
-    if obj.default is not None:
-        normalized = dialect.normalize_default(obj.default)
-        snap["default"] = normalized if normalized is not None else obj.default
-    if obj.checks:
-        snap["checks"] = list(obj.checks)
-    if obj.collation is not None:
-        snap["collation"] = obj.collation
-    domains = snapshot.setdefault("domains", {})
-    existing = domains.get(key(schema, obj.name))
-    if existing is not None and existing != snap:
-        raise SchemaError(f"domain {obj.name!r} is declared twice")
-    domains[key(schema, obj.name)] = snap
-    if schema != default_schema and schema not in snapshot["schemas"]:
-        snapshot["schemas"].append(schema)
-
-
-def _add_composite(
-    snapshot: Snapshot, obj: Composite, default_schema: str, dialect: Dialect
-) -> None:
-    schema = obj.schema or default_schema
-    snap = CompositeSnap(
-        schema=schema,
-        name=obj.name,
-        fields=[
-            CompositeFieldSnap(name=name, type=dialect.normalize_type(sql_type))
-            for name, sql_type in obj.fields
-        ],
-    )
-    composites = snapshot.setdefault("composites", {})
-    existing = composites.get(key(schema, obj.name))
-    if existing is not None and existing != snap:
-        raise SchemaError(f"composite {obj.name!r} is declared twice")
-    composites[key(schema, obj.name)] = snap
-    if schema != default_schema and schema not in snapshot["schemas"]:
-        snapshot["schemas"].append(schema)
 
 
 def _add_role(snapshot: Snapshot, role: Role) -> None:

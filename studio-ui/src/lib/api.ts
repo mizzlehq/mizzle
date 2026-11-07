@@ -29,6 +29,8 @@ export type TableInfo = {
   >
   /** S4-9: columns whose type has no ordering. */
   unsortable?: string[]
+  /** S5-2: composite columns, shown but not edited in the grid. */
+  read_only?: string[]
 }
 
 export type Meta = { read_only: boolean; dialect: string }

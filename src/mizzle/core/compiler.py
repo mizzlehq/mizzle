@@ -351,7 +351,17 @@ class Compiler:
             # Encoded by the column it fills, as in where(): an IntEnum or vector value
             # was sent raw (C33).
             value = replace(value, column=column)
-        return self.visit(value) if isinstance(value, Node) else self.bind(column.encode(value))
+        if isinstance(value, Node):
+            return self.visit(value)
+        return self.typed_param(column, self.bind(column.encode(value)))
+
+    def typed_param(self, _column: ColumnBase | None, marker: str, /) -> str:
+        """The parameter ``marker`` of a value for ``column``; a dialect may cast it."""
+        return marker
+
+    def output(self, node: Node) -> str:
+        """An expression a query returns; a dialect may convert it."""
+        return self.visit(node)
 
     # -- expressions ------------------------------------------------------------------
 
@@ -377,11 +387,11 @@ class Compiler:
                 # In the column's type: ARRAY['a'] was text[] next to varchar[] (Q4-1).
                 bound = self._bound[key] = (node, self.column_literal(node.column, value))
             else:
-                bound = self._bound[key] = (node, self.bind(value))
+                bound = self._bound[key] = (node, self.typed_param(node.column, self.bind(value)))
         return bound[1]
 
     def visit_Placeholder(self, node: Placeholder) -> str:
-        return self.bind(None, node)
+        return self.typed_param(node.column, self.bind(None, node))
 
     def visit_BinaryOp(self, node: BinaryOp) -> str:
         left, right = node.left, node.right
@@ -591,8 +601,8 @@ class Compiler:
 
     def select_slot(self, slot: Slot) -> str:
         if isinstance(slot, type):
-            return ", ".join(self.visit(c) for c in slot.__table__.columns.values())
-        return self.visit(slot)
+            return ", ".join(self.output(c) for c in slot.__table__.columns.values())
+        return self.output(slot)
 
     def count_value(self, value: int | Placeholder) -> str:
         return self.visit(value) if isinstance(value, Placeholder) else self.bind(value)
@@ -682,7 +692,7 @@ class Compiler:
         else:
             parts.append("SELECT")
         if isinstance(node.projection, dict):
-            items = [f"{self.visit(e)} AS {self.quote(k)}" for k, e in node.projection.items()]
+            items = [f"{self.output(e)} AS {self.quote(k)}" for k, e in node.projection.items()]
         else:
             items = [self.select_slot(slot) for slot in node.slots()]
         parts.append(", ".join(items))
@@ -851,7 +861,7 @@ class Compiler:
             value = column.encoder(value)
         self._params.append(value)
         self._placeholders.append(None)
-        return self.param_marker(len(self._params))
+        return self.typed_param(column, self.param_marker(len(self._params)))
 
     def _require_filter(self, node: Update[Table] | Delete[Table], verb: str) -> None:
         if node.where_ is None and not node.all_rows_:

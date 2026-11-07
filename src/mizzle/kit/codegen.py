@@ -17,15 +17,10 @@ from mizzle.core.schema.table import Table
 from mizzle.core.schema.view import View
 from mizzle.core.snapshot import (
     ColumnSnap,
-    GrantsSnap,
     IndexSnap,
     PolicySnap,
     Snapshot,
     TableSnap,
-    TriggerSnap,
-    ViewSnap,
-    default_cost,
-    key,
     sequence_defaults,
 )
 from mizzle.dialects.postgres.ddl import type_ident  # keywords quoted (K4-8)
@@ -57,37 +52,13 @@ _SIMPLE_TYPES = {
     "numeric": "numeric",
     "character varying": "varchar",
     "character": "char",
-    "tsvector": "tsvector",
-    "tsquery": "tsquery",
     "cidr": "cidr",
     "macaddr": "macaddr",
     "macaddr8": "macaddr8",
     "bit": "bit",
     "bit varying": "varbit",
-    "xml": "xml",
-    "money": "money",
     "point": "point",
     "line": "line",
-    "lseg": "lseg",
-    "box": "box",
-    "path": "path",
-    "polygon": "polygon",
-    "circle": "circle",
-    "hstore": "hstore",
-    "citext": "citext",
-    "ltree": "ltree",
-    "int4range": "int4range",
-    "int8range": "int8range",
-    "numrange": "numrange",
-    "tsrange": "tsrange",
-    "tstzrange": "tstzrange",
-    "daterange": "daterange",
-    "int4multirange": "int4multirange",
-    "int8multirange": "int8multirange",
-    "nummultirange": "nummultirange",
-    "tsmultirange": "tsmultirange",
-    "tstzmultirange": "tstzmultirange",
-    "datemultirange": "datemultirange",
     "vector": "vector",
     "halfvec": "halfvec",
     "sparsevec": "sparsevec",
@@ -209,12 +180,8 @@ class _SchemaWriter:
         self.enum_members: dict[str, dict[str, str]] = {}  # db type name -> value -> member
         self.used_enums: set[str] = set()  # db type names a column uses (K4-5)
         self.taken: set[str] = set()  # module-level names: classes and variables (K4-12)
-        self.domains: dict[str, str] = {}  # column type -> Python type for pg_domain()
-        self.composites: set[str] = set()  # column types that are composite types
-        self.other_imports: set[str] = set()  # e.g. "import decimal" for a domain's type
         self.table_classes: dict[str, str] = {}  # "schema.table" -> class name
         self.attrs: dict[str, dict[str, str]] = {}  # "schema.table" -> column -> attribute
-        self.uses_column: bool = False
         self.uses_any: bool = False
         self.uses_relations: set[str] = set()
         self.relations: dict[str, list[str]] = {}  # "schema.table" -> relation lines
@@ -234,10 +201,15 @@ class _SchemaWriter:
         self.taken.add(var)
         return var
 
-    def factory(self, sql_type: str, kwargs: str) -> str:
+    def factory(self, sql_type: str, kwargs: str, *, custom: bool = False) -> str:
+        if custom:
+            self.pg_imports.add("custom")
+            return f"custom({sql_type!r}{', ' + kwargs if kwargs else ''})"
         if sql_type.endswith("[]"):
-            self.pg_imports.add("array")
             item = self.factory(sql_type[:-2], "")
+            if item.startswith("custom("):  # an array of another type: custom() as a whole
+                return self.factory(sql_type[:-2] + "[]", kwargs, custom=True)
+            self.pg_imports.add("array")
             return f"array({item}{', ' + kwargs if kwargs else ''})"
         if sql_type in self.enum_classes:
             self.used_enums.add(sql_type)
@@ -247,13 +219,6 @@ class _SchemaWriter:
             extra = f", schema={schema!r}" if schema != "public" else ""
             extra += f", {kwargs}" if kwargs else ""
             return f"pg_enum({cls}, type_name={name!r}{extra})"
-        if sql_type in self.domains:
-            self.pg_imports.add("pg_domain")
-            py = self.domains[sql_type]
-            return f"pg_domain({sql_type!r}, {py}{', ' + kwargs if kwargs else ''})"
-        if sql_type in self.composites:
-            self.pg_imports.add("pg_composite")
-            return f"pg_composite({sql_type!r}{', ' + kwargs if kwargs else ''})"
         if sql_type in ("jsonb", "json"):
             self.pg_imports.add(sql_type)
             self.uses_any = True
@@ -280,10 +245,8 @@ class _SchemaWriter:
             fn = _SIMPLE_TYPES[sql_type]
             self.pg_imports.add(fn)
             return f"{fn}({kwargs})"
-        self.uses_column = True
-        self.uses_any = True
-        extra = f", {kwargs}" if kwargs else ""
-        return f"Column[Any]({sql_type!r}, None{extra})"
+        # Domains, composites, ranges, extension types...: the type as the database prints it.
+        return self.factory(sql_type, kwargs, custom=True)
 
     def column(self, table: TableSnap, column: ColumnSnap, attr: str) -> str:
         kwargs = f"name={column['name']!r}" if attr != column["name"] else ""
@@ -498,27 +461,11 @@ class _SchemaWriter:
         for c in table["checks"].values():
             not_valid = ", not_valid=True" if c.get("not_valid") else ""
             items.append(f"check({c['name']!r}, {_sql(c['expression'])}{not_valid})")
-        for e in table.get("exclusions", {}).values():
-            keys: list[str] = []
-            for el in e["elements"]:
-                column = el.get("column")
-                key = (
-                    f"cls.{attrs[column]}" if column is not None else _sql(el.get("expression", ""))
-                )
-                keys.append(f"({key}, {el['operator']!r})")
-            options = f", using={e['method']!r}"
-            if where := e.get("where"):
-                options += f", where={_sql(where)}"
-            options += flags(e, ("deferrable", "initially_deferred"))
-            items.append(f"exclusion({', '.join(keys)}, name={e['name']!r}{options})")
-        for pname, bound in table.get("partitions", {}).items():
-            items.append(f"partition({pname!r}, for_values={bound!r})")
         items += [_index_item(i, attrs) for i in table["indexes"].values()]
         if rls := table.get("rls"):
             args = [] if rls["enabled"] else ["enabled=False"]
             items.append(f"rls({', '.join([*args, 'force=True'] if rls['force'] else args)})")
         items += [_policy_item(p) for p in table.get("policies", {}).values()]
-        items += _grant_items(table.get("grants", {}))
         return items
 
     def view(self, k: str, cls: str) -> str:
@@ -546,7 +493,6 @@ class _SchemaWriter:
             f"        return {_sql(view['definition'])}",
         ]
         items = [_index_item(i, attrs) for i in view.get("indexes", {}).values()]
-        items += _grant_items(view.get("grants", {}))
         if items:
             body = "".join(f"            {i},\n" for i in items)
             lines += [
@@ -576,49 +522,6 @@ class _SchemaWriter:
             members = [f"    {names[v]} = {v!r}" for v in enum["values"]]
             enums_code.append(f"class {cls}(enum.StrEnum):\n" + "\n".join(members))
 
-        domains_code: list[str] = []
-        for domain in self.snapshot.get("domains", {}).values():
-            schema, name = domain["schema"], domain["name"]
-            sql_type = type_ident(name)
-            if schema != "public":
-                sql_type = f"{type_ident(schema)}.{sql_type}"
-            py, stmt = _domain_py(domain["base_type"])
-            if stmt == "from typing import Any":
-                self.uses_any = True
-            elif stmt is not None:
-                self.other_imports.add(stmt)
-            self.domains[sql_type] = py
-            args = [repr(name)]
-            if schema != "public":
-                args.append(f"schema={schema!r}")
-            args.append(f"as_={domain['base_type']!r}")
-            if default := domain.get("default"):
-                args.append(f"default={default!r}")
-            if domain.get("not_null"):
-                args.append("not_null=True")
-            checks = domain.get("checks", [])
-            if len(checks) == 1:
-                args.append(f"check={checks[0]!r}")
-            elif checks:
-                # S7: a second keyword argument is a SyntaxError; use checks=[...].
-                args.append(f"checks={list(checks)!r}")
-            if collation := domain.get("collation"):
-                args.append(f"collation={collation!r}")
-            domains_code.append(f"{self.var(f'd_{name}')} = domain({', '.join(args)})")
-
-        composites_code: list[str] = []
-        for comp in self.snapshot.get("composites", {}).values():
-            schema, name = comp["schema"], comp["name"]
-            sql_type = type_ident(name)
-            if schema != "public":
-                sql_type = f"{type_ident(schema)}.{sql_type}"
-            self.composites.add(sql_type)
-            fields = ", ".join(f"({f['name']!r}, {f['type']!r})" for f in comp["fields"])
-            extra = f", schema={schema!r}" if schema != "public" else ""
-            composites_code.append(
-                f"{self.var(f'c_{name}')} = composite({name!r}, [{fields}]{extra})"
-            )
-
         for k, table in self.snapshot["tables"].items():
             name = _class_name(table["name"])
             if name in self.table_classes.values() or name in self.enum_classes.values():
@@ -628,50 +531,6 @@ class _SchemaWriter:
             self.table_classes[k] = name
             self.attrs[k] = self.attrs_of(table["columns"])
         self.add_relations()
-
-        objects_code: list[str] = []
-        function_vars: dict[str, str] = {}  # "schema.name" -> variable, for triggers
-        for ext in self.snapshot.get("extensions", {}).values():
-            schema = ext.get("schema", "public")
-            extra = f", schema={schema!r}" if schema != "public" else ""
-            var = self.var(f"ext_{ext['name']}")
-            objects_code.append(f"{var} = extension({ext['name']!r}{extra})")
-        for fn in self.snapshot.get("functions", {}).values():
-            var = self.var(f"fn_{fn['name']}")  # overloads: fn_f, fn_f2
-            k = key(fn["schema"], fn["name"])
-            if k not in function_vars or not fn["args"]:  # triggers run the one without args
-                function_vars[k] = var
-            args = [repr(fn["name"]), f"returns={fn['returns']!r}", f"body={fn['body']!r}"]
-            if fn["language"] != "plpgsql":
-                args.append(f"language={fn['language']!r}")
-            if fn["args"]:
-                args.append(f"args={fn['args']!r}")
-            if fn["schema"] != "public":
-                args.append(f"schema={fn['schema']!r}")
-            if fn["volatility"] != "volatile":
-                args.append(f"volatility={fn['volatility']!r}")
-            if fn["security_definer"]:
-                args.append("security_definer=True")
-            args += [f"{flag}=True" for flag in ("strict", "leakproof") if fn.get(flag)]
-            if parallel := fn.get("parallel"):
-                args.append(f"parallel={parallel!r}")
-            if (cost := fn.get("cost")) is not None and cost != default_cost(fn["language"]):
-                args.append(f"cost={cost!r}")
-            if settings := fn.get("settings"):
-                args.append(f"settings={settings!r}")
-            objects_code.append(f"{var} = function(\n    " + ",\n    ".join(args) + ",\n)")
-        uses_objects = {
-            name
-            for name, used in (
-                ("extension", self.snapshot.get("extensions")),
-                ("function", self.snapshot.get("functions")),
-            )
-            if used
-        }
-        if domains_code:
-            uses_objects.add("domain")
-        if composites_code:
-            uses_objects.add("composite")
 
         tables_code: list[str] = []
         uses_config: set[str] = set()
@@ -687,8 +546,6 @@ class _SchemaWriter:
                 kw += ", unlogged=True"
             if options := table.get("options"):
                 kw += f", storage={options!r}"
-            if partition_by := table.get("partition_by"):
-                kw += f", partition_by={partition_by!r}"
             lines = ["@final", f"class {self.table_classes[k]}(Table, {kw}):"]
             for cname, column in table["columns"].items():
                 lines.append(f"    {attrs[cname]} = {self.column(table, column, attrs[cname])}")
@@ -703,13 +560,10 @@ class _SchemaWriter:
                     "unique",
                     "foreign_key",
                     "check",
-                    "exclusion",
-                    "partition",
                     "unique_index",
                     "index",
                     "rls",
                     "policy",
-                    "grant",
                 ):
                     if any(i.startswith(f"{maker}(") for i in items):
                         uses_config.add(maker)
@@ -727,9 +581,6 @@ class _SchemaWriter:
                 ]
             tables_code.append("\n".join(lines))
 
-        owners: list[tuple[str, TableSnap | ViewSnap, dict[str, str]]] = [
-            (self.table_classes[k], t, self.attrs[k]) for k, t in self.snapshot["tables"].items()
-        ]
         for k, view in self.snapshot.get("views", {}).items():
             cls = _class_name(view["name"])
             if cls in self.taken:
@@ -737,29 +588,9 @@ class _SchemaWriter:
             cls = _unique(cls, self.taken)
             self.taken.add(cls)
             tables_code.append(self.view(k, cls))
-            owners.append((cls, view, self.attrs_of(view["columns"])))
             for i in view.get("indexes", {}).values():
                 uses_config.add("unique_index" if i["unique"] else "index")
                 has_config = True
-            if view.get("grants"):
-                uses_config.add("grant")
-                has_config = True
-
-        triggers_code: list[str] = []
-        for cls, owner, attrs in owners:
-            for t in owner.get("triggers", {}).values():
-                if t["function"] not in function_vars:
-                    triggers_code.append(
-                        f"# trigger {t['name']!r} runs {t['function']!r}, which was not pulled"
-                    )
-                    continue
-                uses_objects.add("trigger")
-                var = self.var(f"trg_{owner['name']}_{t['name']}")
-                triggers_code.append(
-                    f"{var} = trigger(\n    "
-                    + ",\n    ".join(_trigger_args(t, cls, attrs, function_vars[t["function"]]))
-                    + ",\n)"
-                )
 
         # An enum no column uses is declared on its own, or generate drops it (K4-5).
         unused_enums: list[str] = []
@@ -775,7 +606,6 @@ class _SchemaWriter:
         header = ['"""Generated by `mizzle pull`. Review before committing."""', ""]
         if enums_code:
             header.append("import enum")
-        header.extend(sorted(self.other_imports))
         typing_names: set[str] = {"final"}
         views = bool(self.snapshot.get("views"))
         if self.uses_any:
@@ -787,11 +617,7 @@ class _SchemaWriter:
         blocks = [
             *enums_code,
             *unused_enums,
-            *domains_code,
-            *composites_code,
-            *objects_code,
             *tables_code,
-            *triggers_code,
         ]
         body = "\n\n\n".join(blocks)
         mizzle_names: set[str] = {
@@ -799,49 +625,15 @@ class _SchemaWriter:
             *(["sql"] if re.search(r"\bsql\(", body) else []),  # unused imports fail strict checks
             *uses_config,
             *self.uses_relations,
-            *uses_objects,
         }
         if views:
             mizzle_names |= {"View", "QueryBuilder"}
-        if self.uses_column:
-            mizzle_names.add("Column")
         if has_config:
             mizzle_names.add("Constraint")
         header.append(f"from mizzle import {', '.join(sorted(mizzle_names))}")
         if self.pg_imports:
             header.append(f"from mizzle.pg import {', '.join(sorted(self.pg_imports))}")
         return "\n".join(header) + "\n\n\n" + body + "\n"
-
-
-def _trigger_args(t: TriggerSnap, cls: str, attrs: dict[str, str], execute: str) -> list[str]:
-    args = [
-        repr(t["name"]),
-        f"on={cls}",
-        f"execute={execute}",
-        f"timing={t['timing']!r}",
-        f"events={t['events']!r}",
-    ]
-    if t["for_each"] != "row":
-        args.append(f"for_each={t['for_each']!r}")
-    if t["when"] is not None:
-        args.append(f"when={_sql(t['when'])}")
-    if columns := t.get("columns"):
-        args.append(f"update_of=[{', '.join(f'{cls}.{attrs[c]}' for c in columns)}]")
-    for side, name in (("old_table", t.get("old_table")), ("new_table", t.get("new_table"))):
-        if name is not None:
-            args.append(f"{side}={name!r}")
-    return args
-
-
-def _grant_items(grants: GrantsSnap) -> list[str]:
-    """``grant([...], to=[...])``, one per set of privileges."""
-    by_privileges: dict[tuple[str, ...], list[str]] = {}
-    for role, privileges in grants.items():
-        by_privileges.setdefault(tuple(privileges), []).append(role)
-    return [
-        f"grant({list(privileges)!r}, to={sorted(roles)!r})"
-        for privileges, roles in by_privileges.items()
-    ]
 
 
 def _index_item(i: IndexSnap, attrs: dict[str, str]) -> str:
@@ -885,36 +677,6 @@ def _policy_item(p: PolicySnap) -> str:
 
 def render_schema_module(snapshot: Snapshot) -> str:
     return _SchemaWriter(snapshot).render()
-
-
-_DOMAIN_PY: dict[str, tuple[str, str | None]] = {
-    "text": ("str", None),
-    "character varying": ("str", None),
-    "character": ("str", None),
-    "name": ("str", None),
-    "smallint": ("int", None),
-    "integer": ("int", None),
-    "bigint": ("int", None),
-    "boolean": ("bool", None),
-    "real": ("float", None),
-    "double precision": ("float", None),
-    "numeric": ("decimal.Decimal", "import decimal"),
-    "date": ("datetime.date", "import datetime"),
-    "timestamp without time zone": ("datetime.datetime", "import datetime"),
-    "timestamp with time zone": ("datetime.datetime", "import datetime"),
-    "time without time zone": ("datetime.time", "import datetime"),
-    "time with time zone": ("datetime.time", "import datetime"),
-    "interval": ("datetime.timedelta", "import datetime"),
-    "uuid": ("uuid.UUID", "import uuid"),
-    "bytea": ("bytes", None),
-    "json": ("Any", "from typing import Any"),
-    "jsonb": ("Any", "from typing import Any"),
-}
-
-
-def _domain_py(base_type: str) -> tuple[str, str | None]:
-    name = re.sub(r"\(.*\)", "", base_type.removesuffix("[]")).strip()
-    return _DOMAIN_PY.get(name, ("Any", "from typing import Any"))
 
 
 # -- typegen --------------------------------------------------------------------------

@@ -151,7 +151,7 @@ def pending_migrations(
 
 
 # The kinds of object a pulled baseline creates in its schemas (K4-1).
-_BASELINE_KINDS = ("tables", "views", "enums", "domains", "composites", "functions")
+_BASELINE_KINDS = ("tables", "views", "enums")
 
 
 async def baseline_present(conn: Connection, dialect: Dialect, migration: Migration) -> bool:
@@ -166,12 +166,10 @@ async def baseline_present(conn: Connection, dialect: Dialect, migration: Migrat
     have = cast(Mapping[str, Mapping[str, object]], live)
     found = False
     missing: list[str] = []
-    # Extensions are CREATE ... IF NOT EXISTS and may be preinstalled: they count as
-    # missing, never as found.
-    for kind in (*_BASELINE_KINDS, "extensions"):
+    for kind in _BASELINE_KINDS:
         for name in want.get(kind, {}):
             if name in have.get(kind, {}):
-                found = found or kind != "extensions"
+                found = True
             else:
                 missing.append(f"{kind[:-1]} {name}")
     if not missing:

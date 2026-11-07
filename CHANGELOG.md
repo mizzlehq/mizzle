@@ -1,5 +1,25 @@
 # Changelog
 
+## Unreleased
+
+- **Breaking: mizzle manages only what Drizzle ORM manages.** Functions, triggers, domains,
+  composite types, extensions, exclusion constraints, partitions and grants are gone from
+  the schema API (`function`, `trigger`, `domain`, `composite`, `extension`, `exclusion`,
+  `partition`, `partition_by=`, `grant`, `pg_domain`, `pg_composite`). `generate`, `push`
+  and `pull` leave them alone: never created, dropped or reported as drift; `pull` names
+  them in a warning and reads a partitioned table as a plain one. Write them in a custom
+  migration (`mizzle generate --custom`); see "Not managed by mizzle" in the migrations
+  guide. A vector column no longer creates the `vector` extension either.
+- `custom("type")` in `mizzle.pg`: a column of any other type (a domain, a composite, a
+  range, `citext`, `box`, `app.my_type`...), its DDL type verbatim and its values `str` in
+  the type's text form (sent as text, read as the server prints it, nested rows too).
+  `pull` writes every column of a type mizzle has no column type for as `custom(...)`.
+- `mizzle generate --custom` keeps the previous schema snapshot, so a custom migration can
+  run before the tables that need what it creates; schema changes go into the next
+  generated migration.
+- Studio resolves domains with the server (`pg_type.typbasetype`) instead of parsing type
+  names, and shows composite columns read-only.
+
 ## 0.2.4
 
 - Faster row building: each table's row decoder is generated once (fixed column positions

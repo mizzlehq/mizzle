@@ -12,15 +12,8 @@ from mizzle.core.errors import DatabaseError, SchemaError
 from mizzle.core.snapshot import (
     CheckSnap,
     ColumnSnap,
-    CompositeFieldSnap,
-    CompositeSnap,
-    DomainSnap,
     EnumSnap,
-    ExclusionElementSnap,
-    ExclusionSnap,
-    ExtensionSnap,
     ForeignKeySnap,
-    FunctionSnap,
     GeneratedSnap,
     IdentitySnap,
     IndexSnap,
@@ -30,12 +23,9 @@ from mizzle.core.snapshot import (
     RoleSnap,
     Snapshot,
     TableSnap,
-    TriggerSnap,
     UniqueSnap,
     ViewSnap,
-    default_cost,
     empty_snapshot,
-    function_key,
     key,
     sequence_defaults,
 )
@@ -45,16 +35,11 @@ from mizzle.dialects.postgres.ddl import (
     SERIAL_TYPES,
     create_index,
     default_sql,
-    function_options,
     normalize_default,
     qualified,
     quote,
-    requote_args,
     requote_casts,
-    requote_returns,
     requote_type,
-    sql_standard_body,
-    type_ident,
 )
 
 MIGRATIONS_TABLE = "__mizzle_migrations"
@@ -67,29 +52,16 @@ SELECT c.oid, n.nspname AS schema, c.relname AS name,
        c.relrowsecurity AS rls, c.relforcerowsecurity AS rls_force,
        obj_description(c.oid, 'pg_class') AS comment,
        c.relpersistence::text AS persistence, coalesce(c.reloptions, '{}') AS options,
-       coalesce(tc.reloptions, '{}') AS toast_options,
-       pg_get_partkeydef(c.oid) AS partition_by
+       coalesce(tc.reloptions, '{}') AS toast_options
 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
 LEFT JOIN pg_class tc ON tc.oid = c.reltoastrelid
+-- A partitioned table reads as a plain one; its partitions are not read (not managed).
 WHERE c.relkind IN ('r', 'p') AND n.nspname = ANY($1::text[]) AND c.relname <> $2
   AND NOT c.relispartition
 ORDER BY n.nspname, c.relname
 """
 
 log = logging.getLogger("mizzle")
-
-_PARTITIONS = """
-SELECT c.relname AS name, n.nspname AS schema, pn.nspname AS parent_schema,
-       pc.relname AS parent_name,
-       pg_get_expr(c.relpartbound, c.oid) AS bound, pg_get_partkeydef(c.oid) AS sub_key
-FROM pg_class c
-JOIN pg_namespace n ON n.oid = c.relnamespace
-JOIN pg_inherits i ON i.inhrelid = c.oid
-JOIN pg_class pc ON pc.oid = i.inhparent
-JOIN pg_namespace pn ON pn.oid = pc.relnamespace
-WHERE c.relispartition AND n.nspname = ANY($1::text[])
-ORDER BY pn.nspname, pc.relname, c.relname
-"""
 
 _COLUMNS = """
 SELECT a.attrelid AS table_oid, a.attname AS name,
@@ -129,25 +101,12 @@ SELECT con.conrelid AS table_oid, con.conname AS name, con.contype::text AS kind
        con.condeferrable AS deferrable, con.condeferred AS initially_deferred,
        con.convalidated AS validated,
        EXISTS (SELECT 1 FROM pg_index i WHERE i.indexrelid = con.conindid
-               AND i.indnullsnotdistinct) AS nulls_not_distinct,
-       -- Exclusion constraints (contype 'x'): the backing index gives the keys and method.
-       am.amname AS method,
-       ARRAY(SELECT op.oprname FROM unnest(con.conexclop) WITH ORDINALITY k(o, ord)
-             JOIN pg_operator op ON op.oid = k.o ORDER BY k.ord) AS operators,
-       ARRAY(SELECT CASE WHEN k.n = 0 THEN NULL ELSE a.attname END
-             FROM unnest(ix.indkey::int2[]) WITH ORDINALITY k(n, ord)
-             LEFT JOIN pg_attribute a ON a.attrelid = con.conrelid AND a.attnum = k.n
-             ORDER BY k.ord) AS excl_keys,
-       ARRAY(SELECT pg_get_indexdef(con.conindid, k, true)
-             FROM generate_series(1, ix.indnkeyatts) AS k ORDER BY k) AS excl_defs,
-       pg_get_expr(ix.indpred, con.conrelid) AS excl_predicate
+               AND i.indnullsnotdistinct) AS nulls_not_distinct
 FROM pg_constraint con
 LEFT JOIN pg_class fc ON fc.oid = con.confrelid
 LEFT JOIN pg_namespace fn ON fn.oid = fc.relnamespace
-LEFT JOIN pg_index ix ON ix.indexrelid = con.conindid
-LEFT JOIN pg_class ic ON ic.oid = con.conindid
-LEFT JOIN pg_am am ON am.oid = ic.relam
-WHERE con.conrelid = ANY($1::oid[]) AND con.contype IN ('p', 'u', 'f', 'c', 'x')
+-- Exclusion constraints (contype 'x') are not managed: not read.
+WHERE con.conrelid = ANY($1::oid[]) AND con.contype IN ('p', 'u', 'f', 'c')
 ORDER BY con.conrelid, con.conname
 """
 
@@ -184,6 +143,7 @@ FROM pg_index i
 JOIN pg_class ic ON ic.oid = i.indexrelid
 JOIN pg_am am ON am.oid = ic.relam
 WHERE i.indrelid = ANY($1::oid[])
+  -- The index of a key or of an exclusion constraint (not managed) is not an index of its own.
   AND NOT EXISTS (SELECT 1 FROM pg_constraint con WHERE con.conindid = i.indexrelid
                   AND con.contype IN ('p', 'u', 'x'))
 ORDER BY i.indrelid, ic.relname
@@ -200,60 +160,6 @@ GROUP BY n.nspname, t.typname
 ORDER BY n.nspname, t.typname
 """
 
-_DOMAINS = """
-SELECT t.oid, n.nspname AS schema, t.typname AS name,
-       format_type(t.typbasetype, t.typtypmod) AS base_type,
-       t.typnotnull AS not_null,
-       pg_get_expr(t.typdefaultbin, 0) AS default,
-       (SELECT c.collname FROM pg_collation c WHERE c.oid = t.typcollation) AS collation
-FROM pg_type t
-JOIN pg_namespace n ON n.oid = t.typnamespace
-WHERE t.typtype = 'd' AND n.nspname = ANY($1::text[])
-ORDER BY n.nspname, t.typname
-"""
-
-# S8: a pulled table can use a domain from a schema outside schema_filter.
-_DOMAIN_OIDS = """
-SELECT DISTINCT d.oid
-FROM pg_attribute a
-JOIN pg_type t ON t.oid = a.atttypid
-JOIN pg_type d ON d.oid = CASE WHEN t.typtype = 'd' THEN t.oid
-                               WHEN t.typelem <> 0 THEN t.typelem ELSE 0 END
-WHERE a.attrelid = ANY($1::oid[]) AND a.attnum > 0 AND NOT a.attisdropped
-  AND d.typtype = 'd'
-"""
-
-_DOMAINS_BY_OID = _DOMAINS.replace(
-    "t.typtype = 'd' AND n.nspname = ANY($1::text[])", "t.oid = ANY($1::oid[])"
-)
-
-_DOMAIN_CHECKS = """
-SELECT n.nspname AS schema, t.typname AS domain, pg_get_constraintdef(c.oid) AS definition
-FROM pg_constraint c
-JOIN pg_type t ON t.oid = c.contypid
-JOIN pg_namespace n ON n.oid = t.typnamespace
-WHERE c.contype = 'c' AND n.nspname = ANY($1::text[])
-ORDER BY n.nspname, t.typname
-"""
-
-_DOMAIN_CHECKS_BY_OID = _DOMAIN_CHECKS.replace(
-    "n.nspname = ANY($1::text[])", "t.oid = ANY($1::oid[])"
-)
-
-# Standalone composite types; a table's row type is a composite too, so keep only the
-# pg_class rows of relkind 'c' (the ones CREATE TYPE ... AS makes).
-_COMPOSITES = """
-SELECT n.nspname AS schema, t.typname AS name,
-       a.attname AS field, format_type(a.atttypid, a.atttypmod) AS type
-FROM pg_type t
-JOIN pg_namespace n ON n.oid = t.typnamespace
-JOIN pg_class c ON c.oid = t.typrelid
-JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped
-WHERE t.typtype = 'c' AND c.relkind = 'c' AND n.nspname = ANY($1::text[])
-ORDER BY n.nspname, t.typname, a.attnum
-"""
-
-
 # Objects that belong to an extension (pg_trgm's functions...) are not the schema's own.
 _NOT_EXTENSION = """NOT EXISTS (SELECT 1 FROM pg_depend d WHERE d.classid = {catalog}::regclass
                   AND d.objid = {oid} AND d.deptype = 'e')"""
@@ -267,12 +173,36 @@ WHERE c.relkind IN ('v', 'm') AND n.nspname = ANY($1::text[])
 ORDER BY n.nspname, c.relname
 """
 
-# What pull cannot write yet, to warn about instead of dropping it silently (K8).
+# What mizzle does not manage, for pull to say it leaves out (K8): generate, push and pull
+# neither read nor drop these.
 _SKIPPED = f"""
-SELECT 'procedure ' || p.oid::regprocedure::text AS what
+SELECT CASE p.prokind WHEN 'p' THEN 'procedure ' ELSE 'function ' END
+       || p.oid::regprocedure::text AS what
 FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
-WHERE p.prokind = 'p' AND n.nspname = ANY($1::text[])
+WHERE p.prokind IN ('f', 'p') AND n.nspname = ANY($1::text[])
   AND {_NOT_EXTENSION.format(catalog="'pg_proc'", oid="p.oid")}
+UNION ALL
+SELECT 'trigger ' || quote_ident(t.tgname) || ' on ' || c.oid::regclass::text
+FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid
+JOIN pg_namespace n ON n.oid = c.relnamespace
+WHERE NOT t.tgisinternal AND n.nspname = ANY($1::text[])
+UNION ALL
+SELECT CASE t.typtype WHEN 'd' THEN 'domain ' ELSE 'composite type ' END
+       || t.oid::regtype::text
+FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace
+LEFT JOIN pg_class c ON c.oid = t.typrelid
+WHERE (t.typtype = 'd' OR (t.typtype = 'c' AND c.relkind = 'c'))
+  AND n.nspname = ANY($1::text[])
+  AND {_NOT_EXTENSION.format(catalog="'pg_type'", oid="t.oid")}
+UNION ALL
+SELECT 'extension ' || quote_ident(e.extname)
+FROM pg_extension e WHERE e.extname <> 'plpgsql'
+UNION ALL
+SELECT 'exclusion constraint ' || quote_ident(con.conname) || ' on '
+       || con.conrelid::regclass::text
+FROM pg_constraint con JOIN pg_class c ON c.oid = con.conrelid
+JOIN pg_namespace n ON n.oid = c.relnamespace
+WHERE con.contype = 'x' AND n.nspname = ANY($1::text[])
 UNION ALL
 SELECT 'sequence ' || c.oid::regclass::text
 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
@@ -285,62 +215,25 @@ SELECT CASE WHEN c.relispartition THEN 'partition ' ELSE 'table inheritance ' EN
        || c.oid::regclass::text || ' of ' || i.inhparent::regclass::text
 FROM pg_inherits i JOIN pg_class c ON c.oid = i.inhrelid
 JOIN pg_namespace n ON n.oid = c.relnamespace
-JOIN pg_class pc ON pc.oid = i.inhparent JOIN pg_namespace pn ON pn.oid = pc.relnamespace
 WHERE n.nspname = ANY($1::text[]) AND c.relkind IN ('r', 'p', 'f')  -- not indexes (K4-10)
-  -- pull writes a partition of a table it reads as partition(...), in the parent's schema
-  AND NOT (c.relispartition AND NOT pc.relispartition AND pn.nspname = ANY($1::text[])
-           AND pc.relnamespace = c.relnamespace)
 UNION ALL
-SELECT 'column grant ' || lower(g.privilege_type) || ' on ' || c.oid::regclass::text
-       || '(' || quote_ident(a.attname) || ') to '
-       || CASE WHEN g.grantee = 0 THEN 'public' ELSE pg_get_userbyid(g.grantee) END
+SELECT 'grants on ' || c.oid::regclass::text
 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
-JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped,
-     aclexplode(a.attacl) AS g
-WHERE c.relkind IN ('r', 'p', 'v', 'm') AND n.nspname = ANY($1::text[])
-  AND g.grantee <> c.relowner
+WHERE c.relkind IN ('r', 'p', 'v', 'm') AND n.nspname = ANY($1::text[]) AND NOT c.relispartition
+  AND c.relname <> $2
+  AND (EXISTS (SELECT 1 FROM aclexplode(c.relacl) g WHERE g.grantee <> c.relowner)
+       OR EXISTS (SELECT 1 FROM pg_attribute a WHERE a.attrelid = c.oid AND a.attacl IS NOT NULL))
 ORDER BY 1
 """
 
 
 async def skipped_objects(conn: Connection, schemas: Sequence[str]) -> list[str]:
-    """Objects introspection does not read: procedures, standalone sequences, table
-    inheritance and partitions, column-level grants (K8)."""
-    return [str(row["what"]) for row in await conn.fetch_dicts(_SKIPPED, [list(schemas)])]
+    """Objects mizzle does not manage, so introspection does not read them: functions,
+    procedures, triggers, domains, composite types, extensions, exclusion constraints,
+    partitions, table inheritance, standalone sequences and grants (K8)."""
+    rows = await conn.fetch_dicts(_SKIPPED, [list(schemas), MIGRATIONS_TABLE])
+    return [str(row["what"]) for row in rows]
 
-
-_FUNCTION_COLUMNS = """
-pg_get_function_arguments(p.oid) AS args, pg_get_function_result(p.oid) AS returns,
-l.lanname AS language, p.prosrc AS body, p.provolatile::text AS volatility,
-p.prosecdef AS security_definer, p.proisstrict AS strict, p.proleakproof AS leakproof,
-p.proparallel::text AS parallel, p.procost AS cost, coalesce(p.proconfig, '{}') AS config,
-CASE WHEN p.prosqlbody IS NOT NULL THEN pg_get_functiondef(p.oid) END AS definition
-"""
-
-_FUNCTIONS = f"""
-SELECT n.nspname AS schema, p.proname AS name, {_FUNCTION_COLUMNS}
-FROM pg_proc p
-JOIN pg_namespace n ON n.oid = p.pronamespace
-JOIN pg_language l ON l.oid = p.prolang
-WHERE n.nspname = ANY($1::text[]) AND p.prokind = 'f'
-  AND {_NOT_EXTENSION.format(catalog="'pg_proc'", oid="p.oid")}
-ORDER BY n.nspname, p.proname, p.oid
-"""
-
-_TRIGGERS = """
-SELECT t.tgrelid AS table_oid, t.tgname AS name, t.tgtype AS type,
-       fn.nspname AS function_schema, f.proname AS function_name,
-       pg_get_triggerdef(t.oid) AS definition,
-       ARRAY(SELECT a.attname FROM unnest(t.tgattr::int2[]) AS k(n)
-             JOIN pg_attribute a ON a.attrelid = t.tgrelid AND a.attnum = k.n
-             ORDER BY 1) AS columns,
-       t.tgoldtable AS old_table, t.tgnewtable AS new_table
-FROM pg_trigger t
-JOIN pg_proc f ON f.oid = t.tgfoid
-JOIN pg_namespace fn ON fn.oid = f.pronamespace
-WHERE t.tgrelid = ANY($1::oid[]) AND NOT t.tgisinternal
-ORDER BY t.tgrelid, t.tgname
-"""
 
 _POLICIES = """
 SELECT p.polrelid AS table_oid, p.polname AS name, p.polcmd::text AS command,
@@ -355,35 +248,12 @@ ORDER BY p.polrelid, p.polname
 """
 
 # Privileges granted on tables and views, except the owner's own.
-_GRANTS = """
-SELECT c.oid, CASE WHEN a.grantee = 0 THEN 'public' ELSE pg_get_userbyid(a.grantee) END AS role,
-       array_agg(DISTINCT lower(a.privilege_type)) AS privileges
-FROM pg_class c, aclexplode(c.relacl) AS a
-WHERE c.oid = ANY($1::oid[]) AND a.grantee <> c.relowner
-GROUP BY c.oid, a.grantee
-ORDER BY c.oid, 2
-"""
-
 _ROLES = """
 SELECT rolname AS name, rolcanlogin AS login, rolcreatedb AS create_db,
        rolcreaterole AS create_role, rolinherit AS inherit
 FROM pg_roles WHERE rolname = any($1::text[])
 """
-_EXTENSIONS = """
-SELECT e.extname AS name, n.nspname AS schema, e.extversion AS version
-FROM pg_extension e JOIN pg_namespace n ON n.oid = e.extnamespace
-WHERE e.extname <> 'plpgsql'
-ORDER BY e.extname
-"""
-
 _COMMANDS = {"*": "all", "r": "select", "a": "insert", "w": "update", "d": "delete"}
-_VOLATILITY = {"v": "volatile", "s": "stable", "i": "immutable"}
-_PARALLEL = {"s": "safe", "r": "restricted", "u": "unsafe"}
-# Settings whose value is a list of names (printed as SQL as is); others are quoted.
-_LIST_SETTINGS = {"search_path", "temp_tablespaces", "session_preload_libraries"}
-# pg_trigger.tgtype bits
-_ROW, _BEFORE, _INSTEAD = 1, 2, 64
-_EVENTS = (("insert", 4), ("delete", 8), ("update", 16), ("truncate", 32))
 
 
 type _Row = dict[str, object]
@@ -403,12 +273,6 @@ def _strs(value: object) -> list[str]:
     if not isinstance(value, list):
         raise TypeError(f"expected an array from the catalog, got {type(value).__name__}")
     return [str(v) for v in cast(list[object], value)]
-
-
-def _opt_strs(value: object) -> list[str | None]:
-    if not isinstance(value, list):
-        raise TypeError(f"expected an array from the catalog, got {type(value).__name__}")
-    return [None if v is None else str(v) for v in cast(list[object], value)]
 
 
 def _collation(row: _Row) -> str | None:
@@ -489,78 +353,6 @@ def _view_options(view: ViewSnap, options: list[str]) -> None:
             view["security_barrier"] = True
         elif name == "check_option" and value in ("local", "cascaded"):
             view["check_option"] = "local" if value == "local" else "cascaded"
-
-
-def _trigger_when(definition: str) -> str | None:
-    """The WHEN condition of pg_get_triggerdef's text, without its outer parentheses."""
-    start = definition.find(" WHEN (", definition.find(" FOR EACH "))
-    if start < 0:
-        return None
-    end = definition.rfind(" EXECUTE FUNCTION ")
-    return definition[start + len(" WHEN (") : end - 1]
-
-
-def _trigger(row: _Row) -> TriggerSnap:
-    tgtype = _int(row["type"])
-    timing = "instead of" if tgtype & _INSTEAD else "before" if tgtype & _BEFORE else "after"
-    trigger = TriggerSnap(
-        name=str(row["name"]),
-        timing=timing,
-        events=[name for name, bit in _EVENTS if tgtype & bit],
-        for_each="row" if tgtype & _ROW else "statement",
-        function=key(str(row["function_schema"]), str(row["function_name"])),
-        when=_trigger_when(str(row["definition"])),
-    )
-    if columns := _strs(row["columns"]):
-        trigger["columns"] = columns
-    if row["old_table"] is not None:
-        trigger["old_table"] = str(row["old_table"])
-    if row["new_table"] is not None:
-        trigger["new_table"] = str(row["new_table"])
-    return trigger
-
-
-def _function(schema: str, name: str, row: _Row) -> FunctionSnap:
-    language = str(row["language"])
-    definition = _opt_str(row["definition"])
-    fn = FunctionSnap(
-        schema=schema,
-        name=name,
-        args=str(row["args"]),
-        returns=str(row["returns"]),
-        language=language,
-        body=str(row["body"]) if definition is None else _sql_body(definition),
-        volatility=_VOLATILITY[str(row["volatility"])],
-        security_definer=bool(row["security_definer"]),
-    )
-    if row["strict"]:
-        fn["strict"] = True
-    if row["leakproof"]:
-        fn["leakproof"] = True
-    if (parallel := _PARALLEL[str(row["parallel"])]) != "unsafe":
-        fn["parallel"] = parallel
-    cost = row["cost"]
-    if isinstance(cost, int | float) and float(cost) != default_cost(language):
-        fn["cost"] = float(cost)
-    if config := _strs(row["config"]):
-        fn["settings"] = dict(_setting(c) for c in config)
-    return fn
-
-
-def _setting(config: str) -> tuple[str, str]:
-    """An entry of pg_proc.proconfig ("work_mem=64MB") as name and SQL value."""
-    name, _, value = config.partition("=")
-    if name in _LIST_SETTINGS:
-        return name, "''" if value == '""' else value
-    return name, "'" + value.replace("'", "''") + "'"
-
-
-def _sql_body(definition: str) -> str:
-    """A SQL-standard body (RETURN ... / BEGIN ATOMIC ... END) from pg_get_functiondef: the
-    lines after the header, whose option lines start with a space."""
-    lines = definition.rstrip().split("\n")
-    start = next((i for i, line in enumerate(lines) if i and not line.startswith(" ")), len(lines))
-    return "\n".join(lines[start:])
 
 
 def _index(row: _Row) -> IndexSnap:
@@ -667,17 +459,6 @@ def _requote_types(snapshot: Snapshot, server_keywords: frozenset[str]) -> None:
         column["type"] = requote_type(column["type"], server_keywords)
         if (default := column["default"]) is not None:  # K4-29
             column["default"] = requote_casts(default, server_keywords)
-    for domain in snapshot.get("domains", {}).values():
-        domain["base_type"] = requote_type(domain["base_type"], server_keywords)
-        if (domain_default := domain.get("default")) is not None:
-            domain["default"] = requote_casts(domain_default, server_keywords)
-    for field in (f for c in snapshot.get("composites", {}).values() for f in c["fields"]):
-        field["type"] = requote_type(field["type"], server_keywords)
-    if functions := snapshot.get("functions"):  # K4-25
-        for fn in functions.values():
-            fn["args"] = requote_args(fn["args"], server_keywords)
-            fn["returns"] = requote_returns(fn["returns"], server_keywords)
-        snapshot["functions"] = {function_key(f): f for f in functions.values()}
 
 
 async def _introspect(conn: Connection, schemas: Sequence[str], roles: Sequence[str]) -> Snapshot:
@@ -709,26 +490,9 @@ async def _introspect(conn: Connection, schemas: Sequence[str], roles: Sequence[
             *(f"toast.{o}" for o in _strs(t["toast_options"])),
         ]:
             snap["options"] = dict(o.split("=", 1) for o in options)
-        if (partkey := _opt_str(t["partition_by"])) is not None:
-            snap["partition_by"] = partkey
         by_oid[_int(t["oid"])] = snap
         snapshot["tables"][key(schema, name)] = snap
         _add_schema(snapshot, schema)
-
-    for row in await conn.fetch_dicts(_PARTITIONS, [schema_list]):
-        parent = snapshot["tables"].get(key(str(row["parent_schema"]), str(row["parent_name"])))
-        if parent is not None:  # a partition whose parent is outside the schemas read
-            parent.setdefault("partitions", {})[str(row["name"])] = str(row["bound"])
-        if row["sub_key"] is not None:
-            # Sub-partitions are not modelled: say so rather than drop them silently (a
-            # pulled schema creates the partition without them).
-            log.warning(
-                "mizzle: partition %s.%s is itself partitioned (%s); mizzle does not model "
-                "sub-partitions, so they are left out of the schema",
-                row["schema"],
-                row["name"],
-                row["sub_key"],
-            )
 
     oids = list(by_oid)
     for row in await conn.fetch_dicts(_COLUMNS, [oids]):
@@ -783,24 +547,6 @@ async def _introspect(conn: Connection, schemas: Sequence[str], roles: Sequence[
                 if " MATCH FULL" in str(row["definition"]):
                     _not_modelled(f"foreign key {name}", "MATCH FULL")
                 table["foreign_keys"][name] = fk
-            case "x":
-                elements: list[ExclusionElementSnap] = []
-                keys = _opt_strs(row["excl_keys"])
-                defs = _strs(row["excl_defs"])
-                for i, operator in enumerate(_strs(row["operators"])):
-                    keyname = keys[i] if i < len(keys) else None
-                    if keyname is None:
-                        elements.append(ExclusionElementSnap(operator=operator, expression=defs[i]))
-                    else:
-                        elements.append(ExclusionElementSnap(operator=operator, column=keyname))
-                excl = ExclusionSnap(name=name, method=str(row["method"]), elements=elements)
-                if (where := _opt_str(row["excl_predicate"])) is not None:
-                    excl["where"] = where
-                if row["deferrable"]:
-                    excl["deferrable"] = True
-                if row["initially_deferred"]:
-                    excl["initially_deferred"] = True
-                table.setdefault("exclusions", {})[name] = excl
             case _:
                 pass
 
@@ -820,15 +566,6 @@ async def _introspect(conn: Connection, schemas: Sequence[str], roles: Sequence[
         )
         table.setdefault("policies", {})[policy["name"]] = policy
 
-    for row in await conn.fetch_dicts(_TRIGGERS, [oids]):
-        trigger = _trigger(row)
-        by_oid[_int(row["table_oid"])].setdefault("triggers", {})[trigger["name"]] = trigger
-
-    for row in await conn.fetch_dicts(_GRANTS, [oids]):
-        by_oid[_int(row["oid"])].setdefault("grants", {})[str(row["role"])] = sorted(
-            _strs(row["privileges"])
-        )
-
     await _introspect_objects(conn, schema_list, snapshot, roles, version)
 
     for row in await conn.fetch_dicts(_ENUMS, [schema_list]):
@@ -837,48 +574,6 @@ async def _introspect(conn: Connection, schemas: Sequence[str], roles: Sequence[
         snapshot["enums"][key(schema, name)] = enum
         _add_schema(snapshot, schema)
 
-    domain_rows = await conn.fetch_dicts(_DOMAINS, [schema_list])
-    # S8: domains used by the pulled columns but declared in another schema (outside
-    # schema_filter) are part of the schema too, or the column reads as an opaque type and
-    # the next generate drops the domain.
-    referenced = {_int(row["oid"]) for row in await conn.fetch_dicts(_DOMAIN_OIDS, [oids])}
-    referenced -= {_int(row["oid"]) for row in domain_rows}
-    domain_rows += await conn.fetch_dicts(_DOMAINS_BY_OID, [list(referenced)]) if referenced else []
-    domain_checks: dict[str, list[str]] = {}
-    for row in await conn.fetch_dicts(_DOMAIN_CHECKS, [schema_list]):
-        domain_checks.setdefault(key(str(row["schema"]), str(row["domain"])), []).append(
-            _check_expression(str(row["definition"]))
-        )
-    if referenced:
-        for row in await conn.fetch_dicts(_DOMAIN_CHECKS_BY_OID, [list(referenced)]):
-            domain_checks.setdefault(key(str(row["schema"]), str(row["domain"])), []).append(
-                _check_expression(str(row["definition"]))
-            )
-    for row in domain_rows:
-        schema, name = str(row["schema"]), str(row["name"])
-        domain = DomainSnap(schema=schema, name=name, base_type=str(row["base_type"]))
-        if row["not_null"]:
-            domain["not_null"] = True
-        if (default := normalize_default(_opt_str(row["default"]))) is not None:
-            domain["default"] = default
-        if (collation := _opt_str(row["collation"])) not in (None, "default"):
-            domain["collation"] = collation
-        if checks := domain_checks.get(key(schema, name)):
-            domain["checks"] = sorted(checks)
-        snapshot.setdefault("domains", {})[key(schema, name)] = domain
-        _add_schema(snapshot, schema)
-    _drop_domain_collations(snapshot)
-
-    for row in await conn.fetch_dicts(_COMPOSITES, [schema_list]):
-        schema, name = str(row["schema"]), str(row["name"])
-        composites = snapshot.setdefault("composites", {})
-        composite = composites.setdefault(
-            key(schema, name), CompositeSnap(schema=schema, name=name, fields=[])
-        )
-        composite["fields"].append(
-            CompositeFieldSnap(name=str(row["field"]), type=str(row["type"]))
-        )
-        _add_schema(snapshot, schema)
     return snapshot
 
 
@@ -887,33 +582,10 @@ def _add_schema(snapshot: Snapshot, schema: str) -> None:
         snapshot["schemas"].append(schema)
 
 
-def _drop_domain_collations(snapshot: Snapshot) -> None:
-    """A domain's collation is inherited by every column of that domain, but the column does
-    not name it: read it only when it differs, so it does not show as drift forever."""
-    domains = snapshot.get("domains", {})
-    if not domains:
-        return
-    relations = [*snapshot["tables"].values(), *snapshot.get("views", {}).values()]
-    for relation in relations:
-        for column in relation["columns"].values():
-            if column.get("collation") is None:
-                continue
-            domain = _domain_of(column["type"], domains)
-            if domain is not None and domain.get("collation") == column.get("collation"):
-                del column["collation"]
-
-
-def _domain_of(sql_type: str, domains: dict[str, DomainSnap]) -> DomainSnap | None:
-    if sql_type in domains:
-        return domains[sql_type]
-    matches = [d for d in domains.values() if d["name"] == sql_type]
-    return matches[0] if len(matches) == 1 else None
-
-
 async def _introspect_objects(
     conn: Connection, schemas: list[str], snapshot: Snapshot, roles: Sequence[str], version: int
 ) -> None:
-    """Views, functions and extensions."""
+    """Views and roles."""
     views: dict[int, ViewSnap] = {}
     for row in await conn.fetch_dicts(_VIEWS, [schemas]):
         schema, name = str(row["schema"]), str(row["name"])
@@ -935,19 +607,6 @@ async def _introspect_objects(
         for row in await conn.fetch_dicts(_indexes_query(version), [list(views)]):
             index = _index(row)
             views[_int(row["table_oid"])].setdefault("indexes", {})[index["name"]] = index
-        for row in await conn.fetch_dicts(_TRIGGERS, [list(views)]):
-            trigger = _trigger(row)
-            views[_int(row["table_oid"])].setdefault("triggers", {})[trigger["name"]] = trigger
-        for row in await conn.fetch_dicts(_GRANTS, [list(views)]):
-            views[_int(row["oid"])].setdefault("grants", {})[str(row["role"])] = sorted(
-                _strs(row["privileges"])
-            )
-
-    for row in await conn.fetch_dicts(_FUNCTIONS, [schemas]):
-        schema, name = str(row["schema"]), str(row["name"])
-        fn = _function(schema, name, row)
-        snapshot.setdefault("functions", {})[function_key(fn)] = fn
-        _add_schema(snapshot, schema)
 
     # Only the named roles: the others belong to the server (and other databases), and a
     # pulled baseline must never contain them, or the next generate would drop them.
@@ -960,11 +619,6 @@ async def _introspect_objects(
             create_role=bool(row["create_role"]),
             inherit=bool(row["inherit"]),
         )
-
-    for row in await conn.fetch_dicts(_EXTENSIONS, []):
-        ext = ExtensionSnap(name=str(row["name"]), schema=str(row["schema"]))
-        ext["version"] = str(row["version"])
-        snapshot.setdefault("extensions", {})[ext["name"]] = ext
 
 
 async def _normalize_indexes(snapshot: Snapshot, read_back: _ReadBack, version: int) -> None:
@@ -1000,59 +654,8 @@ async def _normalize_indexes(snapshot: Snapshot, read_back: _ReadBack, version: 
             index["where"] = printed["where"]  # as the database prints it (C24)
 
 
-async def _normalize_grants(snapshot: Snapshot, read_back: _ReadBack) -> None:
-    """``all`` as the privileges it stands for on this server."""
-    relations = [*snapshot["tables"].values(), *snapshot.get("views", {}).values()]
-    if not any("all" in p for r in relations for p in r.get("grants", {}).values()):
-        return
-    temp = f"pg_temp.{quote(_NORM)}"
-    row = await read_back(
-        [f"CREATE TEMP TABLE {quote(_NORM)} ()", f"GRANT ALL ON {temp} TO PUBLIC"],
-        "SELECT array_agg(DISTINCT lower(privilege_type)) AS p FROM aclexplode("
-        f"(SELECT relacl FROM pg_class WHERE oid = to_regclass('{temp}'))) WHERE grantee = 0",
-    )
-    if row is None:
-        return
-    every = sorted(_strs(row["p"]))
-    for relation in relations:
-        for role, privileges in relation.get("grants", {}).items():
-            if "all" in privileges:
-                relation.setdefault("grants", {})[role] = every
-
-
 class _ReadBack(Protocol):
     async def __call__(self, statements: list[str], query: str, /) -> _Row | None: ...
-
-
-async def _normalize_domain_checks(snapshot: Snapshot, read_back: _ReadBack) -> None:
-    """Domain CHECKs as PostgreSQL prints them: a domain whose text was written by hand
-    (``VALUE ~ '@'``) can differ from ``((VALUE ~ '@'::text))``, and generate would then
-    refuse the change. Create each domain in pg_temp and read its checks back."""
-    domains = snapshot.get("domains", {})
-    for domain in domains.values():
-        if not domain.get("checks"):
-            continue
-        create = _create_domain_for_norm(domain)
-        row = await read_back(
-            [create],
-            "SELECT array_agg(pg_get_constraintdef(c.oid) ORDER BY c.conname) AS d "
-            "FROM pg_constraint c "
-            f"WHERE c.contypid = to_regtype('pg_temp.{quote(_NORM)}') AND c.contype = 'c'",
-        )
-        if row is None or row["d"] is None:
-            continue
-        domain["checks"] = sorted(_check_expression(str(d)) for d in _strs(row["d"]))
-
-
-def _create_domain_for_norm(domain: DomainSnap) -> str:
-    """The CREATE DOMAIN written with a throwaway name in pg_temp."""
-    parts = [f"CREATE DOMAIN pg_temp.{quote(_NORM)} AS {domain['base_type']}"]
-    if collation := domain.get("collation"):
-        parts.append(f"COLLATE {type_ident(collation)}")
-    if default := domain.get("default"):
-        parts.append(f"DEFAULT {default_sql(default)}")
-    parts.extend(f"CHECK ({check})" for check in domain.get("checks", []))
-    return " ".join(parts)
 
 
 class _Undo(Exception):
@@ -1063,7 +666,7 @@ _NORM = "__mizzle_norm"
 
 
 def _mentions(expression: str, column: str) -> bool:
-    """Whether a partition key names ``column`` (quoted, or as a plain identifier)."""
+    """Whether an expression names ``column`` (quoted, or as a plain identifier)."""
     if f'"{column}"' in expression:
         return True
     plain = re.escape(column)
@@ -1115,8 +718,8 @@ def _text(value: str) -> str:
 
 
 async def normalize_snapshot(conn: Connection, snapshot: Snapshot) -> Snapshot:
-    """Let the server print view queries, function signatures, policy expressions and
-    trigger conditions, by creating each as a temporary object and reading it back.
+    """Let the server print view queries, policy expressions, checks and defaults, by
+    creating each as a temporary object and reading it back.
 
     Everything runs in a transaction that is rolled back. An object that cannot be created
     against the current database (on a new table, using a new column...) keeps its text:
@@ -1138,7 +741,6 @@ async def normalize_snapshot(conn: Connection, snapshot: Snapshot) -> Snapshot:
 
     try:
         async with conn.transaction():
-            await conn.execute("SET LOCAL check_function_bodies = off", [])
             await conn.execute("SET LOCAL TimeZone = 'UTC'", [])  # as introspect reads
             await _normalize(out, read_back, version)
             rows = await conn.fetch_dicts(_SERVER_KEYWORDS, [])  # as introspect prints them
@@ -1152,59 +754,39 @@ async def normalize_snapshot(conn: Connection, snapshot: Snapshot) -> Snapshot:
 async def _normalize_constraint_expressions(
     table: TableSnap, like: str, norm: str, rel: str, read_back: _ReadBack
 ) -> None:
-    """CHECK and exclusion expressions as PostgreSQL prints them.
+    """CHECK expressions as PostgreSQL prints them.
 
-    A CHECK written by hand (``status <> ''``) reads back as ``(status <> ''::text)``, and
-    a hand-written exclusion predicate gains its outer parentheses and casts. Without this
-    ``generate`` after ``pull`` (or a hand-written constraint) drops and re-adds it forever.
-    All the table's constraints are created in one savepoint, then read back together.
+    A CHECK written by hand (``status <> ''``) reads back as ``(status <> ''::text)``.
+    Without this ``generate`` after ``pull`` (or a hand-written constraint) drops and
+    re-adds it forever. All the table's checks are created in one savepoint, then read
+    back together.
     """
     checks = {n: c for n, c in table.get("checks", {}).items() if "expression" in c}
-    exclusions = {n: x for n, x in table.get("exclusions", {}).items() if "where" in x}
-    if not checks and not exclusions:
+    if not checks:
         return
     statements = [like]
     for name, check in checks.items():
         add = f"ALTER TABLE {norm} ADD CONSTRAINT {quote(name)} CHECK ({check['expression']})"
         statements.append(add + (" NOT VALID" if check.get("not_valid") else ""))
-    for name, exclusion in exclusions.items():
-        keys: list[str] = []
-        for element in exclusion["elements"]:
-            column = element.get("column")
-            key = quote(column) if column is not None else f"({element.get('expression', '')})"
-            keys.append(f"{key} WITH {element['operator']}")
-        elements = ", ".join(keys)
-        statements.append(
-            f"ALTER TABLE {norm} ADD CONSTRAINT {quote(name)} "
-            f"EXCLUDE USING {exclusion['method']} ({elements}) WHERE ({exclusion['where']})"
-        )
     row = await read_back(
         statements,
         "SELECT "
         "ARRAY(SELECT c.conname FROM pg_constraint c "
         f"WHERE c.conrelid = {rel} AND c.contype = 'c' ORDER BY c.conname) AS check_names, "
         "ARRAY(SELECT pg_get_constraintdef(c.oid) FROM pg_constraint c "
-        f"WHERE c.conrelid = {rel} AND c.contype = 'c' ORDER BY c.conname) AS check_defs, "
-        "ARRAY(SELECT c.conname FROM pg_constraint c "
-        f"WHERE c.conrelid = {rel} AND c.contype = 'x' ORDER BY c.conname) AS excl_names, "
-        "ARRAY(SELECT pg_get_expr(i.indpred, i.indrelid) FROM pg_constraint c "
-        "JOIN pg_index i ON i.indexrelid = c.conindid "
-        f"WHERE c.conrelid = {rel} AND c.contype = 'x' ORDER BY c.conname) AS excl_wheres",
+        f"WHERE c.conrelid = {rel} AND c.contype = 'c' ORDER BY c.conname) AS check_defs",
     )
     if row is None:
         return
     for name, definition in zip(_strs(row["check_names"]), _strs(row["check_defs"]), strict=True):
         if name in checks:
             checks[name]["expression"] = _check_expression(definition)
-    for name, predicate in zip(_strs(row["excl_names"]), _strs(row["excl_wheres"]), strict=True):
-        if name in exclusions:
-            exclusions[name]["where"] = predicate
 
 
 async def _normalize(snapshot: Snapshot, read_back: _ReadBack, version: int) -> None:
     norm = f"pg_temp.{quote(_NORM)}"
     # Looked up when each query runs (a missing object reads as NULL, never as text).
-    rel, proc = f"to_regclass('{norm}')", f"to_regproc('{norm}')"
+    rel = f"to_regclass('{norm}')"
     for view in snapshot.get("views", {}).values():
         create = f"CREATE TEMP VIEW {quote(_NORM)} AS {view['definition']}"
         row = await read_back(
@@ -1222,81 +804,13 @@ async def _normalize(snapshot: Snapshot, read_back: _ReadBack, version: int) -> 
                 f"return (it returns {_strs(row['columns'])})"
             )
 
-    functions = snapshot.get("functions", {})
-    for fn in functions.values():
-        # Settings are printed back; a SQL-standard body is parsed, so it needs the real one.
-        plain = copy.copy(fn)
-        plain.pop("leakproof", None)  # LEAKPROOF needs a superuser
-        options = function_options(plain)
-        body = f"\n{fn['body']}" if sql_standard_body(fn) else " AS $$ $$"
-        create = (
-            f"CREATE FUNCTION {norm}({fn['args']}) RETURNS {fn['returns']} "
-            f"LANGUAGE {type_ident(fn['language'])}{options}{body}"
-        )
-        row = await read_back(
-            [create],
-            f"SELECT n.nspname AS schema, p.proname AS name, {_FUNCTION_COLUMNS} "
-            "FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace "
-            f"JOIN pg_language l ON l.oid = p.prolang WHERE p.oid = {proc}",
-        )
-        if row is None:
-            continue
-        printed = _function(fn["schema"], fn["name"], row)
-        fn["args"], fn["returns"] = printed["args"], printed["returns"]
-        if "settings" in printed:
-            fn["settings"] = printed["settings"]
-        if row["definition"] is not None:
-            fn["body"] = printed["body"]
-    if functions:  # keyed by the arguments as printed
-        snapshot["functions"] = {function_key(f): f for f in functions.values()}
-
     await _normalize_indexes(snapshot, read_back, version)
     await _normalize_column_expressions(snapshot, read_back, f"to_regclass('{norm}')")
-    await _normalize_grants(snapshot, read_back)
-    await _normalize_domain_checks(snapshot, read_back)
 
     for table in snapshot["tables"].values():
         like = (
             f"CREATE TEMP TABLE {quote(_NORM)} (LIKE {qualified(table['schema'], table['name'])})"
         )
-        if (partition_by := table.get("partition_by")) is not None:
-            # The key as PostgreSQL prints it, so RANGE (at) matches range (at).
-            row = await read_back(
-                [f"{like} PARTITION BY {partition_by}"],
-                f"SELECT pg_get_partkeydef({rel}) AS k",
-            )
-            if row is not None and row["k"] is not None:
-                table["partition_by"] = str(row["k"])
-        if (partitions := table.get("partitions")) and partition_by is not None:
-            # Create each partition (rolled back after) so a timestamptz bound reads back as
-            # the database prints it, not as the user spelled it. Its parent is a temporary
-            # copy: a partition of the real parent would overlap the one already there.
-            # Only the key's columns: a column of a type not created yet failed the whole
-            # copy, and the bound then compared as spelled (B55).
-            keyed = [
-                c for c in table["columns"].values() if _mentions(partition_by, c["name"])
-            ] or list(table["columns"].values())
-            columns = ", ".join(
-                f"{quote(c['name'])} {SERIAL_TYPES.get(c['type'], c['type'])}" for c in keyed
-            )
-            # TEMP first; a role without the TEMP privilege uses its own schema instead,
-            # inside the same rolled-back savepoint (B59).
-            for where, kind in (("pg_temp", "TEMP TABLE"), (table["schema"], "TABLE")):
-                home, part = qualified(where, _NORM), qualified(where, f"{_NORM}_part")
-                parent = f"CREATE {kind} {home} ({columns}) PARTITION BY {partition_by}"
-                done = True
-                for pname, bound in partitions.items():
-                    row = await read_back(
-                        [parent, f"CREATE {kind} {part} PARTITION OF {home} {bound}"],
-                        "SELECT pg_get_expr(c.relpartbound, c.oid) AS b FROM pg_class c "
-                        f"WHERE c.oid = to_regclass({_text(part)})",
-                    )
-                    if row is not None and row["b"] is not None:
-                        partitions[pname] = str(row["b"])
-                    else:
-                        done = False
-                if done:
-                    break
         for policy in table.get("policies", {}).values():
             create = f"CREATE POLICY p ON {norm} FOR {policy['command'].upper()}"
             if policy["using"] is not None:
@@ -1314,21 +828,4 @@ async def _normalize(snapshot: Snapshot, read_back: _ReadBack, version: int) -> 
                     _opt_str(row["using"]),
                     _opt_str(row["with_check"]),
                 )
-        for trigger in table.get("triggers", {}).values():
-            if trigger["when"] is None:
-                continue
-            events = " OR ".join(e.upper() for e in trigger["events"])
-            row = await read_back(
-                [
-                    like,
-                    f"CREATE FUNCTION {norm}() RETURNS trigger LANGUAGE plpgsql "
-                    "AS $$ BEGIN RETURN NULL; END $$",
-                    f"CREATE TRIGGER t {trigger['timing'].upper()} {events} ON {norm} "
-                    f"FOR EACH {trigger['for_each'].upper()} WHEN ({trigger['when']}) "
-                    f"EXECUTE FUNCTION {norm}()",
-                ],
-                f"SELECT pg_get_triggerdef(oid) AS d FROM pg_trigger WHERE tgrelid = {rel}",
-            )
-            if row is not None and row["d"] is not None:
-                trigger["when"] = _trigger_when(str(row["d"]))
         await _normalize_constraint_expressions(table, like, norm, rel, read_back)

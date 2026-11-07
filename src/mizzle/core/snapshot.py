@@ -74,24 +74,6 @@ class CheckSnap(TypedDict):
     not_valid: NotRequired[bool]
 
 
-class ExclusionElementSnap(TypedDict):
-    """One ``key WITH operator`` of an exclusion constraint. ``column`` is the database
-    column name for a plain key; ``expression`` is the SQL text for an expression key."""
-
-    operator: str
-    column: NotRequired[str]
-    expression: NotRequired[str]
-
-
-class ExclusionSnap(TypedDict):
-    name: str
-    method: str  # access method: gist, btree...
-    elements: list[ExclusionElementSnap]
-    where: NotRequired[str]  # WHERE (predicate): only matching rows are checked
-    deferrable: NotRequired[bool]
-    initially_deferred: NotRequired[bool]
-
-
 class ForeignKeySnap(TypedDict):
     name: str
     columns: list[str]
@@ -135,24 +117,6 @@ class PolicySnap(TypedDict):
     with_check: str | None
 
 
-class TriggerSnap(TypedDict):
-    name: str
-    timing: str  # "before", "after" or "instead of"
-    events: list[str]  # of "insert", "delete", "update", "truncate", in that order
-    for_each: str  # "row" or "statement"
-    function: str  # "schema.name" of a function returning trigger
-    when: str | None
-    # Absent unless used, so snapshots written before these fields existed compare equal.
-    columns: NotRequired[list[str]]  # UPDATE OF these columns (sorted)
-    old_table: NotRequired[str]  # REFERENCING OLD TABLE AS ...
-    new_table: NotRequired[str]  # REFERENCING NEW TABLE AS ...
-
-
-# Privileges per role: role name ("public": everyone) -> sorted privileges ("select", ...),
-# or ["all"] as declared (the database lists them one by one).
-type GrantsSnap = dict[str, list[str]]
-
-
 class TableSnap(TypedDict):
     schema: str
     name: str
@@ -165,44 +129,15 @@ class TableSnap(TypedDict):
     # Absent unless used, so snapshots written before these fields existed compare equal.
     rls: NotRequired[RlsSnap]
     policies: NotRequired[dict[str, PolicySnap]]
-    triggers: NotRequired[dict[str, TriggerSnap]]
-    grants: NotRequired[GrantsSnap]
     comment: NotRequired[str]  # COMMENT ON TABLE
     unlogged: NotRequired[bool]  # CREATE UNLOGGED TABLE
     options: NotRequired[dict[str, str]]  # storage parameters: WITH (fillfactor=70)
-    exclusions: NotRequired[dict[str, ExclusionSnap]]
-    # A partitioned table's key (as pg_get_partkeydef() prints it: "RANGE (logged_at)") and
-    # its partitions: name -> bound (as pg_get_expr() prints it).
-    partition_by: NotRequired[str]
-    partitions: NotRequired[dict[str, str]]
 
 
 class EnumSnap(TypedDict):
     schema: str
     name: str
     values: list[str]
-
-
-class DomainSnap(TypedDict):
-    schema: str
-    name: str
-    base_type: str  # as format_type() prints it
-    # Absent when the default, so snapshots written before these fields existed compare equal.
-    not_null: NotRequired[bool]
-    default: NotRequired[str]
-    checks: NotRequired[list[str]]  # CHECK expressions, sorted
-    collation: NotRequired[str]
-
-
-class CompositeFieldSnap(TypedDict):
-    name: str
-    type: str  # as format_type() prints it
-
-
-class CompositeSnap(TypedDict):
-    schema: str
-    name: str
-    fields: list[CompositeFieldSnap]  # in declaration order
 
 
 class RoleSnap(TypedDict):
@@ -213,30 +148,6 @@ class RoleSnap(TypedDict):
     inherit: bool
 
 
-class ExtensionSnap(TypedDict):
-    name: str
-    # Absent: not declared, so whatever the database has is accepted.
-    schema: NotRequired[str]
-    version: NotRequired[str]
-
-
-class FunctionSnap(TypedDict):
-    schema: str
-    name: str
-    args: str  # as pg_get_function_arguments() prints them
-    returns: str
-    language: str
-    body: str  # verbatim
-    volatility: str  # "volatile", "stable" or "immutable"
-    security_definer: bool
-    # Absent when the default, so snapshots written before these fields existed compare equal.
-    strict: NotRequired[bool]
-    leakproof: NotRequired[bool]
-    parallel: NotRequired[str]  # "safe" or "restricted" ("unsafe" is the default)
-    cost: NotRequired[float]  # absent: the language's default
-    settings: NotRequired[dict[str, str]]  # SET name = value (value as SQL)
-
-
 class ViewSnap(TypedDict):
     schema: str
     name: str
@@ -245,8 +156,6 @@ class ViewSnap(TypedDict):
     # The declared columns: only for `pull`; the diff ignores them.
     columns: dict[str, ColumnSnap]
     indexes: NotRequired[dict[str, IndexSnap]]  # materialized views only
-    triggers: NotRequired[dict[str, TriggerSnap]]  # INSTEAD OF triggers (plain views)
-    grants: NotRequired[GrantsSnap]
     # View options (K6); absent when off, so older snapshots compare equal.
     security_invoker: NotRequired[bool]
     security_barrier: NotRequired[bool]
@@ -262,12 +171,8 @@ class Snapshot(TypedDict):
     enums: dict[str, EnumSnap]  # "schema.name" -> enum
     tables: dict[str, TableSnap]  # "schema.name" -> table
     # Absent unless used, so snapshots written before these fields existed compare equal.
-    extensions: NotRequired[dict[str, ExtensionSnap]]  # name -> extension
     roles: NotRequired[dict[str, RoleSnap]]  # name -> role (managed ones only)
-    functions: NotRequired[dict[str, FunctionSnap]]  # function_key() -> function
     views: NotRequired[dict[str, ViewSnap]]  # "schema.name" -> view
-    domains: NotRequired[dict[str, DomainSnap]]  # "schema.name" -> domain
-    composites: NotRequired[dict[str, CompositeSnap]]  # "schema.name" -> composite type
 
 
 def key(schema: str, name: str) -> str:
@@ -287,16 +192,6 @@ def keyword_default(text: str) -> str:
     print it back; anything else unchanged. Snapshots written before this stored them as
     declared, so the diff compares through it too."""
     return text.upper().replace(" ", "") if _KEYWORD_DEFAULT.fullmatch(text) else text
-
-
-def default_cost(language: str) -> float:
-    """PostgreSQL's COST for a function that does not give one."""
-    return 1.0 if language in ("c", "internal") else 100.0
-
-
-def function_key(fn: FunctionSnap) -> str:
-    """Overloads share a name: "schema.name(args)" tells them apart."""
-    return f"{fn['schema']}.{fn['name']}({fn['args']})"
 
 
 def empty_snapshot(dialect: str, id: str = "00000000-0000-0000-0000-000000000000") -> Snapshot:

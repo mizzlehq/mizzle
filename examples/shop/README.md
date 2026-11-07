@@ -5,10 +5,13 @@ reviews. It uses every 0.2 feature in one app, and its tests run it against a st
 replica, PgBouncer, a TLS-only server with odd settings and a pgvector server.
 
 - **Schema** (`shop/schema.py`): enums (one in the `shop_audit` schema), identity and
-  generated columns, `on_update_now()`, numeric, jsonb, arrays, uuid, tsvector, composite
-  keys, checks, partial / expression / GIN / trigram indexes, a view and a materialized
-  view, row-level security with Supabase-style `auth.uid()` and `crud_policy`, a managed
-  role and an existing one, grants, an audit trigger and an `UPDATE OF price` trigger.
+  generated columns, `on_update_now()`, numeric, jsonb, arrays, uuid, `custom("tsvector")`,
+  composite keys, checks, partial / expression / GIN / trigram indexes, a view and a
+  materialized view, row-level security with Supabase-style `auth.uid()` and `crud_policy`,
+  a managed role and an existing one.
+- **Custom migrations** for what mizzle does not manage: `0001_extensions_and_auth`
+  (pg_trgm, pgcrypto and the `auth.uid()` function, before the tables) and
+  `0003_triggers_and_grants` (an audit trigger, an `UPDATE OF price` trigger, grants).
   `shop/vectors.py` adds embeddings (vector, halfvec, sparsevec, HNSW) on servers with
   pgvector.
 - **Two migration sets**: `migrations/` (`mizzle.toml`) and `migrations_vector/`

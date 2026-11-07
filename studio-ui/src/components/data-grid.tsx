@@ -408,6 +408,7 @@ export function DataGrid({ table, readOnly }: { table: TableInfo; readOnly: bool
                       title={formatValue(value)}
                       onDoubleClick={() =>
                         editable &&
+                        !table.read_only?.includes(c.name) &&
                         setEditing({
                           row: i,
                           key: keyOf(table, row),

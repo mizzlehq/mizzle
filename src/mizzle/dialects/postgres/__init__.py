@@ -82,9 +82,6 @@ class PostgresDialect:
     def view_definition(self, query: Node, casing: Casing | None) -> str:
         return ddl.view_definition(query, casing)
 
-    def type_extension(self, sql_type: str) -> str | None:
-        return ddl.type_extension(sql_type)
-
     async def introspect(
         self, conn: Connection, schemas: Sequence[str], roles: Sequence[str] = ()
     ) -> Snapshot:

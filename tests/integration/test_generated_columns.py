@@ -121,7 +121,7 @@ async def test_no_drift_and_pull_round_trip(
 
     source = render_schema_module(live)
     assert "generated_by_default_as_identity(increment=10, start=1000)" in source
-    assert "tsvector().generated_always_as(sql(" in source
+    assert "custom('tsvector').generated_always_as(sql(" in source
     pulled = build_snapshot(load(source, tmp_path, "pulled_gencols"), dialect)
     assert diff(live, pulled) == []  # the database's own expression text, exactly
 

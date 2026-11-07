@@ -13,19 +13,13 @@ from mizzle.core.naming import Casing
 from mizzle.core.schema.column import MISSING, ColumnBase
 from mizzle.core.snapshot import (
     ColumnSnap,
-    CompositeSnap,
-    DomainSnap,
-    ExclusionElementSnap,
-    ExclusionSnap,
     ForeignKeySnap,
-    FunctionSnap,
     GeneratedSnap,
     IdentitySnap,
     IndexSnap,
     PolicySnap,
     RoleSnap,
     TableSnap,
-    TriggerSnap,
     UniqueSnap,
     keyword_default,
     sequence_defaults,
@@ -34,9 +28,7 @@ from mizzle.core.sql.nodes import Node
 from mizzle.core.steps import (
     AddCheck,
     AddColumn,
-    AddDomainChecks,
     AddEnumValue,
-    AddExclusion,
     AddForeignKey,
     AddPrimaryKey,
     AddUnique,
@@ -46,40 +38,24 @@ from mizzle.core.steps import (
     AlterColumnIdentity,
     AlterColumnNullability,
     AlterColumnType,
-    AlterExtension,
     AlterPolicy,
     AlterRole,
     AlterTableStorage,
-    CheckColumnFreed,
-    CreateComposite,
-    CreateDomain,
     CreateEnum,
-    CreateExtension,
-    CreateFunction,
     CreateIndex,
-    CreatePartition,
     CreatePolicy,
     CreateRole,
     CreateSchema,
     CreateTable,
-    CreateTrigger,
     CreateView,
     DropColumn,
-    DropComposite,
     DropConstraint,
-    DropDomain,
-    DropDomainChecks,
     DropEnum,
-    DropExtension,
-    DropFunction,
     DropIndex,
-    DropPartition,
     DropPolicy,
     DropRole,
     DropTable,
-    DropTrigger,
     DropView,
-    GrantPrivileges,
     RenameColumn,
     RenameConstraint,
     RenameIndex,
@@ -188,27 +164,6 @@ def requote_type(text: str, server_keywords: frozenset[str]) -> str:
     return f"{quote(schema) if schema in stale else schema}.{name}{dims}"
 
 
-# One printed function argument: [mode] [name] type [DEFAULT expr].
-_ARG = re.compile(
-    rf"(?P<head>(?:(?:IN|OUT|INOUT|VARIADIC) )?(?:(?:{_IDENT_PART}) )?)"
-    rf"(?P<type>{_TYPE_PATH.pattern})(?P<tail>(?: DEFAULT .*)?)",
-    re.DOTALL,
-)
-
-
-def requote_args(args: str, server_keywords: frozenset[str]) -> str:
-    """pg_get_function_arguments() text with each argument's type requoted (K4-25)."""
-
-    def one(arg: str) -> str:
-        match = _ARG.fullmatch(arg)
-        if match is None:  # a type of several words: never a keyword
-            return arg
-        tail = requote_casts(match["tail"], server_keywords)
-        return match["head"] + requote_type(match["type"], server_keywords) + tail
-
-    return ", ".join(one(a) for a in _split_args(args))
-
-
 # A string literal or quoted name (kept as is), or the type of a ::cast.
 _CAST = re.compile(rf"""'(?:[^']|'')*'|"(?:[^"]|"")*"|::(?P<type>{_TYPE_PATH.pattern})""")
 
@@ -221,14 +176,6 @@ def requote_casts(text: str, server_keywords: frozenset[str]) -> str:
         return match[0] if cast_type is None else "::" + requote_type(cast_type, server_keywords)
 
     return _CAST.sub(one, text)
-
-
-def requote_returns(returns: str, server_keywords: frozenset[str]) -> str:
-    """pg_get_function_result() text with its types requoted (K4-25)."""
-    if returns.startswith("TABLE(") and returns.endswith(")"):
-        return f"TABLE({requote_args(returns[6:-1], server_keywords)})"
-    setof = "SETOF " if returns.startswith("SETOF ") else ""
-    return setof + requote_type(returns.removeprefix(setof), server_keywords)
 
 
 def normalize_type(sql_type: str) -> str:
@@ -419,44 +366,6 @@ def _deferred(snap: Mapping[str, object]) -> str:
     return " DEFERRABLE" if snap.get("deferrable") else ""
 
 
-def _exclusion_key(e: ExclusionElementSnap) -> str:
-    column = e.get("column")
-    return quote(column) if column is not None else e.get("expression", "")
-
-
-# An operator is made of PostgreSQL's operator characters, or names one with the
-# ``OPERATOR(schema.op)`` form. Anything else (a `;`, a `)`, a quote) is rejected, and so is
-# `--` / `/*` / `*/`, which PostgreSQL would read as the start of a comment, not an operator
-# (B24).
-_OPERATOR_SYMBOL = "+-*/<>=~!@#%^&|`?"
-_EXCLUSION_OPERATOR = re.compile(
-    rf"(?:[{re.escape(_OPERATOR_SYMBOL)}]+\Z"
-    rf"|OPERATOR\([A-Za-z_][A-Za-z0-9_]*\."
-    rf"(?:[{re.escape(_OPERATOR_SYMBOL)}]+|[A-Za-z_][A-Za-z0-9_]*)\)\Z)",
-    re.IGNORECASE,
-)
-_COMMENT_START = re.compile(r"--|/\*|\*/")
-_EXCLUSION_METHOD = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
-
-
-def _exclusion_fragment(excl: ExclusionSnap) -> str:
-    keys = ", ".join(
-        f"{_exclusion_key(e)} WITH {_exclusion_operator(e['operator'])}" for e in excl["elements"]
-    )
-    if not _EXCLUSION_METHOD.fullmatch(excl["method"]):
-        raise SchemaError(f"invalid exclusion method {excl['method']!r}")
-    text = f"EXCLUDE USING {excl['method']} ({keys})"
-    if where := excl.get("where"):
-        text += f" WHERE ({where})"
-    return text + _deferred(excl)
-
-
-def _exclusion_operator(operator: str) -> str:
-    if not _EXCLUSION_OPERATOR.fullmatch(operator) or _COMMENT_START.search(operator):
-        raise SchemaError(f"invalid exclusion operator {operator!r}")
-    return operator
-
-
 def _create_table(table: TableSnap) -> str:
     lines = [column_definition(c) for c in table["columns"].values()]
     if pk := table["primary_key"]:
@@ -469,10 +378,6 @@ def _create_table(table: TableSnap) -> str:
         for u in table["uniques"].values()
     ]
     lines += [
-        f"CONSTRAINT {quote(e['name'])} {_exclusion_fragment(e)}"
-        for e in table.get("exclusions", {}).values()
-    ]
-    lines += [
         f"CONSTRAINT {quote(c['name'])} CHECK ({c['expression']})"
         for c in table["checks"].values()
         if not c.get("not_valid")  # NOT VALID is only valid on ALTER TABLE ADD CONSTRAINT
@@ -480,8 +385,6 @@ def _create_table(table: TableSnap) -> str:
     body = ",\n    ".join(lines)
     kind = "CREATE UNLOGGED TABLE" if table.get("unlogged") else "CREATE TABLE"
     text = f"{kind} {qualified(table['schema'], table['name'])} (\n    {body}\n)"
-    if partition_by := table.get("partition_by"):
-        text += f" PARTITION BY {partition_by}"
     if options := table.get("options"):
         text += " WITH (" + ", ".join(_storage_option(k, v) for k, v in options.items()) + ")"
     return text
@@ -657,25 +560,6 @@ def _alter_type(step: AlterColumnType) -> str:
     return text if step.generated else f"{text} USING {cast}"
 
 
-def _create_domain(domain: DomainSnap) -> str:
-    parts = [
-        f"CREATE DOMAIN {qualified(domain['schema'], domain['name'])} AS {domain['base_type']}"
-    ]
-    if collation := domain.get("collation"):
-        parts.append(f"COLLATE {type_ident(collation)}")
-    if default := domain.get("default"):
-        parts.append(f"DEFAULT {default_sql(default)}")
-    if domain.get("not_null"):
-        parts.append("NOT NULL")
-    parts.extend(f"CHECK ({check})" for check in domain.get("checks", []))
-    return " ".join(parts)
-
-
-def _create_composite(composite: CompositeSnap) -> str:
-    fields = ", ".join(f"{quote(f['name'])} {f['type']}" for f in composite["fields"])
-    return f"CREATE TYPE {qualified(composite['schema'], composite['name'])} AS ({fields})"
-
-
 def render_step(step: Step) -> Statement:
     def alter(schema: str, table: str, action: str) -> Statement:
         return Statement(f"ALTER TABLE {qualified(schema, table)} {action}")
@@ -703,39 +587,8 @@ def render_step(step: Step) -> Statement:
             return Statement(text, transactional=False)
         case DropEnum(schema=schema, name=name):
             return Statement(f"DROP TYPE {qualified(schema, name)}")
-        case CreateDomain(domain=domain):
-            return Statement(_create_domain(domain))
-        case DropDomain(schema=schema, name=name):
-            return Statement(f"DROP DOMAIN {qualified(schema, name)}")
-        case DropDomainChecks(schema=schema, name=name):
-            target = qualified(schema, name)
-            drop = f"ALTER DOMAIN {target} DROP CONSTRAINT %I"
-            return Statement(
-                f"DO $mizzle$ DECLARE c name; BEGIN\nALTER DOMAIN {target} DROP DEFAULT;\n"
-                "FOR c IN SELECT conname FROM pg_constraint WHERE contype = 'c' "
-                f"AND contypid = {_literal(target)}::regtype LOOP\n"
-                f"EXECUTE format({_literal(drop)}, c);\nEND LOOP;\nEND $mizzle$"
-            )
-        case AddDomainChecks(domain=domain):
-            target = qualified(domain["schema"], domain["name"])
-            changes = [f"ADD CHECK ({check})" for check in domain.get("checks", [])]
-            if default := domain.get("default"):
-                changes.insert(0, f"SET DEFAULT {default_sql(default)}")
-            body = "".join(f"ALTER DOMAIN {target} {a};\n" for a in changes)
-            return Statement(f"DO {_dollar_quote(f'BEGIN\n{body}END')}")
-        case CreateComposite(composite=composite):
-            return Statement(_create_composite(composite))
-        case DropComposite(schema=schema, name=name):
-            return Statement(f"DROP TYPE {qualified(schema, name)}")
         case CreateTable(table=table):
             return Statement(_create_table(table))
-        case CreatePartition(schema=schema, parent=parent, name=name, bound=bound):
-            return Statement(
-                f"CREATE TABLE {qualified(schema, name)} PARTITION OF "
-                f"{qualified(schema, parent)} {bound}"
-            )
-        case DropPartition(schema=schema, name=name):
-            return Statement(f"DROP TABLE {qualified(schema, name)}")
         case DropTable(schema=schema, name=name):
             return Statement(f"DROP TABLE {qualified(schema, name)}")
         case RenameTable(schema=schema, old=old, new=new):
@@ -759,8 +612,6 @@ def render_step(step: Step) -> Statement:
             return alter(schema, table, f"ADD COLUMN {column_definition(column)}")
         case DropColumn(schema=schema, table=table, name=name):
             return alter(schema, table, f"DROP COLUMN {quote(name)}")
-        case CheckColumnFreed(schema=schema, table=table, name=name):
-            return Statement(_check_column_freed(schema, table, name))
         case RenameColumn(schema=schema, table=table, old=old, new=new):
             return alter(schema, table, f"RENAME COLUMN {quote(old)} TO {quote(new)}")
         case AlterColumnType():
@@ -801,12 +652,6 @@ def render_step(step: Step) -> Statement:
                 table,
                 f"ADD CONSTRAINT {quote(c['name'])} CHECK ({c['expression']}){not_valid}",
             )
-        case AddExclusion(schema=schema, table=table, exclusion=excl):
-            return alter(
-                schema,
-                table,
-                f"ADD CONSTRAINT {quote(excl['name'])} {_exclusion_fragment(excl)}",
-            )
         case AddForeignKey(schema=schema, table=table, foreign_key=fk):
             return alter(schema, table, f"ADD {_foreign_key(fk)}")
         case DropConstraint(schema=schema, table=table, name=name):
@@ -832,24 +677,6 @@ def render_step(step: Step) -> Statement:
             return Statement(f"ALTER ROLE {quote(role['name'])} {_role_options(role)}")
         case DropRole(name=name):
             return Statement(f"DROP ROLE IF EXISTS {quote(name)}")
-        case CreateExtension(extension=ext):
-            text = f"CREATE EXTENSION IF NOT EXISTS {type_ident(ext['name'])}"
-            if "schema" in ext:
-                text += f" SCHEMA {quote(ext['schema'])}"
-            if "version" in ext:
-                text += f" VERSION {_literal(ext['version'])}"
-            return Statement(text)
-        case AlterExtension(name=name, schema=schema, version=version):
-            action = (
-                f"SET SCHEMA {quote(schema)}" if schema else f"UPDATE TO {_literal(version or '')}"
-            )
-            return Statement(f"ALTER EXTENSION {type_ident(name)} {action}")
-        case DropExtension(name=name):
-            return Statement(f"DROP EXTENSION IF EXISTS {type_ident(name)}")
-        case CreateFunction(function=fn):
-            return Statement(_create_function(fn))
-        case DropFunction(schema=schema, name=name, args=args):
-            return Statement(f"DROP FUNCTION {qualified(schema, name)}({_without_defaults(args)})")
         case CreateView(view=view):
             kind = "MATERIALIZED VIEW" if view["materialized"] else "VIEW"
             name = qualified(view["schema"], view["name"])
@@ -890,22 +717,6 @@ def render_step(step: Step) -> Statement:
             )
         case DropPolicy(schema=schema, table=table, name=name):
             return Statement(f"DROP POLICY {quote(name)} ON {qualified(schema, table)}")
-        case CreateTrigger(schema=schema, table=table, trigger=trigger, replace=replace):
-            return Statement(_create_trigger(schema, table, trigger, replace))
-        case DropTrigger(schema=schema, table=table, name=name):
-            return Statement(f"DROP TRIGGER {quote(name)} ON {qualified(schema, table)}")
-        case GrantPrivileges(
-            schema=schema, table=table, role=role, privileges=privileges, revoke=revoke
-        ):
-            what = ", ".join(p.upper() for p in privileges)
-            on = qualified(schema, table)
-            if revoke:
-                return Statement(f"REVOKE {what} ON {on} FROM {_role(role)}")
-            return Statement(f"GRANT {what} ON {on} TO {_role(role)}")
-        case SaveGrants(schema=schema, name=name, args=str() as args):
-            return Statement(_save_function_grants(schema, name, args))
-        case RestoreGrants(schema=schema, name=name, args=str() as args):
-            return Statement(_restore_function_grants(schema, name, args))
         case SaveGrants(schema=schema, name=name):
             return Statement(_save_grants(qualified(schema, name)))
         case RestoreGrants(schema=schema, name=name, materialized=materialized):
@@ -913,15 +724,6 @@ def render_step(step: Step) -> Statement:
             return Statement(_restore_grants(qualified(schema, name), kind))
         case _:
             raise MigrationError(f"PostgreSQL cannot render {type(step).__name__}")
-
-
-def _dollar_quote(body: str) -> str:
-    tag = "$mizzle$"
-    n = 0
-    while tag in body:
-        n += 1
-        tag = f"$mizzle{n}$"
-    return f"{tag}{body}{tag}"
 
 
 _SAVED = "pg_temp.__mizzle_saved"
@@ -968,154 +770,6 @@ def _restore_grants(name: str, kind: str) -> str:
     )
 
 
-def _check_column_freed(schema: str, table: str, column: str) -> str:
-    rel = _literal(qualified(schema, table))
-    where = f"{table}.{column}"
-    return (
-        "DO $mizzle$ BEGIN\n"
-        "IF EXISTS (SELECT FROM pg_depend d JOIN pg_attribute a "
-        "ON a.attrelid = d.objid AND a.attnum = d.objsubid "
-        f"WHERE d.classid = 'pg_class'::regclass AND d.objid = {rel}::regclass "
-        f"AND a.attname = {_literal(column)} AND d.refclassid = 'pg_proc'::regclass) THEN\n"
-        "  RAISE EXCEPTION '%', "
-        + _literal(
-            f"PostgreSQL 14 keeps {where} tied to the function its expression called after "
-            "DROP EXPRESSION, so dropping that function would drop the column and its data. "
-            "Write a custom migration: copy the column to a new one, or upgrade to "
-            "PostgreSQL 15 or later."
-        )
-        + ";\n"
-        "END IF;\n"
-        "END $mizzle$"
-    )
-
-
-def _function_ref(schema: str, name: str, args: str) -> tuple[str, str]:
-    """The signature as DROP/ALTER/GRANT take it, and the key it is saved under."""
-    signature = f"{qualified(schema, name)}({_without_defaults(args)})"
-    return signature, _literal(f"function {signature}")
-
-
-def _save_function_grants(schema: str, name: str, args: str) -> str:
-    """``_save_grants`` for a function about to be dropped and created again. A new
-    function can be run by PUBLIC and is owned by its creator, so a SECURITY DEFINER
-    function would come back runnable by everyone. ALTER FUNCTION takes the signature the
-    way DROP FUNCTION does (argument names, modes), so a rename finds the one function it
-    means; its row is read under that name, then the name is put back."""
-    signature, saved = _function_ref(schema, name, args)
-    tmp = "__mizzle_saving"
-    moved = f"{qualified(schema, tmp)}({_without_defaults(args)})"
-    return (
-        "DO $mizzle$ DECLARE f record; BEGIN\n"
-        "CREATE TEMP TABLE IF NOT EXISTS __mizzle_saved "
-        "(rel text PRIMARY KEY, acl aclitem[], owner oid, comment text);\n"
-        f"EXECUTE {_literal(f'ALTER FUNCTION {signature} RENAME TO {quote(tmp)}')};\n"
-        "SELECT p.proacl AS acl, p.proowner AS owner, "
-        "obj_description(p.oid, 'pg_proc') AS comment INTO STRICT f FROM pg_proc p "
-        f"WHERE p.pronamespace = {_literal(quote(schema))}::regnamespace "
-        f"AND p.proname = {_literal(tmp)};\n"
-        f"EXECUTE {_literal(f'ALTER FUNCTION {moved} RENAME TO {quote(name)}')};\n"
-        f"INSERT INTO {_SAVED} VALUES ({saved}, f.acl, f.owner, f.comment)\n"
-        "ON CONFLICT (rel) DO UPDATE SET acl = EXCLUDED.acl, owner = EXCLUDED.owner, "
-        "comment = EXCLUDED.comment;\n"
-        "END $mizzle$"
-    )
-
-
-def _restore_function_grants(schema: str, name: str, args: str) -> str:
-    signature, saved = _function_ref(schema, name, args)
-    target = _literal(signature)
-    return (
-        "DO $mizzle$ DECLARE s record; a record; BEGIN\n"
-        "IF to_regclass('pg_temp.__mizzle_saved') IS NULL THEN RETURN; END IF;\n"
-        f"SELECT * INTO s FROM {_SAVED} WHERE rel = {saved};\n"
-        "IF NOT FOUND THEN RETURN; END IF;\n"
-        # Created just now, so owned by the current user.
-        "IF s.owner <> (SELECT oid FROM pg_roles WHERE rolname = current_user) THEN\n"
-        f"  EXECUTE format('ALTER FUNCTION %s OWNER TO %I', {target}, "
-        "pg_get_userbyid(s.owner));\n"
-        "END IF;\n"
-        # NULL is the default (PUBLIC may run it), which the new function has already.
-        "IF s.acl IS NOT NULL THEN\n"
-        f"  EXECUTE format('REVOKE ALL ON FUNCTION %s FROM PUBLIC', {target});\n"
-        "  FOR a IN SELECT * FROM aclexplode(s.acl) WHERE grantee <> s.owner LOOP\n"
-        "    EXECUTE format('GRANT %s ON FUNCTION %s TO %s%s', a.privilege_type, "
-        f"{target}, CASE WHEN a.grantee = 0 THEN 'PUBLIC' "
-        "ELSE quote_ident(pg_get_userbyid(a.grantee)) END, "
-        "CASE WHEN a.is_grantable THEN ' WITH GRANT OPTION' ELSE '' END);\n"
-        "  END LOOP;\n"
-        "END IF;\n"
-        "IF s.comment IS NOT NULL THEN\n"
-        f"  EXECUTE format('COMMENT ON FUNCTION %s IS %L', {target}, s.comment);\n"
-        "END IF;\n"
-        f"DELETE FROM {_SAVED} WHERE rel = {saved};\n"
-        "END $mizzle$"
-    )
-
-
-def _split_args(args: str) -> list[str]:
-    """Function arguments split on their top-level commas."""
-    parts: list[str] = []
-    depth, start, quote_char = 0, 0, ""
-    for i, ch in enumerate(args + ","):
-        if quote_char:
-            quote_char = "" if ch == quote_char else quote_char
-        elif ch in "'\"":
-            quote_char = ch
-        elif ch in "([":
-            depth += 1
-        elif ch in ")]":
-            depth -= 1
-        elif depth == 0 and ch == ",":
-            parts.append(args[start:i].strip())
-            start = i + 1
-    return [p for p in parts if p]
-
-
-def _without_defaults(args: str) -> str:
-    """Function arguments as DROP FUNCTION takes them: ``a integer DEFAULT 1`` -> ``a integer``."""
-    return ", ".join(re.split(r" DEFAULT | = ", p, maxsplit=1)[0] for p in _split_args(args))
-
-
-# A SQL-standard body (PostgreSQL 14+): written as is, not as a string.
-_SQL_BODY = re.compile(r"\s*(?:RETURN\b|BEGIN\s+ATOMIC\b)", re.IGNORECASE)
-
-
-def sql_standard_body(fn: FunctionSnap) -> bool:
-    return fn["language"] == "sql" and _SQL_BODY.match(fn["body"]) is not None
-
-
-def function_options(fn: FunctionSnap) -> str:
-    """Everything after ``LANGUAGE x`` and before the body."""
-    text = ""
-    if fn["volatility"] != "volatile":
-        text += f" {fn['volatility'].upper()}"
-    if fn.get("strict"):
-        text += " STRICT"
-    if fn["security_definer"]:
-        text += " SECURITY DEFINER"
-    if fn.get("leakproof"):
-        text += " LEAKPROOF"
-    if parallel := fn.get("parallel"):
-        text += f" PARALLEL {parallel.upper()}"
-    if (cost := fn.get("cost")) is not None:
-        text += f" COST {cost:g}"
-    for setting, value in fn.get("settings", {}).items():
-        text += f" SET {setting} = {value}"
-    return text
-
-
-def _create_function(fn: FunctionSnap) -> str:
-    text = (
-        f"CREATE OR REPLACE FUNCTION {qualified(fn['schema'], fn['name'])}({fn['args']}) "
-        f"RETURNS {fn['returns']} LANGUAGE {type_ident(fn['language'])}"
-    )
-    text += function_options(fn)
-    if sql_standard_body(fn):
-        return f"{text}\n{fn['body']}"
-    return f"{text} AS {_dollar_quote(fn['body'])}"
-
-
 def _role(name: str) -> str:
     return "PUBLIC" if name == "public" else quote(name)
 
@@ -1129,55 +783,5 @@ def _policy_body(policy: PolicySnap) -> str:
     return text
 
 
-def trigger_events(trigger: TriggerSnap) -> str:
-    """``INSERT OR UPDATE OF a, b``."""
-    events: list[str] = []
-    for event in trigger["events"]:
-        if event == "update" and (columns := trigger.get("columns")):
-            events.append(f"UPDATE OF {_columns(columns)}")
-        else:
-            events.append(event.upper())
-    return " OR ".join(events)
-
-
-def _create_trigger(schema: str, table: str, trigger: TriggerSnap, replace: bool) -> str:
-    fn_schema, _, fn_name = trigger["function"].partition(".")
-    text = (
-        f"CREATE {'OR REPLACE ' if replace else ''}TRIGGER {quote(trigger['name'])} "
-        f"{trigger['timing'].upper()} {trigger_events(trigger)} ON {qualified(schema, table)}"
-    )
-    referencing = [
-        f"{side} TABLE AS {quote(name)}"
-        for side, name in (("OLD", trigger.get("old_table")), ("NEW", trigger.get("new_table")))
-        if name is not None
-    ]
-    if referencing:
-        text += f" REFERENCING {' '.join(referencing)}"
-    text += f" FOR EACH {trigger['for_each'].upper()}"
-    if trigger["when"] is not None:
-        text += f" WHEN ({trigger['when']})"
-    return f"{text} EXECUTE FUNCTION {qualified(fn_schema, fn_name)}()"
-
-
-# Column types that need an extension, and the extension.
-_EXTENSION_TYPES = re.compile(r"(?:vector|halfvec|sparsevec)(?:\(\d+\))?(?:\[\])*")
-
-
-def type_extension(sql_type: str) -> str | None:
-    return "vector" if _EXTENSION_TYPES.fullmatch(sql_type) else None
-
-
 def render(steps: Sequence[Step]) -> list[Statement]:
-    statements: list[Statement] = []
-    for step in steps:
-        # The schema an extension goes into may hold nothing else, so nothing created it.
-        match step:
-            case (
-                CreateExtension(extension={"schema": str(schema)})
-                | AlterExtension(schema=str(schema))
-            ):
-                statements.append(render_step(CreateSchema(schema)))
-            case _:
-                pass
-        statements.append(render_step(step))
-    return statements
+    return [render_step(step) for step in steps]

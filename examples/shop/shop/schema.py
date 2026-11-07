@@ -3,6 +3,10 @@ write reviews. Inventory, an audit log (in its own schema) and notifications com
 
 Lines marked ``# v2`` are the second schema change (see tests/test_migrations.py): the
 test rebuilds version 1 from them to replay both migrations from zero.
+
+What mizzle does not manage (extensions, the auth.uid() helper, the audit and price
+triggers and their functions, grants) lives in hand-written custom migrations:
+migrations/0001_extensions_and_auth and migrations/0003_triggers_and_grants.
 """
 
 import enum
@@ -18,9 +22,6 @@ from mizzle import (
     check,
     count,
     eq,
-    extension,
-    function,
-    grant,
     index,
     lower,
     many,
@@ -31,7 +32,6 @@ from mizzle import (
     role,
     sql,
     sum_,
-    trigger,
     unique,
     unique_index,
 )
@@ -39,6 +39,7 @@ from mizzle.pg import (
     array,
     bigint,
     boolean,
+    custom,
     integer,
     jsonb,
     numeric,
@@ -47,7 +48,6 @@ from mizzle.pg import (
     smallint,
     text,
     timestamp,
-    tsvector,
     uuid,
     varchar,
 )
@@ -61,19 +61,6 @@ DETAILS = "details"  # v2 (v1: details => description)
 SHOP_AUTH = role("shop_authenticated", existing=True)
 # Support staff: created and kept in sync by migrations.
 SHOP_SUPPORT = role("shop_support", inherit=True)
-
-trgm = extension("pg_trgm")
-pgcrypto = extension("pgcrypto")
-
-# Supabase's auth.uid(): the "sub" claim of the request's JWT (set per transaction).
-auth_uid_fn = function(
-    "uid",
-    schema="auth",
-    returns="uuid",
-    language="sql",
-    volatility="stable",
-    body="SELECT nullif(current_setting('request.jwt.claims', true)::jsonb ->> 'sub', '')::uuid",
-)
 
 
 class UserRole(enum.StrEnum):
@@ -149,7 +136,7 @@ class Products(Table, name="products"):
     tags = array(text()).not_null().default(sql("'{}'::text[]"))
     attrs = jsonb[dict[str, Any]]().not_null().default(sql("'{}'::jsonb"))
     active = boolean().not_null().default(True)
-    search = tsvector().generated_always_as(
+    search = custom("tsvector").generated_always_as(
         sql(
             "setweight(to_tsvector('english', name), 'A') || "
             f"setweight(to_tsvector('english', coalesce({DETAILS}, '')), 'B')"
@@ -170,7 +157,7 @@ class Products(Table, name="products"):
             check("products_price_positive", sql("price >= 0")),
             index("products_search_idx").using("gin").on(cls.search),
             index("products_tags_idx").using("gin").on(cls.tags),
-            index("products_name_trgm_idx").using("gin", "gin_trgm_ops").on(cls.name),
+            index("products_name_trgm_idx").using("gin", "gin_trgm_ops").on(cls.name),  # pg_trgm
             index("products_active_store_idx").on(cls.store_id).where(sql("active")),
         ]
 
@@ -218,7 +205,6 @@ class Orders(Table, name="orders"):
         return [
             index("orders_user_placed_idx").on(cls.user_id, cls.placed_at),
             index("orders_open_idx").on(cls.store_id).where(sql("status IN ('pending', 'paid')")),
-            grant("select", to=[SHOP_AUTH]),
             rls(),  # v2
             owner,  # v2
         ]
@@ -271,7 +257,6 @@ class Reviews(Table, name="reviews"):
             unique(cls.product_id, cls.user_id),
             check("reviews_rating_range", sql("rating BETWEEN 1 AND 5")),
             rls(),
-            grant(["select", "insert", "update", "delete"], to=[SHOP_AUTH]),
             *crud_policy(
                 "reviews_owner", to=[SHOP_AUTH], read=True, modify=eq(cls.user_id, auth_uid())
             ),
@@ -293,8 +278,6 @@ class Notifications(Table, name="notifications"):
         return [
             index("notifications_unread_idx").on(cls.user_id).where(sql("read_at IS NULL")),
             rls(force=True),
-            grant(["select", "update"], to=[SHOP_AUTH]),
-            grant("select", to=[SHOP_SUPPORT]),
             policy("notifications_own", to=[SHOP_AUTH], using=eq(cls.user_id, auth_uid())),
             policy("notifications_support", for_="select", to=[SHOP_SUPPORT], using=sql("true")),
         ]
@@ -313,10 +296,7 @@ class AuditLog(Table, name="audit_log", schema=AUDIT):
     @classmethod
     @override
     def config(cls) -> list[Constraint]:
-        return [
-            index("audit_log_row_idx").on(cls.table_name, cls.row_id),
-            grant("select", to=[SHOP_SUPPORT]),
-        ]
+        return [index("audit_log_row_idx").on(cls.table_name, cls.row_id)]
 
 
 # -- views ----------------------------------------------------------------------------
@@ -342,11 +322,6 @@ class ProductRatings(View, name="product_ratings"):
             .from_(Reviews)
             .group_by(Reviews.product_id)
         )
-
-    @classmethod
-    @override
-    def config(cls) -> list[Constraint]:
-        return [grant("select", to=[SHOP_AUTH])]
 
 
 @final
@@ -391,63 +366,6 @@ class TopProducts(View, name="top_products"):
 
 # v2-only:end
 
-
-# -- functions and triggers -----------------------------------------------------------
-
-log_change = function(
-    "log_change",
-    schema=AUDIT,
-    returns="trigger",
-    security_definer=True,
-    settings={"search_path": "pg_catalog, pg_temp"},
-    body="""
-BEGIN
-  INSERT INTO shop_audit.audit_log (table_name, action, row_id, data)
-  VALUES (
-    TG_TABLE_NAME,
-    lower(TG_OP)::shop_audit.audit_action,
-    CASE WHEN TG_OP = 'DELETE' THEN OLD.id::text ELSE NEW.id::text END,
-    CASE WHEN TG_OP = 'DELETE' THEN to_jsonb(OLD) ELSE to_jsonb(NEW) END
-  );
-  RETURN NULL;
-END
-""",
-)
-orders_audit = trigger(
-    "orders_audit",
-    on=Orders,
-    execute=log_change,
-    timing="after",
-    events=["insert", "update", "delete"],
-)
-stores_audit = trigger(
-    "stores_audit", on=Stores, execute=log_change, timing="after", events=["insert", "delete"]
-)
-
-price_changed = function(
-    "price_changed",
-    returns="trigger",
-    body="""
-BEGIN
-  PERFORM pg_notify('shop_price', json_build_object(
-    'product_id', NEW.id, 'old', OLD.price, 'new', NEW.price)::text);
-  INSERT INTO notifications (user_id, kind, payload)
-  SELECT s.owner_id, 'price_changed',
-         jsonb_build_object('product_id', NEW.id, 'old', OLD.price, 'new', NEW.price)
-  FROM stores s WHERE s.id = NEW.store_id;
-  RETURN NULL;
-END
-""",
-)
-products_price_changed = trigger(
-    "products_price_changed",
-    on=Products,
-    execute=price_changed,
-    timing="after",
-    events=["update"],
-    update_of=[Products.price],
-    when=sql("OLD.price IS DISTINCT FROM NEW.price"),
-)
 
 TABLES: list[type[Table]] = [
     Users,

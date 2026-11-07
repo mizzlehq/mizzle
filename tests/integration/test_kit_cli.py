@@ -597,11 +597,11 @@ async def _pull_fresh(project: Path, monkeypatch: pytest.MonkeyPatch) -> None:
 async def test_pull_baseline_checks_every_object_kind(
     project: Path, kit_url: str, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    # K4-1: functions and domains were not checked; a DB missing them only recorded it.
+    # K4-1: views and enums were not checked; a DB missing them only recorded it.
     await execute(
         kit_url,
-        "CREATE DOMAIN posint AS integer CHECK (VALUE > 0); CREATE TABLE t (n posint); "
-        "CREATE FUNCTION one() RETURNS integer LANGUAGE sql AS 'SELECT 1'",
+        "CREATE TYPE mood AS ENUM ('ok'); CREATE TABLE t (n integer);"
+        " CREATE VIEW one AS SELECT 1 AS n",
     )
     await _pull_fresh(project, monkeypatch)
     # K4-18: dry-run on the source database shows the record, not the CREATE statements.
@@ -609,23 +609,23 @@ async def test_pull_baseline_checks_every_object_kind(
     assert await cli("migrate", "--dry-run") == 0
     out = capsys.readouterr().out
     assert "record baseline" in out and "CREATE TABLE" not in out
-    await execute(kit_url, "DROP FUNCTION one()")
+    await execute(kit_url, "DROP VIEW one")
     assert await cli("migrate") == 1
-    assert "missing function" in capsys.readouterr().err
+    assert "missing view" in capsys.readouterr().err
     await execute(kit_url, "DROP SCHEMA public CASCADE; CREATE SCHEMA public")
     assert await cli("migrate") == 0  # nothing there: the baseline runs
-    assert await fetchval(kit_url, "SELECT one()") == 1
+    assert await fetchval(kit_url, "SELECT n FROM one") == 1
 
 
 async def test_pull_baseline_without_tables_runs_on_an_empty_database(
     project: Path, kit_url: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # K4-1: a baseline with no tables, views or enums was recorded on any database.
-    await execute(kit_url, "CREATE FUNCTION one() RETURNS integer LANGUAGE sql AS 'SELECT 1'")
+    await execute(kit_url, "CREATE TYPE mood AS ENUM ('ok')")
     await _pull_fresh(project, monkeypatch)
-    await execute(kit_url, "DROP FUNCTION one()")
+    await execute(kit_url, "DROP TYPE mood")
     assert await cli("migrate") == 0
-    assert await fetchval(kit_url, "SELECT one()") == 1
+    assert await fetchval(kit_url, "SELECT 'ok'::mood::text") == "ok"
 
 
 async def test_crlf_migration_applied_by_an_older_mizzle(
@@ -658,7 +658,8 @@ async def test_non_migration_folders_are_ignored(
 async def test_pull_warns_about_what_it_skips(
     project: Path, kit_url: str, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """(K8) Procedures, standalone sequences, inheritance and column grants are named."""
+    """(K8) What mizzle does not manage is named: procedures, functions, triggers, standalone
+    sequences, inheritance, partitions and grants."""
     conn = await asyncpg.connect(kit_url)
     await conn.execute(
         "CREATE PROCEDURE p_noop() LANGUAGE sql AS 'SELECT 1';"
@@ -666,19 +667,24 @@ async def test_pull_warns_about_what_it_skips(
         "CREATE TABLE base_t (id int); CREATE TABLE child_t () INHERITS (base_t);"
         "GRANT SELECT (id) ON base_t TO public;"
         "CREATE TABLE ev (id int, at date, PRIMARY KEY (id, at)) PARTITION BY RANGE (at);"
-        "CREATE TABLE ev_2026 PARTITION OF ev FOR VALUES FROM ('2026-01-01') TO ('2027-01-01')"
+        "CREATE TABLE ev_2026 PARTITION OF ev FOR VALUES FROM ('2026-01-01') TO ('2027-01-01');"
+        "CREATE FUNCTION f_one() RETURNS int LANGUAGE sql AS 'SELECT 1';"
+        "CREATE DOMAIN posint AS integer CHECK (VALUE > 0)"
     )
     await conn.close()
     assert await cli("pull") == 0
     err = capsys.readouterr().err
-    assert "ev_2026" not in err, err  # written as partition(), its index is no partition (K4-10)
+    assert "ev_2026_pkey" not in err, err  # its index is no partition (K4-10)
     for what in [
         "procedure p_noop()",
+        "function f_one()",
+        "domain posint",
         "sequence s_alone",
         "table inheritance child_t of base_t",
-        "column grant select on base_t(id) to public",
+        "partition ev_2026 of ev",
+        "grants on base_t",
     ]:
-        assert f"warning: pull skips {what}" in err, err
+        assert f"warning: pull skips {what} (not managed by mizzle)" in err, err
 
 
 async def test_pull_update_follows_a_schema_another_app_owns(
@@ -828,20 +834,13 @@ OBJECTS = (
     V1.replace(
         "from mizzle import Table, sql, index",
         "from typing import override\n"
-        "from mizzle import Table, sql, index, eq, View, QueryBuilder, extension, function, "
-        "trigger, policy, rls",
+        "from mizzle import Table, sql, index, eq, View, QueryBuilder, policy, rls",
     ).replace(
         'index("posts_author_idx").on(cls.author_id),',
         'index("posts_author_idx").on(cls.author_id), rls(), '
         'policy("visible", for_="select", using=sql("author_id > 0")),',
     )
     + """
-trgm = extension("pg_trgm")
-lower_name = function(
-    "lower_name", returns="trigger", body="BEGIN NEW.name = lower(NEW.name); RETURN NEW; END"
-)
-users_lower = trigger("users_lower", on=Users, execute=lower_name, events=["insert", "update"])
-
 class Admins(View, name="admins"):
     id = integer()
     email = varchar(255)
@@ -860,7 +859,7 @@ async def test_objects_generate_migrate_push_pull(
     rewrite_schema(project, OBJECTS, monkeypatch)
     assert await cli("generate") == 0
     sql = next(project.glob("migrations/0001_*/migration.sql")).read_text()
-    assert sql.index("CREATE EXTENSION") < sql.index("CREATE TABLE") < sql.index("CREATE VIEW")
+    assert sql.index("CREATE TABLE") < sql.index("CREATE VIEW")
     assert await cli("migrate") == 0
     assert await cli("check") == 0
     assert await cli("generate") == 0
@@ -868,12 +867,12 @@ async def test_objects_generate_migrate_push_pull(
     out = capsys.readouterr().out
     assert "No schema changes." in out and "Database is up to date." in out
 
-    # Change the view query and the function body; drop the unapplied migration once.
-    evolved = OBJECTS.replace("Role.ADMIN", "Role.USER").replace("lower(", "upper(")
+    # Change the view query; drop the unapplied migration once.
+    evolved = OBJECTS.replace("Role.ADMIN", "Role.USER")
     rewrite_schema(project, evolved, monkeypatch)
     assert await cli("generate") == 0
     sql = next(project.glob("migrations/0002_*/migration.sql")).read_text()
-    assert 'DROP VIEW "admins"' in sql and "CREATE OR REPLACE FUNCTION" in sql
+    assert 'DROP VIEW "admins"' in sql
     assert await cli("drop") == 0
     assert await cli("generate") == 0
     assert await cli("migrate") == 0
@@ -888,7 +887,7 @@ async def test_objects_generate_migrate_push_pull(
     monkeypatch.chdir(fresh)
     assert await cli("pull") == 0
     pulled = (fresh / f"{module}.py").read_text()
-    assert "class Admins(View" in pulled and "trigger(" in pulled and "policy(" in pulled
+    assert "class Admins(View" in pulled and "policy(" in pulled
     assert await cli("generate") == 0
     assert await cli("push", "--dry-run") == 0
     out = capsys.readouterr().out
@@ -1720,3 +1719,12 @@ async def test_os_errors_are_clean_cli_errors(
     assert "missing.toml" in capsys.readouterr().err
     assert await cli("typegen", "--out", str(project / "no" / "such" / "dir.py")) == 1
     assert "error:" in capsys.readouterr().err
+
+
+async def test_a_custom_migration_keeps_the_previous_snapshot(project: Path) -> None:
+    # What the tables need (an extension, a function) goes in a custom migration before
+    # them: the schema changes still go into the next generated migration.
+    assert await cli("generate", "--custom", "--name", "setup") == 0
+    assert await cli("generate") == 0
+    [generated] = project.glob("migrations/0002_*/migration.sql")
+    assert "CREATE TABLE" in generated.read_text()

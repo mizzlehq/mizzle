@@ -12,11 +12,8 @@ from mizzle.core.schema.column import MISSING, ColumnBase
 from mizzle.core.schema.constraints import (
     Check,
     Constraint,
-    Exclusion,
     ForeignKey,
-    Grant,
     Index,
-    Partition,
     Policy,
     PrimaryKey,
     RowLevelSecurity,
@@ -34,7 +31,6 @@ class TableInfo:
     comment: str | None = None
     unlogged: bool = False
     storage: dict[str, str] | None = None  # WITH (fillfactor=70, ...)
-    partition_by: str | None = None  # PARTITION BY key, as PostgreSQL prints it
 
 
 def _storage_text(value: str | int | bool) -> str:
@@ -56,7 +52,6 @@ class Table:
         comment: str | None = None,
         unlogged: bool = False,
         storage: Mapping[str, str | int | bool] | None = None,
-        partition_by: str | None = None,
         abstract: bool = False,
         **kwargs: object,
     ) -> None:
@@ -88,7 +83,6 @@ class Table:
             comment,
             unlogged,
             options,
-            partition_by,
         )
 
     @classmethod
@@ -120,9 +114,7 @@ def _constraint_columns(constraint: Constraint) -> tuple[ColumnBase, ...]:
             return tuple(k for k in constraint.columns if isinstance(k, ColumnBase))
         case UniqueConstraint() | PrimaryKey() | ForeignKey():
             return constraint.columns
-        case Exclusion():
-            return tuple(k for k, _ in constraint.elements if isinstance(k, ColumnBase))
-        case Check() | Policy() | RowLevelSecurity() | Grant() | Partition():
+        case Check() | Policy() | RowLevelSecurity():
             return ()
 
 
@@ -201,12 +193,3 @@ def validate_tables(tables: Sequence[type[Table]], casing: Casing | None = None)
                     raise SchemaError(
                         f"{table.__name__}.config() uses {column.qualified_name} from another table"
                     )
-
-        if info.partition_by is None and any(isinstance(c, Partition) for c in constraints):
-            raise SchemaError(
-                f"{table.__name__}: partition(...) needs partition_by=... on the table"
-            )
-        if info.partition_by is not None and not info.partition_by.strip():
-            raise SchemaError(f"{table.__name__}: partition_by cannot be empty")
-        if info.partition_by is not None and info.unlogged:
-            raise SchemaError(f"{table.__name__}: a partitioned table cannot be unlogged")

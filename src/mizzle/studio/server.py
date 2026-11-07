@@ -192,6 +192,10 @@ class Studio:
     read_only: bool
     driver: Driver | None = None
     snapshot: Snapshot | None = field(default=None)
+    # "schema.table" -> column -> the type it behaves as (domains resolved by the server)
+    bases: dict[str, dict[str, str]] = field(default_factory=dict)
+    # "schema.table" -> its composite columns (and arrays of them): read-only in the grid
+    composites: dict[str, list[str]] = field(default_factory=dict)
     history: list[dict[str, object]] = field(default_factory=list)
     saved: dict[str, str] = field(default_factory=dict)
     state_path: Path | None = None
@@ -205,12 +209,19 @@ class Studio:
         if self.snapshot is None or refresh:
             async with self.pool().acquire() as conn:
                 self.snapshot = await self.dialect.introspect(conn, self.schemas)
+                rows = await conn.fetch_dicts(_BASE_TYPES, [self.schemas])
+            self.bases, self.composites = {}, {}
+            for row in rows:
+                k, column = key(str(row["schema"]), str(row["table"])), str(row["name"])
+                self.bases.setdefault(k, {})[column] = str(row["base"])
+                if row["composite"]:
+                    self.composites.setdefault(k, []).append(column)
         return self.snapshot
 
     async def table(
         self, schema: str, name: str, *, fresh: bool = False
     ) -> tuple[TableSnap, dict[str, str]]:
-        """The table and each column's base type (``_base_type``). ``fresh`` re-reads the
+        """The table and each column's base type (``_BASE_TYPES``). ``fresh`` re-reads the
         schema: a write built from a stale snapshot matched rows by a dropped key and cast
         values to a column's old type (S4-3)."""
         snapshot = await self.load_snapshot(refresh=fresh)
@@ -220,7 +231,15 @@ class Studio:
             table = snapshot["tables"].get(key(schema, name))
         if table is None:
             raise StudioError(f"unknown table {schema}.{name}", 404)
-        return table, _base_types(table, snapshot)
+        k = key(schema, name)
+        return table, {
+            c: self.bases.get(k, {}).get(c, t["type"]) for c, t in table["columns"].items()
+        }
+
+    def read_only_columns(self, table: TableSnap) -> list[str]:
+        """Composite columns: the grid shows them, but does not write them (S5-2)."""
+        composites = self.composites.get(key(table["schema"], table["name"]), [])
+        return [c for c in table["columns"] if c in composites]
 
     # -- query history and saved queries ----------------------------------------------
 
@@ -341,15 +360,42 @@ def _as_text(value: object) -> str | None:
     return str(value)
 
 
+# Each column's type as it behaves: a domain resolved to its base type, through domains over
+# domains and arrays of domains (``d[]`` -> ``jsonb[]``), by the server (S5-6). Every
+# type-dependent rule (exact text, CSV signs, key casts, sorting) reads it, so a domain acts
+# like its base type everywhere (S7, S4-1, S4-5, S4-6).
+_BASE_TYPES = """
+WITH RECURSIVE r(rel, name, oid, typmod, dims) AS (
+  SELECT a.attrelid, a.attname::text, a.atttypid, a.atttypmod, 0
+  FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid
+  JOIN pg_namespace n ON n.oid = c.relnamespace
+  WHERE n.nspname = ANY($1::text[]) AND c.relkind IN ('r', 'p')
+    AND a.attnum > 0 AND NOT a.attisdropped
+  UNION ALL
+  SELECT r.rel, r.name,
+         CASE WHEN t.typtype = 'd' THEN t.typbasetype ELSE t.typelem END,
+         CASE WHEN t.typtype = 'd' THEN t.typtypmod ELSE r.typmod END,
+         r.dims + CASE WHEN t.typtype = 'd' THEN 0 ELSE 1 END
+  FROM r JOIN pg_type t ON t.oid = r.oid
+  WHERE t.typtype = 'd' OR t.typcategory = 'A'
+)
+SELECT n.nspname AS schema, c.relname AS table, r.name,
+       format_type(r.oid, r.typmod) || repeat('[]', r.dims) AS base,
+       t.typtype = 'c' AS composite
+FROM r JOIN pg_type t ON t.oid = r.oid
+JOIN pg_class c ON c.oid = r.rel JOIN pg_namespace n ON n.oid = c.relnamespace
+WHERE t.typtype <> 'd' AND t.typcategory <> 'A'
+"""
+
 # A column type that is JSON itself (after domains), not something to_jsonb() turned into JSON.
 _JSON_TYPE = re.compile(r"jsonb?")
 
 
 def _param(params: list[object], column: ColumnSnap, value: object, base: str) -> str:
     if not _JSON_TYPE.fullmatch(base) and isinstance(value, dict | list):
-        # S4-8: an array or composite as the grid has it (to_jsonb's JSON). Its text form
-        # is not the type's input syntax ("[1, 2]"), so the server's own JSON-to-type
-        # conversion reads it back.
+        # S4-8: an array (or a composite in a filter) as the grid has it (to_jsonb's JSON).
+        # Its text form is not the type's input syntax ("[1, 2]"), so the server's own
+        # JSON-to-type conversion reads it back.
         params.append(json.dumps(value))
         return (
             "(SELECT x.v FROM jsonb_to_record(jsonb_build_object("
@@ -458,49 +504,6 @@ def _csv_safe(text: str) -> str:
     # The spreadsheet skips leading whitespace, so " =1+1" and "\n=cmd" are formulas too.
     risky = text.startswith(("\t", "\r")) or text.lstrip().startswith(_FORMULA_LEAD)
     return f"'{text}" if risky else text
-
-
-# A type name as format_type() prints it: ``name``, ``schema.name``, either part quoted,
-# then any array brackets.
-_IDENT = r'(?:"(?:[^"]|"")*"|[^\s".()\[\],]+)'
-_TYPE_NAME = re.compile(rf"({_IDENT})(?:\.({_IDENT}))?((?:\[\])*)")
-
-
-def _unquote(ident: str) -> str:
-    return ident[1:-1].replace('""', '"') if ident.startswith('"') else ident
-
-
-def _base_type(column_type: str, snapshot: Snapshot) -> str:
-    """The type a column behaves as: a domain resolved to its base type, through domains
-    over domains and arrays of domains (``d[]`` -> ``jsonb[]``); any other type unchanged.
-
-    Every type-dependent rule (exact text, CSV signs, key casts, sorting) reads this, so a
-    domain acts like its base type everywhere (S7, S4-1, S4-5, S4-6). The name is parsed,
-    not compared as text: format_type() quotes ``"Mixed Num"`` and qualifies a domain
-    outside the search path."""
-    domains = snapshot.get("domains", {})
-    arrays = ""
-    for _ in range(len(domains)):  # a chain cannot be longer; also stops a cycle
-        match = _TYPE_NAME.fullmatch(column_type)
-        if match is None:
-            break
-        first, second, dims = cast(tuple[str, str | None, str], match.groups())
-        if second is not None:
-            domain = domains.get(key(_unquote(first), _unquote(second)))
-        else:
-            name = _unquote(first)
-            named = [d for d in domains.values() if d["name"] == name]
-            # Unqualified means visible in the search path: public first, else the only one.
-            domain = domains.get(key("public", name)) or (named[0] if len(named) == 1 else None)
-        if domain is None:
-            break
-        arrays += dims
-        column_type = domain["base_type"]
-    return column_type + arrays
-
-
-def _base_types(table: TableSnap, snapshot: Snapshot) -> dict[str, str]:
-    return {name: _base_type(c["type"], snapshot) for name, c in table["columns"].items()}
 
 
 def _cell(value: object, base: str) -> str:
@@ -624,10 +627,12 @@ async def meta(studio: Studio, _request: Request) -> Response:
 async def tables(studio: Studio, _request: Request) -> Response:
     snapshot = await studio.load_snapshot(refresh=True)
     # S4-9: which columns the grid may offer to sort by.
-    listed = [
-        {**t, "unsortable": _unsortable(_base_types(t, snapshot))}
-        for t in snapshot["tables"].values()
-    ]
+    listed: list[dict[str, object]] = []
+    for t in snapshot["tables"].values():
+        _, base = await studio.table(t["schema"], t["name"])
+        listed.append(
+            {**t, "unsortable": _unsortable(base), "read_only": studio.read_only_columns(t)}
+        )
     return JSONResponse({"tables": listed, "enums": snapshot["enums"]})
 
 
@@ -787,6 +792,7 @@ async def insert_row(studio: Studio, request: Request) -> Response:
     _writable(studio)
     table, base = await _table(studio, request, fresh=True)
     values = _object((await _body(request)).get("values", {}), "values")
+    _reject_composites(studio, table, values)
     params: list[object] = []
     target = f"{qualified(table['schema'], table['name'])} AS t"
     if values:
@@ -812,6 +818,7 @@ async def update_row(studio: Studio, request: Request) -> Response:
     values = _object(body.get("values"), "values")
     if not values:
         raise StudioError("values must not be empty")
+    _reject_composites(studio, table, values)
     params: list[object] = []
     match = _key_match(table, base, body.get("key"), params)
     key_params = list(params)  # the key's placeholders come first, so ``match`` reuses them
@@ -830,6 +837,11 @@ async def update_row(studio: Studio, request: Request) -> Response:
     if not rows:
         raise StudioError("row not found", 404)
     return JSONResponse({"row": _row_json(cast(str, rows[0][0]))})
+
+
+def _reject_composites(studio: Studio, table: TableSnap, values: Mapping[str, object]) -> None:
+    if composite := [c for c in studio.read_only_columns(table) if c in values]:
+        raise StudioError(f"{composite[0]} is a composite column: change it with SQL")
 
 
 def _one_row(count: int) -> None:

@@ -105,19 +105,6 @@ class Check:
     not_valid: bool = False  # ADD ... NOT VALID: skip checking existing rows
 
 
-@dataclass(frozen=True)
-class Exclusion:
-    """``EXCLUDE USING method (key WITH operator, ...)``: a generalized unique constraint
-    (ranges that must not overlap: ``(during, "&&")``)."""
-
-    elements: tuple[tuple[ColumnBase | ExprBase, str], ...]
-    name: str | None = None
-    method: str = "gist"
-    predicate: Condition | None = None  # WHERE (...): only rows that match are checked
-    deferrable: bool = False
-    initially_deferred: bool = False
-
-
 type PolicyCommand = Literal["all", "select", "insert", "update", "delete"]
 
 
@@ -163,60 +150,14 @@ class Policy:
     declared_roles: tuple[Role, ...] = ()  # Role objects in ``to``, created by migrations
 
 
-_PRIVILEGES = (
-    "select",
-    "insert",
-    "update",
-    "delete",
-    "truncate",
-    "references",
-    "trigger",
-    "maintain",
-    "all",
-)
-type Privilege = Literal[
-    "select", "insert", "update", "delete", "truncate", "references", "trigger", "maintain", "all"
-]
-
-
-@dataclass(frozen=True)
-class Grant:
-    """``GRANT privileges ON table TO roles``, kept in sync by migrations."""
-
-    privileges: tuple[str, ...]  # sorted; ("all",) for ALL
-    roles: tuple[str, ...]  # sorted; "public" is everyone
-    declared_roles: tuple[Role, ...] = ()  # Role objects in ``to``, created by migrations
-
-
 @dataclass(frozen=True)
 class RowLevelSecurity:
     enabled: bool = True
     force: bool = False  # also for the table owner
 
 
-@dataclass(frozen=True)
-class Partition:
-    """One partition of a partitioned table, declared in ``config()``:
-    ``CREATE TABLE name PARTITION OF parent for_values``. ``for_values`` is the bound as
-    PostgreSQL prints it: ``"FOR VALUES FROM ('2026-01-01') TO ('2027-01-01')"``,
-    ``"FOR VALUES IN ('a', 'b')"``, ``"FOR VALUES WITH (modulus 4, remainder 0)"`` or
-    ``"DEFAULT"``."""
-
-    name: str
-    for_values: str
-
-
 type Constraint = (
-    Index
-    | UniqueConstraint
-    | PrimaryKey
-    | ForeignKey
-    | Check
-    | Exclusion
-    | Policy
-    | RowLevelSecurity
-    | Grant
-    | Partition
+    Index | UniqueConstraint | PrimaryKey | ForeignKey | Check | Policy | RowLevelSecurity
 )
 
 
@@ -274,29 +215,6 @@ def check(name: str, condition: Condition, *, not_valid: bool = False) -> Check:
     return Check(name, condition, not_valid)
 
 
-def exclusion(
-    *elements: tuple[ColumnBase | ExprBase, str],
-    name: str | None = None,
-    using: str = "gist",
-    where: Condition | None = None,
-    deferrable: bool = False,
-    initially_deferred: bool = False,
-) -> Exclusion:
-    """``exclusion((Bookings.during, "&&"), using="gist")``: no two rows may have
-    overlapping ``during`` ranges. Each key is a column or SQL expression and the operator
-    it is compared with (``=``, ``&&``, ``<@``...)."""
-    if not elements:
-        raise SchemaError("exclusion() needs at least one (key, operator) element")
-    return Exclusion(
-        tuple(elements),
-        name,
-        _sql_name("method", using).lower(),
-        where,
-        deferrable,
-        initially_deferred,
-    )
-
-
 def rls(*, enabled: bool = True, force: bool = False) -> RowLevelSecurity:
     """Row-level security on the table; ``force=True`` applies it to the owner too."""
     return RowLevelSecurity(enabled, force)
@@ -320,27 +238,3 @@ def policy(
     # PostgreSQL ignores the other roles when PUBLIC is one of them.
     roles = ("public",) if "public" in names else tuple(sorted(set(names)))
     return Policy(name, for_, roles, using, with_check, as_ == "permissive", managed)
-
-
-def grant(privileges: Privilege | Sequence[Privilege], *, to: Sequence[str | Role]) -> Grant:
-    """``grant(["select", "insert"], to=[reader])`` in a table's or view's ``config()``.
-    Migrations grant what is declared and revoke what was declared before and no longer
-    is; privileges the schema never declared for a role are left alone."""
-    wanted = [privileges] if isinstance(privileges, str) else list(privileges)
-    if not wanted or not to:
-        raise SchemaError("grant() needs at least one privilege and one role")
-    if bad := [p for p in wanted if p not in _PRIVILEGES]:
-        raise SchemaError(f"grant(): unknown privileges {bad}")
-    names = sorted({r.name if isinstance(r, Role) else r for r in to})
-    managed = tuple(r for r in to if isinstance(r, Role) and not r.existing)
-    privs = ("all",) if "all" in wanted else tuple(sorted(set(wanted)))
-    return Grant(privs, tuple(names), managed)
-
-
-def partition(name: str, *, for_values: str) -> Partition:
-    """Declare a partition of the table, which must set ``partition_by=...``. ``for_values``
-    is the bound in PostgreSQL's spelling (see ``Partition``); the partition is created in
-    the table's schema."""
-    if not for_values.strip():
-        raise SchemaError(f"partition {name!r} needs for_values")
-    return Partition(name, for_values.strip())

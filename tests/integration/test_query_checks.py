@@ -1,6 +1,5 @@
 """Round-2 query fixes against a live database: IntEnum labels, JSON null, per-run defaults."""
 
-import datetime
 import enum
 import itertools
 import types
@@ -28,8 +27,6 @@ from mizzle.dialects.postgres.types import (
     lseg,
     numrange,
     path,
-    pg_composite,
-    pg_domain,
     pg_enum,
     point,
     polygon,
@@ -274,57 +271,6 @@ async def test_cte_columns_decode_under_snake_case(driver: PostgresDriver, pg_ur
     finally:
         async with driver.acquire() as conn:
             await conn.execute("DROP TABLE qc_camel; DROP TYPE lvl", [])
-
-
-class Dom(Table, name="qc_dom"):
-    id = serial().primary_key()
-    kids = many(lambda: DomKid)
-
-
-class DomKid(Table, name="qc_dom_kid"):
-    id = serial().primary_key()
-    dom_id = integer().not_null().references(lambda: Dom.id)
-    day = pg_domain("qc_day", datetime.date)
-    at = pg_composite("qc_addr", dict)
-    dom = one(lambda: Dom, fields=lambda: [DomKid.dom_id], references=lambda: [Dom.id])
-
-
-@pytest.fixture
-async def doms(driver: PostgresDriver, pg_url: str) -> AsyncGenerator[Database]:
-    async with driver.acquire() as conn:
-        await conn.execute(
-            "DROP TABLE IF EXISTS qc_dom_kid, qc_dom; DROP DOMAIN IF EXISTS qc_day; "
-            "DROP TYPE IF EXISTS qc_addr; "
-            "CREATE DOMAIN qc_day AS date; CREATE TYPE qc_addr AS (city text, zip int); "
-            "CREATE TABLE qc_dom (id serial PRIMARY KEY); "
-            "CREATE TABLE qc_dom_kid (id serial PRIMARY KEY, "
-            "dom_id int NOT NULL REFERENCES qc_dom, day qc_day, at qc_addr); "
-            "INSERT INTO qc_dom DEFAULT VALUES; "
-            "INSERT INTO qc_dom_kid (dom_id, day, at) VALUES (1, '2026-01-02', ROW('Oslo', 150))",
-            [],
-        )
-    try:
-        async with await Database.connect(pg_url, schema=[Dom, DomKid], pool_size=1) as db:
-            yield db
-    finally:
-        async with driver.acquire() as conn:
-            await conn.execute(
-                "DROP TABLE qc_dom_kid, qc_dom; DROP DOMAIN qc_day; DROP TYPE qc_addr", []
-            )
-
-
-async def test_a_date_domain_decodes(doms: Database) -> None:
-    # Q1: the decoder ran date(date(...)): TypeError on every read.
-    assert await doms.select(DomKid.day).from_(DomKid) == [(datetime.date(2026, 1, 2),)]
-
-
-async def test_a_composite_in_a_nested_row_decodes(doms: Database) -> None:
-    # Q2: the composite came back as a JSON object, which _from_json refused (QueryError).
-    await doms.insert(DomKid).values({"dom_id": 1, "at": {"city": "Bergen", "zip": 5003}})  # Q9
-    plain = await doms.query(DomKid).find_many(order_by=DomKid.id)
-    [parent] = await doms.query(Dom).find_many(with_={"kids": True})
-    assert parent.kids == plain
-    assert plain[0].at == {"city": "Oslo", "zip": 150}
 
 
 async def test_alias_caches_returning_and_merge(db: Database) -> None:

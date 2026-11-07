@@ -324,42 +324,6 @@ def test_schema_file(tmp_path: Path) -> None:
     assert config.schema_file().resolve() == (tmp_path / "app" / "db" / "schema.py").resolve()
 
 
-def test_domain_with_two_checks_renders_as_a_list() -> None:
-    # S7: `check=..., check=...` is a SyntaxError; a domain with several CHECKs uses
-    # checks=[...] so the pulled module compiles.
-    from mizzle.kit.codegen import render_schema_module
-
-    snapshot = empty_snapshot("postgresql")
-    snapshot["schemas"] = ["billing"]
-    snapshot["domains"] = {
-        "billing.price": {
-            "schema": "billing",
-            "name": "price",
-            "base_type": "numeric",
-            "checks": ["VALUE > 0", "VALUE < 1000000"],
-        }
-    }
-    source = render_schema_module(snapshot)
-    compile(source, "pulled.py", "exec")
-    assert "checks=['VALUE > 0', 'VALUE < 1000000']" in source
-
-
-def test_domain_with_one_check_stays_a_keyword() -> None:
-    from mizzle.kit.codegen import render_schema_module
-
-    snapshot = empty_snapshot("postgresql")
-    snapshot["domains"] = {
-        "public.email": {
-            "schema": "public",
-            "name": "email",
-            "base_type": "text",
-            "checks": ["VALUE ~ '@'"],
-        }
-    }
-    source = render_schema_module(snapshot)
-    assert "check=\"VALUE ~ '@'\"" in source
-
-
 @pytest.mark.parametrize(
     ("sql", "expected"),
     [
