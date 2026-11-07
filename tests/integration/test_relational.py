@@ -375,6 +375,8 @@ async def test_distinct_orders_custom_by_its_type(cus_db: Database) -> None:
     assert await query == [{"s": "[1,3)"}, {"s": "[2,4)"}, {"s": "[10,12)"}]
     top = cus_db.select(CusBox.span).from_(CusBox).distinct().order_by(desc(CusBox.span))
     assert await top.limit(2) == [("[10,12)",), ("[2,4)",)]
+    # The subquery's order is not kept by the query around it: ordered again outside.
+    assert top.to_sql()[0].endswith('AS "_d" ORDER BY "_d"."_0" DESC')
 
 
 async def test_cte_and_subquery_keep_the_custom_type(cus_db: Database) -> None:

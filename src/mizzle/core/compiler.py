@@ -692,8 +692,6 @@ class Compiler:
         """SELECT DISTINCT orders only by its outputs, so ordering by one read_as converts
         would sort by the converted value: select and order the real values in a subquery
         and convert them around it (Q6-7)."""
-        # ponytail: relies on PostgreSQL keeping a FROM subquery's order through a plain
-        # projection; repeat the ORDER BY outside (by output name) if a dialect does not.
         named: list[tuple[str | None, ExprBase]]
         if isinstance(node.projection, dict):
             named = list(node.projection.items())
@@ -712,7 +710,21 @@ class Compiler:
             + ("" if key is None else f" AS {self.quote(key)}")
             for i, (key, e) in enumerate(named)
         ]
-        return f"SELECT {', '.join(items)} FROM ({inner}) AS {self.quote('_d')}"
+        # A FROM subquery's order is not kept by the query around it: order again by the
+        # real values, which DISTINCT already put in the select list.
+        order: list[str] = []
+        for item in node.order_by_:
+            expr = item.expr if isinstance(item, OrderBy) else item
+            i = next((i for i, (_, e) in enumerate(named) if e is expr), None)
+            if i is None:
+                continue
+            text = f"{self.quote('_d')}.{self.quote(f'_{i}')}"
+            if isinstance(item, OrderBy):
+                text += " DESC" if item.descending else " ASC"
+                text += f" NULLS {item.nulls.upper()}" if item.nulls else ""
+            order.append(text)
+        tail = f" ORDER BY {', '.join(order)}" if order else ""
+        return f"SELECT {', '.join(items)} FROM ({inner}) AS {self.quote('_d')}{tail}"
 
     def _note_write(self) -> None:
         """Mark the statement as a write; a subclass visitor (MERGE) calls this. What it
