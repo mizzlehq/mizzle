@@ -117,6 +117,16 @@ class CompiledQuery:
         )
 
 
+_JSON = ("json", "jsonb")
+
+
+def no_nul(text: str) -> str:
+    """``text`` unchanged; a NUL in SQL text failed as a lost connection, then retried (Q18)."""
+    if "\x00" in text:
+        raise QueryError(f"SQL text cannot contain a NUL character: {text!r}")
+    return text
+
+
 def _interval_text(value: datetime.timedelta) -> str:
     """``1 day 01:00:00``, ``-1 days +23:00:00``: PostgreSQL's own interval output."""
     parts: list[str] = []
@@ -239,7 +249,7 @@ class Compiler:
         return "?"
 
     def quote(self, ident: str) -> str:
-        return '"' + ident.replace('"', '""') + '"'
+        return '"' + no_nul(ident).replace('"', '""') + '"'
 
     def bind(self, value: object, placeholder: Placeholder | None = None) -> str:
         if self.inline_literals:
@@ -276,11 +286,14 @@ class Compiler:
             case bytes():
                 return self.literal("\\x" + value.hex()) + "::bytea"
             case str():
-                return "'" + value.replace("'", "''") + "'"
+                return "'" + no_nul(value).replace("'", "''") + "'"
             case datetime.date() | datetime.time() | uuid.UUID():
                 return self.literal(str(value))
-            case dict() | list():
+            case dict():
                 return self.literal(json.dumps(value))
+            case list() | tuple():  # an array, not JSON text (Q11); '{}' is typed by context
+                items = cast(Sequence[object], value)
+                return f"ARRAY[{', '.join(self.literal(v) for v in items)}]" if items else "'{}'"
             case _:
                 raise QueryError(f"cannot write {type(value).__name__} as an SQL literal")
 
@@ -347,6 +360,9 @@ class Compiler:
         bound = self._bound.get(key)
         if bound is None:
             value = node.column.encode(node.value) if node.column is not None else node.value
+            json_column = node.column is not None and node.column.sql_type in _JSON
+            if self.inline_literals and json_column and value is not None:
+                value = json.dumps(value)  # as the driver sends it; a list is not an array (Q11)
             bound = self._bound[key] = (node, self.bind(value))
         return bound[1]
 

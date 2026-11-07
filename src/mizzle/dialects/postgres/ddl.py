@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import datetime
+import json
 import re
 from collections.abc import Mapping, Sequence
 from typing import cast
 
+from mizzle.core.compiler import no_nul
 from mizzle.core.errors import MigrationError, SchemaError
 from mizzle.core.naming import Casing
 from mizzle.core.schema.column import MISSING, ColumnBase
@@ -119,10 +121,12 @@ _TRAILING_CAST = re.compile(
     r"::(?:\"[^\"]+\"|[a-z_][a-z0-9_ .\"]*)(?:\(\d+(?:,\s*\d+)?\))?(?:\[\])*$"
 )
 _NUMBER = re.compile(r"-?\d+(?:\.\d+)?(?:e[-+]?\d+)?", re.IGNORECASE)
+# Types a bare number cannot be assigned to: '5'::jsonb and '0101'::"bit" keep their quotes.
+_QUOTED_CAST = re.compile(r'::(?:jsonb?|"bit"|bit(?: varying)?|varbit)(?:\(\d+\))?$')
 
 
 def quote(ident: str) -> str:
-    return '"' + ident.replace('"', '""') + '"'
+    return '"' + no_nul(ident).replace('"', '""') + '"'
 
 
 def qualified(schema: str, name: str) -> str:
@@ -170,6 +174,7 @@ def normalize_default(text: str | None) -> str | None:
     if text is None:
         return None
     text = _TIMESTAMPTZ_DEFAULT.sub(_utc_timestamptz, text.strip())
+    keep_quotes = _QUOTED_CAST.search(text) is not None  # (Q10, Q12)
     while True:
         stripped = _TRAILING_CAST.sub("", text)
         if stripped.startswith("(") and stripped.endswith(")") and stripped.count("(") == 1:
@@ -177,7 +182,8 @@ def normalize_default(text: str | None) -> str | None:
         if stripped == text:
             break
         text = stripped
-    if len(text) >= 2 and text[0] == text[-1] == "'" and _NUMBER.fullmatch(text[1:-1]):
+    quoted = len(text) >= 2 and text[0] == text[-1] == "'"
+    if quoted and not keep_quotes and _NUMBER.fullmatch(text[1:-1]):
         return text[1:-1]
     return keyword_default(text)  # PostgreSQL prints current_user as CURRENT_USER
 
@@ -207,6 +213,8 @@ def column_default(column: ColumnBase, casing: Casing | None = None) -> str | No
         text = c.visit(value)
     else:
         encoded = column.encode(value)
+        if column.sql_type in ("json", "jsonb") and encoded is not None:  # JSON text, even 5 (Q10)
+            return normalize_default(c.literal(json.dumps(encoded)) + "::" + column.sql_type)
         if column.item is not None and isinstance(encoded, list | tuple):
             encoded = _array_text(cast(Sequence[object], encoded))
         if isinstance(encoded, datetime.date | datetime.time):
@@ -468,7 +476,7 @@ def _role_options(role: RoleSnap) -> str:
 
 
 def _literal(text: str) -> str:
-    return "'" + text.replace("'", "''") + "'"
+    return "'" + no_nul(text).replace("'", "''") + "'"
 
 
 # Storage parameter names are identifiers, optionally in the toast namespace. Values are a
