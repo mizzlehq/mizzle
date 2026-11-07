@@ -1064,7 +1064,8 @@ def test_values_are_checked_by_the_column_not_cut_by_a_cast(client: TestClient) 
     )
     rows = "/api/tables/public/st_mod/rows"
     too_long = client.post(rows, json={"values": {"code": "qwertyuiop"}}, headers=AUTH)
-    assert too_long.status_code == 400 and "StringDataRightTruncation" in too_long.text
+    # S9: a 22xxx error shows the server's message.
+    assert too_long.status_code == 400 and "value too long" in too_long.text
     filtered = client.get(
         rows,
         params={"filters": json.dumps([{"column": "code", "op": "eq", "value": "abcZZZ"}])},

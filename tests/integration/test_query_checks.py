@@ -7,7 +7,7 @@ from collections.abc import AsyncGenerator
 
 import pytest
 
-from mizzle import Database, eq, jsonb_build_object, many, one, placeholder
+from mizzle import Database, eq, jsonb_build_object, many, one, placeholder, sql
 from mizzle.core.schema.table import Table
 from mizzle.core.schema.types import integer, text
 from mizzle.dialects.postgres.driver import PostgresDriver
@@ -331,6 +331,9 @@ async def test_alias_caches_returning_and_merge(db: Database) -> None:
     boss = alias(Users, "boss")
     source = db.select(Users.id).from_(Users).subquery("src")
     sid = source.c("id", int)
+    [version] = await db.execute(sql("SHOW server_version_num"))
+    if int(str(version["server_version_num"])) < 150000:
+        return  # MERGE needs PostgreSQL 15
     merge = db.merge(boss).using(source).on(eq(boss.id, sid)).when_matched_then_delete()
     assert await merge == 2
 

@@ -1,4 +1,5 @@
 from collections.abc import AsyncGenerator
+from typing import Any
 
 import asyncpg
 import pytest
@@ -136,14 +137,32 @@ async def test_unreachable_replica_falls_back_to_primary(
         assert [u.email for u in await db.select().from_(Users)] == ["a@example.com"]
 
 
-async def test_a_select_calling_func_runs_on_the_primary(db: Database) -> None:
-    # R6: a func() call may write (nextval, a user function), but such a select went to a
-    # replica and was retried after a lost connection.
-    from mizzle import func
+async def test_a_select_calling_func_is_not_run_again_after_a_lost_connection(
+    db: Database, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # R6: a func() call may write (nextval, a user function), but a select using one was
+    # run again after a lost connection, so its side effect happened twice.
+    from mizzle import ConnectionError, func
+    from mizzle.db import Session
 
-    await db.insert(Users).values(email="primary@example.com")
-    rows = await db.select({"e": func("lower", Users.email)}).from_(Users)
-    assert [row["e"] for row in rows] == ["primary@example.com"]
+    sent: list[str] = []
+    send = Session._send
+
+    def lose_first(self: Session, conn: Any, query: Any, kind: Any) -> Any:
+        sent.append(query.sql)
+        if len(sent) == 1:
+            error = ConnectionError("lost")
+            error.lost = True
+            raise error
+        return send(self, conn, query, kind)
+
+    monkeypatch.setattr(Session, "_send", lose_first)
+    await db.select().from_(Users)  # a plain read runs again
+    assert len(sent) == 2
+    sent.clear()
+    with pytest.raises(ConnectionError):
+        await db.select({"e": func("lower", Users.email)}).from_(Users)
+    assert len(sent) == 1
 
 
 async def test_a_hung_replica_is_skipped_after_one_timeout(pg_url: str) -> None:

@@ -77,8 +77,8 @@ class CompiledQuery:
     dynamic: bool = False
     # True when it calls a function named with func(): mizzle cannot know it leaves the
     # session alone (set_config, pg_advisory_lock...), so the connection is reset after it.
-    # It may also write (nextval, a user function), so it is never retried and never sent
-    # to a replica (R6).
+    # It may also write (nextval, a user function), so it is never run again after a lost
+    # connection (R6). A replica may still run it: a write fails there with an error.
     opaque: bool = False
     # True when the statement writes at any level, including a data-modifying CTE inside a
     # SELECT. Such a SELECT is a write: it must run on the primary, must never be retried,
@@ -91,9 +91,8 @@ class CompiledQuery:
 
     @property
     def pure_read(self) -> bool:
-        """No locks, no writes, no func() call: a replica may run it, and it may run again
-        after a lost connection."""
-        return not (self.locking or self.writes or self.opaque)
+        """No row locks and no writes: a replica may run it."""
+        return not (self.locking or self.writes)
 
     @property
     def has_placeholders(self) -> bool:

@@ -6,6 +6,7 @@
 -- create enum user_role
 -- create enum order_status
 -- create enum audit_action
+-- create function uid
 -- create table users
 -- create table stores
 -- create table products
@@ -35,7 +36,6 @@
 -- add foreign key reviews_product_id_fkey
 -- add foreign key reviews_user_id_fkey
 -- add foreign key notifications_user_id_fkey
--- create function uid
 -- create function log_change
 -- create function price_changed
 -- create view product_ratings
@@ -73,6 +73,8 @@ CREATE TYPE "user_role" AS ENUM ('customer', 'seller', 'admin');
 CREATE TYPE "order_status" AS ENUM ('pending', 'paid', 'shipped', 'cancelled');
 -- mizzle:breakpoint
 CREATE TYPE "shop_audit"."audit_action" AS ENUM ('insert', 'update', 'delete');
+-- mizzle:breakpoint
+CREATE OR REPLACE FUNCTION "auth"."uid"() RETURNS uuid LANGUAGE sql STABLE AS $mizzle$SELECT nullif(current_setting('request.jwt.claims', true)::jsonb ->> 'sub', '')::uuid$mizzle$;
 -- mizzle:breakpoint
 CREATE TABLE "users" (
     "id" uuid NOT NULL DEFAULT gen_random_uuid(),
@@ -219,8 +221,6 @@ ALTER TABLE "reviews" ADD CONSTRAINT "reviews_product_id_fkey" FOREIGN KEY ("pro
 ALTER TABLE "reviews" ADD CONSTRAINT "reviews_user_id_fkey" FOREIGN KEY ("user_id") REFERENCES "users" ("id") ON DELETE CASCADE;
 -- mizzle:breakpoint
 ALTER TABLE "notifications" ADD CONSTRAINT "notifications_user_id_fkey" FOREIGN KEY ("user_id") REFERENCES "users" ("id") ON DELETE CASCADE;
--- mizzle:breakpoint
-CREATE OR REPLACE FUNCTION "auth"."uid"() RETURNS uuid LANGUAGE sql STABLE AS $mizzle$SELECT nullif(current_setting('request.jwt.claims', true)::jsonb ->> 'sub', '')::uuid$mizzle$;
 -- mizzle:breakpoint
 CREATE OR REPLACE FUNCTION "shop_audit"."log_change"() RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $mizzle$
 BEGIN

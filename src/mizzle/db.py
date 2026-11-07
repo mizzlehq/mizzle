@@ -1000,7 +1000,8 @@ class Session(QueryBuilder):
 
         The usual cause is a server restart, failover or idle timeout, which kills every
         pooled connection, so all of them are replaced. A plain read outside a transaction
-        can safely run again; writes and raw SQL never do, as they may have taken effect.
+        can safely run again; writes, raw SQL and func() calls never do, as they may have
+        taken effect.
         A connection that could not be opened (too many connections) leaves the pool alone:
         replacing healthy connections then only made it worse (C12).
         """
@@ -1009,7 +1010,7 @@ class Session(QueryBuilder):
         for driver in (self._driver, *self._replicas):
             if driver is not None:
                 await driver.expire_connections()
-        return read_only and not query.raw
+        return read_only and not query.raw and not query.opaque  # opaque: R6
 
     async def _retry_read(
         self, query: CompiledQuery, kind: _CallKind, read_only: bool

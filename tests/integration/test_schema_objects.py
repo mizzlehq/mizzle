@@ -358,6 +358,10 @@ async def test_normalize_twice_on_one_connection(driver: PostgresDriver) -> None
 async def test_view_options_survive_recreate_and_pull(driver: PostgresDriver) -> None:
     """(K6) security_invoker / security_barrier / check option: written, read back,
     kept when the view is re-created, and written by pull."""
+    async with driver.acquire() as conn:
+        [row] = await conn.fetch("SHOW server_version_num", [])
+    if int(str(row[0])) < 150000:
+        pytest.skip("security_invoker needs PostgreSQL 15")
 
     @final
     class Secure(
