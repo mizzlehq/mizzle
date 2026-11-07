@@ -78,7 +78,7 @@ export function App() {
             <header className="border-b px-4 py-3">
               <h1 className="font-heading font-semibold">SQL console</h1>
             </header>
-            <SqlConsole readOnly={readOnly} />
+            <SqlConsole readOnly={readOnly} onRan={() => void load()} />
           </>
         ) : view === "diagram" ? (
           <>

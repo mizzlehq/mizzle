@@ -27,6 +27,8 @@ export type TableInfo = {
     string,
     { name: string; columns: string[]; unique: boolean; where: string | null }
   >
+  /** S4-9: columns whose type has no ordering. */
+  unsortable?: string[]
 }
 
 export type Meta = { read_only: boolean; dialect: string }

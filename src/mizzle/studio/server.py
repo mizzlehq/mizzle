@@ -207,15 +207,20 @@ class Studio:
                 self.snapshot = await self.dialect.introspect(conn, self.schemas)
         return self.snapshot
 
-    async def table(self, schema: str, name: str) -> TableSnap:
-        snapshot = await self.load_snapshot()
+    async def table(
+        self, schema: str, name: str, *, fresh: bool = False
+    ) -> tuple[TableSnap, dict[str, str]]:
+        """The table and each column's base type (``_base_type``). ``fresh`` re-reads the
+        schema: a write built from a stale snapshot matched rows by a dropped key and cast
+        values to a column's old type (S4-3)."""
+        snapshot = await self.load_snapshot(refresh=fresh)
         table = snapshot["tables"].get(key(schema, name))
-        if table is None:
+        if table is None and not fresh:
             snapshot = await self.load_snapshot(refresh=True)
             table = snapshot["tables"].get(key(schema, name))
         if table is None:
             raise StudioError(f"unknown table {schema}.{name}", 404)
-        return table
+        return table, _base_types(table, snapshot)
 
     # -- query history and saved queries ----------------------------------------------
 
@@ -336,12 +341,27 @@ def _as_text(value: object) -> str | None:
     return str(value)
 
 
-def _param(params: list[object], column: ColumnSnap, value: object) -> str:
+# A column type that is JSON itself (after domains), not something to_jsonb() turned into JSON.
+_JSON_TYPE = re.compile(r"jsonb?")
+
+
+def _param(params: list[object], column: ColumnSnap, value: object, base: str) -> str:
+    if not _JSON_TYPE.fullmatch(base) and isinstance(value, dict | list):
+        # S4-8: an array or composite as the grid has it (to_jsonb's JSON). Its text form
+        # is not the type's input syntax ("[1, 2]"), so the server's own JSON-to-type
+        # conversion reads it back.
+        params.append(json.dumps(value))
+        return (
+            "(SELECT x.v FROM jsonb_to_record(jsonb_build_object("
+            f"'v', ${len(params)}::text::jsonb)) AS x(v {_cast_type(column)}))"
+        )
     params.append(_as_text(value))
     return f"CAST(${len(params)}::text AS {_cast_type(column)})"
 
 
-def _where(table: TableSnap, filters: list[object], params: list[object]) -> str:
+def _where(
+    table: TableSnap, base: Mapping[str, str], filters: list[object], params: list[object]
+) -> str:
     parts: list[str] = []
     for item in filters:
         f = _object(item, "filter")
@@ -349,7 +369,8 @@ def _where(table: TableSnap, filters: list[object], params: list[object]) -> str
         ref = f"t.{quote(column['name'])}"
         op = f.get("op")
         if isinstance(op, str) and op in _COMPARE:
-            parts.append(f"{ref} {_COMPARE[op]} {_param(params, column, f.get('value'))}")
+            value = _param(params, column, f.get("value"), base[column["name"]])
+            parts.append(f"{ref} {_COMPARE[op]} {value}")
         elif op in ("like", "ilike"):
             params.append(_as_text(f.get("value")) or "")
             parts.append(f"{ref}::text {op.upper()} ${len(params)}")
@@ -362,7 +383,9 @@ def _where(table: TableSnap, filters: list[object], params: list[object]) -> str
     return f" WHERE {' AND '.join(parts)}" if parts else ""
 
 
-def _key_match(table: TableSnap, key_values: object, params: list[object]) -> str:
+def _key_match(
+    table: TableSnap, base: Mapping[str, str], key_values: object, params: list[object]
+) -> str:
     pk = table["primary_key"]
     if pk is None:
         raise StudioError(f"{table['name']} has no primary key; change its rows with SQL")
@@ -370,21 +393,37 @@ def _key_match(table: TableSnap, key_values: object, params: list[object]) -> st
     if set(values) != set(pk["columns"]):
         raise StudioError(f"key must give exactly the primary key columns {pk['columns']}")
     return " AND ".join(
-        f"t.{quote(c)} = {_param(params, _column(table, c), values[c])}" for c in pk["columns"]
+        f"t.{quote(c)} = {_param(params, _column(table, c), values[c], base[c])}"
+        for c in pk["columns"]
     )
 
 
-def _order_sql(table: TableSnap, q: Mapping[str, str]) -> str:
+# S4-9: built-in types with no default ordering (and arrays of them).
+# ponytail: a fixed list; a composite with such a field still fails in the database (a 400).
+_UNSORTABLE = re.compile(
+    r"(?:json|xml|point|line|lseg|box|path|polygon|circle|jsonpath|xid|cid|aclitem"
+    r"|txid_snapshot|pg_snapshot)(?:\[\])*"
+)
+
+
+def _unsortable(base: Mapping[str, str]) -> list[str]:
+    return [name for name, t in base.items() if _UNSORTABLE.fullmatch(t)]
+
+
+def _order_sql(table: TableSnap, base: Mapping[str, str], q: Mapping[str, str]) -> str:
     order = q.get("order")
     if order:
         column = _column(table, order)
+        if _UNSORTABLE.fullmatch(base[column["name"]]):
+            raise StudioError(f"cannot sort by {column['name']}: {column['type']} has no order")
         direction = "DESC" if q.get("dir") == "desc" else "ASC"
         sort = [f"t.{quote(column['name'])} {direction}"]
     else:
         sort = []
-    # S13: the key (or ctid) breaks ties, or OFFSET paging repeats and skips rows.
+    # S13: the key (or ctid) breaks ties, or OFFSET paging repeats and skips rows. A ctid
+    # is unique per partition or child table only, so tableoid comes first (S4-7).
     pk = table["primary_key"]
-    sort += [f"t.{quote(c)}" for c in pk["columns"]] if pk else ["t.ctid"]
+    sort += [f"t.{quote(c)}" for c in pk["columns"]] if pk else ["t.tableoid", "t.ctid"]
     return " ORDER BY " + ", ".join(sort)
 
 
@@ -395,12 +434,14 @@ _FORMULA_LEAD = ("=", "+", "-", "@")
 # Types whose text form is a number, interval, date or time: a leading "-" is a sign, not a
 # formula, and prefixing it corrupted the value (B19). to_jsonb() turns intervals, money and
 # dates into JSON strings, so the column type, not the Python type, tells them apart.
+# JSON columns are not here: they arrive as their exact text (``_EXACT_TEXT``), and only that
+# text is safe; a JSON string decoded to a str is not (S4-1).
 # The whole type name must match (``fullmatch``): a domain ``"date".note`` over text starts
 # with ``date`` too (B73). Only modifiers may follow: ``(3)``, ``with time zone``,
 # ``day to second``.
 _SIGNED_TYPE = re.compile(
     r"(?:smallint|integer|bigint|(?:small|big)?serial|numeric|decimal|real|double precision"
-    r"|money|interval|date|time|timestamp|jsonb?)\b[a-z0-9 (),]*",
+    r"|money|interval|date|time|timestamp)\b[a-z0-9 (),]*",
     re.IGNORECASE,
 )
 
@@ -411,31 +452,59 @@ def _csv_safe(text: str) -> str:
     return f"'{text}" if risky else text
 
 
+# A type name as format_type() prints it: ``name``, ``schema.name``, either part quoted,
+# then any array brackets.
+_IDENT = r'(?:"(?:[^"]|"")*"|[^\s".()\[\],]+)'
+_TYPE_NAME = re.compile(rf"({_IDENT})(?:\.({_IDENT}))?((?:\[\])*)")
+
+
+def _unquote(ident: str) -> str:
+    return ident[1:-1].replace('""', '"') if ident.startswith('"') else ident
+
+
 def _base_type(column_type: str, snapshot: Snapshot) -> str:
-    """S7: a domain column's base type (through domains over domains), so a domain over
-    numeric or interval keeps its sign in CSV; any other type unchanged."""
+    """The type a column behaves as: a domain resolved to its base type, through domains
+    over domains and arrays of domains (``d[]`` -> ``jsonb[]``); any other type unchanged.
+
+    Every type-dependent rule (exact text, CSV signs, key casts, sorting) reads this, so a
+    domain acts like its base type everywhere (S7, S4-1, S4-5, S4-6). The name is parsed,
+    not compared as text: format_type() quotes ``"Mixed Num"`` and qualifies a domain
+    outside the search path."""
     domains = snapshot.get("domains", {})
-    seen: set[str] = set()
-    while column_type not in seen:
-        seen.add(column_type)
-        named = [d for d in domains.values() if d["name"] == column_type]
-        domain = domains.get(column_type) or (named[0] if len(named) == 1 else None)
+    arrays = ""
+    for _ in range(len(domains)):  # a chain cannot be longer; also stops a cycle
+        match = _TYPE_NAME.fullmatch(column_type)
+        if match is None:
+            break
+        first, second, dims = cast(tuple[str, str | None, str], match.groups())
+        if second is not None:
+            domain = domains.get(key(_unquote(first), _unquote(second)))
+        else:
+            name = _unquote(first)
+            named = [d for d in domains.values() if d["name"] == name]
+            # Unqualified means visible in the search path: public first, else the only one.
+            domain = domains.get(key("public", name)) or (named[0] if len(named) == 1 else None)
         if domain is None:
             break
+        arrays += dims
         column_type = domain["base_type"]
-    return column_type
+    return column_type + arrays
 
 
-def _cell(value: object, column_type: str) -> str:
-    """One CSV cell. Only text is neutralised: a number, or a string from a numeric,
-    interval, date or time column, cannot be a formula."""
+def _base_types(table: TableSnap, snapshot: Snapshot) -> dict[str, str]:
+    return {name: _base_type(c["type"], snapshot) for name, c in table["columns"].items()}
+
+
+def _cell(value: object, base: str) -> str:
+    """One CSV cell. Only text is neutralised: a number, a string from a numeric,
+    interval, date or time column, or a column's exact text, cannot be a formula."""
     if value is None:
         return ""
     if isinstance(value, bool):
         return "true" if value else "false"
     if isinstance(value, dict | list):
         return json.dumps(value)  # starts with { or [, never a formula
-    if isinstance(value, str) and not _SIGNED_TYPE.fullmatch(column_type):
+    if isinstance(value, str) and not (_SIGNED_TYPE.fullmatch(base) or _EXACT_TEXT.fullmatch(base)):
         return _csv_safe(value)
     return str(value)
 
@@ -480,9 +549,10 @@ _EXACT_TEXT = re.compile(r"(?:jsonb?|numeric)(?:\([^)]*\))?(?:\[\])*")
 _PAIRS = 50
 
 
-def _row_sql(table: TableSnap) -> str:
-    """``_ROW`` with the json, jsonb and numeric columns (and arrays of them) as text."""
-    names = [c["name"] for c in table["columns"].values() if _EXACT_TEXT.fullmatch(c["type"])]
+def _row_sql(base: Mapping[str, str]) -> str:
+    """``_ROW`` with the json, jsonb and numeric columns (and arrays of them, and domains
+    over them: S4-5) as text."""
+    names = [name for name, t in base.items() if _EXACT_TEXT.fullmatch(t)]
     if not names:
         return _ROW
     pairs = ["'" + n.replace("'", "''") + f"', t.{quote(n)}::text" for n in names]
@@ -525,7 +595,9 @@ def _writable(studio: Studio) -> None:
         raise StudioError("Studio is in read-only mode", 403)
 
 
-async def _table(studio: Studio, request: Request) -> TableSnap:
+async def _table(
+    studio: Studio, request: Request, *, fresh: bool = False
+) -> tuple[TableSnap, dict[str, str]]:
     """The table named in ``/api/tables/<schema>/<table>/<action>``. Read from the raw
     path: the decoded one turns a "/" inside a name (sent as %2F) into a separator (S5)."""
     raw = request.scope.get("raw_path")
@@ -533,7 +605,7 @@ async def _table(studio: Studio, request: Request) -> TableSnap:
     parts = path.split("/")
     if len(parts) < 6:
         raise StudioError("expected /api/tables/<schema>/<table>/...", 404)
-    return await studio.table(unquote(parts[-3]), unquote(parts[-2]))
+    return await studio.table(unquote(parts[-3]), unquote(parts[-2]), fresh=fresh)
 
 
 async def meta(studio: Studio, _request: Request) -> Response:
@@ -542,7 +614,12 @@ async def meta(studio: Studio, _request: Request) -> Response:
 
 async def tables(studio: Studio, _request: Request) -> Response:
     snapshot = await studio.load_snapshot(refresh=True)
-    return JSONResponse({"tables": list(snapshot["tables"].values()), "enums": snapshot["enums"]})
+    # S4-9: which columns the grid may offer to sort by.
+    listed = [
+        {**t, "unsortable": _unsortable(_base_types(t, snapshot))}
+        for t in snapshot["tables"].values()
+    ]
+    return JSONResponse({"tables": listed, "enums": snapshot["enums"]})
 
 
 async def relationships(studio: Studio, _request: Request) -> Response:
@@ -571,7 +648,7 @@ async def relationships(studio: Studio, _request: Request) -> Response:
 
 
 async def list_rows(studio: Studio, request: Request) -> Response:
-    table = await _table(studio, request)
+    table, base = await _table(studio, request)
     q = request.query_params
     try:
         limit = min(int(q.get("limit", "50")), MAX_PAGE)
@@ -582,13 +659,13 @@ async def list_rows(studio: Studio, request: Request) -> Response:
     if limit < 0 or offset < 0:
         raise StudioError("limit and offset must be >= 0")
     params: list[object] = []
-    where = _where(table, filters, params)
-    order_sql = _order_sql(table, q)
+    where = _where(table, base, filters, params)
+    order_sql = _order_sql(table, base, q)
     source = f"{qualified(table['schema'], table['name'])} AS t"
     async with studio.pool().acquire() as conn:
         [total] = await conn.fetch(f"SELECT count(*) FROM {source}{where}", params)
         rows = await conn.fetch(
-            f"SELECT {_row_sql(table)} FROM {source}{where}{order_sql}"
+            f"SELECT {_row_sql(base)} FROM {source}{where}{order_sql}"
             f" LIMIT {limit} OFFSET {offset}",
             params,
         )
@@ -616,7 +693,7 @@ async def export_rows(studio: Studio, request: Request) -> Response:
     in memory. A query error before the first byte is a 400; a later one cuts the
     connection, so the download fails instead of ending early.
     """
-    table = await _table(studio, request)
+    table, base = await _table(studio, request)
     q = request.query_params
     fmt = q.get("format", "csv").lower()
     if fmt not in ("csv", "json"):
@@ -626,18 +703,17 @@ async def export_rows(studio: Studio, request: Request) -> Response:
     except ValueError as exc:
         raise StudioError(f"bad query parameters: {exc}") from exc
     params: list[object] = []
-    where = _where(table, filters, params)
-    order_sql = _order_sql(table, q)
+    where = _where(table, base, filters, params)
+    order_sql = _order_sql(table, base, q)
     source = f"{qualified(table['schema'], table['name'])} AS t"
-    row = _row_sql(table) if fmt == "csv" else _ROW  # JSON export: the server's own JSON
+    row = _row_sql(base) if fmt == "csv" else _ROW  # JSON export: the server's own JSON
     sql = f"SELECT {row} FROM {source}{where}{order_sql}"
     headers = {
         "Content-Disposition": _download_name(table["schema"], table["name"], fmt),
         "Cache-Control": "no-store",
     }
     columns = list(table["columns"])
-    snapshot = await studio.load_snapshot()
-    types = [_base_type(c["type"], snapshot) for c in table["columns"].values()]
+    types = [base[c] for c in columns]
     batch_size = 1000
 
     def chunk(batch: Sequence[Row], first: bool) -> bytes:
@@ -700,17 +776,19 @@ def _csv_chunk(columns: Sequence[str], types: Sequence[str], batch: Sequence[Row
 
 async def insert_row(studio: Studio, request: Request) -> Response:
     _writable(studio)
-    table = await _table(studio, request)
+    table, base = await _table(studio, request, fresh=True)
     values = _object((await _body(request)).get("values", {}), "values")
     params: list[object] = []
     target = f"{qualified(table['schema'], table['name'])} AS t"
     if values:
         columns = [_column(table, c) for c in values]
         names = ", ".join(quote(c["name"]) for c in columns)
-        placeholders = ", ".join(_param(params, c, values[c["name"]]) for c in columns)
-        sql = f"INSERT INTO {target} ({names}) VALUES ({placeholders}) RETURNING {_row_sql(table)}"
+        placeholders = ", ".join(
+            _param(params, c, values[c["name"]], base[c["name"]]) for c in columns
+        )
+        sql = f"INSERT INTO {target} ({names}) VALUES ({placeholders}) RETURNING {_row_sql(base)}"
     else:
-        sql = f"INSERT INTO {target} DEFAULT VALUES RETURNING {_row_sql(table)}"
+        sql = f"INSERT INTO {target} DEFAULT VALUES RETURNING {_row_sql(base)}"
     async with studio.pool().acquire() as conn:
         rows = await conn.fetch(sql, params)
     if not rows:  # S14: a BEFORE trigger returned NULL (or a rule did nothing)
@@ -720,31 +798,43 @@ async def insert_row(studio: Studio, request: Request) -> Response:
 
 async def update_row(studio: Studio, request: Request) -> Response:
     _writable(studio)
-    table = await _table(studio, request)
+    table, base = await _table(studio, request, fresh=True)
     body = await _body(request)
     values = _object(body.get("values"), "values")
     if not values:
         raise StudioError("values must not be empty")
     params: list[object] = []
+    match = _key_match(table, base, body.get("key"), params)
+    key_params = list(params)  # the key's placeholders come first, so ``match`` reuses them
     sets = ", ".join(
-        f"{quote(c['name'])} = {_param(params, c, values[c['name']])}"
+        f"{quote(c['name'])} = {_param(params, c, values[c['name']], base[c['name']])}"
         for c in (_column(table, name) for name in values)
     )
-    match = _key_match(table, body.get("key"), params)
-    sql = (
-        f"UPDATE {qualified(table['schema'], table['name'])} AS t SET {sets} "
-        f"WHERE {match} RETURNING {_row_sql(table)}"
-    )
-    async with studio.pool().acquire() as conn:
+    target = f"{qualified(table['schema'], table['name'])} AS t"
+    sql = f"UPDATE {target} SET {sets} WHERE {match} RETURNING {_row_sql(base)}"
+    async with studio.pool().acquire() as conn, conn.transaction():
         rows = await conn.fetch(sql, params)
+        _one_row(len(rows))
+        if not rows and await conn.fetch(f"SELECT 1 FROM {target} WHERE {match}", key_params):
+            # S4-10: the row is there, a BEFORE trigger (or a rule) skipped the update.
+            raise StudioError("no row was updated: a trigger or rule on the table skipped it", 409)
     if not rows:
         raise StudioError("row not found", 404)
     return JSONResponse({"row": _row_json(cast(str, rows[0][0]))})
 
 
+def _one_row(count: int) -> None:
+    """S4-3: a key that matches several rows (its primary key was dropped since the UI
+    loaded the table) changes none of them: raising rolls the transaction back."""
+    if count > 1:
+        raise StudioError(
+            f"the key matches {count} rows, so nothing was changed; reload the table", 409
+        )
+
+
 async def delete_rows(studio: Studio, request: Request) -> Response:
     _writable(studio)
-    table = await _table(studio, request)
+    table, base = await _table(studio, request, fresh=True)
     keys = _array((await _body(request)).get("keys"), "keys")
     if not keys:
         raise StudioError("keys must not be empty")
@@ -752,14 +842,20 @@ async def delete_rows(studio: Studio, request: Request) -> Response:
     async with studio.pool().acquire() as conn, conn.transaction():
         for k in keys:
             params: list[object] = []
-            match = _key_match(table, k, params)
+            match = _key_match(table, base, k, params)
             sql = f"DELETE FROM {qualified(table['schema'], table['name'])} AS t WHERE {match}"
-            deleted += await conn.execute(sql, params)
+            count = await conn.execute(sql, params)
+            _one_row(count)
+            deleted += count
     return JSONResponse({"deleted": deleted})
 
 
 # "cannot run inside a transaction block"
 _NO_TRANSACTION_BLOCK = "25001"
+# Statements that start, end or split a transaction (first token, as in _READ_ONLY_DENIED).
+_TX_CONTROL = re.compile(
+    r"(?:BEGIN|START|COMMIT|END|ROLLBACK|ABORT|SAVEPOINT|RELEASE|PREPARE)\b", re.IGNORECASE
+)
 
 
 def _reject_read_only(statements: Sequence[str]) -> None:
@@ -790,19 +886,40 @@ async def run_sql(studio: Studio, request: Request) -> Response:
         _reject_read_only(statements)
 
     async def first_rows(conn: Connection, statement: str) -> list[Row]:
-        """At most MAX_SQL_ROWS + 1 rows. Every statement runs through a cursor (a portal
-        with a row limit), so a huge result is never loaded whole, whatever its first
-        word: "(SELECT ...)", FETCH ALL, INSERT ... RETURNING (C5, S6)."""
-        none: list[Row] = []
-        async with aclosing(conn.cursor(statement, [], MAX_SQL_ROWS + 1)) as batches:
-            return await anext(batches, none)
+        """At most MAX_SQL_ROWS + 1 rows, with the statement run to its end. A huge result
+        is never loaded whole, whatever its first word (C5, S6).
+
+        A query is a server-side cursor: FETCH keeps the first rows and MOVE runs the rest
+        without sending it. A portal stopped after 1001 rows, so a volatile function in a
+        SELECT ran for those rows only (S4-4). DECLARE takes plain queries only; anything
+        else (INSERT ... RETURNING, a data-modifying WITH, EXPLAIN, FETCH) runs to its end
+        on a portal's first fetch."""
+        # A new name each time: the driver caches each FETCH with its first result's columns.
+        cursor = f"mizzle_studio_{secrets.token_hex(8)}"
+        try:
+            async with conn.transaction():  # a savepoint: DECLARE may refuse the statement
+                await conn.fetch(f"DECLARE {cursor} NO SCROLL CURSOR FOR {statement}", [])
+        except DatabaseError:
+            none: list[Row] = []
+            async with aclosing(conn.cursor(statement, [], MAX_SQL_ROWS + 1)) as batches:
+                return await anext(batches, none)
+        rows = await conn.fetch(f"FETCH {MAX_SQL_ROWS + 1} FROM {cursor}", [])
+        if len(rows) > MAX_SQL_ROWS:
+            await conn.execute(f"MOVE FORWARD ALL IN {cursor}", [])
+        await conn.execute(f"CLOSE {cursor}", [])
+        return rows
 
     async def run(conn: Connection) -> list[dict[str, object]]:
         results: list[dict[str, object]] = []
         for statement in statements:
             if studio.read_only:  # already inside the READ ONLY transaction
                 rows = await first_rows(conn, statement)
-            else:  # a cursor needs a transaction; each statement commits on its own
+            elif _TX_CONTROL.match(statement[first_token(statement) :]):
+                # S4-2: BEGIN/COMMIT/ROLLBACK/SAVEPOINT run as written, never inside a
+                # transaction of ours (which committed the rows the user rolled back).
+                rows = await conn.fetch(statement, [])
+            else:  # a cursor needs a transaction; each statement commits on its own (a
+                # savepoint inside a BEGIN of the user's)
                 try:
                     async with conn.transaction():
                         rows = await first_rows(conn, statement)
@@ -832,7 +949,15 @@ async def run_sql(studio: Studio, request: Request) -> Response:
                 async with conn.transaction(readonly=True):
                     results = await run(conn)
             else:
-                results = await run(conn)
+                try:
+                    results = await run(conn)
+                finally:
+                    # S4-2: a transaction the batch left open (BEGIN with no COMMIT, or a
+                    # failed statement inside it) is rolled back, never committed.
+                    if any(_TX_CONTROL.match(s[first_token(s) :]) for s in statements):
+                        await conn.execute("ROLLBACK", [])
+                    # S4-3: the batch may have changed the schema.
+                    studio.snapshot = None
     except MizzleError:
         studio.record_history(text, ok=False)
         raise

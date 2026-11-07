@@ -71,6 +71,14 @@ const OPS: { value: FilterOp; label: string; needsValue: boolean }[] = [
 // never land on whatever row now sits at that index after a reload.
 type Editing = { row: number; key: Row; column: string; text: string }
 
+function parseJson(text: string, fallback: () => unknown): unknown {
+  try {
+    return JSON.parse(text)
+  } catch {
+    return fallback()
+  }
+}
+
 function keyOf(table: TableInfo, row: Row): Row {
   return Object.fromEntries((table.primary_key?.columns ?? []).map((c) => [c, row[c]]))
 }
@@ -188,6 +196,11 @@ export function DataGrid({ table, readOnly }: { table: TableInfo; readOnly: bool
         dir: order?.dir,
         filters,
       })
+      if (data.rows.length === 0 && offset > 0) {
+        // S4-12: the page is past the end (its rows were deleted): show the last page.
+        setOffset(Math.max(0, Math.floor((data.total - 1) / PAGE_SIZE) * PAGE_SIZE))
+        return
+      }
       setRows(data.rows)
       setTotal(data.total)
       setSelected(new Set())
@@ -220,7 +233,15 @@ export function DataGrid({ table, readOnly }: { table: TableInfo; readOnly: bool
     const column = table.columns[editing.column]
     const key = JSON.stringify(editing.key)
     try {
-      const text = value === null ? null : toDbText(column, value)
+      const original = rows[editing.row]?.[editing.column]
+      // S4-8: an array or composite cell is to_jsonb's JSON; send it parsed and the server
+      // reads it back into the column type. (JSON columns arrive as text, not objects.)
+      const text =
+        value === null
+          ? null
+          : typeof original === "object" && original !== null
+            ? parseJson(value, () => toDbText(column, value))
+            : toDbText(column, value)
       const { row: updated } = await api.update(table, editing.key, {
         [editing.column]: text,
       })
@@ -341,7 +362,8 @@ export function DataGrid({ table, readOnly }: { table: TableInfo; readOnly: bool
                   <button
                     type="button"
                     onClick={() => sortBy(c.name)}
-                    className="inline-flex items-center gap-1 font-medium font-sans"
+                    disabled={table.unsortable?.includes(c.name)}
+                    className="inline-flex items-center gap-1 font-medium font-sans disabled:cursor-default"
                     title={c.type}
                   >
                     {c.name}
