@@ -44,6 +44,8 @@ class PostgresDialect:
         reset_connections: ResetMode = "auto",
         on_connect: Callable[[Connection], Awaitable[None]] | None = None,
         server_settings: Mapping[str, str] | None = None,
+        connect_timeout: float = 10.0,
+        acquire_timeout: float | None = 30.0,
     ) -> PostgresDriver:
         return await PostgresDriver.connect(
             url,
@@ -55,6 +57,8 @@ class PostgresDialect:
             reset_connections=reset_connections,
             on_connect=on_connect,
             server_settings=server_settings,
+            connect_timeout=connect_timeout,
+            acquire_timeout=acquire_timeout,
         )
 
     def column_type(self, column: ColumnBase) -> str:

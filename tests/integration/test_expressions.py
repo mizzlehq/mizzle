@@ -278,7 +278,7 @@ async def test_self_join_with_alias(db: Database) -> None:
         .left_join(other, eq(other.id, Users.id + 1))
         .order_by(Users.id)
     )
-    assert [(u.id, o.id if o else None) for u, o in rows] == [(1, 2), (2, 3), (3, None)]
+    assert [(u and u.id, o and o.id) for u, o in rows] == [(1, 2), (2, 3), (3, None)]
     assert all(type(u) is Users and (o is None or type(o) is Users) for u, o in rows)
     assert rows[0][1] == (await db.select().from_(Users).where(eq(Users.id, 2)))[0]
 

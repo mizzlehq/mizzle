@@ -317,8 +317,8 @@ async def test_alias_caches_returning_and_merge(db: Database) -> None:
     # Q4: each alias() call made a new class, so the decoder/INSERT caches grew per call.
     # Q6: returning() on an alias gave alias-class rows. Q7: MERGE INTO "boss" (no table).
     from mizzle import alias
-    from mizzle.core.compiler import _INSERT_SQL  # pyright: ignore[reportPrivateUsage]
-    from mizzle.core.query.base import _ROW_DECODERS  # pyright: ignore[reportPrivateUsage]
+    from mizzle.core.compiler import _INSERT_SQL
+    from mizzle.core.query.base import _ROW_DECODERS
 
     sizes: list[tuple[int, int]] = []
     for i in range(2):

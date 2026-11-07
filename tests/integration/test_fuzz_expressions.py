@@ -758,8 +758,11 @@ def test_self_join_through_alias(
             want += [(r["id"], None) for r in stored if not any(p[0] is r for p in pairs)]
         else:
             got = await query.join(other, on)
-        key: Callable[[tuple[int, int | None]], tuple[int, int]] = lambda p: (p[0], p[1] or 0)  # noqa: E731
-        assert sorted(((i.id, o.id if o else None) for i, o in got), key=key) == sorted(
+
+        def key(p: tuple[int | None, int | None]) -> tuple[int, int]:
+            return (p[0] or 0, p[1] or 0)
+
+        assert sorted(((i and i.id, o and o.id) for i, o in got), key=key) == sorted(
             want, key=key
         ), f"{mine} {op} other.{theirs}"
         assert all(type(o) is Items for _, o in got if o is not None)

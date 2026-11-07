@@ -68,6 +68,18 @@ from mizzle.dialects.postgres import PostgresDialect
 from mizzle.tracing import Tracer
 
 log = logging.getLogger("mizzle")
+# Seconds a replica that failed to give a connection is skipped.
+_REPLICA_PAUSE = 30.0
+
+# Pushed onto Session._savepoints when the transaction ends: statements are refused.
+_ENDED = object()
+
+
+def _commit_unknown(error: BaseException) -> bool:
+    """Whether ``error``, raised while COMMIT was in flight, leaves its outcome unknown."""
+    return isinstance(error, asyncio.CancelledError | DbConnectionError | QueryTimeout)
+
+
 # The innermost savepoint the running code is inside of (see Session._savepoints).
 _SAVEPOINT: contextvars.ContextVar[object | None] = contextvars.ContextVar(
     "mizzle_savepoint", default=None
@@ -156,6 +168,8 @@ class Session(QueryBuilder):
     _driver: Driver | None
     _replicas: tuple[Driver, ...]
     _next_replica: itertools.count[int]
+    # A replica that failed to give a connection, and when it may be tried again (R7).
+    _replica_down: dict[Driver, float]
     _use_primary: bool
     _timeout: float | None
     _casing: Casing | None
@@ -197,6 +211,7 @@ class Session(QueryBuilder):
         self._driver = driver
         self._replicas = tuple(replicas)
         self._next_replica = itertools.count()
+        self._replica_down = {}
         self._use_primary = False
         self._timeout = None
         self._casing = casing
@@ -221,7 +236,7 @@ class Session(QueryBuilder):
     def fetch(self, query: CompiledQuery, *, read_only: bool = False) -> Awaitable[list[Row]]:
         # A write anywhere in the query (FOR UPDATE, or a data-modifying CTE) needs the
         # primary and must never be retried.
-        return self._call(query, "fetch", read_only and not query.locking and not query.writes)
+        return self._call(query, "fetch", read_only and query.pure_read)
 
     def run(self, query: CompiledQuery) -> Awaitable[int]:
         return self._call(query, "execute")
@@ -260,7 +275,7 @@ class Session(QueryBuilder):
                 # Cursors only live inside a transaction; it ends (and closes the cursor)
                 # when the loop ends, breaks or is cancelled.
                 async with (
-                    self._connection(read_only and not query.locking and not query.writes) as conn,
+                    self._connection(read_only and query.pure_read) as conn,
                     conn.transaction(),
                 ):
                     cursor = conn.cursor(
@@ -330,9 +345,7 @@ class Session(QueryBuilder):
             compiled.opaque,
             compiled.writes,
         )
-        return await self._call(
-            explained, "dicts", is_read and not compiled.locking and not compiled.writes
-        )
+        return await self._call(explained, "dicts", is_read and compiled.pure_read)
 
     async def refresh(self, view: type[View], *, concurrently: bool = False) -> None:
         """``REFRESH MATERIALIZED VIEW``. ``concurrently=True`` keeps the view readable
@@ -399,11 +412,7 @@ class Session(QueryBuilder):
         compiled = self.compile(query)
         if compiled.has_placeholders:
             raise QueryError("copy_from() does not take placeholders")
-        read_only = (
-            isinstance(query, SelectBase | RelationalStatement)
-            and not compiled.locking
-            and not compiled.writes
-        )
+        read_only = isinstance(query, SelectBase | RelationalStatement) and compiled.pure_read
         with self._logged(compiled):
             try:
                 async with self._connection(read_only) as conn:
@@ -695,14 +704,22 @@ class Session(QueryBuilder):
                             yield self
                         finally:
                             _SAVEPOINT.reset(token)
-                            self._savepoints.pop()
+                        # The marker stays until ROLLBACK TO / RELEASE ran: a sibling
+                        # task's statement queued for the lock would otherwise run inside
+                        # the savepoint and be undone with it (R1).
                     except BaseException as exc:
-                        async with self._lock:
-                            if not await savepoint.__aexit__(type(exc), exc, exc.__traceback__):
-                                raise
+                        try:
+                            async with self._lock:
+                                if not await savepoint.__aexit__(type(exc), exc, exc.__traceback__):
+                                    raise
+                        finally:
+                            self._savepoints.remove(marker)
                     else:
-                        async with self._lock:
-                            await savepoint.__aexit__(None, None, None)
+                        try:
+                            async with self._lock:
+                                await savepoint.__aexit__(None, None, None)
+                        finally:
+                            self._savepoints.remove(marker)
                 except BaseException as original:
                     del self._deferred[committed:]
                     # Savepoints released inside this one are undone with it: their
@@ -725,7 +742,7 @@ class Session(QueryBuilder):
         driver = self._require_driver()
         deferred: list[Callable[[], Awaitable[None]]] = []
         rollbacks: list[Callable[[], Awaitable[None]]] = []
-        started = done = False
+        started = committing = done = False
         with self._transaction_span(isolation):
             try:
                 async with driver.acquire() as conn:
@@ -752,13 +769,27 @@ class Session(QueryBuilder):
                         # COMMIT / ROLLBACK under the statement lock: a sibling task's
                         # statement may still be running (C11).
                         async with tx._lock:
+                            tx._savepoints.append(_ENDED)
                             if not await block.__aexit__(type(exc), exc, exc.__traceback__):
                                 raise
                     else:
                         async with tx._lock:
+                            # From here on the transaction refuses statements: one sent
+                            # after COMMIT would run in autocommit on this connection, or
+                            # on a pooled connection someone else now uses (R3).
+                            tx._savepoints.append(_ENDED)
+                            committing = True
                             await block.__aexit__(None, None, None)
                     done = True
             except BaseException as original:
+                if committing and not done and _commit_unknown(original):
+                    # Cancelled or disconnected while COMMIT was in flight: the server may
+                    # have committed or not, so neither hook list runs (R5).
+                    original.add_note(
+                        "COMMIT was interrupted: the transaction may or may not have been "
+                        "committed, so no after_commit or after_rollback hook ran"
+                    )
+                    raise
                 if done:
                     # COMMIT succeeded; the error (a cancel, a timeout) came while the
                     # connection was being released. The data is saved, so the commit hooks
@@ -817,6 +848,7 @@ class Session(QueryBuilder):
         view._rollbacks = self._rollbacks
         view._savepoints = self._savepoints
         view._next_replica = self._next_replica
+        view._replica_down = self._replica_down
         view._use_primary = self._use_primary
         view._timeout = self._timeout
         return view
@@ -832,8 +864,12 @@ class Session(QueryBuilder):
         primary = self._require_driver()
         if not read_only or self._use_primary or not self._replicas:
             return primary.acquire()  # the common case: no extra wrapper
-        replica = self._replicas[next(self._next_replica) % len(self._replicas)]
-        return self._replica_connection(replica, primary)
+        now = time.monotonic()
+        for _ in self._replicas:
+            replica = self._replicas[next(self._next_replica) % len(self._replicas)]
+            if self._replica_down.get(replica, 0.0) <= now:
+                return self._replica_connection(replica, primary)
+        return primary.acquire()  # every replica is down
 
     @asynccontextmanager
     async def _locked(self, conn: Connection) -> AsyncGenerator[Connection]:
@@ -843,7 +879,13 @@ class Session(QueryBuilder):
 
     def _check_savepoint_owner(self) -> None:
         """Refuse a statement that would land in another task's savepoint: a rollback of
-        that savepoint would undo it silently (C11)."""
+        that savepoint would undo it silently (C11). Refuse any statement once the
+        transaction has ended (R3)."""
+        if self._savepoints and self._savepoints[-1] is _ENDED:
+            raise QueryError(
+                "this transaction has ended; run the statement inside its "
+                "`async with db.transaction()` block, or on db"
+            )
         if self._savepoints and _SAVEPOINT.get() is not self._savepoints[-1]:
             raise QueryError(
                 "another task has a savepoint open on this transaction; while it is open, "
@@ -859,8 +901,13 @@ class Session(QueryBuilder):
             try:
                 conn = await stack.enter_async_context(replica.acquire())
             except DbConnectionError:
-                # No statement ran yet, so the primary can take the read.
-                log.warning("mizzle: read replica unavailable; reading from the primary")
+                # No statement ran yet, so the primary can take the read. Reads skip the
+                # replica for a while: a hung one made every read wait (R7).
+                self._replica_down[replica] = time.monotonic() + _REPLICA_PAUSE
+                log.warning(
+                    "mizzle: read replica unavailable; reading from the primary for %.0f s",
+                    _REPLICA_PAUSE,
+                )
                 conn = await stack.enter_async_context(primary.acquire())
             yield conn
 
@@ -1192,6 +1239,8 @@ class Database(Session):
         server_settings: Mapping[str, str] | None = None,
         connect_retries: int = 0,
         connect_backoff: float = 0.5,
+        connect_timeout: float = 10.0,
+        acquire_timeout: float | None = 30.0,
     ) -> Self:
         """Open a pool to ``url`` and one to each read replica URL (same pool settings).
 
@@ -1206,6 +1255,9 @@ class Database(Session):
         because a reset undoes what the hook set; ``server_settings`` sets PostgreSQL GUCs for
         every connection. ``connect_retries`` (with ``connect_backoff`` seconds, doubling each
         time) retries a failed connection, to survive a database that is not up yet.
+        ``connect_timeout`` limits how long opening one connection may take, and
+        ``acquire_timeout`` how long a query waits for a free pooled connection (None: no
+        limit); both raise ``ConnectionError``.
 
         ``reset_connections="auto"`` (the default) resets a connection's session state when
         it goes back to the pool only after a statement that may have changed it: raw
@@ -1217,6 +1269,21 @@ class Database(Session):
         (and the ``on_connect`` hook with it) runs on every release. The reset is ``RESET ALL``,
         advisory unlock, ``UNLISTEN *``, ``CLOSE ALL`` and ``DISCARD TEMP``; ``PREPARE``d
         statements survive it."""
+        # Checked here: asyncpg raises a bare ValueError, or hangs (R11).
+        rules = {
+            "pool_size >= 1": pool_size >= 1,
+            "0 <= pool_min_size <= pool_size": 0 <= pool_min_size <= pool_size,
+            "max_idle >= 0": max_idle >= 0,
+            "query_timeout > 0 or None": query_timeout is None or query_timeout > 0,
+            "statement_cache_size >= 0": statement_cache_size >= 0,
+            "connect_retries >= 0": connect_retries >= 0,
+            "connect_backoff >= 0": connect_backoff >= 0,
+            "connect_timeout > 0": connect_timeout > 0,
+            "acquire_timeout > 0 or None": acquire_timeout is None or acquire_timeout > 0,
+        }
+        for rule, ok in rules.items():
+            if not ok:
+                raise QueryError(f"Database.connect() needs {rule}")
         dialect = dialect_for_url(url)
         for replica in replicas:
             if dialect_for_url(replica).name != dialect.name:
@@ -1246,6 +1313,8 @@ class Database(Session):
                                 reset_connections=reset_connections,
                                 on_connect=on_connect,
                                 server_settings=server_settings,
+                                connect_timeout=connect_timeout,
+                                acquire_timeout=acquire_timeout,
                             )
                         )
                 except DbConnectionError as exc:

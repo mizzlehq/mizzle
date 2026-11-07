@@ -195,6 +195,8 @@ class Dialect(Protocol):
         reset_connections: ResetMode = "auto",
         on_connect: Callable[[Connection], Awaitable[None]] | None = None,
         server_settings: Mapping[str, str] | None = None,
+        connect_timeout: float = 10.0,
+        acquire_timeout: float | None = 30.0,
     ) -> Driver: ...
 
     # -- schema snapshots (normalized so a schema and its database compare equal) -----

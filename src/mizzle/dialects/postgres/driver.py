@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import enum
+import itertools
 import json
 import logging
 import math
+import os
 import re
 import time
 import uuid
@@ -16,12 +18,13 @@ from collections.abc import (
     Awaitable,
     Callable,
     Iterable,
+    Iterator,
     Mapping,
     Sequence,
 )
 from contextlib import asynccontextmanager
 from decimal import Decimal
-from typing import TYPE_CHECKING, Literal, Self, cast, final
+from typing import BinaryIO, Self, cast, final
 from urllib.parse import urlsplit
 
 import asyncpg
@@ -52,17 +55,13 @@ from mizzle.dialects.base import (
     ResetMode,
 )
 
-if TYPE_CHECKING:
-    # Stub-only. It leaves out str paths, which asyncpg accepts (os.fspath).
-    from asyncpg.connection import _OutputType  # pyright: ignore[reportPrivateUsage]
-
-type _AsyncpgIsolation = Literal["read_committed", "repeatable_read", "serializable"]
 log = logging.getLogger("mizzle")
 
-_ISOLATION: dict[IsolationLevel, _AsyncpgIsolation] = {
-    "read committed": "read_committed",
-    "repeatable read": "repeatable_read",
-    "serializable": "serializable",
+# Also the check that a level is valid: it is written into the BEGIN statement.
+_ISOLATION: dict[IsolationLevel, str] = {
+    "read committed": "READ COMMITTED",
+    "repeatable read": "REPEATABLE READ",
+    "serializable": "SERIALIZABLE",
 }
 
 
@@ -231,6 +230,15 @@ _PARAM_OR_QUOTED = re.compile(
 )
 
 
+def _aborted(phase: str) -> DatabaseError:
+    return DatabaseError(
+        "a statement in this transaction failed and its error was caught, so PostgreSQL "
+        "aborted the transaction and nothing was committed. Wrap a statement that may fail "
+        "in a savepoint (tx.transaction())",
+        sql=phase,
+    )
+
+
 def _qualified(schema: str, name: str) -> str:
     return ".".join('"' + part.replace('"', '""') + '"' for part in (schema, name))
 
@@ -244,21 +252,14 @@ def _rowcount(status: str) -> int:
 class PostgresConnection:
     _conn: asyncpg.Connection | PoolConnectionProxy
     dirty: bool  # ran a statement that may have changed session state
-    # Statements the server failed. A failure aborts the open transaction (or savepoint)
-    # even when the caller catches it, and PostgreSQL answers the COMMIT with ROLLBACK and
-    # no error, which asyncpg ignores (C10).
-    _failures: int
+    _savepoint_ids: Iterator[int]
 
     def __init__(self, conn: asyncpg.Connection | PoolConnectionProxy) -> None:
         self._conn = conn
         self.dirty = False
-        self._failures = 0
+        self._savepoint_ids = itertools.count(1)
 
     def _translate(self, exc: Exception, sql: str) -> Exception:
-        if isinstance(exc, TimeoutError) or (
-            isinstance(exc, asyncpg.PostgresError) and getattr(exc, "sqlstate", None)
-        ):
-            self._failures += 1  # a server error, or a cancelled statement
         try:
             server = self._conn.get_server_version().major
         except Exception:  # a detached pool proxy: the version is not needed then
@@ -319,28 +320,47 @@ class PostgresConnection:
     async def transaction(
         self, isolation: IsolationLevel | None = None, readonly: bool = False
     ) -> AsyncGenerator[None]:
-        level = _ISOLATION[isolation] if isolation is not None else None
-        failures = self._failures
+        # BEGIN / COMMIT are sent here, not through asyncpg's Transaction, to read the
+        # COMMIT tag: PostgreSQL answers COMMIT on an aborted transaction with the tag
+        # ROLLBACK and no error. Counting failed statements missed some (COPY errors,
+        # cancelled statements) and counted client-side errors that abort nothing (R2, R4).
         nested, phase = False, "BEGIN"  # the phase is named in the error (C13)
         body_error: BaseException | None = None
         try:
             nested = self._conn.is_in_transaction()  # inside: a detached proxy raises
-            phase = "SAVEPOINT" if nested else "BEGIN"
-            async with self._conn.transaction(isolation=level, readonly=readonly):
+            if nested:
+                name = f"mizzle_sp_{next(self._savepoint_ids)}"
+                phase = "SAVEPOINT"
+                await self._conn.execute(f"SAVEPOINT {name}")
+            else:
+                name = ""
+                begin = "BEGIN"
+                if isolation is not None:
+                    begin += f" ISOLATION LEVEL {_ISOLATION[isolation]}"
+                await self._conn.execute(begin + " READ ONLY" if readonly else begin)
+            try:
+                yield
+            except BaseException as exc:
+                body_error = exc
+                phase = "ROLLBACK TO SAVEPOINT" if nested else "ROLLBACK"
+                await self._conn.execute(
+                    f"ROLLBACK TO SAVEPOINT {name}; RELEASE SAVEPOINT {name}"
+                    if nested
+                    else "ROLLBACK"
+                )
+                raise
+            phase = "RELEASE SAVEPOINT" if nested else "COMMIT"
+            if nested:
                 try:
-                    yield
-                except BaseException as exc:
-                    body_error = exc
-                    phase = "ROLLBACK TO SAVEPOINT" if nested else "ROLLBACK"
-                    raise
-                phase = "RELEASE SAVEPOINT" if nested else "COMMIT"
-                if self._failures != failures:
-                    raise DatabaseError(
-                        "a statement in this transaction failed and its error was caught, so "
-                        "PostgreSQL aborted the transaction and nothing was committed. Wrap a "
-                        "statement that may fail in a savepoint (tx.transaction())",
-                        sql=phase,
+                    await self._conn.execute(f"RELEASE SAVEPOINT {name}")
+                except pg.InFailedSQLTransactionError:
+                    # A statement inside the savepoint failed and its error was caught.
+                    await self._conn.execute(
+                        f"ROLLBACK TO SAVEPOINT {name}; RELEASE SAVEPOINT {name}"
                     )
+                    raise _aborted(phase) from None
+            elif await self._conn.execute("COMMIT") != "COMMIT":
+                raise _aborted(phase)
         # BEGIN / COMMIT failures (body errors are mapped), and a connection lost before
         # ROLLBACK (asyncpg's InterfaceError: "the underlying connection is closed").
         # InternalClientError: BEGIN on a connection the server closed under load.
@@ -356,10 +376,6 @@ class PostgresConnection:
                 body_error.add_note(f"{phase} also failed: {type(exc).__name__}: {exc}")
                 raise body_error from None
             raise _translate(exc, phase) from None
-        finally:
-            # Unchanged on success (it raised otherwise); after an exception the block was
-            # rolled back, which undid any failure inside it.
-            self._failures = failures
 
     async def cursor(
         self,
@@ -418,6 +434,27 @@ class PostgresConnection:
         session_safe: bool = False,
     ) -> int:
         self.dirty |= not session_safe
+        # Errors of the output (disk full, a callback that raises) are raised as they are:
+        # mapped like socket errors they became a lost connection, and every pool was
+        # expired (R8).
+        output_errors: list[Exception] = []
+        file = None
+        if isinstance(output, str | os.PathLike):
+            file = await asyncio.to_thread(open, output, "wb")
+            sink: CopyOutput = file
+        else:
+            sink = output
+
+        async def write(chunk: bytes) -> None:
+            try:
+                if callable(sink):
+                    await sink(chunk)
+                else:
+                    await asyncio.to_thread(cast(BinaryIO, sink).write, chunk)
+            except Exception as exc:
+                output_errors.append(exc)
+                raise
+
         try:
             # COPY takes no bind parameters, so their values are written into the SQL.
             if params:
@@ -426,14 +463,15 @@ class PostgresConnection:
             else:
                 query = sql
             status = await self._conn.copy_from_query(
-                query,
-                output=cast("_OutputType", output),
-                format=format,
-                header=header or None,
-                timeout=timeout,
+                query, output=write, format=format, header=header or None, timeout=timeout
             )
         except Exception as exc:
+            if output_errors:
+                raise output_errors[0] from None
             raise self._translate(exc, sql) from None
+        finally:
+            if file is not None:
+                file.close()
         return _rowcount(status)
 
     async def _inline(self, sql: str, params: Sequence[object]) -> str:
@@ -800,7 +838,16 @@ class _Acquire:
     async def __aenter__(self) -> PostgresConnection:
         start = time.perf_counter()
         try:
-            self._conn = await self._pool.acquire()
+            self._conn = await self._pool.acquire(timeout=self._driver.acquire_timeout)
+        except TimeoutError:
+            # Every connection stayed busy (or a new one did not open) for that long (R9).
+            error = DbConnectionError(
+                "could not get a connection in time: all "
+                f"{self._pool.get_max_size()} pooled connections stayed busy, or the server "
+                "did not answer; raise pool_size, acquire_timeout or connect_timeout"
+            )
+            error.lost = False
+            raise error from None
         except (OSError, asyncpg.PostgresError, asyncpg.InterfaceError) as exc:
             # InterfaceError: "pool is closed", for a view kept after Database.close() (C18).
             error = DbConnectionError(f"could not acquire a connection: {exc}")
@@ -853,11 +900,15 @@ def _is_closed(conn: asyncpg.Connection | PoolConnectionProxy) -> bool:
 class PostgresDriver:
     _pool: asyncpg.Pool
     _url: str | None  # for one-off connections outside the pool (never logged)
+    acquire_timeout: float | None
     last_acquire_ms: float
 
-    def __init__(self, pool: asyncpg.Pool, url: str | None = None) -> None:
+    def __init__(
+        self, pool: asyncpg.Pool, url: str | None = None, acquire_timeout: float | None = 30.0
+    ) -> None:
         self._pool = pool
         self._url = url
+        self.acquire_timeout = acquire_timeout
         self.last_acquire_ms = 0.0
 
     @classmethod
@@ -873,6 +924,8 @@ class PostgresDriver:
         reset_connections: ResetMode = "auto",
         on_connect: Callable[[PostgresConnection], Awaitable[None]] | None = None,
         server_settings: Mapping[str, str] | None = None,
+        connect_timeout: float = 10.0,
+        acquire_timeout: float | None = 30.0,
     ) -> PostgresDriver:
         """``statement_cache_size=0`` is needed behind PgBouncer in transaction mode.
         ``max_idle`` closes connections unused for that many seconds (0 keeps them).
@@ -905,17 +958,18 @@ class PostgresDriver:
                 # Never asyncpg's default reset: ours runs the reset only when needed ("auto",
                 # after a dirty statement) or every time ("always"), and re-runs on_connect.
                 reset=_reset_connection,
+                timeout=connect_timeout,  # asyncpg's default waits 60 s on a hung server (R7)
             )
         except asyncpg.ClientConfigurationError as exc:  # a bad option, such as sslmode
             raise _malformed(url, exc) from None
-        except (OSError, asyncpg.PostgresError) as exc:
+        except (OSError, asyncpg.PostgresError, TimeoutError) as exc:
             # The URL is left out on purpose: it may contain a password.
             error = DbConnectionError(f"could not connect: {type(exc).__name__}: {exc}")
             # A wrong password or a missing database does not fix itself: the caller's
             # retry loop must not sleep and try again (R4).
             error.retryable = _retryable(exc)
             raise error from exc
-        return cls(pool, url)
+        return cls(pool, url, acquire_timeout)
 
     def acquire(self) -> _Acquire:
         return _Acquire(self._pool, self)
