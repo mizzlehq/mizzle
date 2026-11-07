@@ -57,8 +57,15 @@ async def db(driver: PostgresDriver, pg_url: str) -> AsyncGenerator[Database]:
     ) as database:
         yield database
         assert_no_leak(database)
+
+
+@pytest.fixture(autouse=True)
+async def drop_stream_items(driver: PostgresDriver) -> AsyncGenerator[None]:
+    """Every test here may create stream_items; none may leave it behind, pass or fail
+    (a later test file on the same database would see it as drift)."""
+    yield
     async with driver.acquire() as conn:
-        await conn.execute("DROP TABLE stream_items", [])
+        await conn.execute("DROP TABLE IF EXISTS stream_items", [])
 
 
 async def released(db: Database) -> None:
@@ -196,15 +203,11 @@ async def test_logger_sees_one_event_per_stream(pg_url: str, driver: PostgresDri
     async with driver.acquire() as conn:
         await conn.execute(DDL, [])
     events: list[QueryEvent] = []
-    try:
-        async with await Database.connect(pg_url, schema=[Items], logger=events.append) as db:
-            assert len([r async for r in db.select().from_(Items).stream(batch_size=100)]) == 2500
-            async with aclosing(db.select().from_(Items).stream()) as rows:
-                async for _ in rows:
-                    break
-    finally:
-        async with driver.acquire() as conn:
-            await conn.execute("DROP TABLE IF EXISTS stream_items", [])
+    async with await Database.connect(pg_url, schema=[Items], logger=events.append) as db:
+        assert len([r async for r in db.select().from_(Items).stream(batch_size=100)]) == 2500
+        async with aclosing(db.select().from_(Items).stream()) as rows:
+            async for _ in rows:
+                break
     assert [e.error for e in events] == [None, None]
     assert "stream_items" in events[0].sql
 
