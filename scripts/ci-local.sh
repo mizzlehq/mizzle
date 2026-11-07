@@ -86,11 +86,22 @@ run() {  # $1 = job name, rest = command; runs in the background, log in .ci-loc
   ) &
 }
 
-# Ctrl-C: stop every job and remove the test servers.
+# One run at a time: a second run removed the first one's servers (same names).
+exec 9>"$LOGS/.lock"
+if command -v flock >/dev/null && ! flock -n 9; then
+  echo "another scripts/ci-local.sh run is going; wait for it or stop it (Ctrl-C) first"
+  exit 1
+fi
+
+# Ctrl-C: stop every job (and the uv / pytest processes under it), remove the servers.
 cleanup() {
-  kill $(jobs -p) 2>/dev/null
+  trap - INT
+  trap '' TERM
+  kill -TERM -- -$$ 2>/dev/null
   docker rm -f $(docker ps -aq --filter name=mizzle-ci-) >/dev/null 2>&1
   [ -t 1 ] && tput cnorm
+  echo
+  echo "stopped"
   exit 130
 }
 trap cleanup INT TERM
