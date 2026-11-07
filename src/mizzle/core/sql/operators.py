@@ -221,6 +221,8 @@ def desc(expr: ExprBase, *, nulls: Literal["first", "last"] | None = None) -> Or
 
 
 def count(expr: ExprBase | None = None, *, distinct: bool = False) -> Aggregate[int]:
+    if distinct and expr is None:  # count(DISTINCT *) is not SQL (Q17)
+        raise QueryError("count(distinct=True) needs an expression")
     return Aggregate[int]("count", (expr if expr is not None else Star(),), distinct)
 
 

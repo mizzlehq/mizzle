@@ -594,6 +594,11 @@ class OrderBy(Node):
     descending: bool = False
     nulls: Literal["first", "last"] | None = None
 
+    def __post_init__(self) -> None:
+        nulls: object = self.nulls  # written into the SQL as is (Q16)
+        if nulls not in (None, "first", "last"):
+            raise QueryError(f"nulls must be 'first' or 'last', not {nulls!r}")
+
 
 @dataclass(frozen=True)
 class Identifier(Node):

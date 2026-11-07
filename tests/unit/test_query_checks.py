@@ -244,3 +244,52 @@ def test_sql_with_a_lone_brace_is_a_query_error() -> None:
 
     with pytest.raises(QueryError, match="braces"):
         sql("select '{' || {}", 1)
+
+
+def test_ddl_literals_arrays_and_postgres_types() -> None:
+    # Q11: a list is an array, not JSON text. Q12: inet, cidr, ranges, bits, geometry.
+    import ipaddress
+
+    from asyncpg import BitString, Box, LineSegment, Point, Range
+
+    from mizzle.dialects.postgres.ddl import compiler
+
+    c = compiler(None)
+    assert c.literal([1, "a"]) == "ARRAY[1, 'a']" and c.literal([]) == "'{}'"
+    assert c.literal(ipaddress.ip_address("10.0.0.1")) == "'10.0.0.1'::inet"
+    assert c.literal(ipaddress.ip_network("10.0.0.0/8")) == "'10.0.0.0/8'::cidr"
+    assert c.literal(Range(1, 5)) == "'[1,5)'" and c.literal([Range(1, 2)]) == "'{[1,2)}'"
+    assert c.literal(BitString.from_int(5, length=4)) == "'0101'::varbit"
+    assert c.literal(Point(1, 2.5)) == "'(1,2.5)'::point"
+    assert c.literal(Box((0, 0), (2, 3))) == "'(2,3),(0,0)'::box"
+    assert c.literal(LineSegment((0, 0), (1, 1))) == "'[(0,0),(1,1)]'::lseg"
+
+
+def test_json_scalar_defaults_are_json_text() -> None:
+    # Q10: default=5 on jsonb wrote DEFAULT 5, an integer.
+    from asyncpg import BitString
+
+    from mizzle.dialects.postgres.ddl import column_default
+    from mizzle.dialects.postgres.types import bit, jsonb
+
+    assert column_default(jsonb[int]().default(5)) == "'5'"
+    assert column_default(jsonb[str]().default("x")) == "'\"x\"'"
+    assert column_default(jsonb[bool]().default(True)) == "'true'"
+    assert column_default(bit(4).default(BitString.from_int(5, length=4))) == "'0101'"
+
+
+def test_order_nulls_count_distinct_and_nul_are_checked() -> None:
+    from mizzle.core.sql.operators import asc, count, desc
+
+    with pytest.raises(QueryError, match="nulls"):  # Q16
+        asc(Users.id, nulls="last; DROP TABLE users")  # pyright: ignore[reportArgumentType]
+    with pytest.raises(QueryError, match="nulls"):
+        desc(Users.id, nulls="middle")  # pyright: ignore[reportArgumentType]
+    with pytest.raises(QueryError, match="distinct"):  # Q17
+        count(distinct=True)
+    from mizzle.dialects.postgres.ddl import compiler
+
+    with pytest.raises(QueryError, match="NUL"):  # Q18
+        compiler(None).quote("a\x00b")
+    with pytest.raises(QueryError, match="NUL"):
+        compiler(None).literal("a\x00b")

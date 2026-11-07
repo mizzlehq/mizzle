@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import datetime
-from collections.abc import Iterable
+import ipaddress
+from collections.abc import Iterable, Sequence
 from decimal import Decimal
-from typing import TYPE_CHECKING, override
+from typing import TYPE_CHECKING, cast, override
+
+from asyncpg import BitString, Box, Circle, Line, LineSegment, Path, Point, Range
 
 from mizzle.core.compiler import CompiledQuery, Compiler
 from mizzle.core.errors import QueryError
@@ -37,10 +40,90 @@ def _range_parts(ref: str) -> str:
     )
 
 
+def _num(value: float) -> str:
+    """A float as PostgreSQL prints it: 1, not 1.0."""
+    return repr(float(value)).removesuffix(".0")
+
+
+def _point(point: Sequence[float]) -> str:
+    return f"({_num(point[0])},{_num(point[1])})"
+
+
+def _bound(value: object) -> str:
+    text = str(value)
+    if any(ch in text for ch in ' ,()[]"\\'):
+        return '"' + text.replace("\\", "\\\\").replace('"', '\\"') + '"'
+    return text
+
+
+type _Range = Range[int] | Range[Decimal] | Range[datetime.date]
+
+
+def _all_ranges(values: list[object]) -> bool:
+    return bool(values) and all(isinstance(v, Range) for v in values)
+
+
+def _range_text(value: _Range) -> str:
+    if value.isempty:
+        return "empty"
+    lower = "" if value.lower is None else _bound(value.lower)
+    upper = "" if value.upper is None else _bound(value.upper)
+    return f"{'[' if value.lower_inc else '('}{lower},{upper}{']' if value.upper_inc else ')'}"
+
+
+def _geometry_text(value: object) -> str | None:
+    """PostgreSQL's text form of an asyncpg geometric value; None for any other value."""
+    match value:
+        case Point():
+            return _point(value)
+        case Line():
+            return "{" + ",".join(_num(n) for n in value) + "}"
+        case LineSegment():
+            return f"[{_point(value[0])},{_point(value[1])}]"
+        case Box():  # PostgreSQL keeps the upper right corner first
+            (x1, y1), (x2, y2) = value
+            return f"{_point((max(x1, x2), max(y1, y2)))},{_point((min(x1, x2), min(y1, y2)))}"
+        case Path():  # and Polygon, always closed
+            points = ",".join(_point(p) for p in cast(Iterable[Point], value))
+            return f"({points})" if value.is_closed else f"[{points}]"
+        case Circle():
+            return f"<{_point(value[0])},{_num(value[1])}>"
+        case _:
+            return None
+
+
 class PostgresCompiler(Compiler):
     @override
     def param_marker(self, index: int, /) -> str:
         return f"${index}"
+
+    @override
+    def literal(self, value: object) -> str:
+        # Quoted text cast to the type, as for interval and bytea (Q12). A range takes its
+        # type from context: its Python value does not say int4range or int8range.
+        match value:
+            case Range():
+                return self.literal(_range_text(cast(_Range, value)))
+            case list() if _all_ranges(cast(list[object], value)):  # a multirange
+                ranges = cast(list[_Range], value)
+                return self.literal("{" + ",".join(_range_text(r) for r in ranges) + "}")
+            case ipaddress.IPv4Network() | ipaddress.IPv6Network():
+                return self.literal(str(value)) + "::cidr"
+            case (
+                ipaddress.IPv4Address()
+                | ipaddress.IPv6Address()
+                | ipaddress.IPv4Interface()
+                | ipaddress.IPv6Interface()
+            ):
+                return self.literal(str(value)) + "::inet"
+            case BitString():
+                return self.literal(value.as_string()) + "::varbit"
+            case _:
+                geometry = _geometry_text(value)
+                if geometry is None:
+                    return super().literal(value)
+                name = "lseg" if isinstance(value, LineSegment) else type(value).__name__.lower()
+                return f"{self.literal(geometry)}::{name}"
 
     @override
     def compile(self, node: Node) -> CompiledQuery:

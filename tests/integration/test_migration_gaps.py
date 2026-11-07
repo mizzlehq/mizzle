@@ -1582,3 +1582,34 @@ async def test_odd_literal_defaults_apply_and_show_no_drift(driver: PostgresDriv
         current = await dialect.introspect(conn, SCHEMAS)
         expected = await dialect.normalize_snapshot(conn, desired)
     assert diff(current, expected, normalized=True) == []
+
+
+async def test_json_scalar_and_postgres_type_defaults_apply(driver: PostgresDriver) -> None:
+    # Q10: DEFAULT 5 on jsonb. Q12: inet, cidr, range, bit and geometry defaults refused.
+    import ipaddress
+
+    from asyncpg import BitString, Box, Point
+    from asyncpg import Range as R
+
+    from mizzle.pg import inet, jsonb
+
+    @final
+    class Typed(Table, name="typed", schema="mg"):
+        id = integer().primary_key()
+        n = jsonb[int]().default(5)
+        s = jsonb[str]().default("x")
+        ip = inet().default(ipaddress.ip_address("10.0.0.1"))
+        net = cidr().default(ipaddress.ip_network("10.0.0.0/8"))
+        span = int4range().default(R(1, 5))
+        spans = int4multirange().default([R(1, 2), R(4, 6)])
+        bits = bit(4).default(BitString.from_int(5, length=4))
+        vbits = varbit().default(BitString.from_int(3, length=3))
+        at = point().default(Point(1, 2.5))
+        area = box().default(Box((0, 0), (2, 3)))
+
+    desired = snap([Typed])
+    await migrate(driver, empty_snapshot("postgresql"), desired)
+    [row] = await execute(driver, "INSERT INTO mg.typed (id) VALUES (1) RETURNING *")
+    assert row["n"] == 5 and row["s"] == "x" and row["span"] == R(1, 5)
+    assert str(row["ip"]) == "10.0.0.1" and str(row["net"]) == "10.0.0.0/8"
+    assert row["bits"] == BitString.from_int(5, length=4) and row["at"] == Point(1, 2.5)
