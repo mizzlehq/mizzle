@@ -155,7 +155,8 @@ def bind(value: object, like: Iterable[object] = ()) -> Node:
         return Param(value, column)
     if isinstance(value, enum.Enum):
         return _enum_value(value)
-    if isinstance(value, (dict, list)):  # untyped, CASE and jsonb builders failed (Q8)
+    # untyped, CASE and jsonb builders failed (Q8); a plain tuple too, not Point & co (Q4-13)
+    if isinstance(value, (dict, list)) or type(value) is tuple:
         return Cast(Param(_cast(object, value)), "jsonb")
     sql_type = sql_type_of(value)
     return Param(value) if sql_type is None else Cast(Param(value), sql_type)

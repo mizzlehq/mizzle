@@ -3,11 +3,13 @@
 import datetime
 import enum
 import itertools
-from collections.abc import AsyncGenerator
+import types
+from collections.abc import AsyncGenerator, Callable
 
 import pytest
 
 from mizzle import Database, eq, jsonb_build_object, many, one, placeholder, sql
+from mizzle.core.schema.column import ColumnBase
 from mizzle.core.schema.table import Table
 from mizzle.core.schema.types import integer, text
 from mizzle.dialects.postgres.driver import PostgresDriver
@@ -33,6 +35,18 @@ from mizzle.dialects.postgres.types import (
     tsrange,
     tstzrange,
     varbit,
+)
+from mizzle.pg import (
+    bit,
+    bytea,
+    date,
+    datemultirange,
+    double_precision,
+    inet,
+    interval,
+    json,
+    jsonb,
+    numeric,
 )
 from tests.models import Users
 
@@ -374,6 +388,8 @@ async def test_enum_and_json_values_without_a_column_are_typed(db: Database) -> 
         jsonb_build_array(Lvl.HIGH, [1, 2]),
     ).from_(Users)
     assert rows == [(Lvl.HIGH, Color.RED, {"a": 1}, {"c": "red", "d": {"x": [1]}}, [2, [1, 2]])]
+    # Q4-13: a tuple was an untyped parameter too (DataError)
+    assert await db.select(case_().when(yes, (1, 2))).from_(Users) == [([1, 2],)]
 
 
 class DateNest(Table, name="qc_date_nest"):
@@ -415,3 +431,85 @@ async def test_nested_ranges_ignore_the_date_style(driver: PostgresDriver, pg_ur
     finally:
         async with driver.acquire() as conn:
             await conn.execute("DROP TABLE qc_date_kid, qc_date_nest", [])
+
+
+class Hue(enum.Enum):
+    RED = "red"
+    BLUE = "blue"
+
+
+_BITS = "101100111010"
+_ROUND_TRIPS: list[tuple[str, Callable[[], ColumnBase], str]] = [
+    ("int4range", int4range, "'[1,5)'"),
+    ("int4range", int4range, "'empty'"),
+    ("numrange", numrange, "'[1.25,2.5]'"),
+    ("daterange", daterange, "'[2026-01-01,infinity)'"),
+    ("tstzrange", tstzrange, "'[2026-01-01 00:00+00,)'"),
+    ("int4multirange", int4multirange, "'{[1,3),[5,8)}'"),
+    ("int4multirange", int4multirange, "'{}'"),
+    ("datemultirange", datemultirange, "'{[2026-01-01,2026-02-01)}'"),
+    ("int4range[]", lambda: array(int4range()), "ARRAY['[1,2)'::int4range, 'empty']"),
+    *((f"varbit({n})", varbit, f"B'{_BITS[:n]}'") for n in range(1, 13)),
+    ("bit(5)", lambda: bit(5), "B'10101'"),
+    ("varbit[]", lambda: array(varbit()), "ARRAY[B'10101'::varbit, B'']"),
+    ("point", point, "'(1.5,-2)'"),
+    ("point[]", lambda: array(point()), "ARRAY['(1,2)'::point]"),
+    ("line", line, "'{1,2,3}'"),
+    ("lseg", lseg, "'[(0,0),(1.25,1)]'"),
+    ("box", box, "'((3,4),(1,2))'"),
+    ("path", path, "'[(0,0),(1,1)]'"),
+    ("path", path, "'((0,0),(1,1),(1,0))'"),
+    ("polygon", polygon, "'((0,0),(1,1),(1,0))'"),
+    ("circle", circle, "'<(1,2),3>'"),
+    ("numeric", numeric, "'NaN'"),
+    ("numeric", numeric, "'Infinity'"),
+    ("numeric", numeric, "'-Infinity'"),
+    ("numeric", numeric, "'1.50'"),
+    ("numeric(10,2)", lambda: numeric(10, 2), "'NaN'"),
+    ("numeric[]", lambda: array(numeric()), "ARRAY['NaN'::numeric, 2]"),
+    ("double precision", double_precision, "'Infinity'"),
+    ("double precision", double_precision, "'NaN'"),
+    ("date", date, "'infinity'"),
+    ("hue", lambda: pg_enum(Hue), "'red'"),
+    ("hue[]", lambda: array(pg_enum(Hue)), "ARRAY['red', 'blue']::hue[]"),
+    ("jsonb", jsonb, """'{"a": [1, null, "x"]}'"""),
+    ("json", json, """'[1, "two"]'"""),
+    ("cidr", cidr, "'10.0.0.0/8'"),
+    ("inet", inet, "'10.1.2.3/16'"),
+    ("interval", interval, "'-1 day 00:00:01'"),
+    ("bytea", bytea, "'\\x00ff27'::bytea"),
+]
+
+
+@pytest.mark.parametrize(("sql_type", "column", "literal"), _ROUND_TRIPS)
+async def test_select_models_round_trip_every_column_through_json(
+    driver: PostgresDriver,
+    pg_url: str,
+    sql_type: str,
+    column: Callable[[], ColumnBase],
+    literal: str,
+) -> None:
+    # Q4-9/Q4-10/Q4-13: multiranges, BitStrings ('1010 1'), Point/Box, Decimal('NaN') broke
+    # the JSON round trip of a value read from the database.
+    from mizzle.pydantic import select_model
+
+    async with driver.acquire() as conn:
+        await conn.execute(
+            "DROP TABLE IF EXISTS qc_rt; DROP TYPE IF EXISTS hue; "
+            "CREATE TYPE hue AS ENUM ('red', 'blue'); "
+            f"CREATE TABLE qc_rt (id serial PRIMARY KEY, v {sql_type}); "
+            f"INSERT INTO qc_rt (v) VALUES ({literal})",
+            [],
+        )
+    body: dict[str, object] = {"id": serial().primary_key(), "v": column()}
+    rt = types.new_class("Rt", (Table,), {"name": "qc_rt"}, lambda ns: ns.update(body))
+    try:
+        async with await Database.connect(pg_url, schema=[rt], pool_size=1) as db:
+            [(value,)] = await db.select(rt.v).from_(rt)
+        model = select_model(rt)
+        dumped = model.model_validate({"id": 1, "v": value}).model_dump_json()
+        back = model.model_validate_json(dumped).model_dump()["v"]
+        assert back == value or repr(back) == repr(value), dumped
+    finally:
+        async with driver.acquire() as conn:
+            await conn.execute("DROP TABLE qc_rt; DROP TYPE hue", [])
