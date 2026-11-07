@@ -805,3 +805,143 @@ async def test_wrong_error_types_are_mizzle_errors(pg_url: str) -> None:
             "postgresql://u:secretpw@localhost:badport/db", schema=[Users, Posts]
         )
     assert "secretpw" not in str(bad.value)
+
+
+async def test_a_queued_sibling_statement_does_not_land_in_a_closing_savepoint(
+    pg_url: str,
+) -> None:
+    # R1: the savepoint marker was popped before ROLLBACK TO ran. A sibling statement
+    # queued on the lock then ran inside the savepoint and was undone silently.
+    import asyncio
+
+    async with await Database.connect(pg_url, schema=[Users, Posts], pool_size=1) as db:
+
+        async def owner(tx: Any) -> None:
+            with pytest.raises(RuntimeError):
+                async with tx.transaction() as sp:
+                    await sp.execute(sql("SELECT pg_sleep(0.3)"))  # sibling queues here
+                    raise RuntimeError("undo")
+
+        async def sibling(tx: Any) -> None:
+            await asyncio.sleep(0.1)
+            await tx.insert(Users).values({"email": "r1@x"})
+
+        async with db.transaction() as tx:
+            results = await asyncio.gather(owner(tx), sibling(tx), return_exceptions=True)
+        assert results[0] is None
+        assert isinstance(results[1], QueryError), results[1]
+        assert await db.select().from_(Users).where(eq(Users.email, "r1@x")) == []
+
+
+async def test_a_cancelled_statement_aborts_the_commit(pg_url: str) -> None:
+    # R2: a cancelled statement aborts the transaction, but it was not counted as a
+    # failure: COMMIT "succeeded", after_commit ran, and nothing was saved.
+    import asyncio
+
+    ran: list[str] = []
+
+    async def ac() -> None:
+        ran.append("commit")
+
+    async with await Database.connect(pg_url, schema=[Users, Posts], pool_size=1) as db:
+        with pytest.raises(DatabaseError, match="aborted the transaction"):
+            async with db.transaction(after_commit=ac) as tx:
+                await tx.insert(Users).values({"email": "r2@x"})
+                slow = asyncio.ensure_future(tx.execute(sql("SELECT pg_sleep(5)")))
+                await asyncio.sleep(0.2)
+                slow.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await slow
+        assert ran == []
+        assert await db.select().from_(Users).where(eq(Users.email, "r2@x")) == []
+
+
+async def test_a_client_side_encode_error_does_not_abort_the_transaction(pg_url: str) -> None:
+    # R4: asyncpg's client-side DataError (sqlstate 22000) was counted as a server
+    # failure, so a transaction PostgreSQL never aborted was reported as not committed.
+    async with await Database.connect(pg_url, schema=[Users, Posts], pool_size=1) as db:
+        async with db.transaction() as tx:
+            await tx.insert(Users).values({"email": "r4@x"})
+            with pytest.raises(DatabaseError):
+                await tx.executemany(sql("SELECT $1::text"), [[123]])
+        assert len(await db.select().from_(Users).where(eq(Users.email, "r4@x"))) == 1
+
+
+async def test_a_statement_after_the_block_is_refused(pg_url: str) -> None:
+    # R3: a task's statement queued behind COMMIT ran in autocommit on the connection.
+    # R11: a statement on tx after its block gave ConnectionError, not QueryError.
+    import asyncio
+
+    async with await Database.connect(pg_url, schema=[Users, Posts], pool_size=1) as db:
+        async with db.transaction() as tx:
+            late = asyncio.ensure_future(tx.insert(Users).values({"email": "r3@x"}))
+        with pytest.raises(QueryError, match="transaction has ended"):
+            await late
+        with pytest.raises(QueryError, match="transaction has ended"):
+            await tx.select().from_(Users)
+        assert await db.select().from_(Users).where(eq(Users.email, "r3@x")) == []
+
+
+async def test_a_cancel_during_commit_runs_no_hook(pg_url: str) -> None:
+    # R5: a cancel while COMMIT was in flight ran after_rollback, though the server may
+    # have committed. The outcome is unknown, so no hook runs and a note says so.
+    import asyncio
+
+    ran: list[str] = []
+
+    async def ac() -> None:
+        ran.append("commit")
+
+    async def ar() -> None:
+        ran.append("rollback")
+
+    async with await Database.connect(pg_url, schema=[Users, Posts], pool_size=1) as db:
+        await db.execute(sql("CREATE TABLE r5_slow (id int)"))
+        await db.execute(
+            sql(
+                "CREATE FUNCTION r5_sleep() RETURNS trigger LANGUAGE plpgsql AS"
+                " $$ BEGIN PERFORM pg_sleep(1); RETURN NULL; END $$"
+            )
+        )
+        await db.execute(
+            sql(
+                "CREATE CONSTRAINT TRIGGER r5 AFTER INSERT ON r5_slow"
+                " DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION r5_sleep()"
+            )
+        )
+        try:
+
+            async def write() -> None:
+                async with db.transaction(after_commit=ac, after_rollback=ar) as tx:
+                    await tx.execute(sql("INSERT INTO r5_slow VALUES (1)"))
+
+            task = asyncio.ensure_future(write())
+            await asyncio.sleep(0.3)  # the body is done; COMMIT runs the 1 s trigger
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError) as caught:
+                await task
+            assert ran == []
+            assert any("may or may not" in note for note in caught.value.__notes__)
+        finally:
+            await db.execute(sql("DROP TABLE r5_slow"))
+            await db.execute(sql("DROP FUNCTION r5_sleep()"))
+
+
+async def test_acquire_gives_up_after_acquire_timeout(pg_url: str) -> None:
+    # R9: with every pooled connection busy, a query waited forever.
+    async with await Database.connect(
+        pg_url, schema=[Users, Posts], pool_size=1, acquire_timeout=0.2
+    ) as db:
+        async with db.transaction():  # holds the only connection
+            with pytest.raises(ConnectionError, match="in time"):
+                await db.select().from_(Users)
+
+
+@pytest.mark.parametrize(
+    "args",
+    [{"pool_size": 0}, {"pool_min_size": 5, "pool_size": 2}, {"connect_timeout": 0}],
+)
+async def test_bad_pool_args_are_a_query_error(pg_url: str, args: dict[str, Any]) -> None:
+    # R11: asyncpg raised a bare ValueError.
+    with pytest.raises(QueryError, match=r"Database.connect\(\) needs"):
+        await Database.connect(pg_url, schema=[Users, Posts], **args)

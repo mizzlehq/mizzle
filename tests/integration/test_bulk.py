@@ -388,3 +388,19 @@ async def test_timestamptz_infinity_is_aware_everywhere(db: Database) -> None:
     buffer = io.BytesIO()
     await db.copy_from(db.select(Users.created_at).from_(Users).order_by(Users.email), buffer)
     assert buffer.getvalue().decode().split() == ["infinity", "-infinity", "infinity", "infinity"]
+
+
+async def test_copy_from_output_error_is_raised_as_is(db: Database, tmp_path: Path) -> None:
+    # R8: an OSError from the output (disk full) became ConnectionError(lost=True), and
+    # every pool was expired.
+    await db.copy_into(Rows, [{"n": 1, "label": "a"}])
+
+    async def full(_: bytes) -> None:
+        raise OSError(28, "No space left on device")
+
+    with pytest.raises(OSError) as caught:
+        await db.copy_from(db.select().from_(Rows), full)
+    assert type(caught.value) is OSError
+    with pytest.raises(IsADirectoryError):
+        await db.copy_from(db.select().from_(Rows), str(tmp_path))  # a directory
+    assert await db.copy_from(db.select().from_(Rows), str(tmp_path / "ok.csv")) == 1

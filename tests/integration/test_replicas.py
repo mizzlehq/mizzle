@@ -134,3 +134,43 @@ async def test_unreachable_replica_falls_back_to_primary(
     ) as db:
         await db.insert(Users).values(email="a@example.com")
         assert [u.email for u in await db.select().from_(Users)] == ["a@example.com"]
+
+
+async def test_a_select_calling_func_runs_on_the_primary(db: Database) -> None:
+    # R6: a func() call may write (nextval, a user function), but such a select went to a
+    # replica and was retried after a lost connection.
+    from mizzle import func
+
+    await db.insert(Users).values(email="primary@example.com")
+    rows = await db.select({"e": func("lower", Users.email)}).from_(Users)
+    assert [row["e"] for row in rows] == ["primary@example.com"]
+
+
+async def test_a_hung_replica_is_skipped_after_one_timeout(pg_url: str) -> None:
+    # R7: a replica that accepts TCP but never answers made every read wait 60 s.
+    import asyncio
+    import time
+
+    hung: list[asyncio.StreamWriter] = []
+
+    async def accept(_: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        hung.append(writer)  # never answers
+
+    server = await asyncio.start_server(accept, "127.0.0.1", 0)
+    port = server.sockets[0].getsockname()[1]
+    try:
+        async with await Database.connect(
+            pg_url,
+            schema=[Users, Posts],
+            replicas=[f"postgresql://mizzle:mizzle@127.0.0.1:{port}/mizzle"],
+            pool_min_size=0,
+            connect_timeout=0.3,
+        ) as db:
+            await db.select().from_(Users)  # waits connect_timeout, then the primary
+            start = time.perf_counter()
+            await db.select().from_(Users)
+            assert time.perf_counter() - start < 0.2
+    finally:
+        for writer in hung:
+            writer.close()
+        server.close()

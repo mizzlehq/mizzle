@@ -102,22 +102,14 @@ def test_old_servers_name_the_version_needed(sql: str, word: str, needs: str) ->
     assert "needs PostgreSQL" not in str(map_error(other, "selec 1"))
 
 
-class _BrokenBegin:
-    async def __aenter__(self) -> None:
-        raise pg.InternalClientError(
-            "cannot switch to state 15; another operation (2) is in progress"
-        )
-
-    async def __aexit__(self, *_: object) -> None:
-        return None
-
-
 class _BrokenConnection:
     def is_in_transaction(self) -> bool:
         return False
 
-    def transaction(self, **_: object) -> _BrokenBegin:
-        return _BrokenBegin()
+    async def execute(self, *_: object) -> str:
+        raise pg.InternalClientError(
+            "cannot switch to state 15; another operation (2) is in progress"
+        )
 
 
 async def test_begin_on_a_closed_connection_is_a_connection_error() -> None:
