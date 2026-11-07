@@ -198,7 +198,8 @@ export function SqlConsole({ readOnly }: { readOnly: boolean }) {
             {results.length > 0 && (
               <span className="ml-auto">
                 {names}
-                {totalRows} row{totalRows === 1 ? "" : "s"}
+                {totalRows}
+                {results.some((r) => r.truncated) ? "+" : ""} row{totalRows === 1 ? "" : "s"}
                 {results.some((r) => r.truncated) && " (showing first 1000 per statement)"}
               </span>
             )}

@@ -289,6 +289,11 @@ statements that rewrite or lock tables (`CLUSTER`, `REINDEX`, `ANALYZE`, `VACUUM
 server-side functions (`pg_read_file`, `pg_notify`, replication slot functions, ...). That
 list is not the security control and cannot be complete; the role is.
 
+The SQL console keeps a query history and saved queries in `.mizzle/studio.json` in the
+project folder. The history holds the SQL as you typed it, so a statement with a password
+lands there: the file is readable only by you, and `.mizzle/` ignores itself in git. Clear
+the history from the console, or delete the file.
+
 CSV export prefixes a text cell starting with `=`, `+`, `-` or `@` (also after leading
 whitespace) with an apostrophe, so a spreadsheet treats it as text rather than a formula.
 Numbers, intervals, dates and times are left as they are. JSON export is unaltered.

@@ -34,12 +34,12 @@ import re
 import secrets
 import time
 import webbrowser
-from collections.abc import AsyncGenerator, Awaitable, Callable, Mapping, Sequence
+from collections.abc import AsyncGenerator, Awaitable, Callable, Iterable, Mapping, Sequence
 from contextlib import aclosing, asynccontextmanager
 from dataclasses import dataclass, field
 from decimal import Decimal
 from pathlib import Path
-from typing import cast, override
+from typing import Protocol, cast, override
 
 from starlette.applications import Starlette
 from starlette.middleware import Middleware
@@ -243,9 +243,18 @@ class Studio:
         if self.state_path is None:
             return
         try:
-            self.state_path.parent.mkdir(parents=True, exist_ok=True)
-            payload = {"history": self.history, "saved": self.saved}
-            self.state_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+            # The history holds whatever SQL was run, passwords included (C6): keep the file
+            # private to this user, and the folder out of version control.
+            folder = self.state_path.parent
+            folder.mkdir(parents=True, exist_ok=True)
+            ignore = folder / ".gitignore"
+            if not ignore.exists():
+                ignore.write_text("# mizzle Studio state: query history may hold secrets\n*\n")
+            payload = json.dumps({"history": self.history, "saved": self.saved}, indent=2)
+            flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+            with os.fdopen(os.open(self.state_path, flags, 0o600), "w", encoding="utf-8") as f:
+                f.write(payload + "\n")
+            self.state_path.chmod(0o600)  # a file written by an older version kept its mode
         except OSError:
             log.warning("could not write Studio state %s", self.state_path)
 
@@ -292,9 +301,25 @@ def _array(value: object, what: str) -> list[object]:
     return cast(list[object], value)
 
 
+# A size or precision modifier, or a quoted name (kept as it is).
+_TYPMOD = re.compile(r'"(?:[^"]|"")*"|\(\d+(?:\s*,\s*\d+)?\)')
+# Without its modifier, character means character(1) and bit means bit(1).
+_UNBOUNDED = {"character": "bpchar", "bit": "bit varying"}
+
+
 def _cast_type(column: ColumnSnap) -> str:
+    """The column's type without its modifier. An explicit CAST to varchar(5) or
+    numeric(5,2) cuts or rounds the value silently, so an insert stored "qwert" and a key
+    filter matched the wrong row (C4). Without it, the column's own assignment and
+    comparison check the value."""
     # Introspected types come from format_type(), which already quotes when needed.
-    return SERIAL_TYPES.get(column["type"], column["type"])
+    full = SERIAL_TYPES.get(column["type"], column["type"])
+    bare = _TYPMOD.sub(lambda m: m.group(0) if m.group(0).startswith('"') else "", full)
+    arrays = bare.count("[]")
+    base = bare.replace("[]", "").strip()
+    if base.startswith("interval"):  # "interval year to month" cuts the days off too
+        base = "interval"
+    return _UNBOUNDED.get(base, base) + "[]" * arrays
 
 
 def _as_text(value: object) -> str | None:
@@ -396,8 +421,10 @@ def _cell(value: object, column_type: str) -> str:
 
 def jsonable(value: object) -> JSON:
     match value:
-        case None | bool() | int() | str():
+        case None | bool() | str():
             return value
+        case int():  # a browser would round a bigger one (C9)
+            return value if abs(value) <= _EXACT_INT else str(value)
         case float():
             return value if value == value and abs(value) != float("inf") else str(value)
         case dict():
@@ -414,6 +441,14 @@ def jsonable(value: object) -> JSON:
             return str(value)
 
 
+class _Named(Protocol):
+    """A driver row that knows its column names (asyncpg's Record), duplicates included."""
+
+    def keys(self) -> Iterable[str]: ...
+
+
+# Statements that return rows from a query, read through a cursor in the SQL console.
+_QUERY = re.compile(r"(?:SELECT|WITH|VALUES|TABLE)\b", re.IGNORECASE)
 # A browser reads a JSON number as a double: past 2**53 an integer is no longer exact.
 _EXACT_INT = 2**53
 # Each row as the server's JSON text, decoded by ``_row_json``.
@@ -533,7 +568,8 @@ async def export_rows(studio: Studio, request: Request) -> Response:
     """Download every matching row as CSV or JSON (not just the current page).
 
     The rows are streamed from a server-side cursor, so a large export does not have to fit
-    in memory, and nothing is silently cut short.
+    in memory. A query error before the first byte is a 400; a later one cuts the
+    connection, so the download fails instead of ending early.
     """
     table = await _table(studio, request)
     q = request.query_params
@@ -557,30 +593,53 @@ async def export_rows(studio: Studio, request: Request) -> Response:
     types = [c["type"] for c in table["columns"].values()]
     batch_size = 1000
 
+    def chunk(batch: Sequence[Row], first: bool) -> bytes:
+        if fmt == "csv":
+            return _csv_chunk(columns, types, batch)
+        # The server's own JSON text: exact numbers, nothing re-encoded.
+        rows = [cast(str, row[0]).encode() for row in batch]
+        return (b"" if first or not rows else b",") + b",".join(rows)
+
     async def body() -> AsyncGenerator[bytes]:
         async with studio.pool().acquire() as conn, conn.transaction():
-            if fmt == "csv":
-                buffer = io.StringIO()
-                writer = csv.writer(buffer)
-                writer.writerow(columns)
-                yield buffer.getvalue().encode()
-            else:
-                yield b"["
-            first = True
             async with aclosing(conn.cursor(sql, params, batch_size)) as batches:
+                # The first batch is read before any byte is sent, so a query that fails
+                # (a bad filter value) is a 400, not a 200 with a cut-off file (C7).
+                none: list[Row] = []
+                batch = await anext(batches, none)
+                if fmt == "csv":
+                    buffer = io.StringIO()
+                    csv.writer(buffer).writerow(columns)
+                    head = buffer.getvalue().encode()
+                else:
+                    head = b"["
+                yield head + chunk(batch, True)
+                empty = not batch
                 async for batch in batches:
-                    if fmt == "csv":
-                        yield _csv_chunk(columns, types, batch)
-                        continue
-                    for row in batch:
-                        # The server's own JSON text: exact numbers, nothing re-encoded.
-                        yield (b"" if first else b",") + cast(str, row[0]).encode()
-                        first = False
+                    yield chunk(batch, empty)
+                    empty = empty and not batch
             if fmt == "json":
                 yield b"]"
 
+    stream = body()
+    try:
+        first_chunk = await anext(stream)
+    except BaseException:
+        await stream.aclose()
+        raise
+
+    async def rest() -> AsyncGenerator[bytes]:
+        # A later failure raises out of the response, so the connection is cut instead of
+        # ending the file cleanly.
+        try:
+            yield first_chunk
+            async for part in stream:
+                yield part
+        finally:
+            await stream.aclose()
+
     media = "text/csv; charset=utf-8" if fmt == "csv" else "application/json"
-    return StreamingResponse(body(), media_type=media, headers=headers)
+    return StreamingResponse(rest(), media_type=media, headers=headers)
 
 
 def _csv_chunk(columns: Sequence[str], types: Sequence[str], batch: Sequence[Row]) -> bytes:
@@ -677,18 +736,33 @@ async def run_sql(studio: Studio, request: Request) -> Response:
     if studio.read_only:
         _reject_read_only(statements)
 
+    async def first_rows(conn: Connection, statement: str) -> list[Row]:
+        """At most MAX_SQL_ROWS + 1 rows. A query is read through a cursor, so a huge
+        result is never loaded whole (C5); other statements return few rows."""
+        if not _QUERY.match(statement[first_token(statement) :]):
+            return await conn.fetch(statement, [])
+        none: list[Row] = []
+        async with aclosing(conn.cursor(statement, [], MAX_SQL_ROWS + 1)) as batches:
+            return await anext(batches, none)
+
     async def run(conn: Connection) -> list[dict[str, object]]:
         results: list[dict[str, object]] = []
         for statement in statements:
-            rows = await conn.fetch_dicts(statement, [])
-            columns = list(rows[0].keys()) if rows else []
+            if studio.read_only:  # already inside the READ ONLY transaction
+                rows = await first_rows(conn, statement)
+            else:  # a cursor needs a transaction; each statement commits on its own
+                async with conn.transaction():
+                    rows = await first_rows(conn, statement)
+            shown = rows[:MAX_SQL_ROWS]
+            # By position: a dict would merge two columns with the same name (C9).
+            columns = list(cast(_Named, cast(object, rows[0])).keys()) if rows else []
             results.append(
                 {
                     "statement": statement,
                     "columns": columns,
-                    "rows": [[jsonable(r[c]) for c in columns] for r in rows[:MAX_SQL_ROWS]],
+                    "rows": [[jsonable(v) for v in r] for r in shown],
                     "truncated": len(rows) > MAX_SQL_ROWS,
-                    "count": len(rows),
+                    "count": len(shown),
                 }
             )
         return results
@@ -723,7 +797,11 @@ async def clear_history(studio: Studio, _request: Request) -> Response:
 async def _current_table(studio: Studio, data: dict[str, object]) -> TableSnap | None:
     """The table an operation changes, from the live snapshot (None if it does not exist)."""
     schema = data.get("schema", "public")
-    name = data.get("table", data.get("name"))
+    # The field build_steps uses: a table-level operation names the table in "name", a
+    # column one in "table" (where "name" is the column). Mixing them checked one table
+    # and dropped another (C8).
+    field = "name" if data.get("operation") in ("create_table", "drop_table") else "table"
+    name = data.get(field)
     if not isinstance(schema, str) or not isinstance(name, str):
         return None
     snapshot = await studio.load_snapshot()

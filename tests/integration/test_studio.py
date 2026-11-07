@@ -1,5 +1,6 @@
 import csv
 import io
+import json
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -1047,3 +1048,101 @@ def test_an_empty_bearer_is_not_a_failed_login(
         for _ in range(5):
             assert client.get("/api/meta", headers={"Authorization": "Bearer "}).status_code == 401
         assert client.get("/api/meta", headers=AUTH).status_code == 200
+
+
+def test_values_are_checked_by_the_column_not_cut_by_a_cast(client: TestClient) -> None:
+    # C4: CAST($1 AS varchar(5)) cut "qwertyuiop" to "qwert", and a key filter matched and
+    # deleted the wrong row.
+    client.post(
+        "/api/sql",
+        json={
+            "sql": "drop table if exists st_mod; "
+            "create table st_mod (code varchar(3) primary key, amount numeric(5,2), "
+            "flag char(2), bits bit(3)); insert into st_mod values ('abc', 1, 'ab', '101')"
+        },
+        headers=AUTH,
+    )
+    rows = "/api/tables/public/st_mod/rows"
+    too_long = client.post(rows, json={"values": {"code": "qwertyuiop"}}, headers=AUTH)
+    assert too_long.status_code == 400 and "StringDataRightTruncation" in too_long.text
+    filtered = client.get(
+        rows,
+        params={"filters": json.dumps([{"column": "code", "op": "eq", "value": "abcZZZ"}])},
+        headers=AUTH,
+    ).json()
+    assert filtered["rows"] == []
+    deleted = client.request("DELETE", rows, json={"keys": [{"code": "abcZZZ"}]}, headers=AUTH)
+    assert deleted.json() == {"deleted": 0}
+    # Unmodified char and bit mean length 1: they must not cut either.
+    ok = client.post(
+        rows, json={"values": {"code": "xyz", "flag": "cd", "bits": "011"}}, headers=AUTH
+    )
+    assert ok.status_code == 201, ok.text
+    assert ok.json()["row"]["flag"] == "cd" and ok.json()["row"]["bits"] == "011"
+
+
+def test_console_reads_at_most_the_rows_it_shows(client: TestClient) -> None:
+    # C5: every row was loaded before keeping 1000. C9: duplicate column names merged, and
+    # a bigint above 2**53 was a JSON number a browser rounds.
+    big = client.post(
+        "/api/sql", json={"sql": "select g from generate_series(1, 5000) g"}, headers=AUTH
+    ).json()
+    assert big["truncated"] is True and big["count"] == 1000 and len(big["rows"]) == 1000
+    dup = client.post(
+        "/api/sql",
+        json={"sql": "select 1 as a, 2 as a, 9007199254740993::bigint as b"},
+        headers=AUTH,
+    ).json()
+    assert dup["columns"] == ["a", "a", "b"]
+    assert dup["rows"] == [[1, 2, "9007199254740993"]]
+    # Statements that are not queries still run, outside any cursor.
+    done = client.post(
+        "/api/sql",
+        json={"sql": "create temp table st_t (x int); insert into st_t values (1) returning x"},
+        headers=AUTH,
+    ).json()
+    assert done["results"][1]["rows"] == [[1]]
+
+
+def test_studio_state_file_is_private(pg_url: str, driver: PostgresDriver, tmp_path: Path) -> None:
+    # C6: the history (passwords included) was written world-readable, and not ignored.
+    state = tmp_path / ".mizzle" / "studio.json"
+    with make_client(pg_url, state_path=state) as client:
+        client.post("/api/sql", json={"sql": "select 1"}, headers=AUTH)
+    assert state.stat().st_mode & 0o777 == 0o600
+    assert "*" in (tmp_path / ".mizzle" / ".gitignore").read_text()
+
+
+def test_a_failed_export_is_an_error_not_a_short_file(client: TestClient) -> None:
+    # C7: a bad filter gave 200 with only the CSV header (or "[" for JSON).
+    bad = json.dumps([{"column": "id", "op": "eq", "value": "abc"}])
+    for fmt in ("csv", "json"):
+        response = client.get(
+            "/api/tables/public/users/export",
+            params={"format": fmt, "filters": bad},
+            headers=AUTH,
+        )
+        assert response.status_code == 400, (fmt, response.text)
+    # A JSON export with several batches is still one valid array.
+    client.post(
+        "/api/sql",
+        json={
+            "sql": "drop table if exists st_many; create table st_many (id int primary key); "
+            "insert into st_many select generate_series(1, 2500)"
+        },
+        headers=AUTH,
+    )
+    text = client.get(
+        "/api/tables/public/st_many/export", params={"format": "json"}, headers=AUTH
+    ).text
+    assert len(json.loads(text)) == 2500
+
+
+def test_drop_table_drops_the_table_it_checked(client: TestClient) -> None:
+    # C8: "table" was checked and "name" dropped, so hidden tables could be dropped.
+    preview = client.post(
+        "/api/ddl/preview",
+        json={"operation": "drop_table", "schema": "public", "table": "users", "name": "nosuch"},
+        headers=AUTH,
+    )
+    assert preview.status_code == 400 and "does not exist" in preview.text

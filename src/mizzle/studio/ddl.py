@@ -201,7 +201,8 @@ def build_steps(
         case "drop_table":
             if current is None:
                 raise SchemaError(f"table {schema}.{_ident(data, 'name')} does not exist")
-            return [DropTable(schema, name=_ident(data, "name"))]
+            # The table that was checked, never a second name from the request (C8).
+            return [DropTable(current["schema"], name=current["name"])]
         case _:
             table = _ident(data, "table")
             if current is None:
