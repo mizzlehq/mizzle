@@ -249,3 +249,12 @@ def test_forwarded_headers_are_trusted_only_when_configured(
 def test_a_remote_bind_without_an_origin_setting_matches_the_host() -> None:
     # B72: guessing http://0.0.0.0:port refused every browser write behind --host 0.0.0.0.
     assert studio_server._server_origins("0.0.0.0", 4983) is None
+
+
+def test_ipv6_loopback_link_is_bracketed(config: Config, no_ui: None) -> None:
+    # S12: --host ::1 printed and opened http://127.0.0.1:..., not the bound address.
+    token = "t" * 32
+    studio_server.serve(
+        config, port=4983, read_only=False, open_browser=True, host="::1", token=token
+    )
+    assert [f"http://[::1]:4983/#token={token}"] == OPENED
