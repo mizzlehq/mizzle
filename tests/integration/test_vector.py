@@ -100,7 +100,8 @@ def runner() -> Generator[tuple[asyncio.Runner, Database]]:
             await reset(db)
             async with db.driver.acquire() as conn:
                 await conn.execute("DROP EXTENSION IF EXISTS vector CASCADE", [])
-                # The migration creates the extension itself.
+                # mizzle does not manage extensions: a custom migration creates it first.
+                await conn.execute("CREATE EXTENSION vector", [])
                 for statement in dialect.render(
                     diff(empty_snapshot("postgresql"), build_snapshot(TABLES, dialect))
                 ):
