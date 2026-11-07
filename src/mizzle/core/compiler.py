@@ -133,7 +133,7 @@ def no_nul(text: str) -> str:
     return text
 
 
-def _interval_text(value: datetime.timedelta) -> str:
+def interval_text(value: datetime.timedelta) -> str:
     """``1 day 01:00:00``, ``-1 days +23:00:00``: PostgreSQL's own interval output."""
     parts: list[str] = []
     if value.days:
@@ -288,7 +288,7 @@ class Compiler:
             case int() | float() | Decimal():
                 return str(value)
             case datetime.timedelta():  # as PostgreSQL prints it, so defaults compare (C45)
-                return self.literal(_interval_text(value)) + "::interval"
+                return self.literal(interval_text(value)) + "::interval"
             case bytes():
                 return self.literal("\\x" + value.hex()) + "::bytea"
             case str():
@@ -302,6 +302,13 @@ class Compiler:
                 return f"ARRAY[{', '.join(self.literal(v) for v in items)}]" if items else "'{}'"
             case _:
                 raise QueryError(f"cannot write {type(value).__name__} as an SQL literal")
+
+    def column_literal(self, column: ColumnBase, value: object) -> str:
+        """``value`` (encoded) as a literal of ``column``'s type: a default, or a value
+        compared with the column in DDL."""
+        if column.sql_type in _JSON and value is not None:
+            return self.literal(json.dumps(value))  # as the driver sends it, not an array (Q11)
+        return self.literal(value)
 
     def new_alias(self) -> str:
         self._alias_count += 1
@@ -366,10 +373,11 @@ class Compiler:
         bound = self._bound.get(key)
         if bound is None:
             value = node.column.encode(node.value) if node.column is not None else node.value
-            json_column = node.column is not None and node.column.sql_type in _JSON
-            if self.inline_literals and json_column and value is not None:
-                value = json.dumps(value)  # as the driver sends it; a list is not an array (Q11)
-            bound = self._bound[key] = (node, self.bind(value))
+            if self.inline_literals and node.column is not None:
+                # In the column's type: ARRAY['a'] was text[] next to varchar[] (Q4-1).
+                bound = self._bound[key] = (node, self.column_literal(node.column, value))
+            else:
+                bound = self._bound[key] = (node, self.bind(value))
         return bound[1]
 
     def visit_Placeholder(self, node: Placeholder) -> str:
@@ -509,6 +517,13 @@ class Compiler:
 
     def visit_Cast(self, node: Cast) -> str:
         expr = node.expr
+        if (
+            self.inline_literals
+            and node.type in _JSON
+            and isinstance(expr, Param)
+            and isinstance(expr.value, list | tuple | dict)
+        ):  # JSON text, not CAST(ARRAY[1, 2] AS jsonb) (Q4-2)
+            return f"CAST({self.literal(json.dumps(cast(object, expr.value)))} AS {node.type})"
         inner = self._typed_raw(expr, node.type) if isinstance(expr, Raw) else self.visit(expr)
         return f"CAST({inner} AS {node.type})"
 

@@ -3,10 +3,8 @@
 from __future__ import annotations
 
 import datetime
-import json
 import re
 from collections.abc import Mapping, Sequence
-from typing import cast
 
 from mizzle.core.compiler import no_nul
 from mizzle.core.errors import MigrationError, SchemaError
@@ -92,7 +90,7 @@ from mizzle.core.steps import (
     Statement,
     Step,
 )
-from mizzle.dialects.postgres.compiler import PostgresCompiler
+from mizzle.dialects.postgres.compiler import PostgresCompiler, temporal_text
 
 DEFAULT_SCHEMA = "public"
 MAX_IDENTIFIER = 63  # PostgreSQL silently truncates longer names
@@ -210,53 +208,8 @@ def column_default(column: ColumnBase, casing: Casing | None = None) -> str | No
     value = column.default_value
     c = compiler(casing)
     if isinstance(value, Node):
-        text = c.visit(value)
-    else:
-        encoded = column.encode(value)
-        if column.sql_type in ("json", "jsonb") and encoded is not None:  # JSON text, even 5 (Q10)
-            return normalize_default(c.literal(json.dumps(encoded)) + "::" + column.sql_type)
-        if column.item is not None and isinstance(encoded, list | tuple):
-            encoded = _array_text(cast(Sequence[object], encoded))
-        if isinstance(encoded, datetime.date | datetime.time):
-            encoded = _temporal_text(encoded)
-        text = c.literal(encoded)
-    return normalize_default(text)
-
-
-def _trim_fraction(text: str) -> str:
-    """PostgreSQL prints 03:04:05.5, not 03:04:05.500000."""
-    if "." not in text:
-        return text
-    return text.rstrip("0").rstrip(".")
-
-
-def _offset_text(offset: datetime.timedelta) -> str:
-    """UTC offsets as PostgreSQL prints them: +00, +05:45, -03:30."""
-    seconds = int(offset.total_seconds())
-    sign = "-" if seconds < 0 else "+"
-    hours, rest = divmod(abs(seconds), 3600)
-    minutes, secs = divmod(rest, 60)
-    text = f"{sign}{hours:02d}"
-    if minutes or secs:
-        text += f":{minutes:02d}"
-    if secs:
-        text += f":{secs:02d}"
-    return text
-
-
-def _temporal_text(value: datetime.date | datetime.time) -> str:
-    """A date/time default exactly as PostgreSQL prints it back, so a schema and its
-    database compare equal. timestamptz values are stored as instants: written in UTC."""
-    if isinstance(value, datetime.datetime):
-        if value.tzinfo is not None:
-            utc = value.astimezone(datetime.UTC).replace(tzinfo=None)
-            return _trim_fraction(utc.isoformat(" ")) + "+00"
-        return _trim_fraction(value.isoformat(" "))
-    if isinstance(value, datetime.time):
-        text = _trim_fraction(value.replace(tzinfo=None).isoformat())
-        offset = value.utcoffset()
-        return text + _offset_text(offset) if offset is not None else text
-    return value.isoformat()
+        return normalize_default(c.visit(value))
+    return normalize_default(c.column_literal(column, column.encode(value)))
 
 
 # '2024-01-02 08:49:05+05:45'::timestamp with time zone: printed in the session time zone.
@@ -270,22 +223,7 @@ def _utc_timestamptz(match: re.Match[str]) -> str:
         return match.group(0)
     if value.tzinfo is None:
         return match.group(0)
-    return f"'{_temporal_text(value)}'"
-
-
-def _array_text(values: Sequence[object]) -> str:
-    """A 1-D array literal as PostgreSQL prints it back (``{a,"b c"}``), not JSON."""
-
-    def item(value: object) -> str:
-        if value is None:
-            return "NULL"
-        text = ("t" if value else "f") if isinstance(value, bool) else str(value)
-        special = any(ch in '{}",\\' or ch.isspace() for ch in text)
-        if special or text == "" or text.upper() == "NULL":
-            return '"' + text.replace("\\", "\\\\").replace('"', '\\"') + '"'
-        return text
-
-    return "{" + ",".join(item(v) for v in values) + "}"
+    return f"'{temporal_text(value)}'"
 
 
 # -- rendering ------------------------------------------------------------------------

@@ -1,14 +1,17 @@
 from __future__ import annotations
 
 import datetime
+import enum
 import ipaddress
+import json
+import math
 from collections.abc import Iterable, Sequence
 from decimal import Decimal
 from typing import TYPE_CHECKING, cast, override
 
 from asyncpg import BitString, Box, Circle, Line, LineSegment, Path, Point, Range
 
-from mizzle.core.compiler import CompiledQuery, Compiler
+from mizzle.core.compiler import CompiledQuery, Compiler, interval_text
 from mizzle.core.errors import QueryError
 from mizzle.core.sql.alias import real_table
 from mizzle.core.sql.nodes import ExprBase, Node
@@ -48,11 +51,12 @@ def _point(point: Sequence[float]) -> str:
     return f"({_num(point[0])},{_num(point[1])})"
 
 
-def _bound(value: object) -> str:
-    text = str(value)
-    if any(ch in text for ch in ' ,()[]"\\'):
-        return '"' + text.replace("\\", "\\\\").replace('"', '\\"') + '"'
-    return text
+def _quoted(text: str, special: str, quote: str = '""') -> str:
+    """An element of an array, range or composite as PostgreSQL prints it: quoted when
+    needed, with a quote inside as ``quote`` (an array's is backslashed)."""
+    if text and not any(ch in special or ch.isspace() for ch in text):
+        return text
+    return '"' + text.replace("\\", "\\\\").replace('"', quote) + '"'
 
 
 type _Range = Range[int] | Range[Decimal] | Range[datetime.date]
@@ -63,11 +67,166 @@ def _all_ranges(values: list[object]) -> bool:
 
 
 def _range_text(value: _Range) -> str:
-    if value.isempty:
+    """As PostgreSQL prints it: '(' at an unbounded end, 'empty' for [1,1) (Q4-4)."""
+    lower, upper = value.lower, value.upper
+    point = lower is not None and lower == upper and not (value.lower_inc and value.upper_inc)
+    if value.isempty or point:
         return "empty"
-    lower = "" if value.lower is None else _bound(value.lower)
-    upper = "" if value.upper is None else _bound(value.upper)
-    return f"{'[' if value.lower_inc else '('}{lower},{upper}{']' if value.upper_inc else ')'}"
+    low = "(" if lower is None else ("[" if value.lower_inc else "(") + _bound(lower)
+    high = ")" if upper is None else _bound(upper) + ("]" if value.upper_inc else ")")
+    return f"{low},{high}"
+
+
+def _bound(value: object) -> str:
+    return _quoted(pg_text(value), '"\\()[],')
+
+
+_DISCRETE = frozenset(
+    {"int4range", "int8range", "daterange", "int4multirange", "int8multirange", "datemultirange"}
+)
+
+
+def _step[V: (int, datetime.date)](value: V) -> V:
+    return value + 1 if isinstance(value, int) else value + datetime.timedelta(days=1)
+
+
+def _canonical[V: (int, datetime.date)](value: Range[V]) -> Range[V]:
+    """[lower, upper) as PostgreSQL stores a discrete range: [1,5] is [1,6) (Q4-4)."""
+    lower, upper = value.lower, value.upper
+    if value.isempty:
+        return value
+    if lower is not None and not value.lower_inc:
+        lower = _step(lower)
+    if upper is not None and value.upper_inc:
+        upper = _step(upper)
+    if lower is not None and upper is not None and lower >= upper:
+        return Range(empty=True)
+    return Range(lower, upper, lower_inc=lower is not None, upper_inc=False)
+
+
+def canonical_ranges(value: object, sql_type: str) -> object:
+    """``value`` with each range of a discrete range type (an array or multirange of one
+    too) in PostgreSQL's canonical form; a numrange [1,5] stays as it is."""
+    if sql_type.removesuffix("[]") not in _DISCRETE:
+        return value
+    if isinstance(value, Range):
+        return _canonical(cast(Range[int], value))
+    if isinstance(value, list):
+        items = cast(list[object], value)
+        return [_canonical(cast(Range[int], v)) if isinstance(v, Range) else v for v in items]
+    return value
+
+
+def _trim_fraction(text: str) -> str:
+    """PostgreSQL prints 03:04:05.5, not 03:04:05.500000."""
+    if "." not in text:
+        return text
+    return text.rstrip("0").rstrip(".")
+
+
+def _offset_text(offset: datetime.timedelta) -> str:
+    """UTC offsets as PostgreSQL prints them: +00, +05:45, -03:30."""
+    seconds = int(offset.total_seconds())
+    sign = "-" if seconds < 0 else "+"
+    hours, rest = divmod(abs(seconds), 3600)
+    minutes, secs = divmod(rest, 60)
+    text = f"{sign}{hours:02d}"
+    if minutes or secs:
+        text += f":{minutes:02d}"
+    if secs:
+        text += f":{secs:02d}"
+    return text
+
+
+def temporal_text(value: datetime.date | datetime.time) -> str:
+    """A date/time exactly as PostgreSQL prints it back, so a schema and its database
+    compare equal. timestamptz values are stored as instants: written in UTC."""
+    if isinstance(value, datetime.datetime):
+        if value.tzinfo is not None:
+            utc = value.astimezone(datetime.UTC).replace(tzinfo=None)
+            return _trim_fraction(utc.isoformat(" ")) + "+00"
+        return _trim_fraction(value.isoformat(" "))
+    if isinstance(value, datetime.time):
+        text = _trim_fraction(value.replace(tzinfo=None).isoformat())
+        offset = value.utcoffset()
+        return text + _offset_text(offset) if offset is not None else text
+    return value.isoformat()
+
+
+def _json_key(key: object) -> str:
+    return key if isinstance(key, str) else json.dumps(key)
+
+
+def json_text(value: object) -> str:
+    """JSON as PostgreSQL prints jsonb: keys by length then bytes, no \\u escapes, numbers
+    in full (Q4-7). json keeps its text, so it reads back as written there too."""
+    match value:
+        case dict():
+            pairs = [(_json_key(k), v) for k, v in cast(dict[object, object], value).items()]
+            pairs.sort(key=lambda kv: (len(kv[0].encode()), kv[0].encode()))
+            return "{" + ", ".join(f"{json_text(k)}: {json_text(v)}" for k, v in pairs) + "}"
+        case list() | tuple():
+            return "[" + ", ".join(json_text(v) for v in cast(Sequence[object], value)) + "]"
+        case float() if math.isfinite(value):
+            return format(Decimal(repr(value)), "f")  # 1e+20 is 100000000000000000000
+        case Decimal() if value.is_finite():
+            return format(value, "f")
+        case _:
+            return json.dumps(value, ensure_ascii=False, default=pg_text)
+
+
+def array_text(values: Sequence[object]) -> str:
+    """An array literal as PostgreSQL prints it back (``{a,"b c"}``), each element in its
+    own type's text form (Q4-11)."""
+
+    def item(value: object) -> str:
+        if value is None:
+            return "NULL"
+        if isinstance(value, list):
+            return array_text(cast(list[object], value))
+        text = pg_text(value)
+        return '"NULL"' if text.upper() == "NULL" else _quoted(text, '{}",\\', '\\"')
+
+    return "{" + ",".join(item(v) for v in values) + "}"
+
+
+def _composite_text(fields: Sequence[object]) -> str:
+    """``(1.5,usd)``: a composite's fields in order; NULL is nothing (Q4-12)."""
+    return "(" + ",".join("" if v is None else _quoted(pg_text(v), '"\\(),') for v in fields) + ")"
+
+
+def pg_text(value: object) -> str:
+    """``value`` in its type's text form, as PostgreSQL prints it (Q4-4, Q4-11, Q4-12)."""
+    geometry = _geometry_text(value)
+    if geometry is not None:
+        return geometry
+    match value:
+        case bool():  # as in an array or a composite
+            return "t" if value else "f"
+        case enum.Enum():
+            return pg_text(cast(object, value.value))
+        case float() if not math.isfinite(value):
+            return "NaN" if math.isnan(value) else ("-Infinity" if value < 0 else "Infinity")
+        case float():
+            return _num(value)
+        case datetime.timedelta():
+            return interval_text(value)
+        case bytes():
+            return "\\x" + value.hex()
+        case datetime.date() | datetime.time():
+            return temporal_text(value)
+        case Range():
+            return _range_text(cast(_Range, value))
+        case BitString():  # without the spaces as_string() puts every 8 bits (Q4-10)
+            return value.as_string().replace(" ", "")
+        case list():
+            return array_text(cast(list[object], value))
+        case tuple():
+            return _composite_text(cast(tuple[object, ...], value))
+        case dict():
+            return json_text(cast(object, value))
+        case _:
+            return str(value)
 
 
 def _geometry_text(value: object) -> str | None:
@@ -116,13 +275,36 @@ class PostgresCompiler(Compiler):
             ):
                 return self.literal(str(value)) + "::inet"
             case BitString():
-                return self.literal(value.as_string()) + "::varbit"
+                return self.literal(pg_text(value)) + "::varbit"
             case _:
                 geometry = _geometry_text(value)
                 if geometry is None:
                     return super().literal(value)
                 name = "lseg" if isinstance(value, LineSegment) else type(value).__name__.lower()
                 return f"{self.literal(geometry)}::{name}"
+
+    @override
+    def column_literal(self, column: ColumnBase, value: object) -> str:
+        # As PostgreSQL prints it back, so a default compares equal (Q4-4, Q4-7, Q4-11); an
+        # array as '{a}', which takes the column's type where ARRAY['a'] is text[] (Q4-1).
+        value = canonical_ranges(value, column.sql_type)
+        if value is None:
+            return "NULL"
+        if column.sql_type in ("json", "jsonb"):  # JSON text, even 5 (Q10)
+            return f"{self.literal(json_text(value))}::{column.sql_type}"
+        if column.item is not None and isinstance(value, list | tuple):
+            items = cast(Sequence[object], value)
+            if column.item.sql_type in ("json", "jsonb"):  # a list item is JSON, not a dimension
+                items = [None if v is None else json_text(v) for v in items]
+            return self.literal(array_text(items))
+        if column.accepts == (tuple, dict):  # a composite: '(1.5,usd)' (Q4-12)
+            if isinstance(value, dict):  # by field name: the field order is the database's
+                fields = self.literal(json_text(cast(object, value)))
+                return f"jsonb_populate_record(NULL::{column.sql_type}, {fields}::jsonb)"
+            return f"{self.literal(pg_text(value))}::{column.sql_type}"  # not a record
+        if isinstance(value, datetime.date | datetime.time):
+            return self.literal(temporal_text(value))
+        return self.literal(value)
 
     @override
     def compile(self, node: Node) -> CompiledQuery:
