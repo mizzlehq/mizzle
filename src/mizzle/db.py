@@ -898,9 +898,11 @@ class Session(QueryBuilder):
         self, replica: Driver, primary: Driver
     ) -> AsyncGenerator[Connection]:
         async with AsyncExitStack() as stack:
+            on_replica = True
             try:
                 conn = await stack.enter_async_context(replica.acquire())
             except DbConnectionError:
+                on_replica = False
                 # No statement ran yet, so the primary can take the read. Reads skip the
                 # replica for a while: a hung one made every read wait (R7).
                 self._replica_down[replica] = time.monotonic() + _REPLICA_PAUSE
@@ -909,7 +911,11 @@ class Session(QueryBuilder):
                     _REPLICA_PAUSE,
                 )
                 conn = await stack.enter_async_context(primary.acquire())
-            yield conn
+            try:
+                yield conn
+            except DbConnectionError as lost:
+                lost.on_replica = on_replica
+                raise
 
     @overload
     async def _call(
@@ -1010,7 +1016,9 @@ class Session(QueryBuilder):
         for driver in (self._driver, *self._replicas):
             if driver is not None:
                 await driver.expire_connections()
-        return read_only and not query.raw and not query.opaque  # opaque: R6
+        # A func() call may write, so it runs again only when it ran on a replica, which
+        # cannot write (R6).
+        return read_only and not query.raw and (not query.opaque or error.on_replica)
 
     async def _retry_read(
         self, query: CompiledQuery, kind: _CallKind, read_only: bool

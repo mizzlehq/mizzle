@@ -160,9 +160,12 @@ async def test_a_select_calling_func_is_not_run_again_after_a_lost_connection(
     await db.select().from_(Users)  # a plain read runs again
     assert len(sent) == 2
     sent.clear()
-    with pytest.raises(ConnectionError):
-        await db.select({"e": func("lower", Users.email)}).from_(Users)
+    with pytest.raises(ConnectionError):  # on the primary it may have written
+        await db.primary.select({"e": func("lower", Users.email)}).from_(Users)
     assert len(sent) == 1
+    sent.clear()
+    await db.select({"e": func("lower", Users.email)}).from_(Users)  # a replica cannot write
+    assert len(sent) == 2
 
 
 async def test_a_hung_replica_is_skipped_after_one_timeout(pg_url: str) -> None:

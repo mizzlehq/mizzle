@@ -73,10 +73,12 @@ class ConnectionError(DatabaseError):
     ``retryable`` is False when trying again cannot help (bad credentials, unknown database,
     an unsupported feature), so a caller's retry loop can fail fast instead of waiting.
     ``lost`` is False when no connection was opened (the pool could not hand one out):
-    the pooled connections are then fine and are kept."""
+    the pooled connections are then fine and are kept. ``on_replica`` is True when the lost
+    connection was to a read replica, which cannot have written anything."""
 
     retryable: bool = True
     lost: bool = True
+    on_replica: bool = False
 
 
 class QueryTimeout(DatabaseError):
