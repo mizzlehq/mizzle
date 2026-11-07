@@ -14,32 +14,19 @@ from mizzle.core.schema.types import integer, text
 from mizzle.dialects.postgres.driver import PostgresDriver
 from mizzle.dialects.postgres.types import (
     array,
-    box,
     cidr,
-    circle,
-    daterange,
-    hstore,
-    int4multirange,
-    int4range,
     json,
     jsonb,
     line,
-    lseg,
-    numrange,
-    path,
     pg_enum,
     point,
-    polygon,
     serial,
-    tsrange,
-    tstzrange,
     varbit,
 )
 from mizzle.pg import (
     bit,
     bytea,
     date,
-    datemultirange,
     double_precision,
     inet,
     interval,
@@ -133,44 +120,26 @@ class Nest(Table, name="qc_nest"):
 class NestKid(Table, name="qc_nest_kid"):
     id = serial().primary_key()
     nest_id = integer().not_null().references(lambda: Nest.id)
-    ir = int4range()
-    nr = numrange()
-    tz = tstzrange()
-    dr = daterange()
-    mr = int4multirange()
     net = cidr()
     pt = point()
-    bx = box()
     ln = line()
-    ls = lseg()
-    pa = path()
-    pg = polygon()
-    ci = circle()
     bits = varbit()
-    hs = hstore()
     nest = one(lambda: Nest, fields=lambda: [NestKid.nest_id], references=lambda: [Nest.id])
 
 
 async def test_nested_rows_decode_like_plain_rows(driver: PostgresDriver, pg_url: str) -> None:
-    # C30: in a nested (relational) row these came back as str (hstore as dict), while a
-    # plain select gives Range, IPv4Network, Point, BitString...
+    # C30: in a nested (relational) row these came back as str, while a plain select
+    # gives IPv4Network, Point, Line, BitString.
     async with driver.acquire() as conn:
         await conn.execute(
-            "CREATE EXTENSION IF NOT EXISTS hstore; "
             "DROP TABLE IF EXISTS qc_nest_kid, qc_nest; "
             "CREATE TABLE qc_nest (id serial PRIMARY KEY); "
             "CREATE TABLE qc_nest_kid (id serial PRIMARY KEY, "
-            "nest_id int NOT NULL REFERENCES qc_nest, ir int4range, nr numrange, "
-            "tz tstzrange, dr daterange, mr int4multirange, net cidr, pt point, bx box, "
-            "ln line, ls lseg, pa path, pg polygon, ci circle, bits varbit, hs hstore); "
+            "nest_id int NOT NULL REFERENCES qc_nest, net cidr, pt point, ln line, "
+            "bits varbit); "
             "INSERT INTO qc_nest DEFAULT VALUES; "
-            "INSERT INTO qc_nest_kid (nest_id, ir, nr, tz, dr, mr, net, pt, bx, ln, ls, pa, "
-            "pg, ci, bits, hs) VALUES (1, '[1,5)', '(1.25,2.5]', "
-            "'[2026-01-01 10:00+00,)', 'empty', '{[1,3),[5,7)}', '10.0.0.0/8', '(1.5,2)', "
-            "'(3,4),(1,2)', '{1,2,3}', '[(1,2),(3,4)]', '[(0,0),(1,1)]', "
-            "'((0,0),(1,0),(1,1))', '<(1,2),3>', B'0101', 'a=>1'), "
-            "(1, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, "
-            "NULL, NULL, NULL)",
+            "INSERT INTO qc_nest_kid (nest_id, net, pt, ln, bits) VALUES "
+            "(1, '10.0.0.0/8', '(1.5,2)', '{1,2,3}', B'0101'), (1, NULL, NULL, NULL, NULL)",
             [],
         )
     try:
@@ -186,17 +155,11 @@ async def test_nested_rows_decode_like_plain_rows(driver: PostgresDriver, pg_url
 class Boxed(Table, name="qc_boxed", schema="qc_app"):
     id = serial().primary_key()
     levels = array(pg_enum(Lvl, type_name="LvlType", schema="qc_app"))
-    r = int4range()
     s = text()
 
 
-async def test_container_operators_on_enum_arrays_and_ranges(
-    driver: PostgresDriver, pg_url: str
-) -> None:
+async def test_container_operators_on_enum_arrays(driver: PostgresDriver, pg_url: str) -> None:
     # C38: contains() cast to an unquoted, unqualified type: type "lvltype[]" does not exist.
-    # C39: contains(range, 3) cast 3 to bigint: operator does not exist: int4range @> bigint.
-    from asyncpg import Range
-
     from mizzle import contained_by, contains, overlaps, string_agg
 
     async with driver.acquire() as conn:
@@ -204,20 +167,18 @@ async def test_container_operators_on_enum_arrays_and_ranges(
             "DROP SCHEMA IF EXISTS qc_app CASCADE; CREATE SCHEMA qc_app; "
             "CREATE TYPE qc_app.\"LvlType\" AS ENUM ('1', '2'); "
             "CREATE TABLE qc_app.qc_boxed (id serial PRIMARY KEY, "
-            'levels qc_app."LvlType"[], r int4range, s text)',
+            'levels qc_app."LvlType"[], s text)',
             [],
         )
     try:
         async with await Database.connect(pg_url, schema=[Boxed], pool_size=1) as db:
-            await db.insert(Boxed).values({"levels": [Lvl.LOW], "r": Range(1, 5), "s": "a"})
+            await db.insert(Boxed).values({"levels": [Lvl.LOW], "s": "a"})
             for cond in (
                 contains(Boxed.levels, [Lvl.LOW]),
                 contained_by(Boxed.levels, [Lvl.LOW, Lvl.HIGH]),
                 overlaps(Boxed.levels, [Lvl.LOW]),
-                contains(Boxed.r, 3),
             ):
                 assert await db.select(Boxed.id).from_(Boxed).where(cond) == [(1,)]
-            assert await db.select(Boxed.id).from_(Boxed).where(contains(Boxed.r, 9)) == []
             assert await db.select(string_agg(Boxed.s, ",")).from_(Boxed) == [("a",)]
     finally:
         async with driver.acquire() as conn:
@@ -338,47 +299,6 @@ async def test_enum_and_json_values_without_a_column_are_typed(db: Database) -> 
     assert await db.select(case_().when(yes, (1, 2))).from_(Users) == [([1, 2],)]
 
 
-class DateNest(Table, name="qc_date_nest"):
-    id = serial().primary_key()
-    kids = many(lambda: DateKid)
-
-
-class DateKid(Table, name="qc_date_kid"):
-    id = serial().primary_key()
-    nest_id = integer().not_null().references(lambda: DateNest.id)
-    ts = tsrange()
-    dr = daterange()
-    nest = one(lambda: DateNest, fields=lambda: [DateKid.nest_id], references=lambda: [DateNest.id])
-
-
-async def test_nested_ranges_ignore_the_date_style(driver: PostgresDriver, pg_url: str) -> None:
-    # Q13: range bounds were sent as lower(r)::text, which follows DateStyle ('02/01/2026').
-    async with driver.acquire() as conn:
-        await conn.execute(
-            "DROP TABLE IF EXISTS qc_date_kid, qc_date_nest; "
-            "CREATE TABLE qc_date_nest (id serial PRIMARY KEY); "
-            "CREATE TABLE qc_date_kid (id serial PRIMARY KEY, "
-            "nest_id int NOT NULL REFERENCES qc_date_nest, ts tsrange, dr daterange); "
-            "INSERT INTO qc_date_nest DEFAULT VALUES; "
-            "INSERT INTO qc_date_kid (nest_id, ts, dr) "
-            "VALUES (1, '[2026-01-02 10:00,2026-03-04)', '[2026-01-02,2026-03-04)')",
-            [],
-        )
-    try:
-        async with await Database.connect(
-            pg_url,
-            schema=[DateNest, DateKid],
-            pool_size=1,
-            server_settings={"DateStyle": "SQL, DMY"},
-        ) as db:
-            plain = await db.query(DateKid).find_many()
-            [parent] = await db.query(DateNest).find_many(with_={"kids": True})
-            assert parent.kids == plain
-    finally:
-        async with driver.acquire() as conn:
-            await conn.execute("DROP TABLE qc_date_kid, qc_date_nest", [])
-
-
 class Hue(enum.Enum):
     RED = "red"
     BLUE = "blue"
@@ -386,27 +306,12 @@ class Hue(enum.Enum):
 
 _BITS = "101100111010"
 _ROUND_TRIPS: list[tuple[str, Callable[[], ColumnBase], str]] = [
-    ("int4range", int4range, "'[1,5)'"),
-    ("int4range", int4range, "'empty'"),
-    ("numrange", numrange, "'[1.25,2.5]'"),
-    ("daterange", daterange, "'[2026-01-01,infinity)'"),
-    ("tstzrange", tstzrange, "'[2026-01-01 00:00+00,)'"),
-    ("int4multirange", int4multirange, "'{[1,3),[5,8)}'"),
-    ("int4multirange", int4multirange, "'{}'"),
-    ("datemultirange", datemultirange, "'{[2026-01-01,2026-02-01)}'"),
-    ("int4range[]", lambda: array(int4range()), "ARRAY['[1,2)'::int4range, 'empty']"),
     *((f"varbit({n})", varbit, f"B'{_BITS[:n]}'") for n in range(1, 13)),
     ("bit(5)", lambda: bit(5), "B'10101'"),
     ("varbit[]", lambda: array(varbit()), "ARRAY[B'10101'::varbit, B'']"),
     ("point", point, "'(1.5,-2)'"),
     ("point[]", lambda: array(point()), "ARRAY['(1,2)'::point]"),
     ("line", line, "'{1,2,3}'"),
-    ("lseg", lseg, "'[(0,0),(1.25,1)]'"),
-    ("box", box, "'((3,4),(1,2))'"),
-    ("path", path, "'[(0,0),(1,1)]'"),
-    ("path", path, "'((0,0),(1,1),(1,0))'"),
-    ("polygon", polygon, "'((0,0),(1,1),(1,0))'"),
-    ("circle", circle, "'<(1,2),3>'"),
     ("numeric", numeric, "'NaN'"),
     ("numeric", numeric, "'Infinity'"),
     ("numeric", numeric, "'-Infinity'"),
@@ -435,7 +340,7 @@ async def test_select_models_round_trip_every_column_through_json(
     column: Callable[[], ColumnBase],
     literal: str,
 ) -> None:
-    # Q4-9/Q4-10/Q4-13: multiranges, BitStrings ('1010 1'), Point/Box, Decimal('NaN') broke
+    # Q4-9/Q4-10/Q4-13: BitStrings ('1010 1'), Point, Decimal('NaN') broke
     # the JSON round trip of a value read from the database.
     from mizzle.pydantic import select_model
 

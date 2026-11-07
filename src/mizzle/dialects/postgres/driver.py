@@ -2,29 +2,21 @@
 
 from __future__ import annotations
 
-import asyncio
-import enum
 import itertools
 import json
 import logging
-import math
-import os
 import re
 import time
-import uuid
 from collections.abc import (
     AsyncGenerator,
-    AsyncIterator,
     Awaitable,
     Callable,
-    Iterable,
     Iterator,
     Mapping,
     Sequence,
 )
 from contextlib import asynccontextmanager
-from decimal import Decimal
-from typing import BinaryIO, Self, cast, final
+from typing import cast, final
 from urllib.parse import urlsplit
 
 import asyncpg
@@ -35,10 +27,8 @@ from mizzle.core.errors import (
     CheckViolation,
     DatabaseError,
     ForeignKeyViolation,
-    ListenerOverflow,
     MizzleError,
     NotNullViolation,
-    QueryError,
     QueryTimeout,
     SerializationFailure,
     UniqueViolation,
@@ -46,11 +36,7 @@ from mizzle.core.errors import (
 from mizzle.core.errors import ConnectionError as DbConnectionError
 from mizzle.core.query.base import Row
 from mizzle.dialects.base import (
-    CopyFormat,
-    CopyOutput,
     IsolationLevel,
-    Notification,
-    Overflow,
     PoolStats,
     ResetMode,
 )
@@ -191,46 +177,6 @@ def _translate(exc: Exception, sql: str, server: int | None = None) -> Exception
     return mapped
 
 
-def _float_text(value: float) -> str:
-    if math.isnan(value):
-        return "NaN"
-    if math.isinf(value):
-        return "Infinity" if value > 0 else "-Infinity"
-    return str(Decimal(value))  # the exact binary value: float4 then rounds it correctly
-
-
-def _float_literal(value: object, type_name: str) -> str | None:
-    """An exact literal for a float4/float8 (or array) parameter; None for other types
-    (and for ints too big for a float, which the server then rejects as usual)."""
-    try:
-        return _exact_float_literal(value, type_name)
-    except OverflowError:
-        return None
-
-
-def _exact_float_literal(value: object, type_name: str) -> str | None:
-    if type_name in ("float4", "float8") and isinstance(value, float | int):
-        return f"'{_float_text(float(value))}'"
-    if type_name in ("float4[]", "float8[]") and isinstance(value, list | tuple):
-        items = cast(Sequence[object], value)
-        if all(isinstance(v, float | int) for v in items):
-            body = ",".join(_float_text(float(cast(float, v))) for v in items)
-            return f"'{{{body}}}'"
-    return None
-
-
-_PARAM_OR_QUOTED = re.compile(
-    r"\$(\d+)\b"
-    r"|[eE]'(?:[^'\\]|\\.|'')*'"
-    r"|'(?:[^']|'')*'"
-    r'|"(?:[^"]|"")*"'
-    r"|--[^\n]*"
-    r"|/\*.*?\*/"
-    r"|\$([A-Za-z_][A-Za-z0-9_]*)?\$.*?\$\2\$",
-    re.DOTALL,
-)
-
-
 def _aborted(phase: str) -> DatabaseError:
     return DatabaseError(
         "a statement in this transaction failed and its error was caught, so PostgreSQL "
@@ -245,10 +191,6 @@ _ENDED = (
     "so statements after that ran outside it (autocommit). Leave COMMIT and ROLLBACK to "
     "the transaction block"
 )
-
-
-def _qualified(schema: str, name: str) -> str:
-    return ".".join('"' + part.replace('"', '""') + '"' for part in (schema, name))
 
 
 def _rowcount(status: str) -> int:
@@ -408,323 +350,6 @@ class PostgresConnection:
         except Exception as exc:
             raise self._translate(exc, sql) from None
 
-    async def copy_records(
-        self,
-        table: str,
-        schema: str | None,
-        columns: Sequence[str],
-        records: Iterable[Sequence[object]],
-        timeout: float | None = None,
-    ) -> int:
-        sql = f"COPY {table} FROM STDIN"
-        try:
-            status = await self._conn.copy_records_to_table(
-                table, records=records, columns=columns, schema_name=schema, timeout=timeout
-            )
-        except MizzleError:
-            raise  # a row the caller's checks rejected
-        except (ValueError, TypeError, OverflowError) as exc:
-            # asyncpg encodes COPY values in Python; its messages can quote the value.
-            raise DatabaseError(
-                f"{type(exc).__name__}: a COPY value has the wrong type or cannot be encoded "
-                "(value hidden)",
-                sql=sql,
-                original=exc,
-            ) from None
-        except Exception as exc:
-            raise self._translate(exc, sql) from None
-        return _rowcount(status)
-
-    async def copy_out(
-        self,
-        sql: str,
-        params: Sequence[object],
-        output: CopyOutput,
-        format: CopyFormat,
-        header: bool,
-        timeout: float | None = None,
-        *,
-        session_safe: bool = False,
-    ) -> int:
-        self.dirty |= not session_safe
-        # Errors of the output (disk full, a callback that raises) are raised as they are:
-        # mapped like socket errors they became a lost connection, and every pool was
-        # expired (R8).
-        output_errors: list[Exception] = []
-        file = None
-        if isinstance(output, str | os.PathLike):
-            file = await asyncio.to_thread(open, output, "wb")
-            sink: CopyOutput = file
-        else:
-            sink = output
-
-        async def write(chunk: bytes) -> None:
-            try:
-                if callable(sink):
-                    await sink(chunk)
-                else:
-                    await asyncio.to_thread(cast(BinaryIO, sink).write, chunk)
-            except Exception as exc:
-                output_errors.append(exc)
-                raise
-
-        try:
-            # COPY takes no bind parameters, so their values are written into the SQL.
-            if params:
-                async with asyncio.timeout(timeout):
-                    query = await self._inline(sql, params)
-            else:
-                query = sql
-            status = await self._conn.copy_from_query(
-                query, output=write, format=format, header=header or None, timeout=timeout
-            )
-        except Exception as exc:
-            if output_errors:
-                raise output_errors[0] from None
-            raise self._translate(exc, sql) from None
-        finally:
-            if file is not None:
-                file.close()
-        return _rowcount(status)
-
-    async def _inline(self, sql: str, params: Sequence[object]) -> str:
-        """``sql`` with each ``$n`` replaced by its value as a quoted literal. Like asyncpg's
-        own inlining (the server quotes each value), except floats: the server prints those
-        per ``extra_float_digits`` (0 rounds to 15 digits), so they are written here exactly."""
-        statement = await self._conn.prepare(sql)
-        literals: list[str | None] = []
-        casts: list[str] = []
-        values: list[object] = []
-        for value, param in zip(params, statement.get_parameters(), strict=True):
-            exact = _float_literal(value, param.name)
-            if exact is not None or value is None:
-                literals.append(exact or "NULL")
-                continue
-            name = f"_{param.name[:-2]}" if param.name.endswith("[]") else param.name
-            values.append(value)
-            casts.append(f"quote_literal(${len(values)}::{_qualified(param.schema, name)}::text)")
-            literals.append(None)
-        row = await self._conn.fetchrow(f"SELECT {', '.join(casts)}", *values) if casts else None
-        quoted = iter(row or ())
-        texts = [text if text is not None else cast(str, next(quoted)) for text in literals]
-        # Quoted text, identifiers, comments and dollar-quoted bodies keep their "$n" as is.
-        return _PARAM_OR_QUOTED.sub(
-            lambda m: texts[int(m.group(1)) - 1] if m.group(1) else m.group(0), sql
-        )
-
-    @asynccontextmanager
-    async def listen(
-        self,
-        channels: Sequence[str],
-        max_queue: int | None = None,
-        overflow: Overflow = "raise",
-        probe: Callable[[str], Awaitable[None]] | None = None,
-        pooler_session_mode: bool = False,
-        decoder: Callable[[str], object] | None = None,
-    ) -> AsyncGenerator[AsyncIterator[Notification]]:
-        self.dirty = True  # the pool's reset runs UNLISTEN * even if removing a listener fails
-        conn = self._conn
-        transport = _read_transport(conn) if overflow == "block" else None
-        if overflow == "block" and transport is None:
-            raise QueryError(
-                'listen(overflow="block") needs to pause reading the connection, which this '
-                'asyncpg version does not allow; use "raise" or "drop_oldest"'
-            )
-        paused = False
-
-        def resume() -> None:
-            nonlocal paused
-            if paused and transport is not None:
-                paused = False
-                transport.resume_reading()
-
-        # Unbounded so the final _LOST / _OVERFLOW always fits; max_queue is checked here.
-        queue = asyncio.Queue[Notification | _End]()
-        ended = False
-        dropped = 0
-
-        def end(signal: _End) -> None:
-            nonlocal ended
-            if not ended:
-                ended = True
-                queue.put_nowait(signal)
-
-        def on_notify(_conn: object, pid: int, channel: str, payload: object, /) -> None:
-            nonlocal dropped
-            if ended:
-                return
-            if max_queue is not None and queue.qsize() + 1 >= max_queue and transport:
-                # "block": keep this one, then stop reading the socket; PostgreSQL holds
-                # later notifications until the consumer catches up (resume()).
-                nonlocal paused
-                queue.put_nowait(Notification(channel, str(payload), pid))
-                if not paused:
-                    paused = True
-                    transport.pause_reading()
-                return
-            if max_queue is not None and queue.qsize() >= max_queue:
-                if overflow == "raise":
-                    end(_End.OVERFLOW)
-                    return
-                queue.get_nowait()  # a Notification: nothing follows an _End
-                dropped += 1
-                if dropped & (dropped - 1) == 0:  # 1, 2, 4, 8...: not once per message
-                    log.warning(
-                        "mizzle: listen() consumer is %d notifications behind; dropped the "
-                        "oldest (%d so far)",
-                        max_queue,
-                        dropped,
-                    )
-            queue.put_nowait(Notification(channel, str(payload), pid))
-
-        def on_lost(_conn: object, /) -> None:
-            end(_End.LOST)
-
-        conn.add_termination_listener(on_lost)
-        added: list[str] = []
-        try:
-            pooled = probe is not None and await self._behind_pooler()
-            if pooled and not pooler_session_mode:
-                # A test notification cannot prove delivery in transaction mode: one can
-                # arrive while PgBouncer happens to keep this client on the LISTEN session.
-                raise DatabaseError(
-                    "listen() is connected through a connection pooler. PgBouncer in "
-                    "transaction or statement mode drops notifications. Connect listen() "
-                    "directly to PostgreSQL, or pass pooler_session_mode=True if the "
-                    "pooler runs in session mode"
-                )
-            for channel in dict.fromkeys(channels):
-                try:
-                    await conn.add_listener(channel, on_notify)
-                except Exception as exc:
-                    raise _translate(exc, "LISTEN") from None
-                added.append(channel)
-            if pooled and probe is not None:  # session mode: still check it works
-                await self._check_delivery(probe)
-            yield _Notifications(queue, resume if max_queue is not None else None, decoder)
-        finally:
-            resume()  # UNLISTEN below needs the socket read again
-            try:
-                conn.remove_termination_listener(on_lost)
-                lost = conn.is_closed()
-            except asyncpg.InterfaceError:  # lost: the pool already took the proxy back
-                lost = True
-            for channel in () if lost else added:
-                try:
-                    await conn.remove_listener(channel, on_notify)
-                except Exception:
-                    log.warning(
-                        "mizzle: could not UNLISTEN; the connection is reset", exc_info=True
-                    )
-                    break
-
-    async def _behind_pooler(self) -> bool:
-        # PgBouncer and other poolers report their own process ID at startup.
-        try:
-            backend = cast(int, await self._conn.fetchval("SELECT pg_backend_pid()"))
-        except Exception as exc:
-            raise _translate(exc, "SELECT pg_backend_pid()") from None
-        return backend != self._conn.get_server_pid()
-
-    async def _check_delivery(self, probe: Callable[[str], Awaitable[None]]) -> None:
-        """Through a pooler, check that a notification sent from another connection
-        arrives. PgBouncer in transaction mode drops them: the server session that ran
-        LISTEN goes back to its pool, and notifications to an idle one are discarded."""
-        conn = self._conn
-        channel = f"mizzle_probe_{uuid.uuid4().hex}"
-        arrived = asyncio.Event()
-
-        def on_probe(*_: object) -> None:
-            arrived.set()
-
-        sent = False
-        try:
-            await conn.add_listener(channel, on_probe)
-            async with asyncio.timeout(_PROBE_TIMEOUT):
-                await probe(channel)
-                sent = True
-                await arrived.wait()
-        except TimeoutError:
-            if sent:
-                raise DatabaseError(
-                    "listen() cannot receive notifications through this connection: a test "
-                    f"notification sent from another connection did not arrive within "
-                    f"{_PROBE_TIMEOUT:g}s. PgBouncer in transaction or statement mode drops "
-                    "them; connect listen() directly to PostgreSQL (or through session mode)"
-                ) from None
-            raise DatabaseError(
-                "listen() is connected through a connection pooler and could not send a "
-                f"test notification within {_PROBE_TIMEOUT:g}s to check that notifications "
-                "arrive; connect listen() directly to PostgreSQL (or through session mode)"
-            ) from None
-        except Exception as exc:
-            raise _translate(exc, "LISTEN") from None
-        finally:
-            try:
-                await conn.remove_listener(channel, on_probe)
-            except Exception:
-                log.debug("mizzle: could not UNLISTEN the probe channel", exc_info=True)
-
-
-# How long listen() waits for its test notification when connected through a pooler.
-_PROBE_TIMEOUT = 2.0
-
-
-class _End(enum.Enum):
-    LOST = "lost"
-    OVERFLOW = "overflow"
-
-
-def _read_transport(conn: object) -> asyncio.ReadTransport | None:
-    """The asyncio transport under an asyncpg connection (or pool proxy), to pause reading.
-    asyncpg has no public API for this; None if its internals change."""
-    transport: object = getattr(conn, "_transport", None)
-    return transport if isinstance(transport, asyncio.ReadTransport) else None
-
-
-@final
-class _Notifications:
-    """The iterator ``listen()`` yields. A class, not an async generator: a timeout or
-    cancellation while waiting must not end the iteration."""
-
-    __slots__ = ("_decoder", "_on_take", "_queue")
-    _queue: asyncio.Queue[Notification | _End]
-    _on_take: Callable[[], None] | None
-    _decoder: Callable[[str], object] | None
-
-    def __init__(
-        self,
-        queue: asyncio.Queue[Notification | _End],
-        on_take: Callable[[], None] | None = None,
-        decoder: Callable[[str], object] | None = None,
-    ) -> None:
-        self._queue = queue
-        self._on_take = on_take
-        self._decoder = decoder
-
-    def __aiter__(self) -> Self:
-        return self
-
-    async def __anext__(self) -> Notification:
-        event = await self._queue.get()
-        if isinstance(event, Notification):
-            if self._on_take is not None and self._queue.empty():
-                self._on_take()  # overflow="block": caught up, read the socket again
-            if self._decoder is not None:
-                return Notification(
-                    event.channel, event.payload, event.pid, self._decoder(event.payload)
-                )
-            return event
-        self._queue.put_nowait(event)  # stays failed
-        if event is _End.OVERFLOW:
-            raise ListenerOverflow(
-                "the listen() consumer fell max_queue notifications behind; later ones "
-                "were not kept"
-            )
-        raise DbConnectionError(
-            "the listen() connection was lost; notifications sent meanwhile were missed"
-        )
-
 
 @final
 class _PoolConnection(asyncpg.Connection):
@@ -826,7 +451,6 @@ def _json_encode(value: object) -> bytes:
 
 
 async def _init_connection(conn: asyncpg.Connection) -> None:
-    # Binary format, so binary COPY (copy_into) can send JSON too.
     await conn.set_type_codec(
         "json", encoder=_json_encode, decoder=json.loads, schema="pg_catalog", format="binary"
     )
@@ -916,15 +540,11 @@ def _is_closed(conn: asyncpg.Connection | PoolConnectionProxy) -> bool:
 
 class PostgresDriver:
     _pool: asyncpg.Pool
-    _url: str | None  # for one-off connections outside the pool (never logged)
     acquire_timeout: float | None
     last_acquire_ms: float
 
-    def __init__(
-        self, pool: asyncpg.Pool, url: str | None = None, acquire_timeout: float | None = 30.0
-    ) -> None:
+    def __init__(self, pool: asyncpg.Pool, acquire_timeout: float | None = 30.0) -> None:
         self._pool = pool
-        self._url = url
         self.acquire_timeout = acquire_timeout
         self.last_acquire_ms = 0.0
 
@@ -986,7 +606,7 @@ class PostgresDriver:
             # retry loop must not sleep and try again (R4).
             error.retryable = _retryable(exc)
             raise error from exc
-        return cls(pool, url, acquire_timeout)
+        return cls(pool, acquire_timeout)
 
     def acquire(self) -> _Acquire:
         return _Acquire(self._pool, self)
@@ -1008,19 +628,3 @@ class PostgresDriver:
 
     async def expire_connections(self) -> None:
         await self._pool.expire_connections()
-
-    async def notify_unpooled(self, channel: str, payload: str = "") -> None:
-        """Send a notification on a short-lived connection outside the pool, so it works
-        even when every pooled connection is busy (listen()'s pooler check)."""
-        if self._url is None:
-            raise DbConnectionError("no connection URL for a connection outside the pool")
-        try:
-            conn = await asyncpg.connect(self._url, statement_cache_size=0)
-        except (OSError, asyncpg.PostgresError) as exc:
-            raise DbConnectionError(f"could not connect: {type(exc).__name__}: {exc}") from exc
-        try:
-            await conn.execute("SELECT pg_notify($1, $2)", channel, payload)
-        except Exception as exc:
-            raise _translate(exc, "SELECT pg_notify($1, $2)") from None
-        finally:
-            await conn.close()

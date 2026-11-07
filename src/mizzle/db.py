@@ -11,7 +11,6 @@ import random
 import time
 from collections.abc import (
     AsyncGenerator,
-    AsyncIterator,
     Awaitable,
     Callable,
     Generator,
@@ -48,21 +47,15 @@ from mizzle.core.query.builder import QueryBuilder
 from mizzle.core.query.insert import Insert, RowLike, as_mapping, prepare_row
 from mizzle.core.query.relational import RelationalStatement
 from mizzle.core.query.select import SelectBase
-from mizzle.core.schema.column import ColumnBase
 from mizzle.core.schema.table import Table, validate_tables
 from mizzle.core.schema.view import View
 from mizzle.core.sql.nodes import Identifier, Node, Raw
 from mizzle.dialects.base import (
     Connection,
-    CopyFormat,
-    CopyOutput,
     Dialect,
     Driver,
     IsolationLevel,
-    Notification,
-    Overflow,
     PoolStats,
-    Reconnected,
     ResetMode,
 )
 from mizzle.dialects.postgres import PostgresDialect
@@ -346,7 +339,7 @@ class Session(QueryBuilder):
     async def executemany(self, statement: Raw, params: Sequence[Sequence[object]]) -> int:
         """Run one statement (with ``$1``, ``$2``, ... placeholders) for each parameter set,
         pipelined in as few round trips as there can be. Returns how many sets ran. For
-        inserting many rows prefer ``insert_many()``, and for bulk loads ``copy_into()``."""
+        inserting many rows prefer ``insert_many()``."""
         compiled = self.compile(statement)
         if compiled.params or compiled.has_placeholders:
             raise QueryError(
@@ -396,76 +389,6 @@ class Session(QueryBuilder):
             name[:0] = [Identifier(info.schema), "."]
         how = "CONCURRENTLY " if concurrently else ""
         await self.execute(Raw((f"REFRESH MATERIALIZED VIEW {how}", *name)))
-
-    async def copy_into(
-        self,
-        table: type[Table],
-        rows: Iterable[RowLike],
-        *,
-        columns: Sequence[ColumnBase] | None = None,
-    ) -> int:
-        """Bulk load ``rows`` with COPY, much faster than INSERT for many rows; returns
-        the row count. Rows are checked like ``insert().values()``. Every row must set
-        the same columns: ``columns`` (default: those the first row sets). Columns left
-        out get their database default. All rows or none are stored. Tables with
-        vector or tsvector columns are loaded with ``insert_many()`` instead."""
-        it = iter(rows)
-        first = next(it, None)
-        if first is None:
-            return 0
-        if columns is not None:
-            attrs = _copy_attrs(table, columns)
-        else:
-            attrs = tuple(prepare_row(table, as_mapping(first)))
-        if not attrs:
-            raise QueryError("copy_into() needs at least one column")
-        info = table.__table__
-        if any(_text_only(info.columns[a]) for a in attrs):
-            # asyncpg's COPY sends binary values; these types only have a text encoding.
-            return await self.insert_many(table, itertools.chain((first,), it))
-        names = [info.columns[a].db_name(self._casing) for a in attrs]
-        compiled = CompiledQuery(f"COPY {info.name} ({', '.join(names)}) FROM STDIN", (), ())
-        records = _copy_records(table, itertools.chain((first,), it), attrs)
-        with self._logged(compiled):
-            try:
-                async with self._connection() as conn:
-                    return await conn.copy_records(
-                        info.name, info.schema, names, records, self._timeout
-                    )
-            except DbConnectionError as lost:
-                await self._after_lost_connection(compiled, False, lost)
-                raise
-
-    async def copy_from(
-        self,
-        query: Node,  # a select or relational query, or raw sql(...)
-        output: CopyOutput,
-        *,
-        format: CopyFormat = "csv",
-        header: bool = False,
-    ) -> int:
-        """Export the rows of ``query`` with ``COPY (query) TO STDOUT`` into ``output``: a
-        file path, a binary file, or ``async def write(chunk: bytes)``. Returns the row
-        count. Lock-free selects read from a replica, like plain reads."""
-        compiled = self.compile(query)
-        if compiled.has_placeholders:
-            raise QueryError("copy_from() does not take placeholders")
-        read_only = isinstance(query, SelectBase | RelationalStatement) and compiled.pure_read
-        with self._logged(compiled):
-            try:
-                async with self._connection(read_only) as conn:
-                    return await conn.copy_out(
-                        compiled.sql,
-                        compiled.params,
-                        output,
-                        format,
-                        header,
-                        self._timeout,
-                        session_safe=compiled.session_safe,
-                    )
-            except DbConnectionError as lost:
-                await self._after_lost_connection(compiled, False, lost)
-                raise
 
     @overload
     async def insert_many[T: Table](
@@ -528,102 +451,6 @@ class Session(QueryBuilder):
                 else:
                     count += await insert
         return inserted if returning else count
-
-    @overload
-    def listen(
-        self,
-        *channels: str,
-        reconnect: Literal[False] = False,
-        max_queue: int | None = None,
-        overflow: Overflow = "raise",
-        pooler_session_mode: bool = False,
-        decoder: Callable[[str], object] | None = None,
-    ) -> AbstractAsyncContextManager[AsyncIterator[Notification]]: ...
-    @overload
-    def listen(
-        self,
-        *channels: str,
-        reconnect: Literal[True],
-        max_queue: int | None = None,
-        overflow: Overflow = "raise",
-        pooler_session_mode: bool = False,
-        decoder: Callable[[str], object] | None = None,
-    ) -> AbstractAsyncContextManager[AsyncIterator[Notification | Reconnected]]: ...
-    def listen(
-        self,
-        *channels: str,
-        reconnect: bool = False,
-        max_queue: int | None = None,
-        overflow: Overflow = "raise",
-        pooler_session_mode: bool = False,
-        decoder: Callable[[str], object] | None = None,
-    ) -> AbstractAsyncContextManager[AsyncIterator[Notification | Reconnected]]:
-        """Receive ``NOTIFY`` messages sent to ``channels``, on a pooled connection held
-        until the block exits::
-
-            async with db.listen("orders") as events:
-                async for event in events:
-                    print(event.channel, event.payload)
-
-        If the connection is lost, iterating raises ``ConnectionError`` (notifications
-        sent meanwhile are missed). With ``reconnect=True`` it LISTENs again on a new
-        connection instead (retrying until the database is back) and yields a
-        ``Reconnected`` event first, so the gap is never silent.
-
-        ``max_queue`` bounds the notifications waiting to be read (default: no bound).
-        When it is reached, ``overflow="raise"`` makes iteration raise ``ListenerOverflow``
-        after the queued ones; ``"drop_oldest"`` discards the oldest and logs a warning;
-        ``"block"`` stops reading the connection until the consumer catches up, so
-        PostgreSQL holds the rest and nothing is lost (the queue can briefly exceed
-        ``max_queue`` by the notifications already in one network read).
-
-        Through a connection pooler, listen() raises ``DatabaseError``: PgBouncer in
-        transaction or statement mode drops notifications. Connect it directly to
-        PostgreSQL, or pass ``pooler_session_mode=True`` when the pooler runs in session
-        mode (listen() then checks that a test notification arrives).
-
-        ``decoder`` (e.g. ``json.loads``) runs on each ``payload`` and the result is on
-        ``Notification.data``, for notifications that carry JSON::
-
-            async with db.listen("orders", decoder=json.loads) as events:
-                async for event in events:
-                    handle(event.data)
-
-        A decoder that raises propagates that error from the ``async for`` body; the
-        listener stays open, so the next notification is still delivered."""
-        if self._conn is not None:
-            raise QueryError("listen() needs its own connection; call it outside a transaction")
-        if not channels:
-            raise QueryError("listen() needs at least one channel")
-        if max_queue is not None and max_queue < 1:
-            raise QueryError("listen() needs max_queue >= 1")
-        driver = self._require_driver()
-
-        async def open_listener(stack: AsyncExitStack) -> AsyncIterator[Notification]:
-            conn = await stack.enter_async_context(driver.acquire())
-            return await stack.enter_async_context(
-                # The pooler check's test notification must not wait for a pooled
-                # connection: with pool_size=1 the listener holds the only one.
-                conn.listen(
-                    channels,
-                    max_queue,
-                    overflow,
-                    driver.notify_unpooled,
-                    pooler_session_mode,
-                    decoder,
-                )
-            )
-
-        if reconnect:
-            return _reconnecting(_Relistener(open_listener, driver))
-        return _listening(open_listener)
-
-    async def notify(self, channel: str, payload: str = "") -> None:
-        """Send a notification to ``channel`` (``pg_notify``; the payload is a bind
-        parameter). Inside a transaction it is sent on commit."""
-        await self._call(
-            CompiledQuery("SELECT pg_notify($1, $2)", (channel, payload), (None, None)), "execute"
-        )
 
     async def ping(self, timeout: float = 5.0) -> bool:
         """``True`` when the database answers a trivial query, ``False`` when it cannot be
@@ -1130,81 +957,6 @@ class Session(QueryBuilder):
         return conn.fetch_dicts(query.sql, query.params, self._timeout)
 
 
-type _OpenListener = Callable[[AsyncExitStack], Awaitable[AsyncIterator[Notification]]]
-
-
-@asynccontextmanager
-async def _listening(open_listener: _OpenListener) -> AsyncGenerator[AsyncIterator[Notification]]:
-    async with AsyncExitStack() as stack:
-        yield await open_listener(stack)
-
-
-@asynccontextmanager
-async def _reconnecting(
-    listener: _Relistener,
-) -> AsyncGenerator[AsyncIterator[Notification | Reconnected]]:
-    try:
-        await listener.connect()  # the first connection's errors are raised as they are
-        yield listener
-    finally:
-        await listener.close()
-
-
-@final
-class _Relistener:
-    """The iterator ``listen(reconnect=True)`` yields. A class, not an async generator: a
-    timeout or cancellation while waiting must not end the iteration (a reconnect it
-    interrupts starts again on the next call)."""
-
-    __slots__ = ("_driver", "_events", "_open", "_stack")
-    _open: _OpenListener
-    _driver: Driver
-    _stack: AsyncExitStack | None
-    _events: AsyncIterator[Notification] | None
-
-    def __init__(self, open_listener: _OpenListener, driver: Driver) -> None:
-        self._open = open_listener
-        self._driver = driver
-        self._stack = None
-        self._events = None
-
-    async def connect(self) -> None:
-        stack = AsyncExitStack()
-        try:
-            self._events = await self._open(stack)
-        except BaseException:
-            await stack.aclose()
-            raise
-        self._stack = stack
-
-    async def close(self) -> None:
-        stack, self._stack, self._events = self._stack, None, None
-        if stack is not None:
-            await stack.aclose()
-
-    def __aiter__(self) -> Self:
-        return self
-
-    async def __anext__(self) -> Notification | Reconnected:
-        if self._events is not None:
-            try:
-                return await anext(self._events)
-            except DbConnectionError:
-                log.warning("mizzle: the listen() connection was lost; reconnecting")
-                await self.close()
-                await self._driver.expire_connections()  # like any lost connection
-        delay = 0.1
-        while True:
-            try:
-                await self.connect()
-            except DbConnectionError:
-                log.warning("mizzle: listen() could not reconnect; retrying in %gs", delay)
-                await asyncio.sleep(delay)
-                delay = min(delay * 2, 5.0)
-            else:
-                return Reconnected()
-
-
 def _insert_batches(
     table: type[Table],
     rows: Iterable[RowLike],
@@ -1227,54 +979,6 @@ def _insert_batches(
         params += size
     if batch:
         yield tuple(batch)
-
-
-# Extension and text-search types: asyncpg has no binary codec for them, so COPY cannot
-# send them; copy_into() falls back to insert_many() for tables that use them.
-_TEXT_ONLY_TYPES = ("vector", "halfvec", "sparsevec", "tsvector", "tsquery")
-
-
-def _text_only(column: ColumnBase) -> bool:
-    base = column.sql_type.removesuffix("[]").split("(", 1)[0].strip()
-    return base in _TEXT_ONLY_TYPES
-
-
-def _copy_attrs(table: type[Table], columns: Sequence[ColumnBase]) -> tuple[str, ...]:
-    for column in columns:
-        if column.table is not table:
-            raise QueryError(f"{column.qualified_name} is not a column of {table.__name__}")
-    wanted = {column.attr for column in columns}
-    for attr, column in table.__table__.columns.items():
-        if column.required_on_insert and attr not in wanted:
-            raise QueryError(f"{column.qualified_name} is required")
-    return tuple(attr for attr in table.__table__.columns if attr in wanted)
-
-
-def _copy_records(
-    table: type[Table], rows: Iterable[RowLike], attrs: tuple[str, ...]
-) -> Iterator[tuple[object, ...]]:
-    """Check and encode each row while COPY sends them (rows are never all in memory)."""
-    columns = table.__table__.columns
-    for number, row in enumerate(rows):
-        given = as_mapping(row)
-        values = prepare_row(table, given)  # unknown columns, types, NOT NULL, defaults
-        if missing := [a for a in attrs if a not in values]:
-            raise QueryError(
-                f"copy_into() row {number} has no value for {', '.join(missing)}; "
-                "every row must set the same columns"
-            )
-        if extra := [a for a in given if a not in attrs]:
-            raise QueryError(
-                f"copy_into() row {number} sets {', '.join(extra)}, which the first row "
-                "(or columns=) does not"
-            )
-        record: list[object] = []
-        for attr in attrs:
-            value = values[attr]
-            if isinstance(value, Node):
-                raise QueryError("copy_into() cannot send SQL expressions; use insert()")
-            record.append(columns[attr].encode(value))
-        yield tuple(record)
 
 
 def dialect_for_url(url: str) -> Dialect:
@@ -1361,7 +1065,7 @@ class Database(Session):
 
         ``reset_connections="auto"`` (the default) resets a connection's session state when
         it goes back to the pool only after a statement that may have changed it: raw
-        ``sql(...)``, a function named with ``func()``, ``listen()``, direct connection use.
+        ``sql(...)``, a function named with ``func()``, direct connection use.
         Skipping the reset after mizzle-built statements saves a round trip per query (2x on
         a real network). Use ``"always"`` if triggers or database functions change session
         settings themselves (``SET`` or ``set_config(..., false)`` without LOCAL, session

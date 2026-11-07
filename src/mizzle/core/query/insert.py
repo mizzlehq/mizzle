@@ -65,7 +65,7 @@ def prepare_row(
                 if column.computed is None:  # GENERATED ALWAYS identity (bulk paths)
                     raise QueryError(
                         f"{column.qualified_name} is GENERATED ALWAYS AS IDENTITY; the "
-                        "database assigns it. insert_many() and copy_into() cannot set it: "
+                        "database assigns it. insert_many() cannot set it: "
                         f"use db.insert({table.__name__}).values(...).overriding_system_value(), "
                         "or make the column generated_by_default_as_identity()"
                     )

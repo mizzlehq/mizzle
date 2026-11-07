@@ -1,17 +1,13 @@
-"""Identity, generated and on_update columns, and tsvector, against a real database."""
+"""Identity, generated and on_update columns against a real database."""
 
-import asyncio
 import datetime as dt
 import importlib.util
-import os
 import sys
-from collections.abc import AsyncGenerator, Generator, Sequence
+from collections.abc import AsyncGenerator, Sequence
 from pathlib import Path
 from typing import final, override
 
 import pytest
-from hypothesis import HealthCheck, given, settings
-from hypothesis import strategies as st
 
 from mizzle import Constraint, Database, QueryError, Table, eq, excluded, index, sql
 from mizzle.core.schema.relations import many, one
@@ -22,7 +18,7 @@ from mizzle.dialects.postgres.driver import PostgresDriver
 from mizzle.kit.codegen import render_schema_module
 from mizzle.kit.diff import diff
 from mizzle.kit.snapshot import build_snapshot
-from mizzle.pg import bigint, integer, text, timestamp, tsquery, tsvector
+from mizzle.pg import array, bigint, integer, text, timestamp
 
 dialect = PostgresDialect()
 SCHEMA = "gencols"
@@ -42,10 +38,9 @@ class Articles(Table, name="articles", schema=SCHEMA):
     author_id = integer().not_null().references(lambda: Authors.id)
     title = text().not_null()
     body = text().not_null().default("")
-    search = tsvector().generated_always_as(
-        sql("to_tsvector('english', coalesce(title, '') || ' ' || body)")
+    search = array(text()).generated_always_as(
+        sql("string_to_array(lower(coalesce(title, '') || ' ' || body), ' ')")
     )
-    query = tsquery()
     title_length = integer().generated_always_as(sql("length(title)"))
     edited = timestamp().on_update(lambda: STAMP)
     changed = timestamp(tz=True).on_update_now()
@@ -121,7 +116,7 @@ async def test_no_drift_and_pull_round_trip(
 
     source = render_schema_module(live)
     assert "generated_by_default_as_identity(increment=10, start=1000)" in source
-    assert "custom('tsvector').generated_always_as(sql(" in source
+    assert "array(text()).generated_always_as(sql(" in source
     pulled = build_snapshot(load(source, tmp_path, "pulled_gencols"), dialect)
     assert diff(live, pulled) == []  # the database's own expression text, exactly
 
@@ -134,32 +129,27 @@ async def test_identity_and_generated_values(gen_db: Database) -> None:
         await gen_db.insert(Articles)
         .values(
             [
-                {"author_id": ann.id, "title": "Cats sat", "body": "on mats", "query": "cat & mat"},
+                {"author_id": ann.id, "title": "Cats sat", "body": "on mats"},
                 {"author_id": ann.id, "title": "Dogs", "id": 5},  # BY DEFAULT: explicit id is fine
             ]
         )
         .returning()
     )
     assert (a.id, b.id) == (1000, 5)
-    assert a.search == "'cat':1 'mat':4 'sat':2"
-    assert a.query == "'cat' & 'mat'"
+    assert a.search == ["cats", "sat", "on", "mats"]
     assert a.title_length == 8
 
     with pytest.raises(QueryError, match="GENERATED ALWAYS AS IDENTITY"):
         await gen_db.insert(Authors).values(id=9, name="x")
     with pytest.raises(QueryError, match="generated column"):
-        await gen_db.insert(Articles).values(author_id=ann.id, title="x", search="'x'")
+        await gen_db.insert(Articles).values(author_id=ann.id, title="x", search=["x"])
     with pytest.raises(QueryError, match="generated column"):
         await gen_db.update(Articles).set(title_length=1).where(eq(Articles.id, a.id))
 
-    found = (
-        await gen_db.select()
-        .from_(Articles)
-        .where(sql("{} @@ to_tsquery('english', 'cats')", Articles.search))
-    )
+    found = await gen_db.select().from_(Articles).where(sql("{} @> ARRAY['cats']", Articles.search))
     assert [r.id for r in found] == [a.id]
 
-    # Nested rows travel as JSON: tsvector / tsquery / generated values come back the same.
+    # Nested rows travel as JSON: generated values come back the same.
     [loaded] = await gen_db.query(Authors).find_many(
         with_={"articles": {"order_by": Articles.id}}, where=eq(Authors.id, ann.id)
     )
@@ -238,7 +228,7 @@ async def test_generated_migrations(driver: PostgresDriver) -> None:
         table(
             a=integer(),
             g=integer(),
-            t=tsvector().generated_always_as(sql("to_tsvector('simple', a::text)")),
+            t=text().generated_always_as(sql("a::text")),
         ),
     ]
     if version >= 170000:  # ALTER COLUMN ... SET EXPRESSION
@@ -246,7 +236,7 @@ async def test_generated_migrations(driver: PostgresDriver) -> None:
             table(
                 a=integer(),
                 g=integer(),
-                t=tsvector().generated_always_as(sql("to_tsvector('english', a::text)")),
+                t=text().generated_always_as(sql("(a + 1)::text")),
             )
         )
     if version >= 180000:  # VIRTUAL generated columns
@@ -273,103 +263,3 @@ async def test_generated_migrations(driver: PostgresDriver) -> None:
     finally:
         async with driver.acquire() as conn:
             await conn.execute(f"DROP SCHEMA IF EXISTS {SCHEMA} CASCADE", [])
-
-
-# -- tsvector / tsquery values through every read path (fuzzed) -------------------------
-
-
-@final
-class Docs(Table, name="docs", schema=SCHEMA):
-    id = integer().primary_key().generated_always_as_identity()
-    doc = tsvector()
-    query = tsquery()
-    texts = many(lambda: DocTexts)
-
-
-@final
-class DocTexts(Table, name="doc_texts", schema=SCHEMA):
-    id = integer().primary_key().generated_always_as_identity()
-    doc_id = integer().not_null().references(lambda: Docs.id)
-    doc = tsvector()
-    query = tsquery()
-    parent = one(lambda: Docs, fields=lambda: [DocTexts.doc_id], references=lambda: [Docs.id])
-
-
-def _quoted(word: str) -> str:
-    return "'" + word.replace("\\", "\\\\").replace("'", "''") + "'"
-
-
-lexemes = st.text(
-    st.characters(exclude_characters="\x00", exclude_categories=["Cs"]), min_size=1, max_size=8
-)
-positions = st.lists(
-    st.tuples(st.integers(1, 16383), st.sampled_from(["", "A", "B", "C"])), max_size=3
-)
-documents = st.lists(st.tuples(lexemes, positions), max_size=5).map(
-    lambda items: " ".join(
-        _quoted(w) + (":" + ",".join(f"{p}{wt}" for p, wt in pos) if pos else "")
-        for w, pos in items
-    )
-)
-queries = st.lists(lexemes, min_size=1, max_size=4).flatmap(
-    lambda words: st.sampled_from([" & ", " | ", " <-> "]).map(
-        lambda op: op.join(_quoted(w) for w in words)
-    )
-)
-
-
-@pytest.fixture(scope="module")
-def search_runner() -> Generator[tuple[asyncio.Runner, Database]]:
-    url = os.environ.get("MIZZLE_TEST_URL")
-    if not url:
-        pytest.skip("set MIZZLE_TEST_URL to run integration tests")
-    with asyncio.Runner() as loop:
-        db = loop.run(Database.connect(url, schema=[Docs, DocTexts], pool_size=2))
-        loop.run(setup(db.driver, build_snapshot([Docs, DocTexts], dialect)))
-        yield loop, db
-
-        async def teardown() -> None:
-            async with db.driver.acquire() as conn:
-                await conn.execute(f"DROP SCHEMA IF EXISTS {SCHEMA} CASCADE", [])
-            await db.close()
-
-        loop.run(teardown())
-
-
-@settings(
-    max_examples=int(os.environ.get("MIZZLE_FUZZ_EXAMPLES", "200")),
-    deadline=None,
-    suppress_health_check=[HealthCheck.function_scoped_fixture, HealthCheck.too_slow],
-)
-@given(doc=st.none() | documents, query=st.none() | queries)
-def test_search_types_round_trip(
-    search_runner: tuple[asyncio.Runner, Database], doc: str | None, query: str | None
-) -> None:
-    loop, db = search_runner
-
-    async def scenario() -> None:
-        [parent] = await db.insert(Docs).values(doc=doc, query=query).returning()
-        [child] = (
-            await db.insert(DocTexts).values(doc_id=parent.id, doc=doc, query=query).returning()
-        )
-        # PostgreSQL normalizes the text (sorts, merges); every path must agree on it.
-        [selected] = await db.select().from_(DocTexts).where(eq(DocTexts.id, child.id))
-        [loaded] = await db.query(Docs).find_many(
-            where=eq(Docs.id, parent.id), with_={"texts": True}
-        )
-        assert (
-            (selected.doc, selected.query) == (child.doc, child.query) == (parent.doc, parent.query)
-        )
-        assert loaded.texts == [selected]
-        # Writing back what was read keeps it.
-        [again] = (
-            await db.update(DocTexts)
-            .set(doc=selected.doc, query=selected.query)
-            .where(eq(DocTexts.id, child.id))
-            .returning()
-        )
-        assert again == selected
-        await db.delete(DocTexts).where(eq(DocTexts.id, child.id))
-        await db.delete(Docs).where(eq(Docs.id, parent.id))
-
-    loop.run(scenario())

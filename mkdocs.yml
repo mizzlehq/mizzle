@@ -78,7 +78,7 @@ nav:
       - Relational queries: guide/relational.md
       - Transactions and errors: guide/transactions.md
       - Migrations and database objects: guide/migrations.md
-      - Bulk, streaming and LISTEN: guide/bulk.md
+      - Bulk and streaming: guide/bulk.md
       - pgvector: guide/extensions.md
       - Pydantic, Supabase, Studio: guide/integrations.md
   - CLI: cli.md

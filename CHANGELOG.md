@@ -19,6 +19,15 @@
   generated migration.
 - Studio resolves domains with the server (`pg_type.typbasetype`) instead of parsing type
   names, and shows composite columns read-only.
+- Removed column types from `mizzle.pg`: the ranges and multiranges (`int4range`,
+  `int8range`, `numrange`, `daterange`, `tsrange`, `tstzrange` and their `*multirange`),
+  the geometry shapes `box`, `lseg`, `path`, `polygon` and `circle` (`point` and `line`
+  stay), `hstore`, `ltree`, `citext`, `xml`, `money`, `tsvector` and `tsquery`. Declare such
+  a column with `custom("type")`. The range operators went with them: `contains`,
+  `contained_by` and `overlaps` work on arrays and jsonb.
+- Removed `Database.listen()` and `notify()` (with `Notification`, `Reconnected` and
+  `ListenerOverflow`). Use asyncpg's `add_listener` on a connection of your own.
+- Removed `copy_into()` and `copy_from()`. Use `insert_many()` for bulk loads.
 
 ## 0.2.4
 

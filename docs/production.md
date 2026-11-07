@@ -26,7 +26,7 @@ await db.retry(transfer)  # re-run a transaction on a serialization conflict
 
 When a connection goes back to the pool, mizzle resets its session state (`RESET ALL`,
 `UNLISTEN *`, advisory locks, cursors, temp tables) only after a statement that may have changed it: raw
-`sql(...)`, a function you name with `func()`, `listen()`, or direct connection use. After
+`sql(...)`, a function you name with `func()`, or direct connection use. After
 the statements mizzle builds itself it skips the reset, which saves a round trip per query
 (2x on a real network). Open transactions are always rolled back.
 
@@ -40,9 +40,8 @@ db = await Database.connect(url, reset_connections="always")
 
 ## PgBouncer
 
-- **Transaction mode:** pass `statement_cache_size=0`. `db.listen()` refuses to run here,
-  since notifications would be lost: connect `listen()` directly to PostgreSQL.
-- **Session mode:** works as is. `db.listen(..., pooler_session_mode=True)` is allowed.
+- **Transaction mode:** pass `statement_cache_size=0`.
+- **Session mode:** works as is.
 
 ## Memory
 

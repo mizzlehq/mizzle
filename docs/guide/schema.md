@@ -34,7 +34,7 @@ from mizzle import Table
 from mizzle.pg import (
     array, bigint, bigserial, boolean, bytea, date, double_precision, inet, integer,
     interval, json, jsonb, numeric, real, smallint, smallserial, text, time, timestamp,
-    tsquery, tsvector, uuid, varchar,
+    uuid, varchar,
 )
 
 
@@ -62,8 +62,6 @@ class Everything(Table, name="everything"):
     tags = array(text())
     settings = jsonb[dict[str, Any]]()
     raw = json[list[int]]()
-    doc = tsvector()
-    query = tsquery()
 ```
 
 | Function | PostgreSQL type | Python type |
@@ -83,7 +81,6 @@ class Everything(Table, name="everything"):
 | `inet()` | `inet` | `IPv4Address`, `IPv6Address`, ... (`mizzle.pg.IPAddress`) |
 | `array(item)` | `item[]` | `list[item type]` |
 | `jsonb[T]()`, `json[T]()` | `jsonb`, `json` | `T` (a hint for your editor; not checked) |
-| `tsvector()`, `tsquery()` | `tsvector`, `tsquery` | `str` |
 | `pg_enum(EnumClass)` | an enum type | your `enum.Enum` class |
 | `vector(n)`, `halfvec(n)` | pgvector `vector(n)`, `halfvec(n)` | `list[float]` |
 | `sparsevec(n)` | pgvector `sparsevec(n)` | `dict[int, float]` |
@@ -93,6 +90,8 @@ class Everything(Table, name="everything"):
 - `timestamp(tz=True)` values always come back as aware datetimes in UTC.
 - `precision=` keeps 0 to 6 digits of fractional seconds (default 6).
 - The pgvector types need the `vector` extension. See [Extensions](extensions.md).
+- Other PostgreSQL types (ranges, geometry shapes other than `point` and `line`, `hstore`,
+  `citext`, `tsvector`, ...) are not built in; use `custom("type")`.
 
 ## Nullability, defaults and on_update
 
@@ -308,7 +307,7 @@ such a type as `custom(...)`.
 from typing import final
 
 from mizzle import Table, sql
-from mizzle.pg import bigint, integer, numeric, text, tsvector
+from mizzle.pg import bigint, integer, numeric, text
 
 
 @final
@@ -319,7 +318,7 @@ class Invoices(Table, name="invoices"):
     unit_price = numeric(10, 2).not_null()
     total = numeric(12, 2).generated_always_as(sql("qty * unit_price"))
     memo = text().not_null().default("")
-    search = tsvector().generated_always_as(sql("to_tsvector('english', memo)"))
+    shout = text().generated_always_as(sql("upper(memo)"))
 ```
 
 - `generated_always_as_identity()`: the database always assigns the value. An insert that

@@ -33,27 +33,17 @@ from mizzle.pg import (
     bigint,
     bit,
     boolean,
-    box,
     cidr,
-    circle,
-    citext,
-    hstore,
     integer,
     line,
-    lseg,
-    ltree,
     macaddr,
     macaddr8,
-    money,
-    path,
     point,
-    polygon,
     serial,
     text,
     timestamp,
     varbit,
     vector,
-    xml,
 )
 
 dialect = PostgresDialect()
@@ -513,6 +503,7 @@ def test_unlogged_and_storage_sql_and_pull(tmp_path: Path) -> None:
 
 
 @final
+@final
 class Assorted(Table, name="assorted"):
     id = integer().primary_key()
     net = cidr()
@@ -520,18 +511,8 @@ class Assorted(Table, name="assorted"):
     mac8 = macaddr8()
     flags = bit(4)
     variable = varbit(8)
-    doc = xml()
-    amount = money()
     pt = point()
     ln = line()
-    seg = lseg()
-    rect = box()
-    trace = path()
-    area = polygon()
-    disc = circle()
-    attrs = hstore()
-    label = citext()
-    tree = ltree()
     embeddings = array(vector(3))
 
 
@@ -543,18 +524,8 @@ def test_more_column_types_sql_snapshot_and_pull(tmp_path: Path) -> None:
     assert columns["mac8"]["type"] == "macaddr8"
     assert columns["flags"]["type"] == "bit(4)"
     assert columns["variable"]["type"] == "bit varying(8)"
-    assert columns["doc"]["type"] == "xml"
-    assert columns["amount"]["type"] == "money"
     assert columns["pt"]["type"] == "point"
     assert columns["ln"]["type"] == "line"
-    assert columns["seg"]["type"] == "lseg"
-    assert columns["rect"]["type"] == "box"
-    assert columns["trace"]["type"] == "path"
-    assert columns["area"]["type"] == "polygon"
-    assert columns["disc"]["type"] == "circle"
-    assert columns["attrs"]["type"] == "hstore"
-    assert columns["label"]["type"] == "citext"
-    assert columns["tree"]["type"] == "ltree"
     assert columns["embeddings"]["type"] == "vector(3)[]"
 
     create = next(s for s in sqls(empty_snapshot("postgresql"), original) if "CREATE TABLE" in s)

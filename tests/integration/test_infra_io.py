@@ -1,14 +1,12 @@
-"""Streaming, COPY, insert_many and LISTEN/NOTIFY through PgBouncer (transaction mode) and
-the TLS-only "odd" server. Skipped unless the tests/infra/compose.yml variables are set."""
+"""Streaming and insert_many through PgBouncer (transaction mode) and the TLS-only "odd"
+server. Skipped unless the tests/infra/compose.yml variables are set."""
 
-import asyncio
-import io
 from collections.abc import AsyncGenerator
 from typing import Any, final
 
 import pytest
 
-from mizzle import Database, DatabaseError, Table, gt, sql
+from mizzle import Database, Table, gt
 from mizzle.pg import integer, jsonb, serial, text
 from tests.integration.test_infra import env
 from tests.integration.test_stress import assert_no_leak
@@ -42,16 +40,13 @@ async def teardown(url: str) -> None:
 
 async def exercise(db: Database) -> None:
     rows = [{"n": i, "label": f"row {i}", "doc": {"i": i, "s": "é"}} for i in range(3000)]
-    assert await db.copy_into(IoItems, rows) == 3000
+    assert await db.insert_many(IoItems, rows) == 3000
     assert await db.insert_many(IoItems, rows, batch_size=1000) == 3000
     streamed = [r async for r in db.select().from_(IoItems).order_by(IoItems.id).stream(500)]
     assert [(r.n, r.doc) for r in streamed] == [(r["n"], r["doc"]) for r in rows * 2]
     async with db.transaction() as tx:
         async for row in tx.select().from_(IoItems).where(gt(IoItems.n, 2990)).stream(3):
             await tx.update(IoItems).set(label="seen").where(gt(IoItems.id, row.id - 1))
-    out = io.BytesIO()
-    assert await db.copy_from(db.select(IoItems.n).from_(IoItems).where(gt(IoItems.n, 2997)), out)
-    assert sorted(out.getvalue().split()) == [b"2998", b"2998", b"2999", b"2999"]
     assert_no_leak(db)
 
 
@@ -65,42 +60,11 @@ async def bouncer_url() -> AsyncGenerator[str]:
 
 
 async def test_through_pgbouncer(bouncer_url: str) -> None:
-    # Cursors live inside one transaction, and COPY is one statement: both are fine in
-    # transaction mode.
+    # Cursors live inside one transaction: fine in transaction mode.
     async with await Database.connect(
         bouncer_url, schema=[IoItems], statement_cache_size=0, pool_size=3
     ) as db:
         await exercise(db)
-
-
-async def test_listen_through_pgbouncer_raises(bouncer_url: str) -> None:
-    # In transaction mode LISTEN registers on whichever server connection ran it, so
-    # notifications never reach the client. Behind any pooler listen() refuses unless told
-    # the pooler runs in session mode; a test notification alone cannot prove delivery.
-    for _ in range(20):  # not timing-dependent: every attempt raises
-        async with await Database.connect(bouncer_url, statement_cache_size=0) as db:
-            with pytest.raises(DatabaseError, match="pooler_session_mode=True"):
-                async with db.listen("bounced"):
-                    pass
-            assert await db.execute(sql("select 1 as one")) == [{"one": 1}]  # pool still fine
-
-
-async def test_listen_through_pgbouncer_in_session_mode() -> None:
-    url = env("MIZZLE_PGBOUNCER_SESSION_URL")
-    # pool_size=1: the listener holds the only pooled connection, so the test notification
-    # goes out on a connection outside the pool.
-    for pool_size in (2, 1):
-        async with await Database.connect(url, pool_size=pool_size) as db:
-            with pytest.raises(DatabaseError, match="pooler_session_mode=True"):
-                async with db.listen("pooled"):
-                    pass
-            async with db.listen("pooled", pooler_session_mode=True) as events:
-                async with await Database.connect(url, pool_size=1) as sender:
-                    await sender.notify("pooled", "hi")
-                async with asyncio.timeout(5):
-                    event = await anext(events)
-            assert event.payload == "hi"
-            assert_no_leak(db)
 
 
 @pytest.fixture
@@ -116,8 +80,4 @@ async def test_on_the_odd_tls_server(odd_url: str) -> None:
         odd_url, schema=[IoItems], pool_size=3, reset_connections="auto"
     ) as db:
         await exercise(db)
-        async with db.listen("odd") as events:
-            await db.notify("odd", "über")
-            async with asyncio.timeout(5):
-                assert (await anext(events)).payload == "über"
         assert_no_leak(db)

@@ -143,7 +143,7 @@ def _from_json(column: ColumnBase, value: Json) -> object:
         if not isinstance(value, list):
             raise QueryError(f"{column.qualified_name}: expected a JSON array, got {value!r}")
         return [_from_json(column.item, v) for v in value]
-    if column.json_decoder is not None:  # a range, geometry, cidr, bit string (C30)
+    if column.json_decoder is not None:  # point, line, cidr, bit string (C30)
         return column.json_decoder(value)
     kind = column.accepts[0] if column.accepts else None
     if kind is None or kind in (int, str, bool) or column.enum is not None:

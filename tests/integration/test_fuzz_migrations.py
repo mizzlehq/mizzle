@@ -86,7 +86,6 @@ from mizzle.pg import (
     text,
     time,
     timestamp,
-    tsvector,
     varchar,
 )
 from mizzle.pg import uuid as uuid_col
@@ -148,13 +147,6 @@ KINDS: dict[str, Kind] = {
     "varchar(20)": _k(lambda: varchar(20), "", "abc", samples=STRS, check=TEXTCHECK, text=True),
     "varchar": _k(varchar, "z", samples=STRS, check=TEXTCHECK, text=True),
     "boolean": _k(boolean, True, False, samples=("true", "false", "true"), generated="true"),
-    "tsvector": _k(
-        tsvector,
-        "'a' 'b'",  # as PostgreSQL prints it back
-        sql("to_tsvector('simple'::regconfig, 'x y'::text)"),  # defaults compare as printed
-        samples=("'a b'", "'c:1A'", "''"),
-        generated="to_tsvector('english', 'cats sat')",
-    ),
     "date": _k(
         date,
         dt.date(2020, 1, 2),

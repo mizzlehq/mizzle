@@ -1,6 +1,5 @@
 """Runtime and operations: ping, pool stats, connect hooks, slow queries, retries."""
 
-import json
 import logging
 from collections.abc import Generator, Mapping
 from contextlib import contextmanager
@@ -89,17 +88,6 @@ async def test_connect_retries_until_the_database_is_back(
     async with db:
         assert await db.ping() is True
     assert attempts == 3
-
-
-async def test_listen_decodes_json_payloads(pg_url: str) -> None:
-    async with (
-        await Database.connect(pg_url, schema=[Users, Posts]) as db,
-        db.listen("orders", decoder=json.loads) as events,
-    ):
-        await db.notify("orders", json.dumps({"id": 7}))
-        event = await anext(events)
-        assert event.data == {"id": 7}
-        assert event.payload == '{"id": 7}'
 
 
 async def test_transaction_callbacks(db: Database) -> None:

@@ -344,13 +344,9 @@ def all_[T](values: object) -> Expr[T]:
 def _container(value: object, like: object = None) -> Node:
     column = column_of(like) if like is not None else None
     on_json = column is not None and column.sql_type in ("jsonb", "json")
-    # A multirange is a list of ranges too, not a text[] (Q4-19).
-    on_array = column is not None and (
-        column.item is not None or column.sql_type.endswith("multirange")
-    )
+    on_array = column is not None and column.item is not None
     if isinstance(value, Placeholder) and value.column is None and column is not None:
-        # Typed like a literal value (Q5); on a range column it is a range, as PostgreSQL
-        # infers it; a scalar bound needs cast(placeholder(...), integer()).
+        # Typed like a literal value (Q5).
         return Cast(value, "jsonb") if on_json else replace(value, column=column)
     if isinstance(value, Node):
         return value
@@ -368,28 +364,11 @@ def _container(value: object, like: object = None) -> Node:
             return Param(items, column)
         kind = next((t for v in items if (t := sql_type_of(v)) is not None), "text")
         return Cast(Param(items), kind + "[]")
-    element = _RANGE_ELEMENTS.get(column.sql_type) if column is not None else None
-    if element is not None and not hasattr(value, "lower_inc"):  # a scalar, not a range (C39)
-        return Cast(Param(value), element)
     return bind(value)
 
 
-_RANGE_ELEMENTS = {
-    f"{name}{kind}": element
-    for name, element in (
-        ("int4", "integer"),
-        ("int8", "bigint"),
-        ("num", "numeric"),
-        ("ts", "timestamp"),
-        ("tstz", "timestamptz"),
-        ("date", "date"),
-    )
-    for kind in ("range", "multirange")
-}
-
-
 def contains(left: ExprBase, right: object) -> Expr[bool]:
-    """``left @> right``: left contains right (arrays, ranges, jsonb)."""
+    """``left @> right``: left contains right (arrays, jsonb)."""
     return BinaryOp(left, "@>", _container(right, left))
 
 
@@ -399,7 +378,7 @@ def contained_by(left: ExprBase, right: object) -> Expr[bool]:
 
 
 def overlaps(left: ExprBase, right: object) -> Expr[bool]:
-    """``left && right``: the two share any element (arrays, ranges)."""
+    """``left && right``: the two share any element (arrays)."""
     return BinaryOp(left, "&&", _container(right, left))
 
 
