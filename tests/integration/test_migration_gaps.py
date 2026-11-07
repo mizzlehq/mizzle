@@ -1527,3 +1527,25 @@ async def test_pull_writes_valid_code_for_awkward_objects(
     messages = [r.getMessage() for r in caplog.records]
     assert any("NO INHERIT" in m for m in messages)
     assert any("MATCH FULL" in m for m in messages)
+
+
+async def test_pull_keeps_index_order_and_collation_and_key_columns(
+    driver: PostgresDriver, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    # C25: INCLUDE columns were read as keys (a weaker unique rule), and DESC, NULLS LAST
+    # and COLLATE were dropped, with no drift reported.
+    async with driver.acquire() as conn:
+        await conn.execute(
+            "CREATE SCHEMA mg; CREATE TABLE mg.ix (code text, n int); "
+            "CREATE UNIQUE INDEX ix_u ON mg.ix (code) INCLUDE (n); "
+            "CREATE INDEX ix_d ON mg.ix (code DESC NULLS LAST, n NULLS FIRST); "
+            'CREATE INDEX ix_c ON mg.ix (code COLLATE "C" text_pattern_ops)',
+            [],
+        )
+    with caplog.at_level("WARNING", logger="mizzle"):
+        indexes = (await live(driver))["tables"]["mg.ix"]["indexes"]
+        await assert_pull_round_trip(driver, tmp_path)
+    assert indexes["ix_u"]["columns"] == ["code"]
+    assert indexes["ix_d"].get("expression") == "code DESC NULLS LAST, n NULLS FIRST"
+    assert indexes["ix_c"].get("expression") == 'code COLLATE "C" text_pattern_ops'
+    assert any("INCLUDE" in r.getMessage() for r in caplog.records)

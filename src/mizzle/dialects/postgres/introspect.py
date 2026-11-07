@@ -148,9 +148,22 @@ ORDER BY con.conrelid, con.conname
 
 _INDEXES = """
 SELECT i.indrelid AS table_oid, ic.relname AS name, i.indisunique AS unique,
+       -- Key columns only: INCLUDE columns follow them in indkey (C25).
        ARRAY(SELECT a.attname FROM unnest(i.indkey::int2[]) WITH ORDINALITY k(n, ord)
              JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = k.n
-             ORDER BY k.ord) AS columns,
+             WHERE k.ord <= i.indnkeyatts ORDER BY k.ord) AS columns,
+       i.indnatts > i.indnkeyatts AS has_include,
+       -- Per key: DESC (bit 1) and NULLS FIRST (bit 2), and a collation other than the
+       -- column's own.
+       ARRAY(SELECT k.o FROM unnest(i.indoption::int2[]) WITH ORDINALITY k(o, ord)
+             ORDER BY k.ord) AS key_options,
+       ARRAY(SELECT CASE WHEN c.oid IS NULL OR c.collname = 'default'
+                          OR c.oid = a.attcollation THEN NULL ELSE c.collname::text END
+             FROM unnest(i.indcollation::oid[]) WITH ORDINALITY k(o, ord)
+             LEFT JOIN pg_collation c ON c.oid = k.o
+             LEFT JOIN pg_attribute a ON a.attrelid = i.indrelid
+                                     AND a.attnum = (i.indkey::int2[])[k.ord - 1]
+             ORDER BY k.ord) AS collations,
        pg_get_expr(i.indpred, i.indrelid) AS predicate,
        i.indexprs IS NOT NULL AS has_expressions,
        -- Each key on its own, straight from the catalog (no parsing of definition text).
@@ -499,11 +512,17 @@ def _index(row: _Row) -> IndexSnap:
         where=_opt_str(row["predicate"]),
     )
     opclasses = cast(list[str | None], row["opclasses"])
-    if row["has_expressions"]:
+    orders = [_key_order(int(cast(int, o))) for o in cast("list[object]", row["key_options"])]
+    collations = cast(list[str | None], row["collations"])
+    if row["has_include"]:
+        _not_modelled(f"index {index['name']}", "INCLUDE")
+    if row["has_expressions"] or any(orders) or any(collations):
+        # The key list as SQL: the only form that carries DESC, NULLS and COLLATE (C25).
         index["columns"] = []
         keys = _strs(row["keys"])
         index["expression"] = ", ".join(
-            f"{k} {op}" if op else k for k, op in zip(keys, opclasses, strict=True)
+            k + (f" COLLATE {quote(coll)}" if coll else "") + (f" {op}" if op else "") + order
+            for k, op, coll, order in zip(keys, opclasses, collations, orders, strict=True)
         )
     elif any(opclasses):
         index["opclasses"] = opclasses
@@ -514,6 +533,15 @@ def _index(row: _Row) -> IndexSnap:
     if options := _strs(row["options"]):
         index["options"] = dict(o.split("=", 1) for o in options)
     return index
+
+
+def _key_order(option: int) -> str:
+    """An index key's sort order from ``pg_index.indoption`` (DESC: 1, NULLS FIRST: 2),
+    written only where it is not the default."""
+    descending, nulls_first = bool(option & 1), bool(option & 2)
+    if descending:
+        return " DESC" if nulls_first else " DESC NULLS LAST"
+    return " NULLS FIRST" if nulls_first else ""
 
 
 def _not_modelled(what: str, option: str) -> None:
