@@ -281,7 +281,11 @@ SELECT CASE WHEN c.relispartition THEN 'partition ' ELSE 'table inheritance ' EN
        || c.oid::regclass::text || ' of ' || i.inhparent::regclass::text
 FROM pg_inherits i JOIN pg_class c ON c.oid = i.inhrelid
 JOIN pg_namespace n ON n.oid = c.relnamespace
-WHERE n.nspname = ANY($1::text[])
+JOIN pg_class pc ON pc.oid = i.inhparent JOIN pg_namespace pn ON pn.oid = pc.relnamespace
+WHERE n.nspname = ANY($1::text[]) AND c.relkind IN ('r', 'p', 'f')  -- not indexes (K4-10)
+  -- pull writes a partition of a table it reads as partition(...), in the parent's schema
+  AND NOT (c.relispartition AND NOT pc.relispartition AND pn.nspname = ANY($1::text[])
+           AND pc.relnamespace = c.relnamespace)
 UNION ALL
 SELECT 'column grant ' || lower(g.privilege_type) || ' on ' || c.oid::regclass::text
        || '(' || quote_ident(a.attname) || ') to '

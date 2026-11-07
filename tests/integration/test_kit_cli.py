@@ -585,11 +585,14 @@ async def test_pull_warns_about_what_it_skips(
         "CREATE PROCEDURE p_noop() LANGUAGE sql AS 'SELECT 1';"
         "CREATE SEQUENCE s_alone;"
         "CREATE TABLE base_t (id int); CREATE TABLE child_t () INHERITS (base_t);"
-        "GRANT SELECT (id) ON base_t TO public"
+        "GRANT SELECT (id) ON base_t TO public;"
+        "CREATE TABLE ev (id int, at date, PRIMARY KEY (id, at)) PARTITION BY RANGE (at);"
+        "CREATE TABLE ev_2026 PARTITION OF ev FOR VALUES FROM ('2026-01-01') TO ('2027-01-01')"
     )
     await conn.close()
     assert await cli("pull") == 0
     err = capsys.readouterr().err
+    assert "ev_2026" not in err, err  # written as partition(), its index is no partition (K4-10)
     for what in [
         "procedure p_noop()",
         "sequence s_alone",
@@ -690,6 +693,56 @@ async def test_pull_columns_named_like_types_and_helpers(
         text=True,
     )
     assert checked.returncode == 0, checked.stdout
+
+
+async def test_pull_nasty_names_round_trip(
+    tmp_path: Path,
+    kit_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Every pulled Python name is a valid, unique, unmangled identifier that keeps its SQL
+    name (K4-5, K4-6, K4-8, K4-12, K4-14, K4-15)."""
+    conn = await asyncpg.connect(kit_url)
+    await conn.execute(
+        """
+        CREATE SCHEMA s;
+        CREATE TYPE "Mood" AS ENUM ('happy');
+        CREATE TYPE odd AS ENUM ('a', 'A', 'a b', 'a_b', '__x', '_a_', 'None', 'ß', 'SS');
+        CREATE TYPE "table" AS ENUM ('x');
+        CREATE DOMAIN d AS int; CREATE DOMAIN s.d AS int;
+        CREATE TYPE c AS (x int); CREATE TYPE s.c AS (x int);
+        CREATE TABLE t (
+            id int PRIMARY KEY, "__x" int, "__y__" int, "a-b" int, a_b int, "class" int,
+            class_ int, kind "table" DEFAULT 'x', o odd DEFAULT 'A', o2 odd DEFAULT 'a_b',
+            dd d, sd s.d, cc c, sc s.c, "query" int, "override" int
+        );
+        CREATE TABLE s.t (id int PRIMARY KEY);
+        CREATE FUNCTION tf() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN RETURN NEW; END';
+        CREATE TRIGGER tr BEFORE INSERT ON t FOR EACH ROW EXECUTE FUNCTION tf();
+        CREATE TRIGGER tr BEFORE INSERT ON s.t FOR EACH ROW EXECUTE FUNCTION tf();
+        """
+    )
+    await conn.close()
+    module = f"pulled_{uuid.uuid4().hex[:8]}"
+    (tmp_path / "mizzle.toml").write_text(
+        f'schema = "{module}"\nout = "migrations"\nschema_filter = ["public", "s"]\n'
+    )
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.syspath_prepend(str(tmp_path))
+    monkeypatch.setenv("DATABASE_URL", kit_url)
+    assert await cli("pull") == 0
+    source = (tmp_path / f"{module}.py").read_text()
+    assert "    __" not in source  # no mangled class attributes (K4-14)
+    mod = importlib.import_module(module)
+    odd = [m.value for m in mod.Odd]
+    assert odd == ["a", "A", "a b", "a_b", "__x", "_a_", "None", "ß", "SS"]  # (K4-6)
+    names = sorted(c.db_name(None) for c in mod.T.__table__.columns.values())
+    assert len(names) == 16 and "__x" in names and "a-b" in names  # (K4-14, K4-15)
+    capsys.readouterr()
+    assert await cli("generate") == 0
+    out = capsys.readouterr().out
+    assert "No schema changes." in out, out
 
 
 OBJECTS = (

@@ -86,7 +86,8 @@ class Composite:
     schema: str | None = None
 
 
-type SchemaObject = Extension | Function | Trigger | Role | Domain | Composite
+# A module-level pg_enum(...) column declares an enum type no table uses (K4-5).
+type SchemaObject = Extension | Function | Trigger | Role | Domain | Composite | ColumnBase
 
 
 def extension(name: str, *, schema: str | None = None, version: str | None = None) -> Extension:

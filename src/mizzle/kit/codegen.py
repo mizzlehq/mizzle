@@ -7,8 +7,9 @@ import decimal
 import ipaddress
 import keyword
 import re
+import unicodedata
 import uuid
-from collections.abc import Collection, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 
 from mizzle import pg
 from mizzle.core.schema.column import ColumnBase
@@ -27,10 +28,15 @@ from mizzle.core.snapshot import (
     key,
     sequence_defaults,
 )
+from mizzle.dialects.postgres.ddl import type_ident  # keywords quoted (K4-8)
 
 # Names a class body calls (text(), sql(...), one(...)): an attribute of the same name would
 # shadow them for the rest of the class, so such columns get a trailing "_" (and name=).
-_RESERVED_ATTRS = {"config", "from_db", "sql", "one", "many", "Column", "Any", *pg.__all__}
+# The decorators of config()/query() and View.query too (K4-15).
+_RESERVED_ATTRS = {
+    *("config", "from_db", "sql", "one", "many", "Column", "Any", *pg.__all__),
+    *("classmethod", "override", "query"),
+}
 
 _SIMPLE_TYPES = {
     "integer": "integer",
@@ -89,8 +95,12 @@ _SIMPLE_TYPES = {
 
 
 def _identifier(name: str) -> str:
-    ident = re.sub(r"\W", "_", name)
-    if not ident or ident[0].isdigit():
+    # Python reads identifiers NFKC-normalized; some \w characters cannot start/continue one.
+    ident = re.sub(r"\W", "_", unicodedata.normalize("NFKC", name))
+    if not f"a{ident}".isidentifier():
+        ident = re.sub(r"[^a-zA-Z0-9_]", "_", ident)
+    # __x in a class body is name-mangled to _T__x, and __x__ is Python's (K4-14).
+    if not ident or ident[0].isdigit() or ident.startswith("__"):
         ident = f"c_{ident}"
     if keyword.iskeyword(ident) or ident in _RESERVED_ATTRS:
         ident += "_"
@@ -118,6 +128,27 @@ def _unique(cls: str, taken: Collection[str]) -> str:
     while cls in taken:
         cls, n = f"{base}{n}", n + 1
     return cls
+
+
+def _idents(
+    names: Iterable[str], taken: set[str], ident: Callable[[str], str] = _identifier
+) -> dict[str, str]:
+    """name -> ``ident(name)`` made unique in ``taken`` (which it extends); a name that is
+    already its identifier keeps it, so a_b stays a_b and "a-b" gets a_b2 (K4-6, K4-15)."""
+    names = list(names)
+    out: dict[str, str] = {}
+    for exact in (True, False):
+        for name in names:
+            if name not in out and (ident(name) == name) == exact:
+                out[name] = _unique(ident(name), taken)
+                taken.add(out[name])
+    return {name: out[name] for name in names}
+
+
+def _member(value: str) -> str:
+    """An enum member name: upper case, and never _sunder_ or __private (K4-6)."""
+    name = _identifier(value.upper()).upper()
+    return f"M{name}" if name.startswith("_") else name
 
 
 def _words(name: str) -> list[str]:
@@ -163,11 +194,6 @@ def _is_camel(columns: Sequence[str]) -> bool:
 _FK_SUFFIX = re.compile(r"^(.*[a-zA-Z0-9])(?:_id|Id|ID)$")
 
 
-def _type_ident(name: str) -> str:
-    """A name as format_type() prints it: quoted only when necessary."""
-    return name if re.fullmatch(r"[a-z_][a-z0-9_$]*", name) else '"' + name.replace('"', '""') + '"'
-
-
 def _sql(text: str) -> str:
     """A ``sql("...")`` call; without values, sql() takes its text literally."""
     return f"sql({text!r})"
@@ -180,6 +206,9 @@ class _SchemaWriter:
         self.enum_classes: dict[str, str] = {}  # db type name -> class name
         self.enum_values: dict[str, list[str]] = {}  # db type name -> values
         self.enum_names: dict[str, tuple[str, str]] = {}  # db type name -> (schema, name)
+        self.enum_members: dict[str, dict[str, str]] = {}  # db type name -> value -> member
+        self.used_enums: set[str] = set()  # db type names a column uses (K4-5)
+        self.taken: set[str] = set()  # module-level names: classes and variables (K4-12)
         self.domains: dict[str, str] = {}  # column type -> Python type for pg_domain()
         self.composites: set[str] = set()  # column types that are composite types
         self.other_imports: set[str] = set()  # e.g. "import decimal" for a domain's type
@@ -195,12 +224,23 @@ class _SchemaWriter:
         name = _identifier(column)
         return f"{name}_" if name in self.enum_classes.values() else name
 
+    def attrs_of(self, columns: Iterable[str]) -> dict[str, str]:
+        """Column -> attribute, unique in the class (K4-15)."""
+        return _idents(columns, {*self.enum_classes.values(), *_RESERVED_ATTRS}, self.attr)
+
+    def var(self, name: str) -> str:
+        """A module-level variable for an object, unique in the module (K4-12)."""
+        var = _unique(_identifier(name), self.taken)
+        self.taken.add(var)
+        return var
+
     def factory(self, sql_type: str, kwargs: str) -> str:
         if sql_type.endswith("[]"):
             self.pg_imports.add("array")
             item = self.factory(sql_type[:-2], "")
             return f"array({item}{', ' + kwargs if kwargs else ''})"
         if sql_type in self.enum_classes:
+            self.used_enums.add(sql_type)
             self.pg_imports.add("pg_enum")
             cls = self.enum_classes[sql_type]
             schema, name = self.enum_names[sql_type]
@@ -325,7 +365,7 @@ class _SchemaWriter:
         if cls is not None and match is not None:
             value = match.group(1).replace("''", "'")
             if value in self.enum_values[column["type"]]:
-                return f"{cls}.{_identifier(value).upper()}"
+                return f"{cls}.{self.enum_members[column['type']][value]}"
         return _sql(default)
 
     def add_relations(self) -> None:
@@ -493,7 +533,7 @@ class _SchemaWriter:
                 kw += f", {option}=True"
         if check := view.get("check_option"):
             kw += f", check_option={check!r}"
-        attrs = {c: self.attr(c) for c in view["columns"]}
+        attrs = self.attrs_of(view["columns"])
         lines = ["@final", f"class {cls}(View, {kw}):"]
         for cname, column in view["columns"].items():
             kwargs = f"name={cname!r}" if attrs[cname] != cname else ""
@@ -524,22 +564,24 @@ class _SchemaWriter:
             cls = _class_name(enum["name"])
             if cls in self.enum_classes.values():
                 cls = _class_name(f"{enum['schema']}_{enum['name']}")
-            cls = _unique(cls, self.enum_classes.values())
-            sql_type = _type_ident(enum["name"])  # as format_type() prints it
+            cls = _unique(cls, self.taken)
+            self.taken.add(cls)
+            sql_type = type_ident(enum["name"])  # as format_type() prints it
             if enum["schema"] != "public":
-                sql_type = f"{_type_ident(enum['schema'])}.{sql_type}"
+                sql_type = f"{type_ident(enum['schema'])}.{sql_type}"
             self.enum_classes[sql_type] = cls
             self.enum_values[sql_type] = list(enum["values"])
             self.enum_names[sql_type] = (enum["schema"], enum["name"])
-            members = [f"    {_identifier(v).upper()} = {v!r}" for v in enum["values"]]
+            names = self.enum_members[sql_type] = _idents(enum["values"], set(), _member)
+            members = [f"    {names[v]} = {v!r}" for v in enum["values"]]
             enums_code.append(f"class {cls}(enum.StrEnum):\n" + "\n".join(members))
 
         domains_code: list[str] = []
         for domain in self.snapshot.get("domains", {}).values():
             schema, name = domain["schema"], domain["name"]
-            sql_type = _type_ident(name)
+            sql_type = type_ident(name)
             if schema != "public":
-                sql_type = f"{_type_ident(schema)}.{sql_type}"
+                sql_type = f"{type_ident(schema)}.{sql_type}"
             py, stmt = _domain_py(domain["base_type"])
             if stmt == "from typing import Any":
                 self.uses_any = True
@@ -562,44 +604,40 @@ class _SchemaWriter:
                 args.append(f"checks={list(checks)!r}")
             if collation := domain.get("collation"):
                 args.append(f"collation={collation!r}")
-            domains_code.append(f"d_{_identifier(name)} = domain({', '.join(args)})")
+            domains_code.append(f"{self.var(f'd_{name}')} = domain({', '.join(args)})")
 
         composites_code: list[str] = []
         for comp in self.snapshot.get("composites", {}).values():
             schema, name = comp["schema"], comp["name"]
-            sql_type = _type_ident(name)
+            sql_type = type_ident(name)
             if schema != "public":
-                sql_type = f"{_type_ident(schema)}.{sql_type}"
+                sql_type = f"{type_ident(schema)}.{sql_type}"
             self.composites.add(sql_type)
             fields = ", ".join(f"({f['name']!r}, {f['type']!r})" for f in comp["fields"])
             extra = f", schema={schema!r}" if schema != "public" else ""
             composites_code.append(
-                f"c_{_identifier(name)} = composite({name!r}, [{fields}]{extra})"
+                f"{self.var(f'c_{name}')} = composite({name!r}, [{fields}]{extra})"
             )
 
         for k, table in self.snapshot["tables"].items():
             name = _class_name(table["name"])
             if name in self.table_classes.values() or name in self.enum_classes.values():
                 name = _class_name(f"{table['schema']}_{table['name']}")
-            name = _unique(name, {*self.table_classes.values(), *self.enum_classes.values()})
+            name = _unique(name, self.taken)
+            self.taken.add(name)
             self.table_classes[k] = name
-            self.attrs[k] = {c: self.attr(c) for c in table["columns"]}
+            self.attrs[k] = self.attrs_of(table["columns"])
         self.add_relations()
 
         objects_code: list[str] = []
         function_vars: dict[str, str] = {}  # "schema.name" -> variable, for triggers
-        taken_vars: set[str] = set()
         for ext in self.snapshot.get("extensions", {}).values():
             schema = ext.get("schema", "public")
             extra = f", schema={schema!r}" if schema != "public" else ""
-            var = f"ext_{_identifier(ext['name'])}"
+            var = self.var(f"ext_{ext['name']}")
             objects_code.append(f"{var} = extension({ext['name']!r}{extra})")
         for fn in self.snapshot.get("functions", {}).values():
-            var = f"fn_{_identifier(fn['name'])}"
-            n = 2
-            while var in taken_vars:  # overloads
-                var, n = f"fn_{_identifier(fn['name'])}_{n}", n + 1
-            taken_vars.add(var)
+            var = self.var(f"fn_{fn['name']}")  # overloads: fn_f, fn_f2
             k = key(fn["schema"], fn["name"])
             if k not in function_vars or not fn["args"]:  # triggers run the one without args
                 function_vars[k] = var
@@ -689,18 +727,17 @@ class _SchemaWriter:
                 ]
             tables_code.append("\n".join(lines))
 
-        taken = {*self.table_classes.values(), *self.enum_classes.values()}
         owners: list[tuple[str, TableSnap | ViewSnap, dict[str, str]]] = [
             (self.table_classes[k], t, self.attrs[k]) for k, t in self.snapshot["tables"].items()
         ]
         for k, view in self.snapshot.get("views", {}).items():
             cls = _class_name(view["name"])
-            if cls in taken:
+            if cls in self.taken:
                 cls = _class_name(f"{view['schema']}_{view['name']}_view")
-            cls = _unique(cls, taken)
-            taken.add(cls)
+            cls = _unique(cls, self.taken)
+            self.taken.add(cls)
             tables_code.append(self.view(k, cls))
-            owners.append((cls, view, {c: self.attr(c) for c in view["columns"]}))
+            owners.append((cls, view, self.attrs_of(view["columns"])))
             for i in view.get("indexes", {}).values():
                 uses_config.add("unique_index" if i["unique"] else "index")
                 has_config = True
@@ -711,17 +748,28 @@ class _SchemaWriter:
         triggers_code: list[str] = []
         for cls, owner, attrs in owners:
             for t in owner.get("triggers", {}).values():
-                var = f"trg_{_identifier(owner['name'])}_{_identifier(t['name'])}"
                 if t["function"] not in function_vars:
                     triggers_code.append(
                         f"# trigger {t['name']!r} runs {t['function']!r}, which was not pulled"
                     )
                     continue
                 uses_objects.add("trigger")
+                var = self.var(f"trg_{owner['name']}_{t['name']}")
                 triggers_code.append(
                     f"{var} = trigger(\n    "
                     + ",\n    ".join(_trigger_args(t, cls, attrs, function_vars[t["function"]]))
                     + ",\n)"
+                )
+
+        # An enum no column uses is declared on its own, or generate drops it (K4-5).
+        unused_enums: list[str] = []
+        for sql_type, cls in self.enum_classes.items():
+            if sql_type not in self.used_enums:
+                schema, name = self.enum_names[sql_type]
+                extra = f", schema={schema!r}" if schema != "public" else ""
+                self.pg_imports.add("pg_enum")
+                unused_enums.append(
+                    f"{self.var(f'e_{name}')} = pg_enum({cls}, type_name={name!r}{extra})"
                 )
 
         header = ['"""Generated by `mizzle pull`. Review before committing."""', ""]
@@ -738,6 +786,7 @@ class _SchemaWriter:
         header.append("")
         blocks = [
             *enums_code,
+            *unused_enums,
             *domains_code,
             *composites_code,
             *objects_code,

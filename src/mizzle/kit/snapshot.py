@@ -327,6 +327,9 @@ def build_snapshot(
                 _add_domain(snapshot, obj, default_schema, dialect)
             case Composite():
                 _add_composite(snapshot, obj, default_schema, dialect)
+            case ColumnBase():  # pg_enum(...) on its own: the enum type (K4-5)
+                _add_enum(snapshot, obj.enum_schema or default_schema, obj)
+                add_schema(obj.enum_schema or default_schema)
             case Trigger():
                 k = key(schema_of(obj.on), obj.on.__table__.name)
                 on = snapshot["tables"].get(k) or snapshot.get("views", {}).get(k)
