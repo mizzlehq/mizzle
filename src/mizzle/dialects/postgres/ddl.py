@@ -50,6 +50,7 @@ from mizzle.core.steps import (
     AlterPolicy,
     AlterRole,
     AlterTableStorage,
+    CheckColumnFreed,
     CreateComposite,
     CreateDomain,
     CreateEnum,
@@ -758,6 +759,8 @@ def render_step(step: Step) -> Statement:
             return alter(schema, table, f"ADD COLUMN {column_definition(column)}")
         case DropColumn(schema=schema, table=table, name=name):
             return alter(schema, table, f"DROP COLUMN {quote(name)}")
+        case CheckColumnFreed(schema=schema, table=table, name=name):
+            return Statement(_check_column_freed(schema, table, name))
         case RenameColumn(schema=schema, table=table, old=old, new=new):
             return alter(schema, table, f"RENAME COLUMN {quote(old)} TO {quote(new)}")
         case AlterColumnType():
@@ -961,6 +964,28 @@ def _restore_grants(name: str, kind: str) -> str:
         f"  EXECUTE format('COMMENT ON {kind} %s IS %L', {rel}, s.comment);\n"
         "END IF;\n"
         f"DELETE FROM {_SAVED} WHERE rel = {rel};\n"
+        "END $mizzle$"
+    )
+
+
+def _check_column_freed(schema: str, table: str, column: str) -> str:
+    rel = _literal(qualified(schema, table))
+    where = f"{table}.{column}"
+    return (
+        "DO $mizzle$ BEGIN\n"
+        "IF EXISTS (SELECT FROM pg_depend d JOIN pg_attribute a "
+        "ON a.attrelid = d.objid AND a.attnum = d.objsubid "
+        f"WHERE d.classid = 'pg_class'::regclass AND d.objid = {rel}::regclass "
+        f"AND a.attname = {_literal(column)} AND d.refclassid = 'pg_proc'::regclass) THEN\n"
+        "  RAISE EXCEPTION '%', "
+        + _literal(
+            f"PostgreSQL 14 keeps {where} tied to the function its expression called after "
+            "DROP EXPRESSION, so dropping that function would drop the column and its data. "
+            "Write a custom migration: copy the column to a new one, or upgrade to "
+            "PostgreSQL 15 or later."
+        )
+        + ";\n"
+        "END IF;\n"
         "END $mizzle$"
     )
 

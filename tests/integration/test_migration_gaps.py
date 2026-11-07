@@ -1889,7 +1889,16 @@ async def test_function_result_type_changes_under_its_callers(
     await migrate(driver, empty_snapshot("postgresql"), v1)
     await execute(driver, "INSERT INTO mg.k6t (a) VALUES (3)")
     tables = {"kept": [k6_table(kind)], "removed": [k6_table("none")], "table dropped": []}
-    await migrate(driver, v1, snap(tables[then], [k6_function("bigint")]))
+    v2 = snap(tables[then], [k6_function("bigint")])
+    if (kind, then) == ("generated", "removed") and await server_version(driver) < 150000:
+        # PostgreSQL 14 keeps the column tied to the function after DROP EXPRESSION, so
+        # DROP FUNCTION would drop it: stopped, with the column and its data still there.
+        with pytest.raises(DatabaseError, match="PostgreSQL 14 keeps"):
+            await migrate(driver, v1, v2)
+        [row] = await execute(driver, "SELECT a, b FROM mg.k6t")
+        assert (row["a"], row["b"]) == (3, 3)
+        return
+    await migrate(driver, v1, v2)
     if then != "table dropped":
         [row] = await execute(driver, "SELECT a, b FROM mg.k6t")
         assert row["a"] == 3
@@ -1986,6 +1995,10 @@ async def test_view_over_a_column_under_a_function_whose_result_type_changes(
         "column dropped": [table("column dropped"), reader("a")],
         "table dropped": [],
     }
+    if then == "made plain" and await server_version(driver) < 150000:
+        with pytest.raises(DatabaseError, match="PostgreSQL 14 keeps"):  # see K4-26 test
+            await migrate(driver, v1, snap(after[then], [fn("bigint")]))
+        return
     await migrate(driver, v1, snap(after[then], [fn("bigint")]))
 
 

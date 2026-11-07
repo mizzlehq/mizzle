@@ -45,6 +45,7 @@ from mizzle.core.steps import (
     AlterPolicy,
     AlterRole,
     AlterTableStorage,
+    CheckColumnFreed,
     ConstraintKind,
     CreateComposite,
     CreateDomain,
@@ -1195,15 +1196,20 @@ def _defer_calls(plan: _Plan, old_tables: Mapping[str, TableSnap], new: Snapshot
                 or not _mentions(gen["expression"], dropped)
             ):
                 continue
-            if not gen["stored"]:  # cannot be made plain: dropped now, else rebuilt (K4-30)
-                if col_after is None:  # after the views reading it (K4-32)
-                    drop_col = DropColumn(schema, name, col["name"])
-                    plan.drop_columns = [s for s in plan.drop_columns if s != drop_col]
-                    plan.drop_rebuilt.append(drop_col)
+            if after is not None and col_after is None:
+                # Dropped before the function, after the views reading it (K4-30, K4-32);
+                # also when STORED: PostgreSQL 14 would drop it with the function anyway.
+                drop_col = DropColumn(schema, name, col["name"])
+                plan.drop_columns = [s for s in plan.drop_columns if s != drop_col]
+                plan.drop_rebuilt.append(drop_col)
+                continue
+            if not gen["stored"]:  # cannot be made plain: rebuilt, or its table dropped (K4-30)
                 continue
             plain = AlterColumnGenerated(schema, name, col["name"], gen, None, col_after)
             plan.alter_columns = [s for s in plan.alter_columns if s != plain]
             plan.drop_calls.append(plain)
+            if col_after is not None:  # kept as a plain column
+                plan.drop_calls.append(CheckColumnFreed(schema, name, col["name"]))
         for col in table["columns"].values():
             if not _mentions(col["default"], dropped):
                 continue

@@ -269,6 +269,20 @@ class AddColumn(Step):
 
 
 @dataclass(frozen=True)
+class CheckColumnFreed(Step):
+    """Stop the migration if a column made plain still depends on a function (PostgreSQL
+    14 keeps that after DROP EXPRESSION): dropping the function would drop the column."""
+
+    schema: str
+    table: str
+    name: str
+
+    @override
+    def describe(self) -> str:
+        return f"check {self.table}.{self.name} no longer depends on a function"
+
+
+@dataclass(frozen=True)
 class DropColumn(Step):
     schema: str
     table: str
