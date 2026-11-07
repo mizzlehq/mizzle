@@ -117,9 +117,9 @@ _TYPE_ALIASES = {
     "varbit": "bit varying",
 }
 _PLAIN_IDENT = re.compile(r"[a-z_][a-z0-9_$]*")
-_TRAILING_CAST = re.compile(
-    r"::(?:\"[^\"]+\"|[a-z_][a-z0-9_ .\"]*)(?:\(\d+(?:,\s*\d+)?\))?(?:\[\])*$"
-)
+# A type name is dotted parts, each plain or quoted: ::"App"."Mood" too (K4-4).
+_TYPE_PART = r'(?:"(?:[^"]|"")+"|[a-z_][a-z0-9_ ]*)'
+_TRAILING_CAST = re.compile(rf"::{_TYPE_PART}(?:\.{_TYPE_PART})*(?:\(\d+(?:,\s*\d+)?\))?(?:\[\])*$")
 _NUMBER = re.compile(r"-?\d+(?:\.\d+)?(?:e[-+]?\d+)?", re.IGNORECASE)
 # Types a bare number cannot be assigned to: '5'::jsonb and '0101'::"bit" keep their quotes.
 _QUOTED_CAST = re.compile(r'::(?:jsonb?|"bit"|bit(?: varying)?|varbit)(?:\(\d+\))?$')
