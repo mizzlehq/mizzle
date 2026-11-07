@@ -137,11 +137,13 @@ def test_split_statements_handles_quotes_and_comments() -> None:
 _LEFTOVERS = (
     "drop table if exists st_notes, st_csv, st_types, st_num, st_dom, st_mod, st_many, st_json,"
     ' st_neg, "st/a", st_sdom, st_bad, st_head, st_tie, st_skip, st_domt, st_ck, st_tx, st_log,'
-    " st_stale, st_kid, st_parent, st_part, st_sort, st_uskip cascade;"
+    " st_stale, st_kid, st_parent, st_part, st_sort, st_uskip, st_items, st_iv, st_sread,"
+    ' st_call, "st\nnl" cascade;'
     ' drop sequence if exists st_seq; drop schema if exists "date" cascade;'
     ' drop domain if exists st_amt2, st_amt, st_span, st_basedom, "St Base Dom", st_dpair,'
-    " st_dj; drop type if exists st_pair;"
-    " drop function if exists st_skip_fn(), st_logit(int), st_uskip_fn()"
+    " st_dj, interval_st_label; drop type if exists st_pair, interval_st_unit;"
+    " drop function if exists st_skip_fn(), st_logit(int), st_uskip_fn();"
+    " drop procedure if exists st_call_p()"
 )
 
 
@@ -1599,3 +1601,112 @@ def test_update_skipped_by_a_trigger_is_reported(client: TestClient) -> None:
     assert "no row was updated" in response.json()["error"]
     missing = client.patch(rows, json={"key": {"id": 2}, "values": {"v": "b"}}, headers=AUTH)
     assert missing.status_code == 404
+
+
+def test_public_tables_are_always_schema_qualified(client: TestClient) -> None:
+    # S5-1: public.st_items was written bare, so with search_path "$user", public a schema
+    # named after the login role, holding its own st_items, was read, changed and dropped.
+    [[user]] = _query(client, "select quote_ident(current_user)")
+    _sql(
+        client,
+        "create table public.st_items (id int primary key, v text); "
+        "insert into public.st_items values (1, 'public'), (2, 'public'); "
+        f"create schema {user}; create table {user}.st_items (id int primary key, v text); "
+        f"insert into {user}.st_items values (1, 'private')",
+    )
+    try:
+        rows = "/api/tables/public/st_items/rows"
+        assert client.get(rows, headers=AUTH).json()["total"] == 2
+        changed = client.patch(rows, json={"key": {"id": 1}, "values": {"v": "x"}}, headers=AUTH)
+        assert changed.status_code == 200, changed.text
+        deleted = client.request("DELETE", rows, json={"keys": [{"id": 2}]}, headers=AUTH)
+        assert deleted.json() == {"deleted": 1}
+        assert _query(client, "select v from public.st_items") == [["x"]]
+        drop = {"operation": "drop_table", "schema": "public", "name": "st_items"}
+        assert client.post("/api/ddl/apply", json=drop, headers=AUTH).status_code == 200
+        assert _query(client, "select to_regclass('public.st_items') is null") == [[True]]
+        assert _query(client, f"select id, v from {user}.st_items") == [[1, "private"]]
+    finally:
+        _sql(client, f"drop schema {user} cascade")
+
+
+def test_types_named_interval_are_not_cast_to_interval(client: TestClient) -> None:
+    # S5-3: any type whose name started with "interval" was cast to interval: an enum
+    # failed to insert, update or filter, and a text domain stored '1 week' as '7 days'.
+    _sql(
+        client,
+        "create type interval_st_unit as enum ('day', 'week'); "
+        "create domain interval_st_label as text; "
+        "create table st_iv (id int primary key, unit interval_st_unit, "
+        "label interval_st_label, span interval day to second(0)[]); "
+        "insert into st_iv values (1, 'day', 'x', null)",
+    )
+    rows = "/api/tables/public/st_iv/rows"
+    values = {"unit": "week", "label": "1 week", "span": ["1 day 02:00:00.4"]}
+    changed = client.patch(rows, json={"key": {"id": 1}, "values": values}, headers=AUTH)
+    assert changed.status_code == 200, changed.text
+    added = client.post(rows, json={"values": {"id": 2, "unit": "day"}}, headers=AUTH)
+    assert added.status_code == 201, added.text
+    found = client.get(
+        rows,
+        params={"filters": json.dumps([{"column": "unit", "op": "eq", "value": "week"}])},
+        headers=AUTH,
+    )
+    assert found.status_code == 200, found.text
+    assert found.json()["total"] == 1
+    assert _query(client, "select unit::text, label, span::text from st_iv where id = 1") == [
+        ["week", "1 week", '{"1 day 02:00:00"}']
+    ]
+
+
+def test_reads_follow_schema_changes_made_elsewhere(pg_url: str, client: TestClient) -> None:
+    # S5-4: the grid read a cached schema, so a column changed to jsonb outside Studio was
+    # read as decoded JSON (its big number lost), and saving that wrote it back.
+    _sql(
+        client,
+        "create table st_sread (id int primary key, j text); "
+        """insert into st_sread values (1, '{"n": 12345678901234567890}')""",
+    )
+    rows = "/api/tables/public/st_sread/rows"
+    client.get(rows, headers=AUTH)  # cached
+    with make_client(pg_url) as other:  # psql, a migration: not this Studio
+        _sql(other, "alter table st_sread alter column j type jsonb using j::jsonb")
+    [row] = client.get(rows, headers=AUTH).json()["rows"]
+    assert row["j"] == '{"n": 12345678901234567890}'
+
+
+def test_console_runs_call_and_do_that_commit(client: TestClient) -> None:
+    # S5-5: every statement ran in a transaction, so COMMIT inside a procedure or a DO block
+    # was "invalid transaction termination".
+    _sql(
+        client,
+        "create table st_call (v int); insert into st_call values (0); "
+        "create procedure st_call_p() language plpgsql "
+        "as $$ begin update st_call set v = v + 1; commit; end $$",
+    )
+    _sql(client, "call st_call_p()")
+    _sql(client, "do $$ begin update st_call set v = v + 10; commit; end $$")
+    assert _query(client, "select v from st_call") == [[11]]
+
+
+def test_console_errors_name_the_users_statement(client: TestClient, ro_url: str) -> None:
+    # S5-7: a runtime error named Studio's own "FETCH 1001 FROM mizzle_studio_...".
+    statement = "select (select x from (values (1), (2)) v(x))"
+    failed = client.post("/api/sql", json={"sql": statement}, headers=AUTH)
+    assert failed.status_code == 400
+    assert failed.json()["error"].endswith(f"SQL: {statement}")
+    with make_client(ro_url, read_only=True) as read_only:
+        failed = read_only.post("/api/sql", json={"sql": statement}, headers=AUTH)
+        assert failed.status_code == 400
+        assert failed.json()["error"].endswith(f"SQL: {statement}")
+
+
+def test_a_newline_in_a_table_name_is_routed(client: TestClient) -> None:
+    # S5-8: the route's ".*" stopped at a newline, so such a table was listed but 404.
+    _sql(client, 'create table "st\nnl" (id int primary key)')
+    assert client.get("/api/tables/public/st%0Anl/rows", headers=AUTH).status_code == 200
+    export = client.get("/api/tables/public/st%0Anl/export", headers=AUTH)
+    assert export.status_code == 200, export.text
+    disposition = export.headers["content-disposition"]
+    assert 'filename="public.st_nl.csv"' in disposition
+    assert "filename*=UTF-8''public.st%0Anl.csv" in disposition
