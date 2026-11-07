@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import copy
 import re
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Literal, Protocol
 
@@ -182,6 +182,9 @@ class _Plan:
     drop_functions: list[Step] = field(default_factory=list[Step])
     create_functions_early: list[Step] = field(default_factory=list[Step])  # (K1)
     drop_functions_late: list[Step] = field(default_factory=list[Step])  # (K1)
+    # Functions that use a table or view: ordered with the views (K4-13).
+    create_with_views: list[FunctionSnap] = field(default_factory=list[FunctionSnap])
+    drop_with_views: list[FunctionSnap] = field(default_factory=list[FunctionSnap])
     drop_fks: list[Step] = field(default_factory=list[Step])
     drop_constraints: list[Step] = field(default_factory=list[Step])
     drop_indexes: list[Step] = field(default_factory=list[Step])
@@ -196,7 +199,6 @@ class _Plan:
     add_constraints: list[Step] = field(default_factory=list[Step])
     create_indexes: list[Step] = field(default_factory=list[Step])
     add_fks: list[Step] = field(default_factory=list[Step])
-    create_functions: list[Step] = field(default_factory=list[Step])
     drop_replaced: list[Step] = field(default_factory=list[Step])  # tables a view replaces
     create_views: list[Step] = field(default_factory=list[Step])
     rls: list[Step] = field(default_factory=list[Step])
@@ -246,9 +248,8 @@ class _Plan:
             *self.add_constraints,
             *self.create_indexes,
             *self.add_fks,
-            *self.create_functions,
             *self.drop_replaced,
-            *self.create_views,
+            *self.create_views,  # and the functions using tables or views (K4-13)
             *self.rls,
             *self.create_policies,
             *self.create_triggers,
@@ -873,7 +874,8 @@ def _mentions(text: str | None, names: Iterable[str]) -> bool:
     over-report, which recreates an object that did not need it."""
     if not text:
         return False
-    return any(re.search(rf"(?<![\w$]){re.escape(n)}(?![\w$])", text) for n in names)
+    # Unquoted identifiers fold to lower case (K4-2).
+    return any(re.search(rf"(?<![\w$]){re.escape(n)}(?![\w$])", text, re.I) for n in names)
 
 
 def _empty_like(table: TableSnap) -> TableSnap:
@@ -942,8 +944,10 @@ def _diff_functions(old: Snapshot, new: Snapshot, plan: _Plan) -> set[str]:
     after = {function_key(f): f for f in new.get("functions", {}).values()}
     dropped: set[str] = set()
     # (K1) Created before the tables and dropped after them, as a CHECK or DEFAULT may call
-    # them; unless they name a table or view (a row type, a query): those keep their place.
+    # them; unless they use a table or view (a row type, a SQL body): those are created and
+    # dropped in order with the views (K4-13).
     late, early_drop = _uses_relations(after, new), _uses_relations(before, old)
+    early: list[FunctionSnap] = []
     for k, fn in after.items():
         prev = before.get(k)
         if prev is not None and prev["returns"] != fn["returns"]:
@@ -951,26 +955,53 @@ def _diff_functions(old: Snapshot, new: Snapshot, plan: _Plan) -> set[str]:
             plan.drop_functions.append(DropFunction(prev["schema"], prev["name"], prev["args"]))
             dropped.add(prev["name"])
         if prev != fn:
-            creates = plan.create_functions if k in late else plan.create_functions_early
-            creates.append(CreateFunction(fn))
+            (plan.create_with_views if k in late else early).append(fn)
+    plan.create_functions_early += [CreateFunction(f) for f in _topo(_function_nodes(early))]
     for k, prev in before.items():
         if k not in after:
-            drops = plan.drop_functions if k in early_drop else plan.drop_functions_late
-            drops.append(DropFunction(prev["schema"], prev["name"], prev["args"]))
+            if k in early_drop:
+                plan.drop_with_views.append(prev)
+            else:
+                plan.drop_functions_late.append(
+                    DropFunction(prev["schema"], prev["name"], prev["args"])
+                )
             dropped.add(prev["name"])
     return dropped
 
 
+def _checked(f: FunctionSnap) -> str:
+    """What CREATE FUNCTION resolves: the argument and result types, and a SQL body.
+    Other bodies (plpgsql) are only checked when called (K4-3)."""
+    body = f["body"] if f["language"].lower() == "sql" else ""
+    return f"{f['args']} {f['returns']} {body}"
+
+
+def _function_nodes(functions: Iterable[FunctionSnap]) -> list[tuple[str, str, FunctionSnap]]:
+    return [(f["name"], _checked(f), f) for f in functions]
+
+
+def _topo[T](nodes: Sequence[tuple[str, str, T]]) -> list[T]:
+    """The items of ``nodes`` (name, SQL text, item), those whose name the text of another
+    one mentions first (K4-9). Stable; a cycle (or a false match) keeps the given order."""
+    pending, done = list(nodes), list[T]()
+    while pending:
+        ready = [
+            n for n in pending if not any(o is not n and _mentions(n[1], [o[0]]) for o in pending)
+        ]
+        ready = ready or pending[:1]
+        done += [n[2] for n in ready]
+        pending = [n for n in pending if not any(n is r for r in ready)]
+    return done
+
+
 def _uses_relations(functions: Mapping[str, FunctionSnap], snapshot: Snapshot) -> set[str]:
-    """Keys of the functions that may name a table or view of ``snapshot``, or such a
-    function (K1). A word search: it can only over-report."""
+    """Keys of the functions whose creation may need a table or view of ``snapshot``, or
+    such a function (K1). A word search: it can only over-report."""
     names = {t["name"] for t in snapshot["tables"].values()}
     names |= {v["name"] for v in snapshot.get("views", {}).values()}
     found: set[str] = set()
     while more := {
-        k
-        for k, f in functions.items()
-        if k not in found and _mentions(f"{f['args']} {f['returns']} {f['body']}", names)
+        k for k, f in functions.items() if k not in found and _mentions(_checked(f), names)
     }:
         found |= more
         names |= {functions[k]["name"] for k in more}
@@ -1010,21 +1041,14 @@ def _changed_tables(plan: _Plan) -> set[str]:
     return names
 
 
-def _ordered(views: Mapping[str, ViewSnap], keys: Iterable[str]) -> list[str]:
-    """``keys`` with views another one uses first."""
-    pending, done = list(keys), list[str]()
-    while pending:
-        ready = [
-            k
-            for k in pending
-            if not any(
-                o != k and _mentions(views[k]["definition"], [views[o]["name"]]) for o in pending
-            )
-        ]
-        ready = ready or pending[:1]  # a cycle (or a false match): keep the given order
-        done += ready
-        pending = [k for k in pending if k not in ready]
-    return done
+def _ordered(
+    views: Mapping[str, ViewSnap], keys: Iterable[str], functions: Iterable[FunctionSnap]
+) -> list[str | FunctionSnap]:
+    """``keys`` of views and ``functions``, those another one uses first (K4-13)."""
+    nodes: list[tuple[str, str, str | FunctionSnap]] = [
+        (views[k]["name"], views[k]["definition"], k) for k in keys
+    ]
+    return _topo([*nodes, *_function_nodes(functions)])
 
 
 def _view_key(v: ViewSnap) -> tuple[str, bool, bool, bool, str | None]:
@@ -1053,12 +1077,20 @@ def _diff_views(
         if not more:
             break
         redo |= more
-    for k in reversed(_ordered(before, [k for k in before if k in redo])):
+    dropping = _ordered(before, [k for k in before if k in redo], plan.drop_with_views)
+    for k in reversed(dropping):
+        if not isinstance(k, str):
+            plan.drop_views.append(DropFunction(k["schema"], k["name"], k["args"]))
+            continue
         v = before[k]
         if k in after:
             plan.drop_views.append(SaveGrants(v["schema"], v["name"]))
         plan.drop_views.append(DropView(v["schema"], v["name"], v["materialized"]))
-    for k in _ordered(after, [k for k in after if k in redo or k not in before]):
+    creating = [k for k in after if k in redo or k not in before]
+    for k in _ordered(after, creating, plan.create_with_views):
+        if not isinstance(k, str):
+            plan.create_views.append(CreateFunction(k))
+            continue
         v = after[k]
         plan.create_views.append(CreateView(v))
         plan.create_views += [

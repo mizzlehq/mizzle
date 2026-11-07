@@ -1654,6 +1654,110 @@ async def test_functions_used_by_checks_and_defaults(driver: PostgresDriver) -> 
     await migrate(driver, v1, snap([Calls2]))
 
 
+@final
+class K4Users(Table, name="k4users", schema="mg"):
+    id = integer().primary_key()
+
+
+async def test_function_body_naming_a_table_in_upper_case(driver: PostgresDriver) -> None:
+    # K4-2: `Users` was not matched with users, so the function came before the table.
+    users = function(
+        "count_users",
+        schema="mg",
+        returns="bigint",
+        language="sql",
+        body="SELECT count(*) FROM MG.K4Users",
+    )
+    await migrate(driver, empty_snapshot("postgresql"), snap([K4Users], [users]))
+
+
+valid_code = function(
+    "valid_code",
+    schema="mg",
+    returns="boolean",
+    args="c text",
+    body="BEGIN RETURN NOT EXISTS (SELECT 1 FROM mg.banned WHERE code = c); END",
+)
+
+
+@final
+class Banned(Table, name="banned", schema="mg"):
+    code = text().primary_key()
+
+
+@final
+class Coded(Table, name="coded", schema="mg"):
+    code = text()
+
+    @classmethod
+    @override
+    def config(cls) -> list[Constraint]:
+        return [check("coded_valid", sql("mg.valid_code(code)"))]
+
+
+@final
+class Coded2(Table, name="coded", schema="mg"):
+    code = text()
+
+
+async def test_check_calling_a_plpgsql_function_that_reads_a_table(
+    driver: PostgresDriver,
+) -> None:
+    # K4-3: the function was created after the CHECK calling it and dropped before it.
+    v1 = snap([Banned, Coded], [valid_code])
+    await migrate(driver, empty_snapshot("postgresql"), v1)
+    await migrate(driver, v1, snap([Banned, Coded2]))
+
+
+async def test_functions_calling_each_other(driver: PostgresDriver) -> None:
+    # K4-9: created in name order, a_fn before the z_fn it calls.
+    a_fn = function(
+        "a_fn", schema="mg", returns="integer", language="sql", body="SELECT mg.z_fn() + 1"
+    )
+    z_fn = function("z_fn", schema="mg", returns="integer", language="sql", body="SELECT 1")
+    # b_fn reads a table: created after it, still after the z_fn it calls.
+    b_fn = function(
+        "b_fn",
+        schema="mg",
+        returns="bigint",
+        language="sql",
+        body="SELECT count(*) + mg.y_fn() FROM mg.k4users",
+    )
+    y_fn = function(
+        "y_fn",
+        schema="mg",
+        returns="bigint",
+        language="sql",
+        body="SELECT count(*) FROM mg.k4users",
+    )
+    await migrate(driver, empty_snapshot("postgresql"), snap([K4Users], [a_fn, z_fn, b_fn, y_fn]))
+
+
+@final
+class K4Numbers(View, name="k4numbers", schema="mg"):
+    n = integer()
+
+    @classmethod
+    @override
+    def query(cls, db: QueryBuilder):
+        return sql("SELECT 1 AS n")
+
+
+async def test_function_reading_a_view(driver: PostgresDriver) -> None:
+    # K4-13: the function was created before the view; a SQL-standard body depends on the
+    # view, so it is also dropped before it.
+    count = function(
+        "count_numbers",
+        schema="mg",
+        returns="bigint",
+        language="sql",
+        body="RETURN (SELECT count(*) FROM mg.k4numbers)",
+    )
+    v1 = snap([K4Numbers], [count])
+    await migrate(driver, empty_snapshot("postgresql"), v1)
+    await migrate(driver, v1, snap([]))
+
+
 class K4Mood(enum.Enum):
     HAPPY = "happy"
 
