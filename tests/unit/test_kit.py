@@ -55,6 +55,7 @@ def test_normalize_default(raw: str | None, expected: str | None) -> None:
         ("timestamptz", "timestamp with time zone"),
         ("text[]", "text[]"),
         ("varchar(5)[]", "character varying(5)[]"),
+        ("integer[][]", "integer[]"),  # Q5-8: one array type, whatever the dimensions
         ("char(4)", "character(4)"),
         ("char(1)", "character(1)"),
         ("char", "character"),

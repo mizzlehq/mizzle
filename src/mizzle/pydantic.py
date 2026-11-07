@@ -59,7 +59,8 @@ _NAN = Annotated[Decimal, pydantic.Field(allow_inf_nan=True), pydantic.AfterVali
 def column_type(column: ColumnBase) -> object:
     """The Python type a column holds (without ``None``), with length/precision limits."""
     if column.item is not None:
-        return GenericAlias(list, (column_type(column.item),))  # list[item type]
+        # list[item type | None]: any PostgreSQL array can hold NULL (Q5-7).
+        return GenericAlias(list, (cast(type[object], column_type(column.item)) | None,))
     if column.enum is not None:
         return column.enum
     if column.accepts is None:  # json / jsonb

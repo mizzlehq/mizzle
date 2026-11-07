@@ -179,10 +179,9 @@ def requote_casts(text: str, server_keywords: frozenset[str]) -> str:
 
 
 def normalize_type(sql_type: str) -> str:
-    """``varchar(255)`` -> ``character varying(255)``, ``numeric(10, 2)`` -> ``numeric(10,2)``."""
-    array = ""
-    while sql_type.endswith("[]"):
-        sql_type, array = sql_type[:-2], array + "[]"
+    """``varchar(255)`` -> ``character varying(255)``, ``numeric(10, 2)`` -> ``numeric(10,2)``,
+    ``integer[][]`` -> ``integer[]`` (PostgreSQL has one array type per element; Q5-8)."""
+    sql_type, array = _array_base(sql_type)
     match = re.fullmatch(r"([a-z ]+?)\s*(\(.*\))?", sql_type.strip())
     if match is None:
         return sql_type + array
@@ -195,10 +194,18 @@ def normalize_type(sql_type: str) -> str:
     return base + args + array
 
 
+def _array_base(sql_type: str) -> tuple[str, str]:
+    """``integer[][]`` -> ``("integer", "[]")``."""
+    base = sql_type
+    while base.endswith("[]"):
+        base = base[:-2]
+    return base, "[]" if base != sql_type else ""
+
+
 def column_type(column: ColumnBase) -> str:
     if column.enum is not None:
-        array = "[]" if column.sql_type.endswith("[]") else ""
-        name = type_ident(column.sql_type.removesuffix("[]"))
+        base, array = _array_base(column.sql_type)
+        name = type_ident(base)
         if column.enum_schema not in (None, DEFAULT_SCHEMA):  # as format_type() prints it
             name = f"{type_ident(column.enum_schema)}.{name}"
         return name + array
@@ -756,7 +763,14 @@ def _restore_grants(name: str, kind: str) -> str:
         f"IF s.owner <> (SELECT relowner FROM pg_class WHERE oid = {rel}::regclass) THEN\n"
         f"  EXECUTE format('ALTER {kind} %s OWNER TO %I', {rel}, pg_get_userbyid(s.owner));\n"
         "END IF;\n"
-        "FOR a IN SELECT * FROM aclexplode(s.acl) WHERE grantee <> s.owner LOOP\n"
+        # Exactly the saved ACL: the new view has the schema's default privileges (K5-1).
+        "FOR a IN SELECT DISTINCT grantee FROM pg_class, aclexplode("
+        f"coalesce(relacl, acldefault('r', relowner))) WHERE oid = {rel}::regclass LOOP\n"
+        "  EXECUTE format('REVOKE ALL ON %s FROM %s CASCADE', "
+        f"{rel}, CASE WHEN a.grantee = 0 THEN 'PUBLIC' "
+        "ELSE quote_ident(pg_get_userbyid(a.grantee)) END);\n"
+        "END LOOP;\n"
+        "FOR a IN SELECT * FROM aclexplode(coalesce(s.acl, acldefault('r', s.owner))) LOOP\n"
         "  EXECUTE format('GRANT %s ON %s TO %s%s', a.privilege_type, "
         f"{rel}, CASE WHEN a.grantee = 0 THEN 'PUBLIC' "
         "ELSE quote_ident(pg_get_userbyid(a.grantee)) END, "

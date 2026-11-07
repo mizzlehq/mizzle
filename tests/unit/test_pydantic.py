@@ -3,12 +3,13 @@ from typing import Any
 
 import pydantic
 import pytest
+from asyncpg import Point
 
 from mizzle.core.errors import SchemaError
 from mizzle.core.query.builder import QueryBuilder
 from mizzle.core.schema.table import Table
-from mizzle.core.schema.types import numeric, text
-from mizzle.dialects.postgres.types import array, serial
+from mizzle.core.schema.types import integer, numeric, text
+from mizzle.dialects.postgres.types import array, point, serial
 from mizzle.pydantic import insert_model, select_model, update_model
 from tests.models import Posts, Role, Users
 from tests.unit.conftest import FakeRunner
@@ -59,6 +60,19 @@ def test_numeric_and_arrays() -> None:
     assert Model(amount="123.45", tags=["a"]).model_dump()["amount"] == Decimal("123.45")
     assert _errors(Model, {"amount": "1234.5"})  # 5 digits max, 2 after the point
     assert _errors(Model, {"amount": "1", "tags": [1]})
+
+
+def test_array_elements_may_be_null() -> None:
+    # Q5-7: any PostgreSQL array can hold NULL; a row with one failed to validate.
+    class Nulls(Table, name="nulls"):
+        id = serial().primary_key()
+        xs = array(integer())
+        pts = array(point())
+
+    Model = select_model(Nulls)
+    out = Model.model_validate({"id": 1, "xs": [1, None], "pts": [Point(1, 2), None]})
+    assert out.model_dump()["xs"] == [1, None]
+    assert Model.model_validate_json(out.model_dump_json()).model_dump() == out.model_dump()
 
 
 def test_refine_exclude_and_name() -> None:
