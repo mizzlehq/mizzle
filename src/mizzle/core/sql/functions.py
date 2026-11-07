@@ -85,6 +85,9 @@ def column_of(node: object) -> ColumnBase | None:
                 item.expr if isinstance(item, OrderBy) else item for item in node.within_group_
             ]
             return _first_column((*node.args, *grouped))
+        case Func(name="unnest", keeps_type=True):  # one element of the array (C31)
+            column = _first_column(node.args)
+            return None if column is None else column.item
         case Func(keeps_type=True):
             return _first_column(node.args)
         case Over():
@@ -907,7 +910,7 @@ type Array[T] = Expr[list[T]] | Expr[list[T] | None]
 
 def unnest[T](array: Array[T]) -> Expr[T]:
     """Expands an array to one row per element (a set-returning function)."""
-    return TypedFunc[T]("unnest", (array,))
+    return TypedFunc[T]("unnest", (array,), keeps_type=True)
 
 
 def array_length[T](array: Array[T], dimension: int = 1) -> Expr[int | None]:
@@ -932,17 +935,23 @@ def array_position[T](array: Array[T], value: T | Expr[T]) -> Expr[int | None]:
 
 def array_append[T](array: Array[T], value: T | Expr[T]) -> Expr[list[T]]:
     """``array`` with ``value`` appended at the end."""
-    return TypedFunc[list[T]]("array_append", (array, _array_element(value, array)))
+    # keeps_type: the array column decodes the result, so enum elements come back as
+    # members, not labels (C31).
+    return TypedFunc[list[T]](
+        "array_append", (array, _array_element(value, array)), keeps_type=True
+    )
 
 
 def array_remove[T](array: Array[T], value: T | Expr[T]) -> Expr[list[T]]:
     """``array`` with every element equal to ``value`` removed."""
-    return TypedFunc[list[T]]("array_remove", (array, _array_element(value, array)))
+    return TypedFunc[list[T]](
+        "array_remove", (array, _array_element(value, array)), keeps_type=True
+    )
 
 
 def array_cat[T](left: Array[T], right: Array[T]) -> Expr[list[T]]:
     """The two arrays concatenated."""
-    return TypedFunc[list[T]]("array_cat", (left, right))
+    return TypedFunc[list[T]]("array_cat", (left, right), keeps_type=True)
 
 
 # -- json (EX4) -----------------------------------------------------------------------

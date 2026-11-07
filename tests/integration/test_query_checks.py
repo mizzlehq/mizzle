@@ -10,7 +10,7 @@ from mizzle import Database, eq, jsonb_build_object, placeholder
 from mizzle.core.schema.table import Table
 from mizzle.core.schema.types import text
 from mizzle.dialects.postgres.driver import PostgresDriver
-from mizzle.dialects.postgres.types import pg_enum, serial
+from mizzle.dialects.postgres.types import array, pg_enum, serial
 from tests.models import Users
 
 
@@ -26,6 +26,7 @@ class Things(Table, name="qc_things"):
     id = serial().primary_key()
     color = text()
     level = pg_enum(Lvl)
+    levels = array(pg_enum(Lvl))
     tag = text().not_null().unique().default_fn(lambda: f"tag-{next(_ticket)}")
 
 
@@ -35,7 +36,7 @@ async def things(driver: PostgresDriver, pg_url: str) -> AsyncGenerator[Database
         await conn.execute(
             "DROP TABLE IF EXISTS qc_things; DROP TYPE IF EXISTS lvl; "
             "CREATE TYPE lvl AS ENUM ('1', '2'); "
-            "CREATE TABLE qc_things (id serial PRIMARY KEY, color text, level lvl, "
+            "CREATE TABLE qc_things (id serial PRIMARY KEY, color text, level lvl, levels lvl[], "
             "tag text NOT NULL UNIQUE)",
             [],
         )
@@ -70,3 +71,21 @@ async def test_jsonb_build_object_takes_none(db: Database) -> None:
     await db.insert(Users).values({"email": "json@x"})
     rows = await db.select(jsonb_build_object("k", None)).from_(Users).limit(1)
     assert rows == [({"k": None},)]
+
+
+async def test_array_functions_decode_enum_elements(things: Database) -> None:
+    # C31: unnest/array_append/array_cat/array_remove returned labels ('1'), not members.
+    from mizzle import array_append, array_cat, array_remove, unnest
+
+    async with things as db:
+        await db.insert(Things).values({"levels": [Lvl.LOW, Lvl.HIGH]})
+        rows = await db.select(unnest(Things.levels)).from_(Things)
+        assert rows == [(Lvl.LOW,), (Lvl.HIGH,)]
+        [(appended, joined, removed)] = await db.select(
+            array_append(Things.levels, Lvl.LOW),
+            array_cat(Things.levels, Things.levels),
+            array_remove(Things.levels, Lvl.LOW),
+        ).from_(Things)
+        assert appended == [Lvl.LOW, Lvl.HIGH, Lvl.LOW]
+        assert joined == [Lvl.LOW, Lvl.HIGH, Lvl.LOW, Lvl.HIGH]
+        assert removed == [Lvl.HIGH]
