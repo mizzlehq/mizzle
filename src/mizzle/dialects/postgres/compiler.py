@@ -15,7 +15,7 @@ from mizzle.core.compiler import CompiledQuery, Compiler, interval_text
 from mizzle.core.errors import QueryError
 from mizzle.core.sql.alias import real_table
 from mizzle.core.sql.nodes import ExprBase, Node
-from mizzle.dialects.postgres.types import CustomColumn
+from mizzle.dialects.postgres.types import CustomColumn, JsonText
 
 if TYPE_CHECKING:
     from mizzle.core.query.insert import OnConflict
@@ -72,16 +72,21 @@ def _offset_text(offset: datetime.timedelta) -> str:
 
 def temporal_text(value: datetime.date | datetime.time) -> str:
     """A date/time exactly as PostgreSQL prints it back, so a schema and its database
-    compare equal. timestamptz values are stored as instants: written in UTC."""
+    compare equal. timestamptz values are stored as instants: written in UTC. The max and
+    min are infinity and -infinity, as asyncpg sends them (Q5-5)."""
     if isinstance(value, datetime.datetime):
+        utc = value if value.tzinfo is None else value.astimezone(datetime.UTC)
+        if utc.replace(tzinfo=None) in (datetime.datetime.max, datetime.datetime.min):
+            return "infinity" if utc.year == datetime.MAXYEAR else "-infinity"
         if value.tzinfo is not None:
-            utc = value.astimezone(datetime.UTC).replace(tzinfo=None)
-            return _trim_fraction(utc.isoformat(" ")) + "+00"
+            return _trim_fraction(utc.replace(tzinfo=None).isoformat(" ")) + "+00"
         return _trim_fraction(value.isoformat(" "))
     if isinstance(value, datetime.time):
         text = _trim_fraction(value.replace(tzinfo=None).isoformat())
         offset = value.utcoffset()
         return text + _offset_text(offset) if offset is not None else text
+    if value in (datetime.date.max, datetime.date.min):
+        return "infinity" if value == datetime.date.max else "-infinity"
     return value.isoformat()
 
 
@@ -89,22 +94,29 @@ def _json_key(key: object) -> str:
     return key if isinstance(key, str) else json.dumps(key)
 
 
-def json_text(value: object) -> str:
+def json_text(value: object, jsonb: bool = True) -> str:
     """JSON as PostgreSQL prints jsonb: keys by length then bytes, no \\u escapes, numbers
-    in full (Q4-7). json keeps its text, so it reads back as written there too."""
+    in full (Q4-7). json keeps its text, so it reads back as written there too; a float
+    as Python writes it (1e+20), or it would read back as an int (Q5-10c)."""
     match value:
         case dict():
             pairs = [(_json_key(k), v) for k, v in cast(dict[object, object], value).items()]
             pairs.sort(key=lambda kv: (len(kv[0].encode()), kv[0].encode()))
-            return "{" + ", ".join(f"{json_text(k)}: {json_text(v)}" for k, v in pairs) + "}"
+            return "{" + ", ".join(f"{json_text(k)}: {json_text(v, jsonb)}" for k, v in pairs) + "}"
         case list() | tuple():
-            return "[" + ", ".join(json_text(v) for v in cast(Sequence[object], value)) + "]"
-        case float() if math.isfinite(value):
+            items = cast(Sequence[object], value)
+            return "[" + ", ".join(json_text(v, jsonb) for v in items) + "]"
+        case float() if jsonb and math.isfinite(value):
             return format(Decimal(repr(value)), "f")  # 1e+20 is 100000000000000000000
         case Decimal() if value.is_finite():
             return format(value, "f")
         case _:
             return json.dumps(value, ensure_ascii=False, default=pg_text)
+
+
+def _unjson(value: object) -> object:
+    """An element already encoded as a JSON document, decoded: not JSON-encoded twice (Q5-1)."""
+    return cast(object, json.loads(value)) if isinstance(value, JsonText) else value
 
 
 def array_text(values: Sequence[object]) -> str:
@@ -196,11 +208,13 @@ class PostgresCompiler(Compiler):
         if value is None:
             return "NULL"
         if column.sql_type in ("json", "jsonb"):  # JSON text, even 5 (Q10)
-            return f"{self.literal(json_text(value))}::{column.sql_type}"
+            text = json_text(value, column.sql_type == "jsonb")
+            return f"{self.literal(text)}::{column.sql_type}"
         if column.item is not None and isinstance(value, list | tuple):
             items = cast(Sequence[object], value)
             if column.item.sql_type in ("json", "jsonb"):  # a list item is JSON, not a dimension
-                items = [None if v is None else json_text(v) for v in items]
+                jsonb = column.item.sql_type == "jsonb"
+                items = [None if v is None else json_text(_unjson(v), jsonb) for v in items]
             return self.literal(array_text(items))
         if isinstance(value, datetime.date | datetime.time):
             return self.literal(temporal_text(value))

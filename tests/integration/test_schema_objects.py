@@ -428,3 +428,36 @@ async def test_unmanaged_objects_are_left_alone(driver: PostgresDriver, tmp_path
             [],
         )
     assert tuple(row) == (True, True, True, True)
+
+
+async def test_recreated_view_keeps_exactly_its_acl(driver: PostgresDriver) -> None:
+    """A view dropped and created again gets the schema's default privileges; a grant the
+    DBA revoked does not come back with them (K5-1)."""
+    check = f"SELECT has_table_privilege('{ROLE}', 'so_app.so_active', 'SELECT')"
+    await migrate(driver, empty_snapshot("postgresql"), v1())
+    async with driver.acquire() as conn:
+        await conn.execute(
+            f"ALTER DEFAULT PRIVILEGES IN SCHEMA so_app GRANT SELECT ON TABLES TO {ROLE}", []
+        )
+    try:
+        for revoke in (f"REVOKE SELECT ON so_app.so_active FROM {ROLE}", None):
+            for old, new in ((v1(), v2()), (v2(), v1())):
+                async with driver.acquire() as conn:
+                    if revoke is not None:
+                        await conn.execute(revoke, [])
+                    else:  # the owner-only default: a NULL ACL
+                        await conn.execute(
+                            "UPDATE pg_class SET relacl = NULL WHERE oid = 'so_app.so_active'"
+                            "::regclass",
+                            [],
+                        )
+                await migrate(driver, old, new)
+                async with driver.acquire() as conn:
+                    [row] = await conn.fetch(check, [])
+                assert tuple(row) == (False,)
+    finally:
+        async with driver.acquire() as conn:
+            await conn.execute(
+                f"ALTER DEFAULT PRIVILEGES IN SCHEMA so_app REVOKE SELECT ON TABLES FROM {ROLE}",
+                [],
+            )

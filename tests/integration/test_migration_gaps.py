@@ -44,6 +44,7 @@ from mizzle.pg import (
     array,
     bigint,
     bit,
+    boolean,
     bytea,
     char,
     cidr,
@@ -51,6 +52,7 @@ from mizzle.pg import (
     date,
     integer,
     interval,
+    json,
     jsonb,
     line,
     macaddr,
@@ -1031,6 +1033,25 @@ _TYPED_DEFAULTS: dict[str, tuple[Callable[[], ColumnBase], _Check]] = {
         lambda: array(interval()).default([dt.timedelta(hours=1), dt.timedelta(days=-1, hours=1)]),
         lambda v: contains(v, [dt.timedelta(hours=1)]),
     ),
+    # Q5-1: jsonb[]/json[] elements were JSON-encoded twice.
+    "jsonb[] eq": (
+        lambda: array(jsonb[object]()).default([{"k": 1}, "s"]),
+        lambda v: eq(v, [{"k": 1}, "s"]),
+    ),
+    "json[]": (lambda: array(json[object]()).default([{"k": 1}, [1, 2]]), None),
+    "json float": (lambda: json[object]().default({"f": 1e20, "g": 2.5}), None),  # Q5-10c
+    # Q5-5: the max and min are sent as infinity and -infinity.
+    "date max": (lambda: date().default(dt.date.max), lambda v: eq(v, dt.date.max)),
+    "timestamp min": (
+        lambda: timestamp().default(dt.datetime.min),
+        lambda v: eq(v, dt.datetime.min),
+    ),
+    "timestamptz max": (
+        lambda: timestamp(tz=True).default(dt.datetime.max.replace(tzinfo=dt.UTC)),
+        lambda v: eq(v, dt.datetime.max.replace(tzinfo=dt.UTC)),
+    ),
+    # Q5-8: PostgreSQL has one array type, boolean[], for boolean[][].
+    "boolean[][]": (lambda: array(array(boolean())).default([[True, False], [None, True]]), None),
 }
 
 
@@ -1078,6 +1099,12 @@ async def test_typed_defaults_and_check_literals_do_not_drift(
     assert diff(current, desired, compare_expressions=False) == []
     assert diff(current, normalized, compare_expressions=False, normalized=True) == []
     await execute(driver, "INSERT INTO mg.q4_typed (id) VALUES (1)")
+    if kind != "custom":  # The default is what an insert of its value stores.
+        value = column.encode(column.default_value)
+        async with driver.acquire() as conn:
+            await conn.execute("INSERT INTO mg.q4_typed (id, v) VALUES (2, $1)", [value])
+        rows = await execute(driver, "SELECT v::text FROM mg.q4_typed ORDER BY id")
+        assert rows[0] == rows[1]
 
 
 async def test_type_named_like_a_keyword_the_server_lacks(
