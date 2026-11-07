@@ -104,17 +104,55 @@ def _canonical[V: (int, datetime.date)](value: Range[V]) -> Range[V]:
     return Range(lower, upper, lower_inc=lower is not None, upper_inc=False)
 
 
+def _is_empty[V: (int, Decimal, datetime.date)](value: Range[V]) -> bool:
+    lower, upper = value.lower, value.upper
+    return value.isempty or (
+        lower is not None and lower == upper and not (value.lower_inc and value.upper_inc)
+    )
+
+
+def _merged[V: (int, Decimal, datetime.date)](ranges: list[Range[V]]) -> list[Range[V]]:
+    """A multirange as PostgreSQL stores it: sorted, without empty ranges, overlapping or
+    adjacent ones merged: {[1,3),[2,5)} is {[1,5)}, {[1,2],(2,3)} is {[1,3)} (Q4-14)."""
+    out: list[Range[V]] = []
+    for r in sorted(
+        (r for r in ranges if not _is_empty(r)),
+        key=lambda r: (r.lower is not None, r.lower, not r.lower_inc),
+    ):
+        last = out[-1] if out else None
+        if last is None or not (
+            last.upper is None
+            or r.lower is None
+            or r.lower < last.upper
+            or (r.lower == last.upper and (r.lower_inc or last.upper_inc))
+        ):
+            out.append(r)
+            continue
+        upper, upper_inc = r.upper, r.upper_inc
+        if last.upper is None or (
+            upper is not None and (upper, upper_inc) <= (last.upper, last.upper_inc)
+        ):
+            upper, upper_inc = last.upper, last.upper_inc
+        out[-1] = Range(last.lower, upper, lower_inc=last.lower_inc, upper_inc=upper_inc)
+    return out
+
+
 def canonical_ranges(value: object, sql_type: str) -> object:
     """``value`` with each range of a discrete range type (an array or multirange of one
-    too) in PostgreSQL's canonical form; a numrange [1,5] stays as it is."""
-    if sql_type.removesuffix("[]") not in _DISCRETE:
-        return value
+    too) in PostgreSQL's canonical form, a numrange [1,5] as it is; a multirange's ranges
+    then merged and sorted as PostgreSQL stores them."""
+    discrete = sql_type.removesuffix("[]") in _DISCRETE
     if isinstance(value, Range):
-        return _canonical(cast(Range[int], value))
-    if isinstance(value, list):
-        items = cast(list[object], value)
-        return [_canonical(cast(Range[int], v)) if isinstance(v, Range) else v for v in items]
-    return value
+        one = cast(Range[int], value)
+        return _canonical(one) if discrete else one
+    if not isinstance(value, list):
+        return value
+    items = cast(list[object], value)
+    if discrete:
+        items = [_canonical(cast(Range[int], v)) if isinstance(v, Range) else v for v in items]
+    if sql_type.endswith("multirange") and _all_ranges(items):
+        return _merged(cast(list[Range[int]], items))
+    return items
 
 
 def _trim_fraction(text: str) -> str:

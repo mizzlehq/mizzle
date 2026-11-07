@@ -49,6 +49,7 @@ from mizzle.dialects.postgres.ddl import (
     normalize_default,
     qualified,
     quote,
+    requote_type,
     sql_standard_body,
     type_ident,
 )
@@ -640,6 +641,34 @@ def _indexes_query(version: int) -> str:
 async def introspect(
     conn: Connection, schemas: Sequence[str] = (DEFAULT_SCHEMA,), roles: Sequence[str] = ()
 ) -> Snapshot:
+    """The database's schema, read in UTC: the server prints a timestamptz constant (a
+    default, a check) in the session TimeZone, and a schema writes it in UTC (Q4-15)."""
+    try:
+        async with conn.transaction():  # rolled back, and the SET LOCAL with it
+            await conn.execute("SET LOCAL TimeZone = 'UTC'", [])
+            snapshot = await _introspect(conn, schemas, roles)
+            rows = await conn.fetch_dicts(_SERVER_KEYWORDS, [])
+            _requote_types(snapshot, frozenset(str(r["word"]) for r in rows))
+            raise _Undo(snapshot)
+    except _Undo as undo:
+        return cast(Snapshot, undo.args[0])
+
+
+_SERVER_KEYWORDS = "SELECT word FROM pg_get_keywords() WHERE catcode <> 'U'"
+
+
+def _requote_types(snapshot: Snapshot, server_keywords: frozenset[str]) -> None:
+    """Type names quoted as the schema quotes them, whatever the server's version (K4-22)."""
+    relations = [*snapshot["tables"].values(), *snapshot.get("views", {}).values()]
+    for column in (c for r in relations for c in r["columns"].values()):
+        column["type"] = requote_type(column["type"], server_keywords)
+    for domain in snapshot.get("domains", {}).values():
+        domain["base_type"] = requote_type(domain["base_type"], server_keywords)
+    for field in (f for c in snapshot.get("composites", {}).values() for f in c["fields"]):
+        field["type"] = requote_type(field["type"], server_keywords)
+
+
+async def _introspect(conn: Connection, schemas: Sequence[str], roles: Sequence[str]) -> Snapshot:
     snapshot = empty_snapshot("postgresql")
     version = await _server_version_num(conn)
     schema_list = list(schemas)
@@ -1098,6 +1127,7 @@ async def normalize_snapshot(conn: Connection, snapshot: Snapshot) -> Snapshot:
     try:
         async with conn.transaction():
             await conn.execute("SET LOCAL check_function_bodies = off", [])
+            await conn.execute("SET LOCAL TimeZone = 'UTC'", [])  # as introspect reads
             await _normalize(out, read_back, version)
             raise _Undo
     except _Undo:
