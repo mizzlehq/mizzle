@@ -27,6 +27,7 @@ from mizzle.dialects.postgres.types import (
     point,
     polygon,
     serial,
+    tsrange,
     tstzrange,
     varbit,
 )
@@ -256,3 +257,82 @@ async def test_cte_columns_decode_under_snake_case(driver: PostgresDriver, pg_ur
     finally:
         async with driver.acquire() as conn:
             await conn.execute("DROP TABLE qc_camel; DROP TYPE lvl", [])
+
+
+async def test_placeholders_in_any_in_and_containers_are_encoded(things: Database) -> None:
+    # Q5: the placeholder list was sent raw ([2] to an enum array) and in_() gave IN ($1).
+    from mizzle import any_, contains, in_, not_in
+
+    async with things as db:
+        await db.insert(Things).values({"level": Lvl.HIGH, "levels": [Lvl.HIGH]})
+        for cond, found in (
+            (in_(Things.level, placeholder("p")), [(1,)]),
+            (not_in(Things.level, placeholder("p")), []),
+            (eq(Things.level, any_(placeholder("p"))), [(1,)]),
+            (contains(Things.levels, placeholder("p")), [(1,)]),
+        ):
+            prepared = db.select(Things.id).from_(Things).where(cond).prepare()
+            assert await prepared.execute(p=[Lvl.HIGH]) == found
+
+
+class Color(enum.Enum):
+    RED = "red"
+    BLUE = "blue"
+
+
+async def test_enum_and_json_values_without_a_column_are_typed(db: Database) -> None:
+    # Q8: an IntEnum in CASE came back as int; a plain Enum, dict or list was an untyped
+    # parameter ("could not determine data type").
+    from mizzle import case_, is_not_null, jsonb_build_array
+
+    await db.insert(Users).values({"email": "q8@x"})
+    yes = is_not_null(Users.id)
+    rows = await db.select(
+        case_().when(yes, Lvl.HIGH).else_(Lvl.LOW),
+        case_().when(yes, Color.RED).else_(Color.BLUE),
+        case_().when(yes, {"a": 1}).else_({"b": 2}),
+        jsonb_build_object("c", Color.RED, "d", {"x": [1]}),
+        jsonb_build_array(Lvl.HIGH, [1, 2]),
+    ).from_(Users)
+    assert rows == [(Lvl.HIGH, Color.RED, {"a": 1}, {"c": "red", "d": {"x": [1]}}, [2, [1, 2]])]
+
+
+class DateNest(Table, name="qc_date_nest"):
+    id = serial().primary_key()
+    kids = many(lambda: DateKid)
+
+
+class DateKid(Table, name="qc_date_kid"):
+    id = serial().primary_key()
+    nest_id = integer().not_null().references(lambda: DateNest.id)
+    ts = tsrange()
+    dr = daterange()
+    nest = one(lambda: DateNest, fields=lambda: [DateKid.nest_id], references=lambda: [DateNest.id])
+
+
+async def test_nested_ranges_ignore_the_date_style(driver: PostgresDriver, pg_url: str) -> None:
+    # Q13: range bounds were sent as lower(r)::text, which follows DateStyle ('02/01/2026').
+    async with driver.acquire() as conn:
+        await conn.execute(
+            "DROP TABLE IF EXISTS qc_date_kid, qc_date_nest; "
+            "CREATE TABLE qc_date_nest (id serial PRIMARY KEY); "
+            "CREATE TABLE qc_date_kid (id serial PRIMARY KEY, "
+            "nest_id int NOT NULL REFERENCES qc_date_nest, ts tsrange, dr daterange); "
+            "INSERT INTO qc_date_nest DEFAULT VALUES; "
+            "INSERT INTO qc_date_kid (nest_id, ts, dr) "
+            "VALUES (1, '[2026-01-02 10:00,2026-03-04)', '[2026-01-02,2026-03-04)')",
+            [],
+        )
+    try:
+        async with await Database.connect(
+            pg_url,
+            schema=[DateNest, DateKid],
+            pool_size=1,
+            server_settings={"DateStyle": "SQL, DMY"},
+        ) as db:
+            plain = await db.query(DateKid).find_many()
+            [parent] = await db.query(DateNest).find_many(with_={"kids": True})
+            assert parent.kids == plain
+    finally:
+        async with driver.acquire() as conn:
+            await conn.execute("DROP TABLE qc_date_kid, qc_date_nest", [])

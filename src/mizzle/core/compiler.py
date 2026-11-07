@@ -367,6 +367,11 @@ class Compiler:
             if quantified.values is not None:
                 inner = self._quantified_array(quantified.values, other)
                 return f"{quantified.quantifier} ({inner})"
+            value, column = quantified.value, column_of(other)
+            if isinstance(value, Placeholder) and value.column is None and column is not None:
+                # A placeholder list is encoded like a literal one (Q5).
+                array = replace(value, column=self._array_column(column))
+                return f"{quantified.quantifier} ({self.visit(array)})"
         return self.operand_of(node, other)
 
     def visit_BoolOp(self, node: BoolOp) -> str:
@@ -395,10 +400,13 @@ class Compiler:
         items = list(values)
         column = column_of(other) if other is not None else None
         if column is not None:
-            array_column = column if column.item is not None else column.array_column()
-            return self.visit(Param(items, array_column))
+            return self.visit(Param(items, self._array_column(column)))
         kind = next((t for v in items if (t := sql_type_of(v)) is not None), "text")
         return self.visit(Cast(Param(items), kind + "[]"))
+
+    @staticmethod
+    def _array_column(column: ColumnBase) -> ColumnBase:
+        return column if column.item is not None else column.array_column()
 
     def visit_InList(self, node: InList) -> str:
         if isinstance(node.values, tuple):

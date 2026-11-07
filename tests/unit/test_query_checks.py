@@ -244,3 +244,17 @@ def test_sql_with_a_lone_brace_is_a_query_error() -> None:
 
     with pytest.raises(QueryError, match="braces"):
         sql("select '{' || {}", 1)
+
+
+def test_in_a_placeholder_is_an_array_typed_by_the_column(qb: QueryBuilder) -> None:
+    # Q5: in_(col, placeholder) compiled to IN ($1) and the list skipped the column encoder.
+    from mizzle import any_, in_, not_in, placeholder
+
+    for cond, op in (
+        (in_(Kinds.level, placeholder("p")), "= ANY ($1)"),
+        (not_in(Kinds.level, placeholder("p")), "<> ALL ($1)"),
+        (eq(Kinds.level, any_(placeholder("p"))), "= ANY ($1)"),
+    ):
+        compiled = qb.select(Kinds.id).from_(Kinds).where(cond).prepare().compiled
+        assert compiled.sql.endswith(f'"kinds"."level" {op}')
+        assert compiled.bind({"p": [Level.HIGH]}).params == (["2"],)

@@ -135,6 +135,11 @@ def not_(condition: Condition) -> Expr[bool]:
 
 
 def _in(left: ExprBase, values: Iterable[object] | Node, negate: bool) -> Expr[bool]:
+    if isinstance(values, Placeholder):
+        # IN ($1) would compare with the whole list as one value: bind it as an array,
+        # typed by the left side like any_() (Q5).
+        quantified = AnyAll[object]("ALL" if negate else "ANY", values)
+        return BinaryOp(left, "<>" if negate else "=", quantified)
     if isinstance(values, Node):  # subquery
         return InList(left, values, negate)
     if isinstance(values, (str, bytes)):  # a str is an Iterable[str]: "abc" is not a list (C36)
@@ -335,11 +340,15 @@ def all_[T](values: object) -> Expr[T]:
 
 
 def _container(value: object, like: object = None) -> Node:
-    if isinstance(value, Node):
-        return value
     column = column_of(like) if like is not None else None
     on_json = column is not None and column.sql_type in ("jsonb", "json")
     on_array = column is not None and column.item is not None
+    if isinstance(value, Placeholder) and value.column is None and column is not None:
+        # Typed like a literal value (Q5); on a range column it is a range, as PostgreSQL
+        # infers it; a scalar bound needs cast(placeholder(...), integer()).
+        return Cast(value, "jsonb") if on_json else replace(value, column=column)
+    if isinstance(value, Node):
+        return value
     if isinstance(value, dict):
         return Cast(Param(cast("dict[str, object]", value)), "jsonb")
     if isinstance(value, (list, tuple, set, frozenset)):
@@ -395,9 +404,9 @@ def _json_key(key: str | int) -> Node:
     return Cast(Param(key), "text")
 
 
-def get_field[T](value: Expr[T], key: str | int) -> Expr[T]:
+def get_field(value: ExprBase, key: str | int) -> Expr[Json]:
     """``value -> key``: a jsonb field (as jsonb). ``key`` is a string or array index."""
-    return PostfixOp[T](value, "->", _json_key(key))
+    return PostfixOp[Json](value, "->", _json_key(key))  # a field, not the column type (Q15)
 
 
 def get_field_text(value: ExprBase, key: str | int) -> Expr[str | None]:
@@ -405,9 +414,9 @@ def get_field_text(value: ExprBase, key: str | int) -> Expr[str | None]:
     return PostfixOp[str | None](value, "->>", _json_key(key))
 
 
-def get_path[T](value: Expr[T], path: list[str] | tuple[str, ...]) -> Expr[T]:
+def get_path(value: ExprBase, path: list[str] | tuple[str, ...]) -> Expr[Json]:
     """``value #> path``: a jsonb value at a text-array path."""
-    return PostfixOp[T](value, "#>", Cast(Param(path_keys(path, "get_path")), "text[]"))
+    return PostfixOp[Json](value, "#>", Cast(Param(path_keys(path, "get_path")), "text[]"))
 
 
 def get_path_text(value: ExprBase, path: list[str] | tuple[str, ...]) -> Expr[str | None]:

@@ -30,11 +30,10 @@ _AS_TEXT = frozenset(
 
 def _range_parts(ref: str) -> str:
     """A range as [lower, upper, lower_inc, upper_inc, empty]; the bounds as text, so a
-    numeric or timestamp bound is exact (C30)."""
-    return (
-        f"json_build_array(lower({ref})::text, upper({ref})::text, lower_inc({ref}), "
-        f"upper_inc({ref}), isempty({ref}))"
-    )
+    numeric or timestamp bound is exact (C30). to_json gives ISO dates whatever the
+    session's DateStyle, which ::text follows (Q13)."""
+    lower, upper = (f"to_json({end}({ref})) #>> '{{}}'" for end in ("lower", "upper"))
+    return f"json_build_array({lower}, {upper}, lower_inc({ref}), upper_inc({ref}), isempty({ref}))"
 
 
 class PostgresCompiler(Compiler):
