@@ -21,7 +21,8 @@ lint() {
     uv run ruff check && uv run ruff format --check &&
     uv run basedpyright && uv run mypy &&
     uv run basedpyright --pythonversion 3.14 && uv run mypy --python-version 3.14 &&
-    uv run --group docs zensical build --strict --clean && uv run python scripts/llms_full.py
+    uv run --group docs zensical build --strict --clean && uv run python scripts/llms_full.py &&
+    uv lock --check
 }
 
 ui() {

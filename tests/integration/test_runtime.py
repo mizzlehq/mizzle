@@ -724,7 +724,6 @@ async def test_stream_does_not_leave_its_span_current(pg_url: str) -> None:
     import asyncio
     import contextvars
     import gc
-    from collections.abc import Generator
     from contextlib import contextmanager
 
     current: contextvars.ContextVar[str | None] = contextvars.ContextVar("span", default=None)
