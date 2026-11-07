@@ -22,6 +22,8 @@ from mizzle.dialects.postgres.types import (
     hstore,
     int4multirange,
     int4range,
+    json,
+    jsonb,
     line,
     lseg,
     numrange,
@@ -513,3 +515,32 @@ async def test_select_models_round_trip_every_column_through_json(
     finally:
         async with driver.acquire() as conn:
             await conn.execute("DROP TABLE qc_rt; DROP TYPE hue", [])
+
+
+class JsonArrays(Table, name="qc_json_arrays"):
+    id = serial().primary_key()
+    jb = array(jsonb())
+    js = array(json())
+
+
+async def test_each_json_array_element_is_one_document(driver: PostgresDriver, pg_url: str) -> None:
+    # Q4-5: a list element became an array dimension: [[1]] was stored as a 2-D jsonb[]
+    # (jb[1] IS NULL) and [{"a": 1}, [1]] failed with a DataError.
+    async with driver.acquire() as conn:
+        await conn.execute(
+            "DROP TABLE IF EXISTS qc_json_arrays; "
+            "CREATE TABLE qc_json_arrays (id serial PRIMARY KEY, jb jsonb[], js json[])",
+            [],
+        )
+    try:
+        async with await Database.connect(pg_url, schema=[JsonArrays], pool_size=1) as db:
+            for value in ([[1]], [{"a": 1}, [1]], [[1, [2]], None, "x", 1], []):
+                [row] = await db.insert(JsonArrays).values({"jb": value, "js": value}).returning()
+                assert (row.jb, row.js) == (value, value)
+                [dims] = await db.execute(
+                    sql(f"SELECT array_ndims(jb) AS n FROM qc_json_arrays WHERE id = {row.id}")
+                )
+                assert dims == {"n": 1 if value else None}
+    finally:
+        async with driver.acquire() as conn:
+            await conn.execute("DROP TABLE qc_json_arrays", [])

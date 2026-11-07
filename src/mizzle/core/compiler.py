@@ -221,7 +221,7 @@ class Compiler:
         self._writes = False
         self._bound = {}
         self._context = None
-        text = self.visit(node)
+        text = no_nul(self.visit(node))  # also raw sql() and collate() text (Q4-8)
         return CompiledQuery(
             text,
             tuple(self._params),
@@ -394,10 +394,18 @@ class Compiler:
         # compared against, so an enum list is a `role[]` parameter, not `text[]`.
         if issubclass(type(node), AnyAll):
             quantified = cast("AnyAll[object]", node)
+            value, column = quantified.value, column_of(other)
+            listed = quantified.values is not None or isinstance(value, Placeholder)
+            if listed and column is not None and column.item is not None:
+                # PostgreSQL has no array-of-arrays type for the parameter (Q4-3).
+                raise QueryError(
+                    f"{column.qualified_name} is an array: ANY/ALL (and in_() with a "
+                    "placeholder) cannot compare it with a list of arrays; use in_() with "
+                    "a list of values"
+                )
             if quantified.values is not None:
                 inner = self._quantified_array(quantified.values, other)
                 return f"{quantified.quantifier} ({inner})"
-            value, column = quantified.value, column_of(other)
             if isinstance(value, Placeholder) and value.column is None and column is not None:
                 # A placeholder list is encoded like a literal one (Q5).
                 array = replace(value, column=self._array_column(column))

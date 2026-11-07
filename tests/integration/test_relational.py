@@ -2,10 +2,12 @@ import datetime
 import enum
 import ipaddress
 import uuid
+from collections.abc import Iterable, Sized
 from decimal import Decimal
-from typing import Any
+from typing import Any, cast
 
 import pytest
+from asyncpg import Record
 
 from mizzle import Database, QueryError, RelationNotLoaded, Table, desc, eq, gt, like, sql
 from mizzle.core.schema.relations import many, one
@@ -22,6 +24,8 @@ from mizzle.pg import (
     interval,
     jsonb,
     numeric,
+    pg_composite,
+    pg_domain,
     pg_enum,
     real,
     serial,
@@ -202,3 +206,97 @@ async def test_every_type_survives_json(driver: PostgresDriver, pg_url: str) -> 
 
         await db.execute(sql("DROP TABLE rel_thing, rel_owner"))
         await db.execute(sql("DROP TYPE rel_mood"))
+
+
+class DomOwner(Table, name="rel_dom_owner"):
+    id = serial().primary_key()
+    rows = many(lambda: DomRow)
+
+
+class DomRow(Table, name="rel_dom_row"):
+    id = serial().primary_key()
+    owner_id = integer().not_null()
+    num = pg_domain("rel_d_num")
+    tstz = pg_domain("rel_d_tstz")
+    day = pg_domain("rel_d_day")
+    span = pg_domain("rel_d_span")
+    nums = pg_domain("rel_d_nums")
+    deep = pg_domain("rel_d_deep")
+    blob = pg_domain("rel_d_blob")
+    money_none = pg_composite("rel_c_money")
+    money_tuple = pg_composite("rel_c_money", tuple)
+    money_dict = pg_composite("rel_c_money", dict)
+    owner = one(
+        lambda: DomOwner, fields=lambda: [DomRow.owner_id], references=lambda: [DomOwner.id]
+    )
+
+
+_DOM_DDL = r"""
+CREATE DOMAIN rel_d_num AS numeric; CREATE DOMAIN rel_d_tstz AS timestamptz;
+CREATE DOMAIN rel_d_day AS date; CREATE DOMAIN rel_d_span AS int4range;
+CREATE DOMAIN rel_d_nums AS numeric(30,3)[]; CREATE DOMAIN rel_d_deep AS rel_d_num;
+CREATE DOMAIN rel_d_blob AS bytea;
+CREATE TYPE rel_c_money AS (amount numeric, day date, at timestamptz, tags text[], d rel_d_num);
+CREATE TABLE rel_dom_owner (id serial PRIMARY KEY);
+CREATE TABLE rel_dom_row (id serial PRIMARY KEY, owner_id int NOT NULL, num rel_d_num,
+  tstz rel_d_tstz, day rel_d_day, span rel_d_span, nums rel_d_nums, deep rel_d_deep,
+  blob rel_d_blob, money_none rel_c_money, money_tuple rel_c_money, money_dict rel_c_money);
+INSERT INTO rel_dom_owner DEFAULT VALUES;
+INSERT INTO rel_dom_row (owner_id, num, tstz, day, span, nums, deep, blob,
+  money_none, money_tuple, money_dict)
+SELECT 1, 12345678901234567890.123, '2020-01-01 00:00:00.123456+00', '2020-02-29', '[1,5)',
+  '{1.500,NULL}', 0.1, '\x00ff', m, m, m
+FROM (SELECT ROW(1.10, '2020-01-02', '2020-01-01+00', '{a,NULL}', 2.50)::rel_c_money AS m) s;
+INSERT INTO rel_dom_row (owner_id, money_none) VALUES (1, ROW(NULL, NULL, NULL, NULL, NULL));
+"""
+_DOM_DROP = (
+    "DROP TABLE IF EXISTS rel_dom_row, rel_dom_owner; DROP TYPE IF EXISTS rel_c_money; "
+    "DROP DOMAIN IF EXISTS rel_d_deep, rel_d_num, rel_d_tstz, rel_d_day, rel_d_span, "
+    "rel_d_nums, rel_d_blob"
+)
+
+
+def _assert_same(nested: object, plain: object) -> None:
+    """Equal and of the same type, all the way down (Decimal digits too)."""
+    if isinstance(plain, Record):
+        plain = dict(plain.items())  # a nested composite is a dict by field name
+    assert type(nested) is type(plain), (nested, plain)
+    if isinstance(plain, Decimal):
+        assert str(nested) == str(plain)
+    elif isinstance(plain, list | tuple):
+        items = list(cast(Iterable[object], nested))
+        assert len(items) == len(cast(Sized, plain))
+        for a, b in zip(items, cast(Iterable[object], plain), strict=True):
+            _assert_same(a, b)
+    elif isinstance(plain, dict):
+        got = cast(dict[str, object], nested)
+        want = cast(dict[str, object], plain)
+        assert got.keys() == want.keys()
+        for key, value in want.items():
+            _assert_same(got[key], value)
+    else:
+        assert nested == plain
+
+
+@pytest.mark.parametrize(
+    "attr", [a for a in DomRow.__table__.columns if a not in ("id", "owner_id")]
+)
+async def test_nested_domains_and_composites_decode_like_a_plain_select(
+    driver: PostgresDriver, pg_url: str, attr: str
+) -> None:
+    # Q4-6: without a py_type, a nested domain came back as raw JSON (numeric -> float,
+    # timestamptz -> str, range -> '[1,5)'), and composite fields too (Decimal -> float).
+    async with driver.acquire() as conn:
+        await conn.execute(_DOM_DROP + ";" + _DOM_DDL, [])
+    try:
+        async with await Database.connect(pg_url, schema=[DomOwner, DomRow]) as db:
+            plain = await db.select().from_(DomRow).order_by(DomRow.id)
+            query = db.query(DomOwner).find_many(with_={"rows": {"order_by": DomRow.id}})
+            [owner] = await query.prepare().execute()  # prepared before the first type lookup
+            streamed = [o async for o in query.stream()]
+            for nested in (owner.rows, streamed[0].rows):
+                for got, want in zip(nested, plain, strict=True):
+                    _assert_same(getattr(got, attr), getattr(want, attr))
+    finally:
+        async with driver.acquire() as conn:
+            await conn.execute(_DOM_DROP, [])

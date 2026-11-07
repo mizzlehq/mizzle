@@ -54,6 +54,7 @@ from mizzle.dialects.base import (
     PoolStats,
     ResetMode,
 )
+from mizzle.dialects.postgres.types import JsonText
 
 log = logging.getLogger("mizzle")
 
@@ -808,8 +809,12 @@ def _retryable(exc: BaseException) -> bool:
     return not code.startswith(_PERMANENT_SQLSTATES)
 
 
+def _json_text(value: object) -> str:
+    return value if isinstance(value, JsonText) else json.dumps(value)  # Q4-5
+
+
 def _jsonb_encode(value: object) -> bytes:
-    return b"\x01" + json.dumps(value).encode()  # binary jsonb: a version byte, then text
+    return b"\x01" + _json_text(value).encode()  # binary jsonb: a version byte, then text
 
 
 def _jsonb_decode(data: bytes) -> object:
@@ -817,7 +822,7 @@ def _jsonb_decode(data: bytes) -> object:
 
 
 def _json_encode(value: object) -> bytes:
-    return json.dumps(value).encode()
+    return _json_text(value).encode()
 
 
 async def _init_connection(conn: asyncpg.Connection) -> None:
