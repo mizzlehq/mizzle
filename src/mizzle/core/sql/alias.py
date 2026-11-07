@@ -18,8 +18,15 @@ class TableAlias:
     __alias_of__: ClassVar[type[Table]]
 
 
+# (real table, alias name) -> alias class. One class per alias, so the decoder and INSERT
+# SQL caches keyed by table class do not grow with every alias() call (Q4).
+_ALIASES: dict[tuple[type[Table], str], type[Table]] = {}
+
+
 def alias_table[T: Table](table: type[T], name: str) -> type[T]:
     real: type[Table] = table.__alias_of__ if issubclass(table, TableAlias) else table
+    if (cached := _ALIASES.get((real, name))) is not None:
+        return cast(type[T], cached)
     # Copies of the columns, attached to the new class: they compile with the alias name.
     columns: dict[str, ColumnBase] = {
         attr: copy.copy(column) for attr, column in real.__table__.columns.items()
@@ -28,6 +35,7 @@ def alias_table[T: Table](table: type[T], name: str) -> type[T]:
         real.__name__, (Table, TableAlias), {"name": name}, lambda ns: ns.update(columns)
     )
     cast(type[TableAlias], cls).__alias_of__ = real
+    _ALIASES[real, name] = cls
     # Typed as the real table so columns (``alias.id``) and rows keep their types.
     return cast(type[T], cls)
 

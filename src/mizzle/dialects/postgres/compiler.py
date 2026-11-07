@@ -75,7 +75,7 @@ class PostgresCompiler(Compiler):
             raise QueryError(f"merge({node.table.__name__}) needs at least one when_* clause")
         prefix = self._with_ctes(node.ctes)
         text = (
-            f"MERGE INTO {self.table_name(node.table)} USING {self.source(node.source_)}"
+            f"MERGE INTO {self.source(node.table)} USING {self.source(node.source_)}"  # (Q7)
             f" ON {self.visit(node.on_)}"
         )
         return prefix + text + "".join(f" {self._merge_when(node.table, w)}" for w in node.when_)
