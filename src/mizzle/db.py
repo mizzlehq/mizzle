@@ -94,6 +94,12 @@ _OPEN_SAVEPOINT = (
 )
 
 
+_UNDONE = (
+    "an enclosing savepoint was rolled back while this one was open, which undid this one "
+    "too; await tasks that open savepoints inside the block that started them"
+)
+
+
 def _timeout_ok(seconds: float | None) -> bool:
     """A timeout is a finite number of seconds > 0, or None. 0, a negative, NaN or inf
     failed every statement or meant no limit at all (R4-6)."""
@@ -111,9 +117,11 @@ def _commit_unknown(error: BaseException) -> bool:
     return isinstance(error, asyncio.CancelledError | DbConnectionError | QueryTimeout)
 
 
-# The innermost savepoint the running code is inside of (see Session._savepoints).
-_SAVEPOINT: contextvars.ContextVar[object | None] = contextvars.ContextVar(
-    "mizzle_savepoint", default=None
+# The savepoints the running code is inside of, innermost last (see Session._savepoints).
+# A stack, not one marker: code inside savepoints of two transactions still owns the
+# innermost one of each (R5-3).
+_SAVEPOINT: contextvars.ContextVar[tuple[_Marker, ...]] = contextvars.ContextVar(
+    "mizzle_savepoint", default=()
 )
 
 
@@ -435,6 +443,25 @@ class Session(QueryBuilder):
             raise QueryError(f"on_conflict must be an insert into {table.__name__}")
         if template.rows:
             raise QueryError("on_conflict must not have values(); pass the rows to insert_many()")
+        if self._conn is None:
+            return await self._insert_rows(template, table, rows, batch_size, returning)
+        # In a transaction, its hidden savepoint holds the statement lock from SAVEPOINT to
+        # RELEASE: a sibling task's statement (asyncio.gather) waits for it instead of being
+        # refused for landing in another task's savepoint (R5-2).
+        async with self._lock:
+            self._check_savepoint_owner()
+            session = self._view()
+            session._lock = asyncio.Lock()
+            return await session._insert_rows(template, table, rows, batch_size, returning)
+
+    async def _insert_rows[T: Table](
+        self,
+        template: Insert[T],
+        table: type[T],
+        rows: Iterable[RowLike],
+        batch_size: int | None,
+        returning: bool,
+    ) -> int | list[T]:
         count = 0
         inserted: list[T] = []
         async with self.transaction() as tx:
@@ -569,7 +596,7 @@ class Session(QueryBuilder):
                         await savepoint.__aenter__()
                         self._savepoints.append(marker)
                     started = True
-                    token = _SAVEPOINT.set(marker)
+                    token = _SAVEPOINT.set((*_SAVEPOINT.get(), marker))
                     try:
                         try:
                             yield self
@@ -582,6 +609,8 @@ class Session(QueryBuilder):
                         broken = False
                         try:
                             async with self._lock:
+                                if marker not in self._savepoints:
+                                    raise  # an enclosing savepoint's ROLLBACK TO undid it
                                 if not await savepoint.__aexit__(type(exc), exc, exc.__traceback__):
                                     raise
                         except asyncio.CancelledError as cancel:
@@ -593,6 +622,8 @@ class Session(QueryBuilder):
                         broken = False
                         try:
                             async with self._lock:
+                                if marker not in self._savepoints:
+                                    raise QueryError(_UNDONE)
                                 if self._savepoints[-1] is not marker:
                                     # A task started inside still has a savepoint open (or
                                     # one was interrupted): roll back, never release it (R4-2).
@@ -770,10 +801,16 @@ class Session(QueryBuilder):
             yield conn
 
     def _end_marker(self, marker: _Marker, broken: bool) -> None:
+        if marker not in self._savepoints:
+            return  # undone already by an enclosing savepoint's ROLLBACK TO
+        at = self._savepoints.index(marker)
         if broken:
-            self._savepoints[self._savepoints.index(marker)] = _BROKEN
+            self._savepoints[at] = _BROKEN
         else:
-            self._savepoints.remove(marker)
+            # Its ROLLBACK TO / RELEASE also ended every savepoint opened inside it, a
+            # broken one included: their markers go too, or the transaction stayed
+            # refused for good (R5-4).
+            del self._savepoints[at:]
 
     def _check_savepoint_owner(self) -> None:
         """Refuse a statement that would land in another task's savepoint: a rollback of
@@ -789,17 +826,14 @@ class Session(QueryBuilder):
                 "a savepoint of this transaction was cancelled before its ROLLBACK TO / "
                 "RELEASE completed, so its state is unknown; the transaction must roll back"
             )
-        current = _SAVEPOINT.get()
-        if (
-            isinstance(current, _Marker)
-            and current.savepoints is self._savepoints
-            and current not in self._savepoints
-        ):
+        mine = [m for m in _SAVEPOINT.get() if m.savepoints is self._savepoints]
+        current = mine[-1] if mine else None
+        if current is not None and current not in self._savepoints:
             raise QueryError(  # R4-3
                 "the savepoint this task was started in has ended; its statements cannot "
                 "run in the transaction any more"
             )
-        if self._savepoints and _SAVEPOINT.get() is not self._savepoints[-1]:
+        if self._savepoints and current is not self._savepoints[-1]:
             raise QueryError(
                 "another task has a savepoint open on this transaction; while it is open, "
                 "only that task (and tasks it starts) may use the transaction. Await the "

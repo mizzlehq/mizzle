@@ -196,11 +196,15 @@ async def test_logger_sees_one_event_per_stream(pg_url: str, driver: PostgresDri
     async with driver.acquire() as conn:
         await conn.execute(DDL, [])
     events: list[QueryEvent] = []
-    async with await Database.connect(pg_url, schema=[Items], logger=events.append) as db:
-        assert len([r async for r in db.select().from_(Items).stream(batch_size=100)]) == 2500
-        async with aclosing(db.select().from_(Items).stream()) as rows:
-            async for _ in rows:
-                break
+    try:
+        async with await Database.connect(pg_url, schema=[Items], logger=events.append) as db:
+            assert len([r async for r in db.select().from_(Items).stream(batch_size=100)]) == 2500
+            async with aclosing(db.select().from_(Items).stream()) as rows:
+                async for _ in rows:
+                    break
+    finally:
+        async with driver.acquire() as conn:
+            await conn.execute("DROP TABLE IF EXISTS stream_items", [])
     assert [e.error for e in events] == [None, None]
     assert "stream_items" in events[0].sql
 

@@ -191,6 +191,19 @@ _ENDED = (
     "so statements after that ran outside it (autocommit). Leave COMMIT and ROLLBACK to "
     "the transaction block"
 )
+_CHAINED = (
+    "the transaction was already ended by a COMMIT AND CHAIN or ROLLBACK AND CHAIN sent as "
+    "raw SQL inside it, so statements after that ran in a new transaction, which was rolled "
+    "back. Leave COMMIT and ROLLBACK to the transaction block"
+)
+# BEGIN marks its transaction with a SET LOCAL, which COMMIT / ROLLBACK AND CHAIN undo while
+# is_in_transaction() stays true; COMMIT and ROLLBACK first check the mark is still there
+# (R5-5). ponytail: a RESET ALL inside the transaction also clears it and reads as a chain.
+_MARK = "; SET LOCAL mizzle.tx = 'on'"
+_CHECK = (
+    "DO $$BEGIN IF current_setting('mizzle.tx', true) IS DISTINCT FROM 'on' THEN "
+    "RAISE SQLSTATE 'MZ001'; END IF; END$$; "
+)
 
 
 def _rowcount(status: str) -> int:
@@ -287,7 +300,7 @@ class PostgresConnection:
                 begin = "BEGIN"
                 if isolation is not None:
                     begin += f" ISOLATION LEVEL {_ISOLATION[isolation]}"
-                await self._conn.execute(begin + " READ ONLY" if readonly else begin)
+                await self._conn.execute((begin + " READ ONLY" if readonly else begin) + _MARK)
             try:
                 yield
             except BaseException as exc:
@@ -296,11 +309,12 @@ class PostgresConnection:
                 if not self._conn.is_in_transaction():
                     exc.add_note(_ENDED)  # R4-4
                     raise
-                await self._conn.execute(
-                    f"ROLLBACK TO SAVEPOINT {name}; RELEASE SAVEPOINT {name}"
-                    if nested
-                    else "ROLLBACK"
-                )
+                if nested:
+                    await self._conn.execute(
+                        f"ROLLBACK TO SAVEPOINT {name}; RELEASE SAVEPOINT {name}"
+                    )
+                elif await self._end("ROLLBACK") is None:
+                    exc.add_note(_CHAINED)
                 raise
             phase = "RELEASE SAVEPOINT" if nested else "COMMIT"
             if not self._conn.is_in_transaction():
@@ -314,8 +328,12 @@ class PostgresConnection:
                         f"ROLLBACK TO SAVEPOINT {name}; RELEASE SAVEPOINT {name}"
                     )
                     raise _aborted(phase) from None
-            elif await self._conn.execute("COMMIT") != "COMMIT":
-                raise _aborted(phase)
+            else:
+                tag = await self._end("COMMIT")
+                if tag is None:
+                    raise DatabaseError(_CHAINED, sql=phase)
+                if tag != "COMMIT":
+                    raise _aborted(phase)
         # BEGIN / COMMIT failures (body errors are mapped), and a connection lost before
         # ROLLBACK (asyncpg's InterfaceError: "the underlying connection is closed").
         # InternalClientError: BEGIN on a connection the server closed under load.
@@ -331,6 +349,20 @@ class PostgresConnection:
                 body_error.add_note(f"{phase} also failed: {type(exc).__name__}: {exc}")
                 raise body_error from None
             raise _translate(exc, phase) from None
+
+    async def _end(self, command: str) -> str | None:
+        """Run COMMIT or ROLLBACK and return its tag, or None (after a ROLLBACK) when the
+        transaction BEGIN started was already ended by a raw ... AND CHAIN (R5-5)."""
+        try:
+            return await self._conn.execute(_CHECK + command)
+        except pg.InFailedSQLTransactionError:
+            # Aborted: the check cannot run, and COMMIT answers with the tag ROLLBACK.
+            return await self._conn.execute(command)
+        except asyncpg.PostgresError as exc:
+            if exc.sqlstate != "MZ001":
+                raise
+            await self._conn.execute("ROLLBACK")
+            return None
 
     async def cursor(
         self,
@@ -523,9 +555,17 @@ class _Acquire:
 
 
 def _malformed(url: str, exc: Exception) -> DbConnectionError:
-    """A malformed database URL as a clean, permanent error (C18), never with its password."""
-    password = re.search(r"://[^/@]*?:([^@/]+)@", url)
-    message = str(exc).replace(password.group(1), "***") if password else str(exc)
+    """A malformed database URL as a clean, permanent error (C18), never with any part of
+    its user name or password. These may hold an unencoded '/', '?' or '#', so the parser
+    split them and echoes a piece of them, quoted (R5-1)."""
+    message = str(exc)
+    rest = url.partition("://")[2]
+    if "@" in rest:
+        message = re.sub(r"'[^']*'|\"[^\"]*\"", "'***'", message)
+        # Pieces of 1-2 characters are left: they would garble the message's own words.
+        for part in sorted(re.split(r"[:/?#@]", rest[: rest.rfind("@")]), key=len, reverse=True):
+            if len(part) > 2:
+                message = message.replace(part, "***")
     error = DbConnectionError(f"the database URL is malformed: {message}")
     error.retryable = False
     return error
