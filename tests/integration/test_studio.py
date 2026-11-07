@@ -1196,7 +1196,7 @@ def test_json_and_numeric_cells_keep_their_exact_text(client: TestClient) -> Non
 def test_negative_scale_numeric_keys_are_not_rounded(client: TestClient) -> None:
     # S4: numeric(5,-2) kept its modifier in the cast, so 1250 rounded to 1300 and the
     # DELETE removed that row.
-    client.post(
+    made = client.post(
         "/api/sql",
         json={
             "sql": "drop table if exists st_neg; create table st_neg (k numeric(5,-2) "
@@ -1204,6 +1204,8 @@ def test_negative_scale_numeric_keys_are_not_rounded(client: TestClient) -> None
         },
         headers=AUTH,
     )
+    if "error" in made.json():  # a negative scale needs PostgreSQL 15
+        pytest.skip(made.json()["error"])
     rows = "/api/tables/public/st_neg/rows"
     deleted = client.request("DELETE", rows, json={"keys": [{"k": "1250"}]}, headers=AUTH)
     assert deleted.json() == {"deleted": 0}
