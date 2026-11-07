@@ -379,10 +379,13 @@ def _order_sql(table: TableSnap, q: Mapping[str, str]) -> str:
     if order:
         column = _column(table, order)
         direction = "DESC" if q.get("dir") == "desc" else "ASC"
-        return f" ORDER BY t.{quote(column['name'])} {direction}"
-    if table["primary_key"]:
-        return " ORDER BY " + ", ".join(f"t.{quote(c)}" for c in table["primary_key"]["columns"])
-    return ""
+        sort = [f"t.{quote(column['name'])} {direction}"]
+    else:
+        sort = []
+    # S13: the key (or ctid) breaks ties, or OFFSET paging repeats and skips rows.
+    pk = table["primary_key"]
+    sort += [f"t.{quote(c)}" for c in pk["columns"]] if pk else ["t.ctid"]
+    return " ORDER BY " + ", ".join(sort)
 
 
 # A cell a spreadsheet would evaluate as a formula. CSV has no types, so the only defence is
@@ -406,6 +409,21 @@ def _csv_safe(text: str) -> str:
     # The spreadsheet skips leading whitespace, so " =1+1" and "\n=cmd" are formulas too.
     risky = text.startswith(("\t", "\r")) or text.lstrip().startswith(_FORMULA_LEAD)
     return f"'{text}" if risky else text
+
+
+def _base_type(column_type: str, snapshot: Snapshot) -> str:
+    """S7: a domain column's base type (through domains over domains), so a domain over
+    numeric or interval keeps its sign in CSV; any other type unchanged."""
+    domains = snapshot.get("domains", {})
+    seen: set[str] = set()
+    while column_type not in seen:
+        seen.add(column_type)
+        named = [d for d in domains.values() if d["name"] == column_type]
+        domain = domains.get(column_type) or (named[0] if len(named) == 1 else None)
+        if domain is None:
+            break
+        column_type = domain["base_type"]
+    return column_type
 
 
 def _cell(value: object, column_type: str) -> str:
@@ -618,7 +636,8 @@ async def export_rows(studio: Studio, request: Request) -> Response:
         "Cache-Control": "no-store",
     }
     columns = list(table["columns"])
-    types = [c["type"] for c in table["columns"].values()]
+    snapshot = await studio.load_snapshot()
+    types = [_base_type(c["type"], snapshot) for c in table["columns"].values()]
     batch_size = 1000
 
     def chunk(batch: Sequence[Row], first: bool) -> bytes:
@@ -637,7 +656,7 @@ async def export_rows(studio: Studio, request: Request) -> Response:
                 batch = await anext(batches, none)
                 if fmt == "csv":
                     buffer = io.StringIO()
-                    csv.writer(buffer).writerow(columns)
+                    csv.writer(buffer).writerow([_csv_safe(c) for c in columns])  # S10
                     head = buffer.getvalue().encode()
                 else:
                     head = b"["
@@ -693,8 +712,10 @@ async def insert_row(studio: Studio, request: Request) -> Response:
     else:
         sql = f"INSERT INTO {target} DEFAULT VALUES RETURNING {_row_sql(table)}"
     async with studio.pool().acquire() as conn:
-        [row] = await conn.fetch(sql, params)
-    return JSONResponse({"row": _row_json(cast(str, row[0]))}, status_code=201)
+        rows = await conn.fetch(sql, params)
+    if not rows:  # S14: a BEFORE trigger returned NULL (or a rule did nothing)
+        raise StudioError("no row was inserted: a trigger or rule on the table skipped it", 409)
+    return JSONResponse({"row": _row_json(cast(str, rows[0][0]))}, status_code=201)
 
 
 async def update_row(studio: Studio, request: Request) -> Response:
@@ -922,6 +943,13 @@ def _api(
             return await handler(studio, request)
         except StudioError as exc:
             return JSONResponse({"error": str(exc)}, status_code=exc.status)
+        except DatabaseError as exc:
+            # S9: the driver hides class-22 messages (they quote the value); here the user
+            # typed that value, so show the server's message (never its DETAIL).
+            message = getattr(exc.original, "message", None)
+            if (exc.sqlstate or "").startswith("22") and isinstance(message, str):
+                return JSONResponse({"error": message}, status_code=400)
+            return JSONResponse({"error": str(exc)}, status_code=400)
         except MizzleError as exc:
             return JSONResponse({"error": str(exc)}, status_code=400)
 
@@ -1297,15 +1325,16 @@ def serve(
         basic_auth=basic_auth,
     )
     mode = " (read-only)" if read_only else ""
+    netloc = f"[{host}]:{port}" if ":" in host else f"{host}:{port}"  # S12: IPv6 in brackets
     if loopback:
-        link = f"http://127.0.0.1:{port}/#token={token_value}"
+        link = f"http://{netloc if host == '::1' else f'127.0.0.1:{port}'}/#token={token_value}"
         print(f"mizzle studio{mode} running at {link}\nPress Ctrl+C to stop.")
         if open_browser:
             webbrowser.open(link)
     else:
         how = "HTTP Basic" if basic_auth else "the bearer token"
         print(
-            f"mizzle studio{mode} listening on {host}:{port} (authenticate with {how}).\n"
+            f"mizzle studio{mode} listening on {netloc} (authenticate with {how}).\n"
             "Press Ctrl+C to stop."
         )
     # uvicorn trusts X-Forwarded-For from 127.0.0.1 by default, so any local process could

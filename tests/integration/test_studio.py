@@ -1274,3 +1274,74 @@ def test_read_only_keeps_saved_queries_and_history_untouched(
             {"name": "top", "sql": "select 42"}
         ]
     assert state.read_text() == before
+
+
+def _sql(client: TestClient, sql: str) -> None:
+    response = client.post("/api/sql", json={"sql": sql}, headers=AUTH)
+    assert response.status_code == 200, response.text
+
+
+def test_csv_keeps_signed_values_of_domain_columns(client: TestClient) -> None:
+    # S7: a domain over numeric/interval read as text, so -5 exported as '-5.
+    _sql(
+        client,
+        "drop table if exists st_sdom; drop domain if exists st_amt2, st_amt, st_span; "
+        "create domain st_amt as numeric; create domain st_amt2 as st_amt; "
+        "create domain st_span as interval; "
+        "create table st_sdom (id int primary key, a st_amt, b st_amt2, c st_span); "
+        "insert into st_sdom values (1, -5, -1.5, '-1 day')",
+    )
+    text = client.get("/api/tables/public/st_sdom/export", headers=AUTH).text
+    assert list(csv.reader(io.StringIO(text)))[1] == ["1", "-5", "-1.5", "-1 days"]
+
+
+def test_data_errors_show_the_server_message(client: TestClient) -> None:
+    # S9: a class-22 error (invalid input syntax) came back as "invalid value (value hidden)".
+    _sql(client, "drop table if exists st_bad; create table st_bad (id int primary key)")
+    response = client.post(
+        "/api/tables/public/st_bad/rows", json={"values": {"id": "abc"}}, headers=AUTH
+    )
+    assert response.status_code == 400
+    assert response.json()["error"] == 'invalid input syntax for type integer: "abc"'
+
+
+def test_csv_header_is_formula_safe(client: TestClient) -> None:
+    # S10: a column named "=cmd()" went out raw in the header row.
+    _sql(client, 'drop table if exists st_head; create table st_head (id int, "=cmd()" int)')
+    text = client.get("/api/tables/public/st_head/export", headers=AUTH).text
+    assert next(csv.reader(io.StringIO(text))) == ["id", "'=cmd()"]
+
+
+def test_paging_by_a_non_unique_column_sees_every_row(client: TestClient) -> None:
+    # S13: ORDER BY a column full of ties had no tie-breaker, so pages repeated rows.
+    _sql(
+        client,
+        "drop table if exists st_tie; create table st_tie (id int primary key, g int); "
+        "insert into st_tie select i, 0 from generate_series(1, 30) i",
+    )
+    seen: list[int] = []
+    for offset in range(0, 30, 3):
+        page = client.get(
+            "/api/tables/public/st_tie/rows",
+            params={"order": "g", "limit": "3", "offset": str(offset)},
+            headers=AUTH,
+        ).json()
+        seen += [row["id"] for row in page["rows"]]
+    assert seen == list(range(1, 31))
+
+
+def test_insert_skipped_by_a_trigger_is_reported(client: TestClient) -> None:
+    # S14: a BEFORE trigger returning NULL left RETURNING empty, and the insert was a 500.
+    _sql(
+        client,
+        "drop table if exists st_skip; create table st_skip (id int primary key); "
+        "create or replace function st_skip_fn() returns trigger language plpgsql "
+        "as 'begin return null; end'; "
+        "create trigger st_skip_tr before insert on st_skip "
+        "for each row execute function st_skip_fn()",
+    )
+    response = client.post(
+        "/api/tables/public/st_skip/rows", json={"values": {"id": 1}}, headers=AUTH
+    )
+    assert response.status_code == 409
+    assert "no row was inserted" in response.json()["error"]
