@@ -185,7 +185,7 @@ def array_text(values: Sequence[object]) -> str:
         if isinstance(value, list):
             return array_text(cast(list[object], value))
         text = pg_text(value)
-        return '"NULL"' if text.upper() == "NULL" else _quoted(text, '{}",\\', '\\"')
+        return f'"{text}"' if text.upper() == "NULL" else _quoted(text, '{}",\\', '\\"')
 
     return "{" + ",".join(item(v) for v in values) + "}"
 
