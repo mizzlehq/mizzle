@@ -298,7 +298,12 @@ the history from the console, or delete the file.
 
 CSV export prefixes a text cell starting with `=`, `+`, `-` or `@` (also after leading
 whitespace) with an apostrophe, so a spreadsheet treats it as text rather than a formula.
-Numbers, intervals, dates and times are left as they are. JSON export is unaltered.
+Numbers, intervals, dates, times and JSON values are left as they are. JSON export is
+unaltered.
+
+`json`, `jsonb` and `numeric` cells (and arrays of them) are shown and edited as the
+database's own text, so `1.50` stays `1.50` and a big number inside JSON keeps every digit.
+Edit a JSON cell as JSON: a string keeps its quotes (`"42"`).
 
 In the browser, a table's **Structure** tab can create and alter tables and columns: add a
 table, add or drop a column, change a column's type, nullability or default, and drop a

@@ -40,6 +40,7 @@ from dataclasses import dataclass, field
 from decimal import Decimal
 from pathlib import Path
 from typing import Protocol, cast, override
+from urllib.parse import unquote
 
 from starlette.applications import Starlette
 from starlette.middleware import Middleware
@@ -50,7 +51,7 @@ from starlette.routing import BaseRoute, Mount, Route
 from starlette.staticfiles import StaticFiles
 from starlette.types import ASGIApp
 
-from mizzle.core.errors import MigrationError, MizzleError
+from mizzle.core.errors import DatabaseError, MigrationError, MizzleError
 from mizzle.core.query.base import Row
 from mizzle.core.snapshot import ColumnSnap, Snapshot, TableSnap, key
 from mizzle.dialects.base import Connection, Dialect, Driver
@@ -302,7 +303,7 @@ def _array(value: object, what: str) -> list[object]:
 
 
 # A size or precision modifier, or a quoted name (kept as it is).
-_TYPMOD = re.compile(r'"(?:[^"]|"")*"|\(\d+(?:\s*,\s*\d+)?\)')
+_TYPMOD = re.compile(r'"(?:[^"]|"")*"|\(-?\d+(?:\s*,\s*-?\d+)?\)')
 # Without its modifier, character means character(1) and bit means bit(1).
 _UNBOUNDED = {"character": "bpchar", "bit": "bit varying"}
 
@@ -394,7 +395,7 @@ _FORMULA_LEAD = ("=", "+", "-", "@")
 # ``day to second``.
 _SIGNED_TYPE = re.compile(
     r"(?:smallint|integer|bigint|(?:small|big)?serial|numeric|decimal|real|double precision"
-    r"|money|interval|date|time|timestamp)\b[a-z0-9 (),]*",
+    r"|money|interval|date|time|timestamp|jsonb?)\b[a-z0-9 (),]*",
     re.IGNORECASE,
 )
 
@@ -447,12 +448,29 @@ class _Named(Protocol):
     def keys(self) -> Iterable[str]: ...
 
 
-# Statements that return rows from a query, read through a cursor in the SQL console.
-_QUERY = re.compile(r"(?:SELECT|WITH|VALUES|TABLE)\b", re.IGNORECASE)
 # A browser reads a JSON number as a double: past 2**53 an integer is no longer exact.
 _EXACT_INT = 2**53
 # Each row as the server's JSON text, decoded by ``_row_json``.
 _ROW = "to_jsonb(t.*)::text"
+# Columns sent as their exact text: a JSON value or a numeric decoded into the browser's
+# doubles lost digits (1.50 -> 1.5) and turned big numbers inside JSON into strings, which
+# an edit then wrote back (S1, S3).
+_EXACT_TEXT = re.compile(r"(?:jsonb?|numeric)(?:\([^)]*\))?(?:\[\])*")
+# jsonb_build_object takes at most 100 arguments: 50 columns per call.
+_PAIRS = 50
+
+
+def _row_sql(table: TableSnap) -> str:
+    """``_ROW`` with the json, jsonb and numeric columns (and arrays of them) as text."""
+    names = [c["name"] for c in table["columns"].values() if _EXACT_TEXT.fullmatch(c["type"])]
+    if not names:
+        return _ROW
+    pairs = ["'" + n.replace("'", "''") + f"', t.{quote(n)}::text" for n in names]
+    parts = [
+        "jsonb_build_object(" + ", ".join(pairs[i : i + _PAIRS]) + ")"
+        for i in range(0, len(pairs), _PAIRS)
+    ]
+    return "(" + " || ".join(["to_jsonb(t.*)", *parts]) + ")::text"
 
 
 def _exact_int(text: str) -> int | str:
@@ -488,8 +506,14 @@ def _writable(studio: Studio) -> None:
 
 
 async def _table(studio: Studio, request: Request) -> TableSnap:
-    path: dict[str, object] = request.path_params
-    return await studio.table(str(path["schema"]), str(path["table"]))
+    """The table named in ``/api/tables/<schema>/<table>/<action>``. Read from the raw
+    path: the decoded one turns a "/" inside a name (sent as %2F) into a separator (S5)."""
+    raw = request.scope.get("raw_path")
+    path = raw.decode("ascii") if isinstance(raw, bytes) else str(request.url.path)
+    parts = path.split("/")
+    if len(parts) < 6:
+        raise StudioError("expected /api/tables/<schema>/<table>/...", 404)
+    return await studio.table(unquote(parts[-3]), unquote(parts[-2]))
 
 
 async def meta(studio: Studio, _request: Request) -> Response:
@@ -544,7 +568,8 @@ async def list_rows(studio: Studio, request: Request) -> Response:
     async with studio.pool().acquire() as conn:
         [total] = await conn.fetch(f"SELECT count(*) FROM {source}{where}", params)
         rows = await conn.fetch(
-            f"SELECT {_ROW} FROM {source}{where}{order_sql} LIMIT {limit} OFFSET {offset}",
+            f"SELECT {_row_sql(table)} FROM {source}{where}{order_sql}"
+            f" LIMIT {limit} OFFSET {offset}",
             params,
         )
     return JSONResponse({"total": total[0], "rows": [_row_json(cast(str, r[0])) for r in rows]})
@@ -584,7 +609,8 @@ async def export_rows(studio: Studio, request: Request) -> Response:
     where = _where(table, filters, params)
     order_sql = _order_sql(table, q)
     source = f"{qualified(table['schema'], table['name'])} AS t"
-    sql = f"SELECT {_ROW} FROM {source}{where}{order_sql}"
+    row = _row_sql(table) if fmt == "csv" else _ROW  # JSON export: the server's own JSON
+    sql = f"SELECT {row} FROM {source}{where}{order_sql}"
     headers = {
         "Content-Disposition": _download_name(table["schema"], table["name"], fmt),
         "Cache-Control": "no-store",
@@ -661,9 +687,9 @@ async def insert_row(studio: Studio, request: Request) -> Response:
         columns = [_column(table, c) for c in values]
         names = ", ".join(quote(c["name"]) for c in columns)
         placeholders = ", ".join(_param(params, c, values[c["name"]]) for c in columns)
-        sql = f"INSERT INTO {target} ({names}) VALUES ({placeholders}) RETURNING {_ROW}"
+        sql = f"INSERT INTO {target} ({names}) VALUES ({placeholders}) RETURNING {_row_sql(table)}"
     else:
-        sql = f"INSERT INTO {target} DEFAULT VALUES RETURNING {_ROW}"
+        sql = f"INSERT INTO {target} DEFAULT VALUES RETURNING {_row_sql(table)}"
     async with studio.pool().acquire() as conn:
         [row] = await conn.fetch(sql, params)
     return JSONResponse({"row": _row_json(cast(str, row[0]))}, status_code=201)
@@ -684,7 +710,7 @@ async def update_row(studio: Studio, request: Request) -> Response:
     match = _key_match(table, body.get("key"), params)
     sql = (
         f"UPDATE {qualified(table['schema'], table['name'])} AS t SET {sets} "
-        f"WHERE {match} RETURNING {_ROW}"
+        f"WHERE {match} RETURNING {_row_sql(table)}"
     )
     async with studio.pool().acquire() as conn:
         rows = await conn.fetch(sql, params)
@@ -707,6 +733,10 @@ async def delete_rows(studio: Studio, request: Request) -> Response:
             sql = f"DELETE FROM {qualified(table['schema'], table['name'])} AS t WHERE {match}"
             deleted += await conn.execute(sql, params)
     return JSONResponse({"deleted": deleted})
+
+
+# "cannot run inside a transaction block"
+_NO_TRANSACTION_BLOCK = "25001"
 
 
 def _reject_read_only(statements: Sequence[str]) -> None:
@@ -737,10 +767,9 @@ async def run_sql(studio: Studio, request: Request) -> Response:
         _reject_read_only(statements)
 
     async def first_rows(conn: Connection, statement: str) -> list[Row]:
-        """At most MAX_SQL_ROWS + 1 rows. A query is read through a cursor, so a huge
-        result is never loaded whole (C5); other statements return few rows."""
-        if not _QUERY.match(statement[first_token(statement) :]):
-            return await conn.fetch(statement, [])
+        """At most MAX_SQL_ROWS + 1 rows. Every statement runs through a cursor (a portal
+        with a row limit), so a huge result is never loaded whole, whatever its first
+        word: "(SELECT ...)", FETCH ALL, INSERT ... RETURNING (C5, S6)."""
         none: list[Row] = []
         async with aclosing(conn.cursor(statement, [], MAX_SQL_ROWS + 1)) as batches:
             return await anext(batches, none)
@@ -751,8 +780,15 @@ async def run_sql(studio: Studio, request: Request) -> Response:
             if studio.read_only:  # already inside the READ ONLY transaction
                 rows = await first_rows(conn, statement)
             else:  # a cursor needs a transaction; each statement commits on its own
-                async with conn.transaction():
-                    rows = await first_rows(conn, statement)
+                try:
+                    async with conn.transaction():
+                        rows = await first_rows(conn, statement)
+                except DatabaseError as exc:
+                    if exc.sqlstate != _NO_TRANSACTION_BLOCK:
+                        raise
+                    # VACUUM, CREATE DATABASE, ...: refused before they started, so running
+                    # them on their own is safe. They return no rows.
+                    rows = await conn.fetch(statement, [])
             shown = rows[:MAX_SQL_ROWS]
             # By position: a dict would merge two columns with the same name (C9).
             columns = list(cast(_Named, cast(object, rows[0])).keys()) if rows else []
@@ -1106,7 +1142,7 @@ def create_app(
         finally:
             await studio.driver.close()
 
-    tables_path = "/api/tables/{schema}/{table}/rows"
+    tables_path = "/api/tables/{names:path}/rows"
     routes: list[BaseRoute] = [
         Route("/api/meta", _api(studio, meta)),
         Route("/api/tables", _api(studio, tables)),
@@ -1116,7 +1152,7 @@ def create_app(
         Route(tables_path, _api(studio, update_row), methods=["PATCH"]),
         Route(tables_path, _api(studio, delete_rows), methods=["DELETE"]),
         Route(
-            "/api/tables/{schema}/{table}/export",
+            "/api/tables/{names:path}/export",
             _api(studio, export_rows),
             methods=["GET"],
         ),

@@ -1146,3 +1146,107 @@ def test_drop_table_drops_the_table_it_checked(client: TestClient) -> None:
         headers=AUTH,
     )
     assert preview.status_code == 400 and "does not exist" in preview.text
+
+
+def test_json_and_numeric_cells_keep_their_exact_text(client: TestClient) -> None:
+    # S1: big or precise numbers inside jsonb came back as strings, and an edit wrote the
+    # strings back. S2: jsonb "42" saved unchanged became the number 42. S3: CSV and the
+    # grid showed numeric 1.50 as 1.5.
+    client.post(
+        "/api/sql",
+        json={
+            "sql": "drop table if exists st_json; create table st_json (id int primary key, "
+            "j jsonb, s jsonb, n numeric(6,2), ns numeric[]); insert into st_json values "
+            """(1, '{"big": 12345678901234567890, "p": 0.1000000000000000055511151231257827,"""
+            """ "x": 1}', '"42"', 1.50, '{1.50,2}')"""
+        },
+        headers=AUTH,
+    )
+    rows = "/api/tables/public/st_json/rows"
+    [row] = client.get(rows, headers=AUTH).json()["rows"]
+    assert (
+        row["j"]
+        == '{"p": 0.1000000000000000055511151231257827, "x": 1, "big": 12345678901234567890}'
+    )
+    assert row["s"] == '"42"' and row["n"] == "1.50" and row["ns"] == "{1.50,2}"
+    edited = row["j"].replace('"x": 1', '"x": 2')
+    saved = client.patch(
+        rows, json={"key": {"id": 1}, "values": {"j": edited, "s": row["s"]}}, headers=AUTH
+    )
+    assert saved.status_code == 200, saved.text
+    check = client.post(
+        "/api/sql",
+        json={
+            "sql": "select jsonb_typeof(j->'big'), jsonb_typeof(j->'p'), jsonb_typeof(s) "
+            "from st_json"
+        },
+        headers=AUTH,
+    ).json()
+    assert check["rows"] == [["number", "number", "string"]]
+    text = client.get("/api/tables/public/st_json/export", headers=AUTH).text
+    [header, line] = list(csv.reader(io.StringIO(text)))
+    assert dict(zip(header, line, strict=True))["n"] == "1.50"
+    assert dict(zip(header, line, strict=True))["s"] == '"42"'
+    exported = client.get(
+        "/api/tables/public/st_json/export", params={"format": "json"}, headers=AUTH
+    ).text
+    assert '"big": 12345678901234567890' in exported
+
+
+def test_negative_scale_numeric_keys_are_not_rounded(client: TestClient) -> None:
+    # S4: numeric(5,-2) kept its modifier in the cast, so 1250 rounded to 1300 and the
+    # DELETE removed that row.
+    client.post(
+        "/api/sql",
+        json={
+            "sql": "drop table if exists st_neg; create table st_neg (k numeric(5,-2) "
+            "primary key); insert into st_neg values (1200), (1300)"
+        },
+        headers=AUTH,
+    )
+    rows = "/api/tables/public/st_neg/rows"
+    deleted = client.request("DELETE", rows, json={"keys": [{"k": "1250"}]}, headers=AUTH)
+    assert deleted.json() == {"deleted": 0}
+    assert client.get(rows, headers=AUTH).json()["total"] == 2
+
+
+def test_a_slash_in_a_table_name_is_routed(client: TestClient) -> None:
+    # S5: %2F was decoded before routing, so "a/b" fell through to a 404.
+    client.post(
+        "/api/sql",
+        json={"sql": 'drop table if exists "st/a"; create table "st/a" (id int primary key)'},
+        headers=AUTH,
+    )
+    client.get("/api/tables", headers=AUTH)  # load the snapshot
+    response = client.get("/api/tables/public/st%2Fa/rows", headers=AUTH)
+    assert response.status_code == 200, response.text
+    assert response.json()["total"] == 0
+
+
+def test_console_reads_every_statement_through_a_cursor(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # S6: only statements starting with SELECT/WITH/VALUES/TABLE used the cursor, so
+    # "(select ...)", FETCH ALL and INSERT ... RETURNING loaded every row.
+    from mizzle.dialects.postgres.driver import PostgresConnection
+
+    fetched: list[str] = []
+    original = PostgresConnection.fetch
+
+    async def spy(self: PostgresConnection, sql: str, *args: Any, **kwargs: Any) -> Any:
+        fetched.append(sql)
+        return await original(self, sql, *args, **kwargs)
+
+    monkeypatch.setattr(PostgresConnection, "fetch", spy)
+    for sql in (
+        "(select g from generate_series(1, 5000) g)",
+        "create temp table st_c (g int); insert into st_c select generate_series(1, 5000) "
+        "returning g",
+    ):
+        result = client.post("/api/sql", json={"sql": sql}, headers=AUTH).json()
+        last = result["results"][-1] if "results" in result else result
+        assert last["truncated"] is True and last["count"] == 1000
+    assert not [s for s in fetched if "5000" in s]
+    # Statements that cannot run in a transaction block still run.
+    vacuum = client.post("/api/sql", json={"sql": "vacuum"}, headers=AUTH)
+    assert vacuum.status_code == 200, vacuum.text
