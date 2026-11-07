@@ -1249,7 +1249,8 @@ def test_console_reads_every_statement_through_a_cursor(
         result = client.post("/api/sql", json={"sql": sql}, headers=AUTH).json()
         last = result["results"][-1] if "results" in result else result
         assert last["truncated"] is True and last["count"] == 1000
-    assert not [s for s in fetched if "5000" in s]
+    # A DECLARE returns no rows; its FETCH is limited (S4-4).
+    assert not [s for s in fetched if "5000" in s and not s.startswith("DECLARE")]
     # Statements that cannot run in a transaction block still run.
     vacuum = client.post("/api/sql", json={"sql": "vacuum"}, headers=AUTH)
     assert vacuum.status_code == 200, vacuum.text
@@ -1348,3 +1349,218 @@ def test_insert_skipped_by_a_trigger_is_reported(client: TestClient) -> None:
     )
     assert response.status_code == 409
     assert "no row was inserted" in response.json()["error"]
+
+
+def _rows(client: TestClient, table: str, **params: str) -> list[dict[str, Any]]:
+    response = client.get(f"/api/tables/public/{table}/rows", params=params, headers=AUTH)
+    assert response.status_code == 200, response.text
+    return response.json()["rows"]
+
+
+def _query(client: TestClient, sql: str) -> list[list[Any]]:
+    response = client.post("/api/sql", json={"sql": sql}, headers=AUTH)
+    assert response.status_code == 200, response.text
+    return response.json()["rows"]
+
+
+@pytest.mark.parametrize(
+    ("decl", "literal", "grid", "cell"),
+    [
+        # S4-5: a domain over numeric lost its zeros, one over jsonb its big numbers.
+        ("numeric(30,10)", "1.50", "1.5000000000", None),
+        ("jsonb", """'{"big": 12345678901234567890}'""", '{"big": 12345678901234567890}', None),
+        # S4-1: a JSON string came out of a json domain as a bare formula.
+        ("json", """'"=HYPERLINK(1)"'""", '"=HYPERLINK(1)"', None),
+        ("jsonb", """'"=1+1"'""", '"=1+1"', None),
+        # S4-6: a domain whose name needs quotes kept its CSV sign prefix.
+        ("numeric", "-2", "-2", None),
+        ("interval", "'-1 day'", "-1 days", None),
+        # An array of a domain, and a domain over an array.
+        ("jsonb[]", """array['{"a": 1}'::jsonb]""", '{"{\\"a\\": 1}"}', None),
+        ("numeric(4,2)[]", "'{1.50}'", "{1.50}", None),
+        # Text is still neutralised.
+        ("text", "'=1+1'", "=1+1", "'=1+1"),
+    ],
+)
+@pytest.mark.parametrize("name", ["st_basedom", '"St Base Dom"'])
+def test_a_domain_behaves_like_its_base_type(
+    client: TestClient, decl: str, literal: str, grid: str, cell: str | None, name: str
+) -> None:
+    # A jsonb[] case is an array of the domain; every other one a domain over ``decl``.
+    of_domain = decl == "jsonb[]"
+    _sql(
+        client,
+        f"drop table if exists st_domt; drop domain if exists {name}; "
+        f"create domain {name} as {decl.removesuffix('[]') if of_domain else decl}; "
+        f"create table st_domt (id int primary key, c {name}{'[]' if of_domain else ''}); "
+        f"insert into st_domt values (1, {literal})",
+    )
+    [row] = _rows(client, "st_domt")
+    assert row["c"] == grid
+    text = client.get("/api/tables/public/st_domt/export", headers=AUTH).text
+    assert list(csv.reader(io.StringIO(text)))[1][1] == (cell or grid)
+    # Saving the cell unchanged keeps the value.
+    before = _query(client, "select c::text from st_domt")
+    saved = client.patch(
+        "/api/tables/public/st_domt/rows",
+        json={"key": {"id": 1}, "values": {"c": row["c"]}},
+        headers=AUTH,
+    )
+    assert saved.status_code == 200, saved.text
+    assert _query(client, "select c::text from st_domt") == before
+
+
+@pytest.mark.parametrize("decl", ["int[]", "st_pair", "st_pair[]", "st_dpair", "st_dpair[]"])
+def test_array_and_composite_keys_and_cells(client: TestClient, decl: str) -> None:
+    # S4-8: the grid's key (to_jsonb's list or object) was sent as "[1, 2]" text, a
+    # malformed array or record literal, so such rows could not be changed.
+    one = "'{1,2}'" if decl == "int[]" else f"row(1, 'x')::{decl.removesuffix('[]')}"
+    literal = f"array[{one}]" if decl.endswith("[]") and decl != "int[]" else one
+    _sql(
+        client,
+        "drop table if exists st_ck; drop domain if exists st_dpair; "
+        "drop type if exists st_pair; create type st_pair as (a int, b text); "
+        "create domain st_dpair as st_pair; "
+        f"create table st_ck (k {decl} primary key, c {decl}, v text); "
+        f"insert into st_ck values ({literal}, {literal}, 'a')",
+    )
+    rows = "/api/tables/public/st_ck/rows"
+    [row] = _rows(client, "st_ck")
+    assert isinstance(row["k"], list | dict)
+    updated = client.patch(
+        rows, json={"key": {"k": row["k"]}, "values": {"v": "b", "c": row["c"]}}, headers=AUTH
+    )
+    assert updated.status_code == 200, updated.text
+    assert updated.json()["row"]["v"] == "b" and updated.json()["row"]["c"] == row["c"]
+    deleted = client.request("DELETE", rows, json={"keys": [{"k": row["k"]}]}, headers=AUTH)
+    assert deleted.json() == {"deleted": 1}
+
+
+def test_console_transaction_control_runs_as_written(client: TestClient) -> None:
+    # S4-2: each statement ran in a transaction of its own, so ROLLBACK undid nothing.
+    _sql(
+        client,
+        "drop table if exists st_tx; create table st_tx (v int); insert into st_tx values (0)",
+    )
+    _sql(client, "begin; update st_tx set v = 1; rollback")
+    assert _query(client, "select v from st_tx") == [[0]]
+    _sql(client, "begin; update st_tx set v = 2")  # left open: rolled back, not committed
+    assert _query(client, "select v from st_tx") == [[0]]
+    failed = client.post(
+        "/api/sql", json={"sql": "begin; update st_tx set v = 3; select 1/0; commit"}, headers=AUTH
+    )
+    assert failed.status_code == 400
+    assert _query(client, "select v from st_tx") == [[0]]
+    _sql(
+        client,
+        "begin; update st_tx set v = 4; savepoint s; update st_tx set v = 5; rollback to s; commit",
+    )
+    assert _query(client, "select v from st_tx") == [[4]]
+
+
+def test_console_runs_a_query_to_its_end(client: TestClient) -> None:
+    # S4-4: the cursor stopped after 1001 rows, so a volatile function ran for those only.
+    _sql(
+        client,
+        "drop table if exists st_log; create table st_log (n int); "
+        "create or replace function st_logit(i int) returns int language sql volatile "
+        "as 'insert into st_log values (i) returning i'",
+    )
+    result = client.post(
+        "/api/sql", json={"sql": "select st_logit(g) from generate_series(1, 3000) g"}, headers=AUTH
+    ).json()
+    assert result["truncated"] is True and result["count"] == 1000
+    assert _query(client, "select count(*) from st_log") == [[3000]]
+
+
+def test_writes_follow_schema_changes(client: TestClient) -> None:
+    # S4-3: the snapshot outlived DDL run in the console, so a time cast to the old date
+    # type was dropped, and a key whose primary key was gone changed two rows.
+    _sql(
+        client,
+        "drop table if exists st_stale; "
+        "create table st_stale (id int primary key, at date); "
+        "insert into st_stale values (1, null)",
+    )
+    client.get("/api/tables", headers=AUTH)  # the UI's start: the snapshot is cached
+    _sql(client, "alter table st_stale alter column at type timestamp")
+    saved = client.patch(
+        "/api/tables/public/st_stale/rows",
+        json={"key": {"id": 1}, "values": {"at": "2024-03-03 10:30"}},
+        headers=AUTH,
+    )
+    assert saved.status_code == 200, saved.text
+    assert _query(client, "select at::text from st_stale") == [["2024-03-03 10:30:00"]]
+    # A parent's primary key does not cover its children: one key, two rows.
+    _sql(
+        client,
+        "drop table if exists st_kid, st_parent; "
+        "create table st_parent (id int primary key, v text); "
+        "create table st_kid () inherits (st_parent); "
+        "insert into st_parent values (1, 'a'); insert into st_kid values (1, 'a')",
+    )
+    rows = "/api/tables/public/st_parent/rows"
+    update = client.patch(rows, json={"key": {"id": 1}, "values": {"v": "b"}}, headers=AUTH)
+    assert update.status_code == 409 and "2 rows" in update.json()["error"]
+    delete = client.request("DELETE", rows, json={"keys": [{"id": 1}]}, headers=AUTH)
+    assert delete.status_code == 409
+    assert _query(client, "select v from st_parent") == [["a"], ["a"]]
+
+
+def test_paging_a_partitioned_table_without_a_key(client: TestClient) -> None:
+    # S4-7: a ctid is unique per partition only, so pages repeated and skipped rows.
+    partitions = "".join(
+        f"create table st_part{i} partition of st_part for values in ({i}); " for i in range(8)
+    )
+    _sql(
+        client,
+        "drop table if exists st_part; "
+        f"create table st_part (p int, n int) partition by list (p); {partitions}"
+        "insert into st_part select p, p * 100 + g from generate_series(0, 7) p, "
+        "generate_series(1, 30) g",
+    )
+    seen = [
+        row["n"]
+        for offset in range(0, 240, 50)
+        for row in _rows(client, "st_part", limit="50", offset=str(offset))
+    ]
+    assert sorted(seen) == sorted(p * 100 + g for p in range(8) for g in range(1, 31))
+
+
+def test_columns_without_an_order_are_not_sortable(client: TestClient) -> None:
+    # S4-9: sorting json/xml/point failed in the database, and the UI offered it.
+    _sql(
+        client,
+        "drop table if exists st_sort; drop domain if exists st_dj; create domain st_dj as json; "
+        "create table st_sort (id int primary key, j json, d st_dj, x xml, pt point, "
+        "ja json[], n numeric)",
+    )
+    tables = client.get("/api/tables", headers=AUTH).json()["tables"]
+    [table] = [t for t in tables if t["name"] == "st_sort"]
+    assert table["unsortable"] == ["j", "d", "x", "pt", "ja"]
+    for column in table["unsortable"]:
+        response = client.get(
+            "/api/tables/public/st_sort/rows", params={"order": column}, headers=AUTH
+        )
+        assert response.status_code == 400
+        assert response.json()["error"].startswith(f"cannot sort by {column}")
+    _rows(client, "st_sort", order="n")
+
+
+def test_update_skipped_by_a_trigger_is_reported(client: TestClient) -> None:
+    # S4-10: a BEFORE UPDATE trigger returning NULL answered 404 "row not found".
+    _sql(
+        client,
+        "drop table if exists st_uskip; create table st_uskip (id int primary key, v text); "
+        "insert into st_uskip values (1, 'a'); "
+        "create or replace function st_uskip_fn() returns trigger language plpgsql "
+        "as 'begin return null; end'; "
+        "create trigger st_uskip_tr before update on st_uskip "
+        "for each row execute function st_uskip_fn()",
+    )
+    rows = "/api/tables/public/st_uskip/rows"
+    response = client.patch(rows, json={"key": {"id": 1}, "values": {"v": "b"}}, headers=AUTH)
+    assert response.status_code == 409
+    assert "no row was updated" in response.json()["error"]
+    missing = client.patch(rows, json={"key": {"id": 2}, "values": {"v": "b"}}, headers=AUTH)
+    assert missing.status_code == 404

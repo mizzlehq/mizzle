@@ -30,6 +30,10 @@ import {
 } from "@/lib/api"
 
 const READ_ONLY_SQL = /^\s*(select|with|explain|show|table|values)\b/i
+// S4-11: a statement that starts like a query can still write ("with d as (delete ...)",
+// "select ... into", "explain analyze delete"). Any of these words asks first.
+const MAY_WRITE =
+  /\b(insert|update|delete|merge|into|truncate|create|drop|alter|analy[sz]e|copy|call|do|lock|grant|revoke|nextval|setval|refresh|vacuum|notify|set_config)\b/i
 const PREVIEW = 60
 
 type Panel = "history" | "saved" | null
@@ -77,7 +81,7 @@ function ResultTable({ result }: { result: SqlStatementResult }) {
   )
 }
 
-export function SqlConsole({ readOnly }: { readOnly: boolean }) {
+export function SqlConsole({ readOnly, onRan }: { readOnly: boolean; onRan: () => void }) {
   const [text, setText] = useState("select now()")
   const [results, setResults] = useState<SqlStatementResult[]>([])
   const [error, setError] = useState<string | null>(null)
@@ -114,6 +118,7 @@ export function SqlConsole({ readOnly }: { readOnly: boolean }) {
     } finally {
       setRunning(false)
       void refresh()
+      if (!readOnly) onRan() // S4-3: the batch may have changed the schema
     }
   }
 
@@ -122,7 +127,8 @@ export function SqlConsole({ readOnly }: { readOnly: boolean }) {
     .split(";")
     .map((s) => s.trim())
     .filter(Boolean)
-  const onlyReads = statements.length > 0 && statements.every((s) => READ_ONLY_SQL.test(s))
+  const onlyReads =
+    statements.length > 0 && statements.every((s) => READ_ONLY_SQL.test(s) && !MAY_WRITE.test(s))
   const run = () => {
     if (!text.trim() || running) return
     if (!readOnly && !onlyReads) setConfirm(true)
@@ -175,10 +181,12 @@ export function SqlConsole({ readOnly }: { readOnly: boolean }) {
               <PlayIcon />
               {running ? "Running…" : "Run"}
             </Button>
-            <Button variant="outline" onClick={() => void save()}>
-              <SaveIcon />
-              Save
-            </Button>
+            {!readOnly && (
+              <Button variant="outline" onClick={() => void save()}>
+                <SaveIcon />
+                Save
+              </Button>
+            )}
             <Button
               variant="outline"
               aria-pressed={panel === "history"}
@@ -279,19 +287,21 @@ export function SqlConsole({ readOnly }: { readOnly: boolean }) {
                   >
                     {query.name}
                   </button>
-                  <Button
-                    size="icon-xs"
-                    variant="ghost"
-                    aria-label={`Delete ${query.name}`}
-                    onClick={() => void remove(query.name)}
-                  >
-                    <Trash2Icon />
-                  </Button>
+                  {!readOnly && (
+                    <Button
+                      size="icon-xs"
+                      variant="ghost"
+                      aria-label={`Delete ${query.name}`}
+                      onClick={() => void remove(query.name)}
+                    >
+                      <Trash2Icon />
+                    </Button>
+                  )}
                 </div>
               ))}
             {panel === "saved" && saved.length === 0 && (
               <p className="p-2 text-muted-foreground text-xs">
-                No saved queries. Name one with Save.
+                {readOnly ? "No saved queries." : "No saved queries. Name one with Save."}
               </p>
             )}
           </div>
