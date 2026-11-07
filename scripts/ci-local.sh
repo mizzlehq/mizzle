@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Run what .github/workflows/ci.yml runs, on this machine, before a push.
 # Needs docker, uv and pnpm. Logs go to .ci-local/. Exit code 0 = every job passed.
+# In a terminal it shows a live board: each job, its state, time and last log line.
 #   scripts/ci-local.sh            all jobs
 #   scripts/ci-local.sh test       only the PostgreSQL x Python matrix
 set -uo pipefail
@@ -71,12 +72,70 @@ infra() {
       uv run pytest -q tests/test_load.py -k restart
 }
 
-declare -A PIDS
+JOBS=()
+START=$SECONDS
 run() {  # $1 = job name, rest = command; runs in the background, log in .ci-local/
-  ("${@:2}") >"$LOGS/$1.log" 2>&1 &
-  PIDS[$1]=$!
+  rm -f "$LOGS/$1.rc" "$LOGS/$1.start" "$LOGS/$1.end"
+  [ " ${JOBS[*]} " == *" $1 "* ]] || JOBS+=("$1")
+  (
+    echo $SECONDS >"$LOGS/$1.start"
+    ("${@:2}") >"$LOGS/$1.log" 2>&1
+    rc=$?
+    echo $SECONDS >"$LOGS/$1.end"
+    echo $rc >"$LOGS/$1.rc"
+  ) &
 }
 
+# Ctrl-C: stop every job and remove the test servers.
+cleanup() {
+  kill $(jobs -p) 2>/dev/null
+  docker rm -f $(docker ps -aq --filter name=mizzle-ci-) >/dev/null 2>&1
+  [ -t 1 ] && tput cnorm
+  exit 130
+}
+trap cleanup INT TERM
+
+state() {  # $1 = job: prints running / PASS / FAIL / waiting
+  if [ -f "$LOGS/$1.rc" ]; then
+    [ "$(cat "$LOGS/$1.rc")" = 0 ] && echo PASS || echo FAIL
+  elif [ -f "$LOGS/$1.start" ]; then echo running
+  else echo waiting; fi
+}
+
+LIVE=0
+[ -t 1 ] && LIVE=1
+draw() {  # one screen: a line per job with its state, time and last log line
+  local cols job s since ended last color
+  cols=$(tput cols 2>/dev/null || echo 120)
+  printf '\033[H\033[1mmizzle local CI\033[0m  %ds   logs: %s\033[K\n\033[K\n' \
+    $((SECONDS - START)) "$LOGS"
+  for job in "${JOBS[@]}"; do
+    s=$(state "$job")
+    case $s in PASS) color=32 ;; FAIL) color=31 ;; running) color=33 ;; *) color=90 ;; esac
+    since=$(cat "$LOGS/$job.start" 2>/dev/null || echo $SECONDS)
+    ended=$(cat "$LOGS/$job.end" 2>/dev/null || echo $SECONDS)
+    # The last non-empty line; pytest -q prints its progress as "....  [ 45%]".
+    last=$(tail -c 4000 "$LOGS/$job.log" 2>/dev/null | tr '\r' '\n' | grep -v '^[[:space:]]*$' |
+      tail -n 1 | sed 's/\x1b\[[0-9;]*m//g')
+    [ "$s" = waiting ] && last=""
+    printf '\033[%sm%-8s\033[0m %-20s %4ss  %s\033[K\n' "$color" "$s" "$job" \
+      $((ended - since)) "${last:0:$((cols - 38))}"
+  done
+  printf '\033[J'
+}
+
+watch_jobs() {  # until every started job has its .rc file
+  local job busy
+  while :; do
+    busy=0
+    for job in "${JOBS[@]}"; do [ "$(state "$job")" = running ] && busy=1; done
+    [ $LIVE = 1 ] && draw
+    [ $busy = 0 ] && return
+    sleep 1
+  done
+}
+
+[ $LIVE = 1 ] && { tput civis; printf '\033[2J'; }
 # The matrix runs in parallel (one server per entry); infra after it, since a restart of the
 # infra primary must not overlap anything.
 if [ "$ONLY" = all ]; then
@@ -89,12 +148,27 @@ for entry in "${MATRIX[@]}"; do
   py=${entry%/*} pg=${entry#*/}
   run "test-py$py-pg$pg" test_one "$py" "$pg" $((port++))
 done
+if [ "$ONLY" = all ]; then
+  JOBS+=(infra)  # shown as waiting until the matrix is done
+  rm -f "$LOGS/infra.rc" "$LOGS/infra.start" "$LOGS/infra.end"
+fi
+sleep 1  # every job has written its .start
+watch_jobs
+if [ "$ONLY" = all ]; then
+  run infra infra
+  sleep 1
+  watch_jobs
+fi
+[ $LIVE = 1 ] && tput cnorm
 
 failed=0
-for job in "${!PIDS[@]}"; do
-  if wait "${PIDS[$job]}"; then echo "PASS $job"; else echo "FAIL $job  ($LOGS/$job.log)"; failed=1; fi
+for job in "${JOBS[@]}"; do
+  if [ "$(state "$job")" = PASS ]; then
+    [ $LIVE = 1 ] || echo "PASS $job"
+  else
+    echo "FAIL $job  ($LOGS/$job.log)"
+    failed=1
+  fi
 done
-if [ "$ONLY" = all ]; then
-  if (infra) >"$LOGS/infra.log" 2>&1; then echo "PASS infra"; else echo "FAIL infra  ($LOGS/infra.log)"; failed=1; fi
-fi
+[ $failed = 0 ] && echo "all jobs passed"
 exit $failed
