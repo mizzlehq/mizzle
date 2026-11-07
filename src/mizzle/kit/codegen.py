@@ -100,7 +100,11 @@ def _identifier(name: str) -> str:
 def _class_name(name: str) -> str:
     # Upper-case only the first letter of each part: NotificationStatus stays as it is.
     parts = re.split(r"[^a-zA-Z0-9]+", name)
-    return "".join(part[0].upper() + part[1:] for part in parts if part) or "T"
+    ident = "".join(part[0].upper() + part[1:] for part in parts if part) or "T"
+    # A leading digit ("2e") or a capitalized keyword ("None") is not a class name (C26).
+    if ident[0].isdigit():
+        ident = f"T{ident}"
+    return f"{ident}_" if keyword.iskeyword(ident) else ident
 
 
 def _words(name: str) -> list[str]:

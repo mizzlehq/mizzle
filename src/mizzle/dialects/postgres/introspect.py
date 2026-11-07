@@ -88,6 +88,7 @@ ORDER BY pn.nspname, pc.relname, c.relname
 
 _COLUMNS = """
 SELECT a.attrelid AS table_oid, a.attname AS name,
+       pg_get_serial_sequence(a.attrelid::regclass::text, a.attname) AS owned_sequence,
        format_type(a.atttypid, a.atttypmod) AS type, a.attnotnull AS not_null,
        pg_get_expr(d.adbin, d.adrelid) AS default,
        a.attidentity::text AS identity, a.attgenerated::text AS generated,
@@ -363,7 +364,15 @@ def _column(row: _Row) -> ColumnSnap:
     name, sql_type, not_null = str(row["name"]), str(row["type"]), bool(row["not_null"])
     default = _opt_str(row["default"])
     serial = next((s for s, base in SERIAL_TYPES.items() if base == sql_type), None)
-    if serial is not None and default is not None and _NEXTVAL.fullmatch(default):
+    # Only a sequence the column owns (what serial creates; its name survives a rename): a
+    # shared or hand-made sequence pulled as serial() changed the column on the next
+    # generate (C26).
+    if (
+        serial is not None
+        and row["owned_sequence"] is not None
+        and default is not None
+        and _NEXTVAL.fullmatch(default)
+    ):
         column = ColumnSnap(name=name, type=serial, not_null=not_null, default=None)
         if (comment := _opt_str(row["comment"])) is not None:
             column["comment"] = comment
@@ -507,9 +516,19 @@ def _index(row: _Row) -> IndexSnap:
     return index
 
 
+def _not_modelled(what: str, option: str) -> None:
+    log.warning(
+        "mizzle: %s uses %s, which mizzle does not model; a schema built from this one "
+        "creates it without it",
+        what,
+        option,
+    )
+
+
 def _check_expression(definition: str) -> str:
     # pg_get_constraintdef: "CHECK ((title <> ''::text))" -> "(title <> ''::text)"
-    expr = definition.removeprefix("CHECK ").removesuffix(" NOT VALID")
+    # NO INHERIT is not modelled: kept in the text it made the next migrate fail (C26).
+    expr = definition.removeprefix("CHECK ").removesuffix(" NOT VALID").removesuffix(" NO INHERIT")
     return expr[1:-1] if expr.startswith("(") and expr.endswith(")") else expr
 
 
@@ -612,7 +631,10 @@ async def introspect(
                     unique["initially_deferred"] = True
                 table["uniques"][name] = unique
             case "c":
-                expression = _check_expression(str(row["definition"]))
+                definition = str(row["definition"])
+                if " NO INHERIT" in definition:
+                    _not_modelled(f"check {name}", "NO INHERIT")
+                expression = _check_expression(definition)
                 check = CheckSnap(name=name, expression=expression)
                 if not row["validated"]:
                     check["not_valid"] = True
@@ -633,6 +655,8 @@ async def introspect(
                     fk["initially_deferred"] = True
                 if not row["validated"]:
                     fk["not_valid"] = True
+                if " MATCH FULL" in str(row["definition"]):
+                    _not_modelled(f"foreign key {name}", "MATCH FULL")
                 table["foreign_keys"][name] = fk
             case "x":
                 elements: list[ExclusionElementSnap] = []

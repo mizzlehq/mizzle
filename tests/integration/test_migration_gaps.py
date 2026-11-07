@@ -1500,3 +1500,30 @@ async def test_an_identity_added_to_a_column_with_rows_starts_after_them(
     await migrate(driver, v1, snap([Identity]))
     [row] = await execute(driver, "INSERT INTO mg.ids (note) VALUES ('c') RETURNING id")
     assert row["id"] == 3
+
+
+async def test_pull_writes_valid_code_for_awkward_objects(
+    driver: PostgresDriver, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    # C26: a table or enum named with a leading digit gave `class 2e`, NO INHERIT broke the
+    # next migrate, MATCH FULL was dropped silently, and a column on a shared sequence
+    # became serial().
+    async with driver.acquire() as conn:
+        await conn.execute(
+            "CREATE SCHEMA mg; CREATE TYPE mg.\"2e\" AS ENUM ('a'); "
+            'CREATE TABLE mg."1stuff" (id int PRIMARY KEY, e mg."2e"); '
+            "CREATE TABLE mg.chk (a int, CONSTRAINT pos CHECK (a > 0) NO INHERIT); "
+            "CREATE TABLE mg.ref (id int PRIMARY KEY); "
+            "CREATE TABLE mg.fk (a int, CONSTRAINT f FOREIGN KEY (a) REFERENCES mg.ref "
+            "MATCH FULL); CREATE SEQUENCE mg.shared START 100; "
+            "CREATE TABLE mg.seq (n int DEFAULT nextval('mg.shared'))",
+            [],
+        )
+    with caplog.at_level("WARNING", logger="mizzle"):
+        source = await assert_pull_round_trip(driver, tmp_path)
+    assert "class T1stuff(" in source and "class T2e(" in source
+    assert "NO INHERIT" not in source
+    assert "serial()" not in source
+    messages = [r.getMessage() for r in caplog.records]
+    assert any("NO INHERIT" in m for m in messages)
+    assert any("MATCH FULL" in m for m in messages)
