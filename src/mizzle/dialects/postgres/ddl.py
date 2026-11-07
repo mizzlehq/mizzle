@@ -528,7 +528,16 @@ def _set_expression(step: AlterColumnGenerated, new: GeneratedSnap) -> str:
         "IF current_setting('server_version_num')::int >= 170000 THEN\n"
         f"  EXECUTE {_literal(set_expression)};\n"
         "ELSE\n"
-        "  SELECT array_agg(d) INTO defs FROM (\n"
+        # Constraints and indexes on the column are made again below; nothing else (K6-10).
+        + _unmanaged_check(
+            table,
+            step.table,
+            step.column,
+            " AND d.classid <> 'pg_constraint'::regclass AND NOT EXISTS (SELECT 1 FROM pg_class "
+            "i WHERE d.classid = 'pg_class'::regclass AND i.oid = d.objid "
+            "AND i.relkind IN ('i', 'I'))",
+        )
+        + "  SELECT array_agg(d) INTO defs FROM (\n"
         "    SELECT format('ALTER TABLE %s ADD CONSTRAINT %I %s', "
         f"{rel}, conname, pg_get_constraintdef(c.oid)) AS d\n"
         "    FROM pg_constraint c JOIN pg_attribute a ON a.attrelid = c.conrelid\n"
@@ -753,6 +762,14 @@ def _save_grants(name: str) -> str:
     )
     return (
         "DO $mizzle$ BEGIN\n"
+        # PostgreSQL has no statement to disable a view's trigger or rule (only a catalog
+        # edit does it): it would come back enabled, so stop before the view is dropped (K6-11).
+        f"IF EXISTS (SELECT 1 FROM pg_trigger WHERE tgrelid = {rel}::regclass "
+        "AND NOT tgisinternal AND tgenabled <> 'O') OR EXISTS (SELECT 1 FROM pg_rewrite "
+        f"WHERE ev_class = {rel}::regclass AND rulename <> '_RETURN' AND ev_enabled <> 'O') THEN\n"
+        f"  RAISE EXCEPTION 'view % has a disabled trigger or rule, which would come back "
+        f"enabled when it is created again; this needs a custom migration', {rel};\n"
+        "END IF;\n"
         f"CREATE TEMP TABLE IF NOT EXISTS __mizzle_saved "
         "(rel text PRIMARY KEY, acl aclitem[], owner oid, comment text);\n"
         "CREATE TEMP TABLE IF NOT EXISTS __mizzle_saved_sql (rel text, col name, stmt text);\n"
@@ -831,10 +848,17 @@ def _rebuild_guard(step: DropColumn) -> str:
     """Stop before a column is dropped to be added again if anything mizzle does not manage
     uses it (column grants, exclusion constraints, triggers...): the drop would take it
     silently (K6-7). What mizzle manages on it (keys, indexes, views) is gone by then."""
-    rel, col = _literal(qualified(step.schema, step.table)), _literal(step.name)
-    what = _literal(f"{step.table}.{step.name}")
+    table = qualified(step.schema, step.table)
+    return f"DO $mizzle$ BEGIN\n{_unmanaged_check(table, step.table, step.name)}END $mizzle$"
+
+
+def _unmanaged_check(table: str, name: str, column: str, restored: str = "") -> str:
+    """The IF ... RAISE that refuses to drop a column something unmanaged depends on.
+    `restored` is an extra SQL condition on the dependency `d` for what the caller
+    makes again after the drop."""
+    rel, col = _literal(table), _literal(column)
+    what = _literal(f"{name}.{column}")
     return (
-        "DO $mizzle$ BEGIN\n"
         "IF EXISTS (SELECT 1 FROM pg_attribute a WHERE a.attrelid = "
         f"{rel}::regclass AND a.attname = {col} AND a.attacl IS NOT NULL)\n"
         "OR EXISTS (SELECT 1 FROM pg_depend d JOIN pg_attribute a ON a.attrelid = d.refobjid "
@@ -844,12 +868,11 @@ def _rebuild_guard(step: DropColumn) -> str:
         "AND NOT EXISTS (SELECT 1 FROM pg_class s WHERE d.classid = 'pg_class'::regclass "
         "AND s.oid = d.objid AND s.relkind = 'S') "
         "AND NOT EXISTS (SELECT 1 FROM pg_constraint n WHERE d.classid = "
-        "'pg_constraint'::regclass AND n.oid = d.objid AND n.contype = 'n')) THEN\n"
+        f"'pg_constraint'::regclass AND n.oid = d.objid AND n.contype = 'n'){restored}) THEN\n"
         f"  RAISE EXCEPTION 'column % is dropped and added again, which would drop the grants, "
         "constraints or triggers on it that mizzle does not manage; this needs a custom "
         f"migration', {what};\n"
         "END IF;\n"
-        "END $mizzle$"
     )
 
 

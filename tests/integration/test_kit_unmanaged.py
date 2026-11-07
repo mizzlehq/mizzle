@@ -12,6 +12,7 @@ from mizzle import QueryBuilder, Table, View, sql
 from mizzle.core.errors import DatabaseError, SchemaError
 from mizzle.core.snapshot import Snapshot, empty_snapshot
 from mizzle.core.sql.nodes import Node
+from mizzle.core.steps import Statement
 from mizzle.dialects.postgres import PostgresDialect, ddl
 from mizzle.dialects.postgres.driver import PostgresDriver
 from mizzle.kit.diff import diff
@@ -52,10 +53,14 @@ async def live(url: str, schemas: Sequence[str] = ("public",)) -> Snapshot:
 
 
 async def migrate(url: str, old: Snapshot, new: Snapshot) -> None:
+    await apply(url, dialect.render(diff(old, new)))
+
+
+async def apply(url: str, statements: list[Statement]) -> None:
     driver = await PostgresDriver.connect(url, pool_size=1)
     try:
         async with driver.acquire() as conn:
-            await apply_statements(conn, dialect.render(diff(old, new)))
+            await apply_statements(conn, statements)
     finally:
         await driver.close()
 
@@ -103,6 +108,39 @@ async def test_recreated_view_keeps_triggers_rules_and_column_grants(kit_url: st
     assert row["triggers"] == ["t_view"] and row["rules"] == ["r_del"]
     assert row["acl"] is not None and "=w/" in row["acl"]
     await execute(kit_url, "INSERT INTO v_items (name) VALUES ('a')")  # the trigger works
+
+
+@pytest.mark.parametrize(
+    ("unmanaged", "catalog"),
+    [
+        (
+            "CREATE TRIGGER t_view INSTEAD OF INSERT ON v_items FOR EACH ROW "
+            "EXECUTE FUNCTION trg_v()",
+            "UPDATE pg_trigger SET tgenabled = 'D' WHERE tgname = 't_view'",
+        ),
+        (
+            "CREATE RULE r_del AS ON DELETE TO v_items DO INSTEAD NOTHING",
+            "UPDATE pg_rewrite SET ev_enabled = 'R' WHERE rulename = 'r_del'",
+        ),
+    ],
+)
+async def test_recreating_a_view_refuses_to_enable_its_disabled_triggers_and_rules(
+    kit_url: str, unmanaged: str, catalog: str
+) -> None:
+    # K6-11: a disabled trigger or rule came back enabled. No ALTER disables one on a view,
+    # so it is a catalog edit, and making it again would need one too.
+    v1 = build_snapshot([Items, items_view("")], dialect)
+    await migrate(kit_url, empty_snapshot("postgresql"), v1)
+    await execute(
+        kit_url,
+        "CREATE FUNCTION trg_v() RETURNS trigger LANGUAGE plpgsql AS "
+        f"$f$ BEGIN RETURN NEW; END $f$; {unmanaged}; {catalog}",
+    )
+    v2 = build_snapshot([Items, items_view(" WHERE id > 0")], dialect)
+    with pytest.raises(DatabaseError, match="disabled trigger or rule"):
+        await migrate(kit_url, v1, v2)
+    await execute(kit_url, catalog.replace("'D'", "'O'").replace("'R'", "'O'"))
+    await migrate(kit_url, v1, v2)  # enabled: kept as it is
 
 
 @pytest.mark.parametrize(
@@ -174,6 +212,43 @@ async def test_rebuilding_a_column_refuses_to_drop_unmanaged_objects_on_it(kit_u
             await migrate(kit_url, v1, v2)
         await execute(kit_url, undo)
     await migrate(kit_url, v1, v2)  # nothing on it: rebuilt
+
+
+async def test_changing_an_expression_before_pg17_refuses_to_drop_unmanaged_objects(
+    kit_url: str,
+) -> None:
+    # K6-10: PostgreSQL < 17 drops the generated column and adds it again; a column grant
+    # or trigger on it went silently. Run that branch here by asking for a later version.
+    def calc(expression: str) -> Snapshot:
+        @final
+        class Calc(Table, name="calc"):
+            id = serial().primary_key()
+            b = integer().generated_always_as(sql(expression)).unique()
+
+        return build_snapshot([Calc], dialect)
+
+    v1, v2 = calc("id * 2"), calc("id * 3")
+    await migrate(kit_url, empty_snapshot("postgresql"), v1)
+    [change] = dialect.render(diff(v1, v2))
+    old_branch = [Statement(change.sql.replace(">= 170000", ">= 9900000"))]
+    for unmanaged, undo in [
+        ("GRANT SELECT (b) ON calc TO PUBLIC", "REVOKE SELECT (b) ON calc FROM PUBLIC"),
+        (
+            "CREATE FUNCTION trg_c() RETURNS trigger LANGUAGE plpgsql AS "
+            "$f$ BEGIN RETURN NEW; END $f$; CREATE TRIGGER t_b AFTER UPDATE OF b ON calc "
+            "FOR EACH ROW EXECUTE FUNCTION trg_c()",
+            "DROP TRIGGER t_b ON calc",
+        ),
+    ]:
+        await execute(kit_url, unmanaged)
+        with pytest.raises(DatabaseError, match="needs a custom migration"):
+            await apply(kit_url, old_branch)
+        await execute(kit_url, undo)
+    await apply(kit_url, old_branch)  # only the unique key on it: made again
+    row = await fetch_one(
+        kit_url, "SELECT count(*) AS n FROM pg_constraint WHERE conname = 'calc_b_key'"
+    )
+    assert row["n"] == 1
 
 
 def test_custom_type_spellings_normalize_as_the_server_prints_them() -> None:

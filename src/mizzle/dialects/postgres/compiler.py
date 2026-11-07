@@ -15,7 +15,8 @@ from mizzle.core.compiler import CompiledQuery, Compiler, interval_text
 from mizzle.core.errors import QueryError
 from mizzle.core.schema.column import ColumnBase
 from mizzle.core.sql.alias import real_table
-from mizzle.core.sql.nodes import ExprBase, Node
+from mizzle.core.sql.functions import column_of
+from mizzle.core.sql.nodes import CteColumn, ExprBase, Node
 from mizzle.dialects.postgres.types import CustomColumn, JsonText
 
 if TYPE_CHECKING:
@@ -250,7 +251,10 @@ class PostgresCompiler(Compiler):
 
     @override
     def read_as(self, node: Node, text: str, /) -> str:
-        # custom() values reach Python as text, an array of them as text[] (Q6-2)
+        # custom() values reach Python as text, an array of them as text[] (Q6-2), also
+        # from a CTE or subquery, which keeps the type (Q6-8)
+        if isinstance(node, CteColumn):
+            node = column_of(node) or node
         if isinstance(node, CustomColumn):
             return f"{text}::text"
         if isinstance(node, ColumnBase) and _custom_items(node):
