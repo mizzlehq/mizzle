@@ -31,6 +31,7 @@ from mizzle.core.sql.nodes import (
     Cube,
     Excluded,
     Exists,
+    ExprBase,
     Fragment,
     Frame,
     Func,
@@ -180,7 +181,6 @@ class Compiler:
     # Whether the statement being compiled returns its rows to Python, so output() converts
     # them (read_as); off inside a subquery that feeds a write or an expression.
     _read: bool
-    _order_read: bool  # in the ORDER BY of a read SELECT DISTINCT: as its outputs are read
     # (id(Param), SQL type it is compared with) -> its marker: a reused node reuses its
     # parameter, unless raw SQL holding it sits next to values of different types.
     # Marker per (node id, context). The node is kept in the value: a temporary Param (an
@@ -217,7 +217,7 @@ class Compiler:
         self._alias_count = 0
         # id(column) -> its output name, while a UNION's ORDER BY renders (C42).
         self._output_names: dict[int, str] = {}
-        self._read, self._order_read = True, False
+        self._read = True
 
     def compile(self, node: Node) -> CompiledQuery:
         self._params, self._placeholders, self._raw, self._locking = [], [], False, False
@@ -226,7 +226,7 @@ class Compiler:
         self._writes = False
         self._bound = {}
         self._context = None
-        self._read, self._order_read = True, False
+        self._read = True
         text = no_nul(self.visit(node))  # also raw sql() and collate() text (Q4-8)
         return CompiledQuery(
             text,
@@ -514,12 +514,8 @@ class Compiler:
         return f"GROUPING SETS ({', '.join(rendered)})"
 
     def visit_OrderBy(self, node: OrderBy) -> str:
-        text = f"{self._order_expr(node.expr)} {'DESC' if node.descending else 'ASC'}"
+        text = f"{self.visit(node.expr)} {'DESC' if node.descending else 'ASC'}"
         return f"{text} NULLS {node.nulls.upper()}" if node.nulls else text
-
-    def _order_expr(self, node: Node) -> str:
-        text = self.visit(node)
-        return self.read_as(node, text) if self._order_read else text
 
     def visit_Raw(self, node: Raw) -> str:
         self._raw = True
@@ -611,8 +607,11 @@ class Compiler:
             if issubclass(source, TableAlias):
                 return f"{self.table_name(source.__alias_of__)} AS {self.table_name(source)}"
             return self.table_name(source)
-        if source.inline:
-            return f"({self.visit(source.query)}) AS {self.quote(source.alias or source.name)}"
+        if source.inline:  # the outer select list converts what it reads (Q6-8)
+            read, self._read = self._read, False
+            text = f"({self.visit(source.query)}) AS {self.quote(source.alias or source.name)}"
+            self._read = read
+            return text
         if source.alias is not None:
             return f"{self.quote(source.name)} AS {self.quote(source.alias)}"
         return self.quote(source.name)
@@ -674,14 +673,46 @@ class Compiler:
         # A nested SELECT (e.g. EXISTS in a UNION's ORDER BY) names its own tables again.
         qualify, self.qualify_columns = self.qualify_columns, self._qualify_default
         saved, self._output_names = self._output_names, {}
-        read, order_read = self._read, self._order_read
-        self._order_read = False
+        read = self._read
         try:
+            if read and node.distinct_ and any(self._converted(e) for e in node.order_by_):
+                return self._sorted_distinct(node)
             return self._select_body(node)
         finally:
             self.qualify_columns = qualify
             self._output_names = saved
-            self._read, self._order_read = read, order_read
+            self._read = read
+
+    def _converted(self, node: Node) -> bool:
+        """Whether ``read_as`` converts ``node`` where rows reach Python."""
+        expr = node.expr if isinstance(node, OrderBy) else node
+        return self.read_as(expr, "") != ""
+
+    def _sorted_distinct(self, node: SelectBase) -> str:
+        """SELECT DISTINCT orders only by its outputs, so ordering by one read_as converts
+        would sort by the converted value: select and order the real values in a subquery
+        and convert them around it (Q6-7)."""
+        # ponytail: relies on PostgreSQL keeping a FROM subquery's order through a plain
+        # projection; repeat the ORDER BY outside (by output name) if a dialect does not.
+        named: list[tuple[str | None, ExprBase]]
+        if isinstance(node.projection, dict):
+            named = list(node.projection.items())
+        else:
+            named = [
+                (None, e)
+                for slot in node.slots()
+                for e in (slot.__table__.columns.values() if isinstance(slot, type) else (slot,))
+            ]
+        self._read = False
+        hidden = {f"_{i}": e for i, (_, e) in enumerate(named)}
+        inner = self._select_body(replace(node, projection=hidden))
+        self._read = True
+        items = [
+            self.read_as(e, f"{self.quote('_d')}.{self.quote(f'_{i}')}")
+            + ("" if key is None else f" AS {self.quote(key)}")
+            for i, (key, e) in enumerate(named)
+        ]
+        return f"SELECT {', '.join(items)} FROM ({inner}) AS {self.quote('_d')}"
 
     def _note_write(self) -> None:
         """Mark the statement as a write; a subclass visitor (MERGE) calls this. What it
@@ -700,11 +731,12 @@ class Compiler:
         if not ctes:
             return ""
         keyword = "WITH RECURSIVE" if any(c.recursive for c in ctes) else "WITH"
-        read = self._read  # each CTE as its statement: a write in one turns it off
+        read = self._read  # the outer select list converts what it reads from them (Q6-8)
         rendered: list[str] = []
         for c in ctes:
+            self._read = False
             rendered.append(f"{self.quote(c.name)} AS ({self.visit(c.query)})")
-            self._read = read
+        self._read = read
         return f"{keyword} {', '.join(rendered)} "
 
     def _select_body(self, node: SelectBase) -> str:
@@ -716,7 +748,7 @@ class Compiler:
             parts.append(self._with_ctes(node.ctes).rstrip())
         if node.distinct_ and node.distinct_on_:
             raise QueryError("distinct() and distinct_on() cannot be combined")
-        read = self._read  # CTEs, the select list and FROM sources reach the reader
+        read = self._read  # the select list reaches the reader
         if node.distinct_on_:
             self._read = False
             columns = ", ".join(self.visit(e) for e in node.distinct_on_)
@@ -758,11 +790,7 @@ class Compiler:
             windows = (f"{self.quote(n)} AS ({self.window(w)})" for n, w in node.windows_)
             parts.append("WINDOW " + ", ".join(windows))
         if node.order_by_:
-            # SELECT DISTINCT orders only by what it outputs: a column it converts, by the
-            # converted value (Q6-3).
-            self._order_read = read and node.distinct_
-            parts.append("ORDER BY " + ", ".join(self._order_expr(e) for e in node.order_by_))
-            self._order_read = False
+            parts.append("ORDER BY " + ", ".join(self.visit(e) for e in node.order_by_))
         if node.limit_ is not None:
             parts.append(f"LIMIT {self.count_value(node.limit_)}")
         if node.offset_ is not None:

@@ -366,3 +366,35 @@ async def test_select_feeding_a_write_keeps_the_custom_type(
             .when_matched_then_update({"span": src.c("s", str)})
         )
         assert merged == 2
+
+
+async def test_distinct_orders_custom_by_its_type(cus_db: Database) -> None:
+    # Q6-7: SELECT DISTINCT ordered a custom() column by its text: "[10,12)" < "[2,4)".
+    await cus_db.insert(CusBox).values([{"span": "[10,12)"}, {"span": "[2,4)"}])
+    query = cus_db.select({"s": CusBox.span}).from_(CusBox).distinct().order_by(CusBox.span)
+    assert await query == [{"s": "[1,3)"}, {"s": "[2,4)"}, {"s": "[10,12)"}]
+    top = cus_db.select(CusBox.span).from_(CusBox).distinct().order_by(desc(CusBox.span))
+    assert await top.limit(2) == [("[10,12)",), ("[2,4)",)]
+
+
+async def test_cte_and_subquery_keep_the_custom_type(cus_db: Database) -> None:
+    # Q6-8: a CTE selecting a custom() column gave text, so comparing it outside compared
+    # text with the type (an error) or text with text.
+    await cus_db.insert(CusBox).values(span="[10,12)")
+    spans = cus_db.select({"s": CusBox.span}).from_(CusBox).cte("spans")
+    found = (
+        await cus_db.with_(spans)
+        .select({"s": spans.c("s", str)})
+        .from_(spans)
+        .where(gt(spans.c("s", str), "[2,4)"))
+    )
+    assert found == [{"s": "[10,12)"}]
+    sub = cus_db.select({"id": CusBox.id, "s": CusBox.span}).from_(CusBox).subquery("sub")
+    joined = (
+        await cus_db.select(sub.c("s", str))
+        .from_(sub)
+        .join(CusBox, eq(CusBox.span, sub.c("s", str)))
+        .where(eq(CusBox.id, sub.c("id", int)))
+        .order_by(sub.c("id", int))
+    )
+    assert joined == [("[1,3)",), ("[1,3)",), ("[10,12)",)]

@@ -13,9 +13,9 @@
 - `custom("type")` in `mizzle.pg`: a column of any other type (a domain, a composite, a
   range, `citext`, `box`, `app.my_type`...), its DDL type verbatim and its values `str` in
   the type's text form (sent as text, read as the server prints it, nested rows too; an
-  array of them as `list[str]`). A select feeding a write (`from_select`, MERGE `using`)
-  or a subquery in a condition keeps the type; `distinct()` orders such a column by its
-  text.
+  array of them as `list[str]`). Only the outermost select list or RETURNING casts it to
+  text: CTEs, FROM subqueries, selects feeding a write (`from_select`, MERGE `using`) and
+  subqueries in a condition keep the type, and `distinct()` orders such a column by it.
 - A `Decimal` inside a json/jsonb value is written with its exact digits, and a value
   JSON cannot hold names the reason (`Object of type set is not JSON serializable`).
 - `select_model` accepts multi-dimensional array values.
