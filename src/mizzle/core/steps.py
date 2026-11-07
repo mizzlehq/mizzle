@@ -652,10 +652,12 @@ class DropView(Step):
 @dataclass(frozen=True)
 class SaveGrants(Step):
     """Remember the privileges, owner and comment of a view about to be dropped and
-    created again (they go with the view), for ``RestoreGrants``."""
+    created again (they go with the view), for ``RestoreGrants``. With ``args``: of that
+    function (a new function can be run by PUBLIC, and is owned by whoever creates it)."""
 
     schema: str
     name: str
+    args: str | None = None
 
     @override
     def describe(self) -> str:
@@ -667,6 +669,7 @@ class RestoreGrants(Step):
     schema: str
     name: str
     materialized: bool
+    args: str | None = None  # a function's (see SaveGrants)
 
     @override
     def describe(self) -> str:

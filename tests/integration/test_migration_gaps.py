@@ -1861,6 +1861,63 @@ async def test_view_recreated_under_a_sql_standard_function(driver: PostgresDriv
     assert row["t"] == 2
 
 
+@pytest.mark.parametrize("path", ["view", "returns"])
+async def test_function_created_again_keeps_its_privileges(
+    driver: PostgresDriver, path: str
+) -> None:
+    # A function dropped and created again (a view it reads is re-created, K4-20; or its
+    # result type changes) came back runnable by PUBLIC, owned by the migrating user and
+    # without its comment: a SECURITY DEFINER function then ran for everyone.
+    def guarded(returns: str) -> SchemaObject:
+        return function(
+            "k4_guarded",
+            schema="mg",
+            args="a integer, b text DEFAULT 'x'",
+            returns=returns,
+            language="sql",
+            security_definer=True,
+            body=f"RETURN (SELECT count(*)::{returns} FROM mg.k4numbers) + a",
+        )
+
+    @final
+    class K4Numbers2(View, name="k4numbers", schema="mg"):
+        n = integer()
+
+        @classmethod
+        @override
+        def query(cls, db: QueryBuilder):
+            return sql("SELECT 2 AS n")
+
+    v1 = snap([K4Numbers], [guarded("bigint")])
+    v2 = (
+        snap([K4Numbers2], [guarded("bigint")])
+        if path == "view"
+        else snap([K4Numbers], [guarded("numeric")])
+    )
+    await migrate(driver, empty_snapshot("postgresql"), v1)
+    await execute(
+        driver,
+        "DO $$ BEGIN CREATE ROLE mg_k4_reader; CREATE ROLE mg_k4_owner; "
+        "EXCEPTION WHEN duplicate_object THEN NULL; END $$",
+    )
+    await execute(driver, "GRANT mg_k4_owner TO CURRENT_USER")
+    fn = "mg.k4_guarded(integer, text)"
+    await execute(driver, f"ALTER FUNCTION {fn} OWNER TO mg_k4_owner")
+    await execute(driver, f"REVOKE ALL ON FUNCTION {fn} FROM PUBLIC")
+    await execute(driver, f"GRANT EXECUTE ON FUNCTION {fn} TO mg_k4_reader")
+    await execute(driver, f"COMMENT ON FUNCTION {fn} IS 'only for readers'")
+    state = (
+        "SELECT p.proacl::text[] AS acl, pg_get_userbyid(p.proowner) AS owner, "
+        "obj_description(p.oid, 'pg_proc') AS comment FROM pg_proc p "
+        "WHERE p.proname = 'k4_guarded'"
+    )
+    [before] = await execute(driver, state)
+    await migrate(driver, v1, v2)
+    [after] = await execute(driver, state)
+    assert after == before
+    assert not any(str(a).startswith("=") for a in cast(list[str], after["acl"]))
+
+
 async def test_column_type_change_recreates_the_checks_and_indexes_using_it(
     driver: PostgresDriver,
 ) -> None:

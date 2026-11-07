@@ -838,6 +838,10 @@ def render_step(step: Step) -> Statement:
             if revoke:
                 return Statement(f"REVOKE {what} ON {on} FROM {_role(role)}")
             return Statement(f"GRANT {what} ON {on} TO {_role(role)}")
+        case SaveGrants(schema=schema, name=name, args=str() as args):
+            return Statement(_save_function_grants(schema, name, args))
+        case RestoreGrants(schema=schema, name=name, args=str() as args):
+            return Statement(_restore_function_grants(schema, name, args))
         case SaveGrants(schema=schema, name=name):
             return Statement(_save_grants(qualified(schema, name)))
         case RestoreGrants(schema=schema, name=name, materialized=materialized):
@@ -896,6 +900,69 @@ def _restore_grants(name: str, kind: str) -> str:
         f"  EXECUTE format('COMMENT ON {kind} %s IS %L', {rel}, s.comment);\n"
         "END IF;\n"
         f"DELETE FROM {_SAVED} WHERE rel = {rel};\n"
+        "END $mizzle$"
+    )
+
+
+def _function_ref(schema: str, name: str, args: str) -> tuple[str, str]:
+    """The signature as DROP/ALTER/GRANT take it, and the key it is saved under."""
+    signature = f"{qualified(schema, name)}({_without_defaults(args)})"
+    return signature, _literal(f"function {signature}")
+
+
+def _save_function_grants(schema: str, name: str, args: str) -> str:
+    """``_save_grants`` for a function about to be dropped and created again. A new
+    function can be run by PUBLIC and is owned by its creator, so a SECURITY DEFINER
+    function would come back runnable by everyone. ALTER FUNCTION takes the signature the
+    way DROP FUNCTION does (argument names, modes), so a rename finds the one function it
+    means; its row is read under that name, then the name is put back."""
+    signature, saved = _function_ref(schema, name, args)
+    tmp = "__mizzle_saving"
+    moved = f"{qualified(schema, tmp)}({_without_defaults(args)})"
+    return (
+        "DO $mizzle$ DECLARE f record; BEGIN\n"
+        "CREATE TEMP TABLE IF NOT EXISTS __mizzle_saved "
+        "(rel text PRIMARY KEY, acl aclitem[], owner oid, comment text);\n"
+        f"EXECUTE {_literal(f'ALTER FUNCTION {signature} RENAME TO {quote(tmp)}')};\n"
+        "SELECT p.proacl AS acl, p.proowner AS owner, "
+        "obj_description(p.oid, 'pg_proc') AS comment INTO STRICT f FROM pg_proc p "
+        f"WHERE p.pronamespace = {_literal(quote(schema))}::regnamespace "
+        f"AND p.proname = {_literal(tmp)};\n"
+        f"EXECUTE {_literal(f'ALTER FUNCTION {moved} RENAME TO {quote(name)}')};\n"
+        f"INSERT INTO {_SAVED} VALUES ({saved}, f.acl, f.owner, f.comment)\n"
+        "ON CONFLICT (rel) DO UPDATE SET acl = EXCLUDED.acl, owner = EXCLUDED.owner, "
+        "comment = EXCLUDED.comment;\n"
+        "END $mizzle$"
+    )
+
+
+def _restore_function_grants(schema: str, name: str, args: str) -> str:
+    signature, saved = _function_ref(schema, name, args)
+    target = _literal(signature)
+    return (
+        "DO $mizzle$ DECLARE s record; a record; BEGIN\n"
+        "IF to_regclass('pg_temp.__mizzle_saved') IS NULL THEN RETURN; END IF;\n"
+        f"SELECT * INTO s FROM {_SAVED} WHERE rel = {saved};\n"
+        "IF NOT FOUND THEN RETURN; END IF;\n"
+        # Created just now, so owned by the current user.
+        "IF s.owner <> (SELECT oid FROM pg_roles WHERE rolname = current_user) THEN\n"
+        f"  EXECUTE format('ALTER FUNCTION %s OWNER TO %I', {target}, "
+        "pg_get_userbyid(s.owner));\n"
+        "END IF;\n"
+        # NULL is the default (PUBLIC may run it), which the new function has already.
+        "IF s.acl IS NOT NULL THEN\n"
+        f"  EXECUTE format('REVOKE ALL ON FUNCTION %s FROM PUBLIC', {target});\n"
+        "  FOR a IN SELECT * FROM aclexplode(s.acl) WHERE grantee <> s.owner LOOP\n"
+        "    EXECUTE format('GRANT %s ON FUNCTION %s TO %s%s', a.privilege_type, "
+        f"{target}, CASE WHEN a.grantee = 0 THEN 'PUBLIC' "
+        "ELSE quote_ident(pg_get_userbyid(a.grantee)) END, "
+        "CASE WHEN a.is_grantable THEN ' WITH GRANT OPTION' ELSE '' END);\n"
+        "  END LOOP;\n"
+        "END IF;\n"
+        "IF s.comment IS NOT NULL THEN\n"
+        f"  EXECUTE format('COMMENT ON FUNCTION %s IS %L', {target}, s.comment);\n"
+        "END IF;\n"
+        f"DELETE FROM {_SAVED} WHERE rel = {saved};\n"
         "END $mizzle$"
     )
 

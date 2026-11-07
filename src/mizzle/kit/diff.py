@@ -186,6 +186,9 @@ class _Plan:
     # Functions that use a table or view: ordered with the views (K4-13).
     create_with_views: list[FunctionSnap] = field(default_factory=list[FunctionSnap])
     drop_with_views: list[FunctionSnap] = field(default_factory=list[FunctionSnap])
+    # Functions dropped and created again: their privileges, owner and comment are saved
+    # before the drop and put back after the create (function_key).
+    keep_grants: set[str] = field(default_factory=set[str])
     drop_fks: list[Step] = field(default_factory=list[Step])
     drop_constraints: list[Step] = field(default_factory=list[Step])
     drop_indexes: list[Step] = field(default_factory=list[Step])
@@ -883,6 +886,8 @@ def diff(
     touched |= _changed_tables(plan)
     touched |= _diff_views(old, new, plan, touched, compare_expressions)
     _defer_calls(plan, old_tables, new)
+    plan.create_functions_early = _restore_after(plan.create_functions_early, plan.keep_grants)
+    plan.create_views = _restore_after(plan.create_views, plan.keep_grants)
     for k, table in new["tables"].items():
         if (before := old_tables.get(k)) is not None:
             _diff_security(before, table, plan, touched)
@@ -960,6 +965,18 @@ def _diff_extensions(old: Snapshot, new: Snapshot, plan: _Plan, drop_unlisted: b
         plan.drop_extensions += [DropExtension(n) for n in before if n not in after]
 
 
+def _restore_after(steps: list[Step], keep: set[str]) -> list[Step]:
+    """Each CreateFunction of a function dropped and created again, followed by putting
+    its privileges, owner and comment back."""
+    out: list[Step] = []
+    for step in steps:
+        out.append(step)
+        if isinstance(step, CreateFunction) and function_key(step.function) in keep:
+            f = step.function
+            out.append(RestoreGrants(f["schema"], f["name"], False, f["args"]))
+    return out
+
+
 def _diff_functions(old: Snapshot, new: Snapshot, plan: _Plan) -> set[str]:
     """Returns the names of functions that are dropped (also to be created again).
     Functions are matched by name and arguments: overloads are separate functions, and
@@ -977,7 +994,11 @@ def _diff_functions(old: Snapshot, new: Snapshot, plan: _Plan) -> set[str]:
         prev = before.get(k)
         if prev is not None and prev["returns"] != fn["returns"]:
             # CREATE OR REPLACE cannot change it.
-            plan.drop_functions.append(DropFunction(prev["schema"], prev["name"], prev["args"]))
+            plan.drop_functions += [
+                SaveGrants(prev["schema"], prev["name"], prev["args"]),
+                DropFunction(prev["schema"], prev["name"], prev["args"]),
+            ]
+            plan.keep_grants.add(k)
             dropped.add(prev["name"])
         if prev != fn:
             (plan.create_with_views if k in late else early).append(fn)
@@ -1070,9 +1091,9 @@ def _defer_calls(plan: _Plan, old_tables: Mapping[str, TableSnap], new: Snapshot
         for c in checks:
             del table["checks"][c["name"]]
             later.append(AddCheck(schema, name, c))
-        for c in defaults:
-            later.append(AlterColumnDefault(schema, name, c["name"], c["default"]))
-            c["default"] = None
+        for col in defaults:
+            later.append(AlterColumnDefault(schema, name, col["name"], col["default"]))
+            col["default"] = None
         plan.create_tables[i] = CreateTable(table)
     for i, step in enumerate(plan.add_columns):
         if isinstance(step, AddColumn) and calls(default := step.column["default"]):
@@ -1112,22 +1133,22 @@ def _defer_calls(plan: _Plan, old_tables: Mapping[str, TableSnap], new: Snapshot
                 for s in steps
             ):
                 later.append(AddCheck(schema, name, again))
-        for c in table["columns"].values():
-            if not _mentions(c["default"], dropped):
+        for col in table["columns"].values():
+            if not _mentions(col["default"], dropped):
                 continue
-            plan.drop_calls.append(AlterColumnDefault(schema, name, c["name"], None))
-            again = after["columns"].get(c["name"]) if after else None
+            plan.drop_calls.append(AlterColumnDefault(schema, name, col["name"], None))
+            col_again = after["columns"].get(col["name"]) if after else None
             if (
-                again is not None
-                and again["default"] is not None
+                col_again is not None
+                and col_again["default"] is not None
                 and not any(
                     isinstance(s, AlterColumnDefault)
-                    and (s.schema, s.table, s.column) == (schema, name, c["name"])
+                    and (s.schema, s.table, s.column) == (schema, name, col["name"])
                     and s.default is not None
                     for s in steps
                 )
             ):
-                later.append(AlterColumnDefault(schema, name, c["name"], again["default"]))
+                later.append(AlterColumnDefault(schema, name, col["name"], col_again["default"]))
     plan.create_calls += later
 
 
@@ -1214,35 +1235,40 @@ def _diff_views(
         redo_fns |= more_fns
     created = {function_key(f) for f in plan.create_with_views}
     for k in sorted(redo_fns):
-        prev = functions[k]
-        plan.drop_with_views.append(prev)
-        drop = DropFunction(prev["schema"], prev["name"], prev["args"])
-        plan.drop_functions = [s for s in plan.drop_functions if s != drop]
+        old_fn = functions[k]
+        plan.drop_with_views.append(old_fn)
+        drop = DropFunction(old_fn["schema"], old_fn["name"], old_fn["args"])
+        save = SaveGrants(old_fn["schema"], old_fn["name"], old_fn["args"])
+        plan.drop_functions = [s for s in plan.drop_functions if s not in (drop, save)]
         fn = next((f for f in new.get("functions", {}).values() if function_key(f) == k), None)
         if (
-            fn is not None and fn == prev and k not in created
+            fn is not None and fn == old_fn and k not in created
         ):  # else created (or not) by _diff_functions
             plan.create_with_views.append(fn)
     dropping = _ordered(before, [k for k in before if k in redo], plan.drop_with_views)
-    for k in reversed(dropping):
-        if not isinstance(k, str):
-            plan.drop_views.append(DropFunction(k["schema"], k["name"], k["args"]))
+    kept = {function_key(f) for f in new.get("functions", {}).values()}
+    for item in reversed(dropping):
+        if not isinstance(item, str):
+            if function_key(item) in kept:
+                plan.drop_views.append(SaveGrants(item["schema"], item["name"], item["args"]))
+                plan.keep_grants.add(function_key(item))
+            plan.drop_views.append(DropFunction(item["schema"], item["name"], item["args"]))
             continue
-        v = before[k]
-        if k in after:
+        v = before[item]
+        if item in after:
             plan.drop_views.append(SaveGrants(v["schema"], v["name"]))
         plan.drop_views.append(DropView(v["schema"], v["name"], v["materialized"]))
     creating = [k for k in after if k in redo or k not in before]
-    for k in _ordered(after, creating, plan.create_with_views):
-        if not isinstance(k, str):
-            plan.create_views.append(CreateFunction(k))
+    for item in _ordered(after, creating, plan.create_with_views):
+        if not isinstance(item, str):
+            plan.create_views.append(CreateFunction(item))
             continue
-        v = after[k]
+        v = after[item]
         plan.create_views.append(CreateView(v))
         plan.create_views += [
             CreateIndex(v["schema"], v["name"], i) for i in v.get("indexes", {}).values()
         ]
-        if k in before:
+        if item in before:
             plan.create_views.append(RestoreGrants(v["schema"], v["name"], v["materialized"]))
     for k, v in after.items():
         prev = before.get(k)
