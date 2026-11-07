@@ -311,6 +311,7 @@ async def test_a_composite_in_a_nested_row_decodes(doms: Database) -> None:
     assert parent.kids == plain
     assert plain[0].at == {"city": "Oslo", "zip": 150}
 
+
 async def test_alias_caches_returning_and_merge(db: Database) -> None:
     # Q4: each alias() call made a new class, so the decoder/INSERT caches grew per call.
     # Q6: returning() on an alias gave alias-class rows. Q7: MERGE INTO "boss" (no table).

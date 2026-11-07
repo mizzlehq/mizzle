@@ -15,6 +15,7 @@ from mizzle.core.snapshot import (
     CompositeSnap,
     DomainSnap,
     ExclusionSnap,
+    FunctionSnap,
     GrantsSnap,
     IndexSnap,
     Snapshot,
@@ -179,6 +180,8 @@ class _Plan:
     drop_policies: list[Step] = field(default_factory=list[Step])
     drop_views: list[Step] = field(default_factory=list[Step])
     drop_functions: list[Step] = field(default_factory=list[Step])
+    create_functions_early: list[Step] = field(default_factory=list[Step])  # (K1)
+    drop_functions_late: list[Step] = field(default_factory=list[Step])  # (K1)
     drop_fks: list[Step] = field(default_factory=list[Step])
     drop_constraints: list[Step] = field(default_factory=list[Step])
     drop_indexes: list[Step] = field(default_factory=list[Step])
@@ -233,6 +236,7 @@ class _Plan:
             *self.drop_indexes,
             *self.drop_rebuilt,
             *self.drop_early,
+            *self.create_functions_early,  # a CHECK or DEFAULT may call them (K1)
             *self.create_tables,
             *self.create_partitions,
             *self.add_columns,
@@ -253,6 +257,7 @@ class _Plan:
             *self.grants,
             *self.drop_partitions,
             *self.drop_tables,
+            *self.drop_functions_late,  # after the CHECKs and DEFAULTs calling them (K1)
             *self.drop_composites,
             *self.drop_domains,
             *self.drop_enums,
@@ -936,6 +941,9 @@ def _diff_functions(old: Snapshot, new: Snapshot, plan: _Plan) -> set[str]:
     before = {function_key(f): f for f in old.get("functions", {}).values()}
     after = {function_key(f): f for f in new.get("functions", {}).values()}
     dropped: set[str] = set()
+    # (K1) Created before the tables and dropped after them, as a CHECK or DEFAULT may call
+    # them; unless they name a table or view (a row type, a query): those keep their place.
+    late, early_drop = _uses_relations(after, new), _uses_relations(before, old)
     for k, fn in after.items():
         prev = before.get(k)
         if prev is not None and prev["returns"] != fn["returns"]:
@@ -943,12 +951,30 @@ def _diff_functions(old: Snapshot, new: Snapshot, plan: _Plan) -> set[str]:
             plan.drop_functions.append(DropFunction(prev["schema"], prev["name"], prev["args"]))
             dropped.add(prev["name"])
         if prev != fn:
-            plan.create_functions.append(CreateFunction(fn))
+            creates = plan.create_functions if k in late else plan.create_functions_early
+            creates.append(CreateFunction(fn))
     for k, prev in before.items():
         if k not in after:
-            plan.drop_functions.append(DropFunction(prev["schema"], prev["name"], prev["args"]))
+            drops = plan.drop_functions if k in early_drop else plan.drop_functions_late
+            drops.append(DropFunction(prev["schema"], prev["name"], prev["args"]))
             dropped.add(prev["name"])
     return dropped
+
+
+def _uses_relations(functions: Mapping[str, FunctionSnap], snapshot: Snapshot) -> set[str]:
+    """Keys of the functions that may name a table or view of ``snapshot``, or such a
+    function (K1). A word search: it can only over-report."""
+    names = {t["name"] for t in snapshot["tables"].values()}
+    names |= {v["name"] for v in snapshot.get("views", {}).values()}
+    found: set[str] = set()
+    while more := {
+        k
+        for k, f in functions.items()
+        if k not in found and _mentions(f"{f['args']} {f['returns']} {f['body']}", names)
+    }:
+        found |= more
+        names |= {functions[k]["name"] for k in more}
+    return found
 
 
 def _changed_tables(plan: _Plan) -> set[str]:

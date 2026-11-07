@@ -131,11 +131,12 @@ def test_function_overloads_and_options() -> None:
         "public.f(a integer, b integer DEFAULT 1)",
     ]
     statements = sqls(empty_snapshot("postgresql"), snap)
-    assert 'FUNCTION "f"(a integer) RETURNS integer LANGUAGE sql\nRETURN a' in statements[1]
+    # (K1) functions come before the tables
+    assert 'FUNCTION "f"(a integer) RETURNS integer LANGUAGE sql\nRETURN a' in statements[0]
     assert (
         "LANGUAGE sql STRICT LEAKPROOF PARALLEL SAFE COST 3 SET search_path = public, pg_temp "
         "AS $mizzle$SELECT a + b$mizzle$"
-    ) in statements[2]
+    ) in statements[1]
     only_two = build_snapshot([T], dialect, objects=[two])
     assert sqls(snap, only_two) == ['DROP FUNCTION "f"(a integer)']
     assert _without_defaults("a integer, b text DEFAULT 'x, y', c int[] DEFAULT '{1,2}'") == (
