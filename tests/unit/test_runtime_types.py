@@ -113,6 +113,9 @@ class _BrokenBegin:
 
 
 class _BrokenConnection:
+    def is_in_transaction(self) -> bool:
+        return False
+
     def transaction(self, **_: object) -> _BrokenBegin:
         return _BrokenBegin()
 

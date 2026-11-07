@@ -3,7 +3,7 @@ from collections.abc import AsyncGenerator
 import asyncpg
 import pytest
 
-from mizzle import Database, QueryTimeout, eq, sql
+from mizzle import Database, DatabaseError, QueryTimeout, eq, sql
 from mizzle.dialects.postgres.driver import PostgresDriver
 from tests.models import Posts, Users
 
@@ -52,16 +52,19 @@ async def test_query_timeout(pg_url: str, driver: PostgresDriver) -> None:
         # The pool's only connection still works after the cancel.
         assert await db.execute(sql("select 1 as one")) == [{"one": 1}]
         await db.with_timeout(5).execute(sql("select pg_sleep(0.3)"))
-        async with db.transaction() as tx:
-            with pytest.raises(QueryTimeout):
-                await tx.with_timeout(0.1).execute(sql("select pg_sleep(2)"))
+        # A caught timeout still aborts the transaction, so it cannot commit (C10).
+        with pytest.raises(DatabaseError, match="aborted the transaction"):
+            async with db.transaction() as tx:
+                with pytest.raises(QueryTimeout):
+                    await tx.with_timeout(0.1).execute(sql("select pg_sleep(2)"))
 
 
 async def test_server_statement_timeout_is_query_timeout(db: Database) -> None:
-    async with db.transaction() as tx:
-        await tx.execute(sql("set local statement_timeout = 50"))
-        with pytest.raises(QueryTimeout):
-            await tx.execute(sql("select pg_sleep(2)"))
+    with pytest.raises(DatabaseError, match="aborted the transaction"):
+        async with db.transaction() as tx:
+            await tx.execute(sql("set local statement_timeout = 50"))
+            with pytest.raises(QueryTimeout):
+                await tx.execute(sql("select pg_sleep(2)"))
 
 
 async def test_pool_settings(pg_url: str, driver: PostgresDriver) -> None:

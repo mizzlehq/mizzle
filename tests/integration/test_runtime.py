@@ -551,3 +551,108 @@ async def test_a_hook_error_is_visible_after_raise_from(pg_url: str) -> None:
             assert id(error) not in seen, "the exception chain is a cycle"
             seen.add(id(error))
             error = error.__cause__ or error.__context__
+
+
+async def test_a_caught_failure_does_not_commit(pg_url: str) -> None:
+    # C10: PostgreSQL answers COMMIT of an aborted transaction with ROLLBACK and no error,
+    # so the block "succeeded", after_commit ran, and nothing was saved.
+    ran: list[str] = []
+
+    async def ac() -> None:
+        ran.append("commit")
+
+    async def ar() -> None:
+        ran.append("rollback")
+
+    async with await Database.connect(pg_url, schema=[Users, Posts], pool_size=1) as db:
+        with pytest.raises(DatabaseError, match="aborted the transaction") as caught:
+            async with db.transaction(after_commit=ac, after_rollback=ar) as tx:
+                await tx.insert(Users).values({"email": "c10@x"})
+                with pytest.raises(DatabaseError):
+                    await tx.insert(Users).values({"email": "c10@x"})  # unique
+        assert ran == ["rollback"]
+        assert "COMMIT" in str(caught.value)
+        assert await db.select().from_(Users).where(eq(Users.email, "c10@x")) == []
+
+        # A failure inside a savepoint that rolled back leaves the outer one committable.
+        async with db.transaction() as tx:
+            await tx.insert(Users).values({"email": "c10b@x"})
+            with pytest.raises(DatabaseError):
+                async with tx.transaction() as sp:
+                    await sp.insert(Users).values({"email": "c10b@x"})
+        assert len(await db.select().from_(Users).where(eq(Users.email, "c10b@x"))) == 1
+
+
+async def test_a_sibling_task_cannot_write_into_a_savepoint(pg_url: str) -> None:
+    # C11: an insert from another task landed in a savepoint that then rolled back: it
+    # returned its id, and the row was silently gone after the outer commit.
+    import asyncio
+
+    async with await Database.connect(pg_url, schema=[Users, Posts], pool_size=1) as db:
+
+        async def savepoint(tx: Any) -> None:
+            with pytest.raises(RuntimeError):
+                async with tx.transaction() as sp:
+                    await sp.execute(sql("SELECT 1"))
+                    await asyncio.sleep(0.2)
+                    raise RuntimeError("undo")
+
+        async def insert(tx: Any) -> None:
+            await asyncio.sleep(0.05)
+            await tx.insert(Users).values({"email": "c11@x"})
+
+        async with db.transaction() as tx:
+            results = await asyncio.gather(savepoint(tx), insert(tx), return_exceptions=True)
+            assert results[0] is None
+            assert isinstance(results[1], QueryError)
+            assert "savepoint open" in str(results[1])
+
+            # Tasks started inside the savepoint may use it.
+            async with tx.transaction() as sp:
+                await asyncio.gather(
+                    sp.insert(Users).values({"email": "c11a@x"}),
+                    sp.insert(Users).values({"email": "c11b@x"}),
+                )
+        emails = await db.select(Users.email).from_(Users).where(eq(Users.email, "c11a@x"))
+        assert emails == [("c11a@x",)]
+
+
+async def test_a_body_error_is_kept_when_the_rollback_fails(pg_url: str) -> None:
+    # C13: the body's error was replaced by "ConnectionError ... SQL: COMMIT".
+    async with await Database.connect(pg_url, schema=[Users, Posts], pool_size=1) as db:
+        with pytest.raises(ValueError, match="body") as caught:
+            async with db.transaction() as tx:
+                [row] = await tx.execute(sql("SELECT pg_backend_pid() AS pid"))
+                async with await Database.connect(
+                    pg_url, schema=[Users, Posts], pool_size=1
+                ) as other:
+                    await other.execute(sql(f"SELECT pg_terminate_backend({row['pid']})"))
+                raise ValueError("body")
+        assert any("ROLLBACK also failed" in note for note in caught.value.__notes__)
+
+
+async def test_no_rollback_hook_when_the_transaction_never_began(
+    pg_url: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # C15: a failed acquire ran after_rollback, though nothing had begun.
+    from collections.abc import AsyncGenerator
+    from contextlib import asynccontextmanager
+
+    from mizzle import ConnectionError as DbConnectionError
+
+    ran: list[str] = []
+
+    async def ar() -> None:
+        ran.append("rollback")
+
+    @asynccontextmanager
+    async def no_connection() -> AsyncGenerator[None]:
+        raise DbConnectionError("too many connections")
+        yield
+
+    async with await Database.connect(pg_url, schema=[Users, Posts], pool_size=1) as db:
+        monkeypatch.setattr(db.driver, "acquire", no_connection)
+        with pytest.raises(DbConnectionError):
+            async with db.transaction(after_rollback=ar):
+                pass
+    assert ran == []

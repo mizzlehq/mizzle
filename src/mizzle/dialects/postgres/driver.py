@@ -241,12 +241,21 @@ def _rowcount(status: str) -> int:
 class PostgresConnection:
     _conn: asyncpg.Connection | PoolConnectionProxy
     dirty: bool  # ran a statement that may have changed session state
+    # Statements the server failed. A failure aborts the open transaction (or savepoint)
+    # even when the caller catches it, and PostgreSQL answers the COMMIT with ROLLBACK and
+    # no error, which asyncpg ignores (C10).
+    _failures: int
 
     def __init__(self, conn: asyncpg.Connection | PoolConnectionProxy) -> None:
         self._conn = conn
         self.dirty = False
+        self._failures = 0
 
     def _translate(self, exc: Exception, sql: str) -> Exception:
+        if isinstance(exc, TimeoutError) or (
+            isinstance(exc, asyncpg.PostgresError) and getattr(exc, "sqlstate", None)
+        ):
+            self._failures += 1  # a server error, or a cancelled statement
         try:
             server = self._conn.get_server_version().major
         except Exception:  # a detached pool proxy: the version is not needed then
@@ -308,9 +317,27 @@ class PostgresConnection:
         self, isolation: IsolationLevel | None = None, readonly: bool = False
     ) -> AsyncGenerator[None]:
         level = _ISOLATION[isolation] if isolation is not None else None
+        failures = self._failures
+        nested, phase = False, "BEGIN"  # the phase is named in the error (C13)
+        body_error: BaseException | None = None
         try:
+            nested = self._conn.is_in_transaction()  # inside: a detached proxy raises
+            phase = "SAVEPOINT" if nested else "BEGIN"
             async with self._conn.transaction(isolation=level, readonly=readonly):
-                yield
+                try:
+                    yield
+                except BaseException as exc:
+                    body_error = exc
+                    phase = "ROLLBACK TO SAVEPOINT" if nested else "ROLLBACK"
+                    raise
+                phase = "RELEASE SAVEPOINT" if nested else "COMMIT"
+                if self._failures != failures:
+                    raise DatabaseError(
+                        "a statement in this transaction failed and its error was caught, so "
+                        "PostgreSQL aborted the transaction and nothing was committed. Wrap a "
+                        "statement that may fail in a savepoint (tx.transaction())",
+                        sql=phase,
+                    )
         # BEGIN / COMMIT failures (body errors are mapped), and a connection lost before
         # ROLLBACK (asyncpg's InterfaceError: "the underlying connection is closed").
         # InternalClientError: BEGIN on a connection the server closed under load.
@@ -320,7 +347,16 @@ class PostgresConnection:
             pg.InternalClientError,
             OSError,
         ) as exc:
-            raise _translate(exc, "COMMIT") from None
+            if body_error is not None:
+                # The rollback after the body's error failed: the body's error is the one
+                # that matters; the failed rollback is a note on it (C13).
+                body_error.add_note(f"{phase} also failed: {type(exc).__name__}: {exc}")
+                raise body_error from None
+            raise _translate(exc, phase) from None
+        finally:
+            # Unchanged on success (it raised otherwise); after an exception the block was
+            # rolled back, which undid any failure inside it.
+            self._failures = failures
 
     async def cursor(
         self,

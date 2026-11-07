@@ -40,7 +40,9 @@ async with db.transaction() as tx:
 transaction, on other connections.
 
 Statements on one `tx` never overlap, so `asyncio.gather` on it is safe; they run one
-after another:
+after another. While a savepoint is open, only the code inside it (and tasks it starts) may
+use the transaction: a statement from another task would be undone with the savepoint, so
+it raises `QueryError` instead.
 
 ```python
 async with db.transaction() as tx:
@@ -96,6 +98,10 @@ Two rules keep hook errors from confusing the outcome:
   not, and a note on the error says the transaction was committed. Do not retry it.
 - Savepoints on one transaction run one at a time, from the task that opened them. A
   savepoint started from another task while one is open raises `QueryError`.
+- A statement that fails aborts the whole transaction in PostgreSQL, even if you catch the
+  error. Leaving the block then raises `DatabaseError` ("aborted the transaction"), the
+  `after_rollback` hooks run, and nothing is committed. To go on after an expected failure,
+  run the statement in a savepoint (`tx.transaction()`).
 
 ## Isolation levels and read-only
 
