@@ -589,7 +589,7 @@ class Select[R](SelectBase, Executable[list[R]], SetOps[R]):
     """A SELECT whose rows are ``R`` (a table row, a tuple, or a dict)."""
 
     @overload
-    def left_join[A, J: Table](
+    def left_join[A, J: Table](  # type: ignore[overload-overlap]
         self: Select[tuple[A, J]], source: type[J], on: Condition
     ) -> Select[tuple[A, J | None]]: ...
     @overload
@@ -597,9 +597,21 @@ class Select[R](SelectBase, Executable[list[R]], SetOps[R]):
         self: Select[tuple[A, B, J]], source: type[J], on: Condition
     ) -> Select[tuple[A, B, J | None]]: ...
     @overload
-    def left_join[A, B, J: Table](
+    def left_join[A, B, J: Table](  # type: ignore[overload-overlap]
         self: Select[tuple[A, J, B]], source: type[J], on: Condition
     ) -> Select[tuple[A, J | None, B]]: ...
+    @overload
+    def left_join[J: Table](
+        self: Select[tuple[J]], source: type[J], on: Condition
+    ) -> Select[tuple[J | None]]: ...
+    @overload
+    def left_join[B, J: Table](
+        self: Select[tuple[J, B]], source: type[J], on: Condition
+    ) -> Select[tuple[J | None, B]]: ...
+    @overload
+    def left_join[A, B, J: Table](
+        self: Select[tuple[J, A, B]], source: type[J], on: Condition
+    ) -> Select[tuple[J | None, A, B]]: ...
     @overload
     def left_join(self, source: Source, on: Condition) -> Self: ...
     def left_join(self, source: Source, on: Condition) -> SelectBase:
@@ -610,6 +622,10 @@ class Select[R](SelectBase, Executable[list[R]], SetOps[R]):
         self: Select[tuple[A, J]], source: type[J], on: Condition
     ) -> Select[tuple[A | None, J]]: ...
     @overload
+    def right_join[A, B, J: Table](
+        self: Select[tuple[A, B, J]], source: type[J], on: Condition
+    ) -> Select[tuple[A | None, B | None, J]]: ...
+    @overload
     def right_join(self, source: Source, on: Condition) -> Self: ...
     def right_join(self, source: Source, on: Condition) -> SelectBase:
         return self._join("RIGHT", source, on)
@@ -618,6 +634,14 @@ class Select[R](SelectBase, Executable[list[R]], SetOps[R]):
     def full_join[A, J: Table](
         self: Select[tuple[A, J]], source: type[J], on: Condition
     ) -> Select[tuple[A | None, J | None]]: ...
+    @overload
+    def full_join[J: Table](
+        self: Select[tuple[J]], source: type[J], on: Condition
+    ) -> Select[tuple[J | None]]: ...
+    @overload
+    def full_join[A, B, J: Table](
+        self: Select[tuple[A, B, J]], source: type[J], on: Condition
+    ) -> Select[tuple[A | None, B | None, J | None]]: ...
     @overload
     def full_join(self, source: Source, on: Condition) -> Self: ...
     def full_join(self, source: Source, on: Condition) -> SelectBase:

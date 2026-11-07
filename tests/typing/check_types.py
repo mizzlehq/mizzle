@@ -36,6 +36,22 @@ async def rows(qb: QueryBuilder, user: Users, post: Posts) -> None:
         await qb.select(Users, Posts).from_(Users).right_join(Posts, eq(Posts.author_id, Users.id)),
         list[tuple[Users | None, Posts]],
     )
+    # C34: the joined table may sit in any slot; that slot is the optional one.
+    on = eq(Users.id, Posts.author_id)
+    assert_type(
+        await qb.select(Users, Posts).from_(Posts).left_join(Users, on),
+        list[tuple[Users | None, Posts]],
+    )
+    assert_type(await qb.select(Users).from_(Posts).left_join(Users, on), list[tuple[Users | None]])
+    assert_type(
+        await qb.select(Users, Posts, Users.id).from_(Posts).left_join(Users, on),
+        list[tuple[Users | None, Posts, int]],
+    )
+    assert_type(await qb.select(Users).from_(Posts).full_join(Users, on), list[tuple[Users | None]])
+    assert_type(
+        await qb.select(Users.id, Users, Posts).from_(Users).right_join(Posts, on),
+        list[tuple[int | None, Users | None, Posts]],
+    )
     assert_type(
         await qb.select({"n": count()}).from_(Users).where(eq(Users.id, 1)),
         list[dict[str, object]],
@@ -276,3 +292,11 @@ async def typed_rows(qb: QueryBuilder) -> None:
 def json_aggregates_are_json() -> None:
     # C32: json_agg(created_at) said list[datetime] but returned ISO strings.
     assert_type(json_agg(Users.created_at), Aggregate[list[Json] | None])
+
+
+def string_agg_takes_text() -> None:
+    from mizzle import string_agg
+
+    # C46: string_agg(integer, text) does not exist in PostgreSQL.
+    string_agg(Users.id, ",")  # type: ignore[arg-type]  # pyright: ignore[reportArgumentType]
+    string_agg(Users.bio, ",")

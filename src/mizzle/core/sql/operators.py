@@ -137,6 +137,10 @@ def not_(condition: Condition) -> Expr[bool]:
 def _in(left: ExprBase, values: Iterable[object] | Node, negate: bool) -> Expr[bool]:
     if isinstance(values, Node):  # subquery
         return InList(left, values, negate)
+    if isinstance(values, (str, bytes)):  # a str is an Iterable[str]: "abc" is not a list (C36)
+        raise QueryError(
+            "in_()/not_in() take a sequence of values, not a string; wrap it in a list"
+        )
     return InList(left, tuple(_wrap(v, left) for v in values), negate)
 
 
@@ -345,11 +349,29 @@ def _container(value: object, like: object = None) -> Node:
         if on_json:
             return Cast(Param(items), "jsonb")
         if on_array:
-            assert column is not None
-            return Cast(Param(items, column), column.sql_type)
+            # No cast: the server types the parameter from the array column, and an
+            # enum array's type name may need quotes or a schema (C38).
+            return Param(items, column)
         kind = next((t for v in items if (t := sql_type_of(v)) is not None), "text")
         return Cast(Param(items), kind + "[]")
+    element = _RANGE_ELEMENTS.get(column.sql_type) if column is not None else None
+    if element is not None and not hasattr(value, "lower_inc"):  # a scalar, not a range (C39)
+        return Cast(Param(value), element)
     return bind(value)
+
+
+_RANGE_ELEMENTS = {
+    f"{name}{kind}": element
+    for name, element in (
+        ("int4", "integer"),
+        ("int8", "bigint"),
+        ("num", "numeric"),
+        ("ts", "timestamp"),
+        ("tstz", "timestamptz"),
+        ("date", "date"),
+    )
+    for kind in ("range", "multirange")
+}
 
 
 def contains(left: ExprBase, right: object) -> Expr[bool]:
@@ -418,7 +440,9 @@ def array_agg[T](expr: Expr[T]) -> Aggregate[list[T] | None]:
     return Aggregate[list[T] | None]("array_agg", (expr,), keeps_type=True, returns_array=True)
 
 
-def string_agg[T](expr: Expr[T], delimiter: str | Expr[str]) -> Aggregate[str | None]:
+def string_agg(
+    expr: Expr[str] | Expr[str | None], delimiter: str | Expr[str]
+) -> Aggregate[str | None]:
     """Joins the values with ``delimiter``: ``string_agg(Users.email, ", ")``."""
     return Aggregate[str | None]("string_agg", (expr, bind(delimiter)))
 

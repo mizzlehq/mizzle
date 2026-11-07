@@ -226,3 +226,21 @@ def test_a_placeholder_value_is_encoded_by_its_column(qb: QueryBuilder) -> None:
     assert "2" in insert.prepare().compiled.bind({"p": Level.HIGH}).params
     update = qb.update(Kinds).set({"level": placeholder("p")}).where(eq(Kinds.id, 1))
     assert "2" in update.prepare().compiled.bind({"p": Level.HIGH}).params
+
+
+def test_in_refuses_a_bare_string(qb: QueryBuilder) -> None:
+    # C36: a str is an Iterable[str], so in_(col, "abc") became IN ('a', 'b', 'c').
+    from mizzle import in_, not_in
+
+    with pytest.raises(QueryError, match="not a string"):
+        in_(Users.email, "abc")
+    with pytest.raises(QueryError, match="not a string"):
+        not_in(Users.email, "abc")
+
+
+def test_sql_with_a_lone_brace_is_a_query_error() -> None:
+    # C43: string.Formatter raised a raw ValueError.
+    from mizzle import sql
+
+    with pytest.raises(QueryError, match="braces"):
+        sql("select '{' || {}", 1)

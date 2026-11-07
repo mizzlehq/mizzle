@@ -166,3 +166,44 @@ async def test_nested_rows_decode_like_plain_rows(driver: PostgresDriver, pg_url
     finally:
         async with driver.acquire() as conn:
             await conn.execute("DROP TABLE qc_nest_kid, qc_nest", [])
+
+
+class Boxed(Table, name="qc_boxed", schema="qc_app"):
+    id = serial().primary_key()
+    levels = array(pg_enum(Lvl, type_name="LvlType", schema="qc_app"))
+    r = int4range()
+    s = text()
+
+
+async def test_container_operators_on_enum_arrays_and_ranges(
+    driver: PostgresDriver, pg_url: str
+) -> None:
+    # C38: contains() cast to an unquoted, unqualified type: type "lvltype[]" does not exist.
+    # C39: contains(range, 3) cast 3 to bigint: operator does not exist: int4range @> bigint.
+    from asyncpg import Range
+
+    from mizzle import contained_by, contains, overlaps, string_agg
+
+    async with driver.acquire() as conn:
+        await conn.execute(
+            "DROP SCHEMA IF EXISTS qc_app CASCADE; CREATE SCHEMA qc_app; "
+            "CREATE TYPE qc_app.\"LvlType\" AS ENUM ('1', '2'); "
+            "CREATE TABLE qc_app.qc_boxed (id serial PRIMARY KEY, "
+            'levels qc_app."LvlType"[], r int4range, s text)',
+            [],
+        )
+    try:
+        async with await Database.connect(pg_url, schema=[Boxed], pool_size=1) as db:
+            await db.insert(Boxed).values({"levels": [Lvl.LOW], "r": Range(1, 5), "s": "a"})
+            for cond in (
+                contains(Boxed.levels, [Lvl.LOW]),
+                contained_by(Boxed.levels, [Lvl.LOW, Lvl.HIGH]),
+                overlaps(Boxed.levels, [Lvl.LOW]),
+                contains(Boxed.r, 3),
+            ):
+                assert await db.select(Boxed.id).from_(Boxed).where(cond) == [(1,)]
+            assert await db.select(Boxed.id).from_(Boxed).where(contains(Boxed.r, 9)) == []
+            assert await db.select(string_agg(Boxed.s, ",")).from_(Boxed) == [("a",)]
+    finally:
+        async with driver.acquire() as conn:
+            await conn.execute("DROP SCHEMA qc_app CASCADE", [])
