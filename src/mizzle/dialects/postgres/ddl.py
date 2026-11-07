@@ -335,8 +335,26 @@ def column_definition(column: ColumnSnap) -> str:
     if column["not_null"]:
         parts.append("NOT NULL")
     if column["default"] is not None:
-        parts.append(f"DEFAULT {column['default']}")
+        parts.append(f"DEFAULT {default_sql(column['default'])}")
     return " ".join(parts)
+
+
+def default_sql(text: str) -> str:
+    """``text`` ready for DEFAULT, which takes no AT TIME ZONE, AND, IS ... unless in
+    parentheses (K11): any space outside quotes and brackets adds them."""
+    depth, in_quote = 0, ""
+    for ch in text:
+        if in_quote:
+            in_quote = "" if ch == in_quote else in_quote
+        elif ch in "'\"":
+            in_quote = ch
+        elif ch in "([":
+            depth += 1
+        elif ch in ")]":
+            depth -= 1
+        elif ch.isspace() and depth == 0:
+            return f"({text})"
+    return text
 
 
 def _foreign_key(fk: ForeignKeySnap) -> str:
@@ -609,7 +627,7 @@ def _create_domain(domain: DomainSnap) -> str:
     if collation := domain.get("collation"):
         parts.append(f"COLLATE {type_ident(collation)}")
     if default := domain.get("default"):
-        parts.append(f"DEFAULT {default}")
+        parts.append(f"DEFAULT {default_sql(default)}")
     if domain.get("not_null"):
         parts.append("NOT NULL")
     parts.extend(f"CHECK ({check})" for check in domain.get("checks", []))
@@ -705,7 +723,7 @@ def render_step(step: Step) -> Statement:
         case AlterColumnGenerated():
             return Statement(_alter_generated(step))
         case AlterColumnDefault(schema=schema, table=table, column=column, default=default):
-            action = "DROP DEFAULT" if default is None else f"SET DEFAULT {default}"
+            action = "DROP DEFAULT" if default is None else f"SET DEFAULT {default_sql(default)}"
             return alter(schema, table, f"ALTER COLUMN {quote(column)} {action}")
         case AddPrimaryKey(schema=schema, table=table, primary_key=pk):
             return alter(

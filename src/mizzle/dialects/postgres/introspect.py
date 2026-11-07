@@ -44,6 +44,7 @@ from mizzle.dialects.postgres.ddl import (
     DEFAULT_SCHEMA,
     SERIAL_TYPES,
     create_index,
+    default_sql,
     function_options,
     normalize_default,
     qualified,
@@ -952,7 +953,7 @@ def _create_domain_for_norm(domain: DomainSnap) -> str:
     if collation := domain.get("collation"):
         parts.append(f"COLLATE {type_ident(collation)}")
     if default := domain.get("default"):
-        parts.append(f"DEFAULT {default}")
+        parts.append(f"DEFAULT {default_sql(default)}")
     parts.extend(f"CHECK ({check})" for check in domain.get("checks", []))
     return " ".join(parts)
 
@@ -983,14 +984,20 @@ async def _normalize_column_expressions(snapshot: Snapshot, read_back: _ReadBack
             for name, c in table["columns"].items()
         }
         for name, column in table["columns"].items():
-            generated = column.get("generated")
-            if column["default"] is None and generated is None:
-                continue
+            generated, default = column.get("generated"), column["default"]
             if generated is not None:
                 extra = f" GENERATED ALWAYS AS ({generated['expression']}) STORED"
+            elif default is not None:
+                extra = f" DEFAULT {default_sql(default)}"
             else:
-                extra = f" DEFAULT {column['default']}"
-            columns = ", ".join(sql + (extra if n == name else "") for n, sql in plain.items())
+                continue
+            # Only the columns it can use (K4): one of a type made later (a new enum) failed
+            # the whole table, so every other expression kept its text and showed as drift.
+            columns = ", ".join(
+                sql + (extra if n == name else "")
+                for n, sql in plain.items()
+                if n == name or (generated is not None and _mentions(generated["expression"], n))
+            )
             row = await read_back(
                 [f"CREATE TEMP TABLE {quote(_NORM)} ({columns})"],
                 "SELECT pg_get_expr(d.adbin, d.adrelid) AS e FROM pg_attrdef d "

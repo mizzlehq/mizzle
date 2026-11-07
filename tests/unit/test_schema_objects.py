@@ -184,8 +184,8 @@ def test_snapshot() -> None:
 def test_create_order_and_sql() -> None:
     assert described(empty_snapshot("postgresql"), snap()) == [
         "create extension pg_trgm",
+        "create function touch",  # before the tables: a CHECK or DEFAULT may call it (K1)
         "create table users",
-        "create function touch",
         "create view active_users",
         "create materialized view user_counts",
         "create index user_counts_active",
@@ -197,7 +197,7 @@ def test_create_order_and_sql() -> None:
     ]
     statements = sqls(empty_snapshot("postgresql"), snap())
     assert statements[0] == "CREATE EXTENSION IF NOT EXISTS pg_trgm"
-    assert statements[2] == (
+    assert statements[1] == (
         'CREATE OR REPLACE FUNCTION "touch"() RETURNS trigger LANGUAGE plpgsql '
         "AS $mizzle$BEGIN NEW.updated_at = now(); RETURN NEW; END$mizzle$"
     )
@@ -222,8 +222,8 @@ def test_drop_order_is_reversed() -> None:
         "drop view emails",
         "drop materialized view user_counts",
         "drop view active_users",
-        "drop function touch",
         "drop table users",
+        "drop function touch",  # after the tables (K1)
         "drop extension pg_trgm",
     ]
 
@@ -301,11 +301,11 @@ def test_function_changes() -> None:
     moved = trigger("users_touch", on=Users, execute=args, events=["update"])
     assert described(snap(objects=[new_trigger]), snap(objects=[moved])) == [
         "drop trigger users_touch on users",
-        "drop function touch",
-        "create function touch",
+        "create function touch",  # another overload: both exist for a moment (K1)
         "create trigger users_touch on users",
+        "drop function touch",
     ]
-    assert sqls(snap(objects=[new_trigger]), snap(objects=[moved]))[1] == (
+    assert sqls(snap(objects=[new_trigger]), snap(objects=[moved]))[3] == (
         'DROP FUNCTION "touch"()'
     )
 

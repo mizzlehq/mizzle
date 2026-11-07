@@ -68,6 +68,7 @@ from mizzle.pg import (
     int4multirange,
     int4range,
     integer,
+    interval,
     line,
     lseg,
     ltree,
@@ -323,7 +324,7 @@ async def test_function_overloads_options_and_sql_bodies(
     # One overload goes, the other stays; options are replaced in place.
     v2 = snap([Holder], [add2, tidy2])
     steps = [s.describe() for s in await migrate(driver, v1, v2)]
-    assert steps == ["drop function add", "create function tidy"]
+    assert steps == ["create function tidy", "drop function add"]  # (K1) drops go last
     tidy_live = (await live(driver)).get("functions", {})["mg.tidy(t text)"]
     assert "settings" not in tidy_live and "leakproof" not in tidy_live
 
@@ -1556,7 +1557,7 @@ async def test_odd_literal_defaults_apply_and_show_no_drift(driver: PostgresDriv
     import datetime
     from decimal import Decimal
 
-    from mizzle.pg import bytea, double_precision, interval, numeric
+    from mizzle.pg import bytea, double_precision, numeric
 
     @final
     class Odd(Table, name="odd", schema="mg"):
@@ -1582,3 +1583,81 @@ async def test_odd_literal_defaults_apply_and_show_no_drift(driver: PostgresDriv
         current = await dialect.introspect(conn, SCHEMAS)
         expected = await dialect.normalize_snapshot(conn, desired)
     assert diff(current, expected, normalized=True) == []
+
+
+# -- functions called by CHECKs and DEFAULTs, defaults of new types, raw defaults ------------
+
+positive = function(
+    "positive",
+    schema="mg",
+    returns="boolean",
+    args="x integer",
+    language="sql",
+    volatility="immutable",
+    body="SELECT x > 0",
+)
+seven = function("seven", schema="mg", returns="integer", language="sql", body="SELECT 7")
+
+
+@final
+class Calls(Table, name="calls", schema="mg"):
+    id = integer().primary_key()
+    n = integer().default(sql("mg.seven()"))
+
+    @classmethod
+    @override
+    def config(cls) -> list[Constraint]:
+        return [check("calls_n_positive", sql("mg.positive(n)"))]
+
+
+@final
+class Calls2(Table, name="calls", schema="mg"):
+    id = integer().primary_key()
+    n = integer()
+
+
+async def test_functions_used_by_checks_and_defaults(driver: PostgresDriver) -> None:
+    # K1: functions were created after the tables and dropped before the constraints.
+    v1 = snap([Calls], [positive, seven])
+    await migrate(driver, empty_snapshot("postgresql"), v1)
+    await migrate(driver, v1, snap([Calls2]))
+
+
+class K4Mood(enum.Enum):
+    HAPPY = "happy"
+
+
+@final
+class Waits(Table, name="waits", schema="mg"):
+    id = integer().primary_key()
+    wait = interval().default(sql("'1 day 5 seconds'::interval"))
+    mood = pg_enum(K4Mood, type_name="mg_k4_mood", schema="mg")  # not created yet
+
+
+async def test_column_of_a_new_type_leaves_other_defaults_normalized(
+    driver: PostgresDriver,
+) -> None:
+    # K4: the temporary table failed on the new type, so `wait` kept its text (drift).
+    async with driver.acquire() as conn:
+        printed = await dialect.normalize_snapshot(conn, snap([Waits]))
+    assert printed["tables"]["mg.waits"]["columns"]["wait"]["default"] == "'1 day 00:00:05'"
+
+
+@final
+class Stamps(Table, name="stamps", schema="mg"):
+    id = integer().primary_key()
+    at = timestamp().default(sql("now() AT TIME ZONE 'utc'"))
+
+
+@final
+class Stamps2(Table, name="stamps", schema="mg"):
+    id = integer().primary_key()
+    at = timestamp().default(sql("now() AT TIME ZONE 'utc'"))
+    on = timestamp().default(sql("now() AT TIME ZONE 'utc'"))
+
+
+async def test_raw_operator_default_is_parenthesized(driver: PostgresDriver) -> None:
+    # K11: DEFAULT now() AT TIME ZONE 'utc' is a syntax error without parentheses.
+    v1 = snap([Stamps])
+    await migrate(driver, empty_snapshot("postgresql"), v1)  # CREATE TABLE
+    await migrate(driver, v1, snap([Stamps2]))  # ADD COLUMN
