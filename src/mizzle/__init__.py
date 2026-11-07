@@ -126,7 +126,7 @@ from mizzle.core.sql.functions import (
     upper,
     websearch_to_tsquery,
 )
-from mizzle.core.sql.nodes import Condition, Expr
+from mizzle.core.sql.nodes import Condition, Expr, Json
 from mizzle.core.sql.operators import (
     all_,
     and_,
@@ -211,6 +211,7 @@ __all__ = [
     "DatabaseError",
     "Expr",
     "ForeignKeyViolation",
+    "Json",
     "ListenerOverflow",
     "MigrationError",
     "MigrationLockTimeout",

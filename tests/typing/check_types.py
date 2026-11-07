@@ -11,8 +11,8 @@ from typing import Any, TypedDict, assert_type
 
 from mizzle.core.query.builder import QueryBuilder
 from mizzle.core.schema.column import Column
-from mizzle.core.sql.nodes import Aggregate, Expr
-from mizzle.core.sql.operators import count, eq, lt, nullable
+from mizzle.core.sql.nodes import Aggregate, Expr, Json
+from mizzle.core.sql.operators import count, eq, json_agg, lt, nullable
 from tests.models import Posts, Role, Users
 
 
@@ -271,3 +271,8 @@ async def typed_rows(qb: QueryBuilder) -> None:
     # T8: the generated <Table>Row TypedDict names the shape a select returns.
     rows = await qb.select({"id": Users.id, "email": Users.email}).from_(Users).as_rows(UsersRow)
     assert_type(rows, list[UsersRow])
+
+
+def json_aggregates_are_json() -> None:
+    # C32: json_agg(created_at) said list[datetime] but returned ISO strings.
+    assert_type(json_agg(Users.created_at), Aggregate[list[Json] | None])

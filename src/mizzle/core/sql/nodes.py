@@ -435,6 +435,10 @@ class TypedFunc[T](Func, Expr[T]):
     pass
 
 
+# JSON as returned by the driver's json codec (nested rows of relational queries, json_agg).
+type Json = bool | int | float | str | list[Json] | dict[str, Json] | None
+
+
 @dataclass(frozen=True)
 class Aggregate[T](TypedFunc[T]):
     """An aggregate (``count``, ``sum_``...); ``.over(...)`` makes it a window function."""

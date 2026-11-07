@@ -27,6 +27,7 @@ from mizzle.core.sql.nodes import (
     ExprBase,
     Fragment,
     InList,
+    Json,
     Node,
     Not,
     OrderBy,
@@ -457,19 +458,23 @@ def var_pop(expr: _Number) -> Aggregate[float | Decimal | None]:
     return Aggregate[float | Decimal | None]("var_pop", (expr,))
 
 
-def json_agg[T](expr: Expr[T]) -> Aggregate[list[T] | None]:
+# The values become JSON: a date, Decimal or UUID comes back as JSON text or a float, not as
+# the column's type, so the result is typed Json (C32).
+
+
+def json_agg(expr: ExprBase) -> Aggregate[list[Json] | None]:
     """Collects the values into a ``json`` array."""
-    return Aggregate[list[T] | None]("json_agg", (expr,))
+    return Aggregate[list[Json] | None]("json_agg", (expr,))
 
 
-def jsonb_agg[T](expr: Expr[T]) -> Aggregate[list[T] | None]:
+def jsonb_agg(expr: ExprBase) -> Aggregate[list[Json] | None]:
     """Collects the values into a ``jsonb`` array."""
-    return Aggregate[list[T] | None]("jsonb_agg", (expr,))
+    return Aggregate[list[Json] | None]("jsonb_agg", (expr,))
 
 
-def json_object_agg[K, V](key: Expr[K], value: Expr[V]) -> Aggregate[dict[str, V] | None]:
+def json_object_agg(key: ExprBase, value: ExprBase) -> Aggregate[dict[str, Json] | None]:
     """Collects key/value pairs into a ``json`` object."""
-    return Aggregate[dict[str, V] | None]("json_object_agg", (key, value))
+    return Aggregate[dict[str, Json] | None]("json_object_agg", (key, value))
 
 
 # -- ordered-set aggregates (EX9) -----------------------------------------------------

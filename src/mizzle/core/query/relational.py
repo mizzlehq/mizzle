@@ -24,7 +24,7 @@ from mizzle.core.schema.column import ColumnBase
 from mizzle.core.schema.relations import Link
 from mizzle.core.schema.table import Table
 from mizzle.core.sql.alias import real_table
-from mizzle.core.sql.nodes import Condition, ExprBase, Node, OrderBy
+from mizzle.core.sql.nodes import Condition, ExprBase, Json, Node, OrderBy
 
 
 class WithOptions(TypedDict, total=False):
@@ -38,8 +38,6 @@ class WithOptions(TypedDict, total=False):
 type OrderItem = ExprBase | OrderBy
 type With = Mapping[str, bool | WithOptions]
 type OrderArg = OrderItem | Sequence[OrderItem] | None
-# JSON as returned by the driver's json codec (nested rows of relational queries).
-type Json = bool | int | float | str | list[Json] | dict[str, Json] | None
 
 
 @dataclass(frozen=True)
