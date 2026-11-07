@@ -67,7 +67,9 @@ const OPS: { value: FilterOp; label: string; needsValue: boolean }[] = [
   { value: "is_not_null", label: "is not null", needsValue: false },
 ]
 
-type Editing = { row: number; column: string; text: string }
+// S11: the edit carries the row's primary key, not just its index, so a save can
+// never land on whatever row now sits at that index after a reload.
+type Editing = { row: number; key: Row; column: string; text: string }
 
 function keyOf(table: TableInfo, row: Row): Row {
   return Object.fromEntries((table.primary_key?.columns ?? []).map((c) => [c, row[c]]))
@@ -87,7 +89,8 @@ function FilterBar({
   const [op, setOp] = useState<FilterOp>("eq")
   const [value, setValue] = useState("")
   const needsValue = OPS.find((o) => o.value === op)?.needsValue ?? true
-  const value_ = op === "ilike" ? `%${value}%` : value
+  // S16: escape LIKE wildcards (backslash is the default LIKE escape) so "50%" means 50%.
+  const value_ = op === "ilike" ? `%${value.replace(/[\\%_]/g, "\\$&")}%` : value
 
   const add = () => {
     if (!column || (needsValue && value === "")) return
@@ -188,6 +191,7 @@ export function DataGrid({ table, readOnly }: { table: TableInfo; readOnly: bool
       setRows(data.rows)
       setTotal(data.total)
       setSelected(new Set())
+      setEditing(null) // S11: the open editor's row index no longer means the same row
       setError(null)
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
@@ -213,14 +217,16 @@ export function DataGrid({ table, readOnly }: { table: TableInfo; readOnly: bool
 
   const saveEdit = async (value: string | null) => {
     if (!editing) return
-    const row = rows[editing.row]
     const column = table.columns[editing.column]
+    const key = JSON.stringify(editing.key)
     try {
       const text = value === null ? null : toDbText(column, value)
-      const { row: updated } = await api.update(table, keyOf(table, row), {
+      const { row: updated } = await api.update(table, editing.key, {
         [editing.column]: text,
       })
-      setRows((current) => current.map((r, i) => (i === editing.row ? updated : r)))
+      setRows((current) =>
+        current.map((r) => (JSON.stringify(keyOf(table, r)) === key ? updated : r))
+      )
       setEditing(null)
       toast.success("Row updated")
     } catch (e) {
@@ -379,7 +385,13 @@ export function DataGrid({ table, readOnly }: { table: TableInfo; readOnly: bool
                       className="max-w-80 truncate"
                       title={formatValue(value)}
                       onDoubleClick={() =>
-                        editable && setEditing({ row: i, column: c.name, text: editText(value) })
+                        editable &&
+                        setEditing({
+                          row: i,
+                          key: keyOf(table, row),
+                          column: c.name,
+                          text: editText(value),
+                        })
                       }
                     >
                       {isEditing ? (

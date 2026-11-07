@@ -1250,3 +1250,27 @@ def test_console_reads_every_statement_through_a_cursor(
     # Statements that cannot run in a transaction block still run.
     vacuum = client.post("/api/sql", json={"sql": "vacuum"}, headers=AUTH)
     assert vacuum.status_code == 200, vacuum.text
+
+
+def test_read_only_keeps_saved_queries_and_history_untouched(
+    pg_url: str, ro_url: str, driver: PostgresDriver, tmp_path: Path
+) -> None:
+    """S15: read-only Studio may not write saved queries or history, nor read the
+    read-write history; an empty saved-query name is refused."""
+    state = tmp_path / "studio.json"
+    with make_client(pg_url, state_path=state) as client:
+        blank = client.put("/api/queries/saved/%20", json={"sql": "select 1"}, headers=AUTH)
+        assert blank.status_code == 400
+        client.put("/api/queries/saved/top", json={"sql": "select 42"}, headers=AUTH)
+        client.post("/api/sql", json={"sql": "select 'rw secret'"}, headers=AUTH)
+    before = state.read_text()
+    with make_client(ro_url, read_only=True, state_path=state) as client:
+        assert client.get("/api/queries/history", headers=AUTH).json()["history"] == []
+        put = client.put("/api/queries/saved/x", json={"sql": "select 1"}, headers=AUTH)
+        assert put.status_code == 403
+        assert client.delete("/api/queries/saved/top", headers=AUTH).status_code == 403
+        client.post("/api/sql", json={"sql": "select 1"}, headers=AUTH)
+        assert client.get("/api/queries/saved", headers=AUTH).json()["saved"] == [
+            {"name": "top", "sql": "select 42"}
+        ]
+    assert state.read_text() == before
