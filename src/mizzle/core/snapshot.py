@@ -9,7 +9,7 @@ schema and the database it created compare equal.
 from __future__ import annotations
 
 import re
-from typing import NotRequired, TypedDict
+from typing import Literal, NotRequired, TypedDict
 
 SNAPSHOT_VERSION = 1
 
@@ -48,21 +48,48 @@ class ColumnSnap(TypedDict):
     # Absent unless set, so snapshots written before these fields existed compare equal.
     identity: NotRequired[IdentitySnap]
     generated: NotRequired[GeneratedSnap]
+    collation: NotRequired[str]  # COLLATE name, when not the database default
+    comment: NotRequired[str]  # COMMENT ON COLUMN
 
 
 class PrimaryKeySnap(TypedDict):
     name: str
     columns: list[str]
+    deferrable: NotRequired[bool]
+    initially_deferred: NotRequired[bool]
 
 
 class UniqueSnap(TypedDict):
     name: str
     columns: list[str]
+    # Absent when the default (NULLs are distinct), so older snapshots compare equal.
+    nulls_not_distinct: NotRequired[bool]
+    deferrable: NotRequired[bool]
+    initially_deferred: NotRequired[bool]
 
 
 class CheckSnap(TypedDict):
     name: str
     expression: str
+    not_valid: NotRequired[bool]
+
+
+class ExclusionElementSnap(TypedDict):
+    """One ``key WITH operator`` of an exclusion constraint. ``column`` is the database
+    column name for a plain key; ``expression`` is the SQL text for an expression key."""
+
+    operator: str
+    column: NotRequired[str]
+    expression: NotRequired[str]
+
+
+class ExclusionSnap(TypedDict):
+    name: str
+    method: str  # access method: gist, btree...
+    elements: list[ExclusionElementSnap]
+    where: NotRequired[str]  # WHERE (predicate): only matching rows are checked
+    deferrable: NotRequired[bool]
+    initially_deferred: NotRequired[bool]
 
 
 class ForeignKeySnap(TypedDict):
@@ -73,6 +100,9 @@ class ForeignKeySnap(TypedDict):
     ref_columns: list[str]
     on_delete: str | None  # None means the database default (NO ACTION)
     on_update: str | None
+    deferrable: NotRequired[bool]
+    initially_deferred: NotRequired[bool]
+    not_valid: NotRequired[bool]
 
 
 class IndexSnap(TypedDict):
@@ -88,6 +118,7 @@ class IndexSnap(TypedDict):
     # Expression indexes carry theirs inside ``expression``.
     opclasses: NotRequired[list[str | None]]
     options: NotRequired[dict[str, str]]  # storage parameters: WITH (m = 16, ...)
+    nulls_not_distinct: NotRequired[bool]  # UNIQUE index: NULLs are equal
 
 
 class RlsSnap(TypedDict):
@@ -136,12 +167,42 @@ class TableSnap(TypedDict):
     policies: NotRequired[dict[str, PolicySnap]]
     triggers: NotRequired[dict[str, TriggerSnap]]
     grants: NotRequired[GrantsSnap]
+    comment: NotRequired[str]  # COMMENT ON TABLE
+    unlogged: NotRequired[bool]  # CREATE UNLOGGED TABLE
+    options: NotRequired[dict[str, str]]  # storage parameters: WITH (fillfactor=70)
+    exclusions: NotRequired[dict[str, ExclusionSnap]]
+    # A partitioned table's key (as pg_get_partkeydef() prints it: "RANGE (logged_at)") and
+    # its partitions: name -> bound (as pg_get_expr() prints it).
+    partition_by: NotRequired[str]
+    partitions: NotRequired[dict[str, str]]
 
 
 class EnumSnap(TypedDict):
     schema: str
     name: str
     values: list[str]
+
+
+class DomainSnap(TypedDict):
+    schema: str
+    name: str
+    base_type: str  # as format_type() prints it
+    # Absent when the default, so snapshots written before these fields existed compare equal.
+    not_null: NotRequired[bool]
+    default: NotRequired[str]
+    checks: NotRequired[list[str]]  # CHECK expressions, sorted
+    collation: NotRequired[str]
+
+
+class CompositeFieldSnap(TypedDict):
+    name: str
+    type: str  # as format_type() prints it
+
+
+class CompositeSnap(TypedDict):
+    schema: str
+    name: str
+    fields: list[CompositeFieldSnap]  # in declaration order
 
 
 class RoleSnap(TypedDict):
@@ -186,6 +247,10 @@ class ViewSnap(TypedDict):
     indexes: NotRequired[dict[str, IndexSnap]]  # materialized views only
     triggers: NotRequired[dict[str, TriggerSnap]]  # INSTEAD OF triggers (plain views)
     grants: NotRequired[GrantsSnap]
+    # View options (K6); absent when off, so older snapshots compare equal.
+    security_invoker: NotRequired[bool]
+    security_barrier: NotRequired[bool]
+    check_option: NotRequired[Literal["local", "cascaded"]]
 
 
 class Snapshot(TypedDict):
@@ -201,6 +266,8 @@ class Snapshot(TypedDict):
     roles: NotRequired[dict[str, RoleSnap]]  # name -> role (managed ones only)
     functions: NotRequired[dict[str, FunctionSnap]]  # function_key() -> function
     views: NotRequired[dict[str, ViewSnap]]  # "schema.name" -> view
+    domains: NotRequired[dict[str, DomainSnap]]  # "schema.name" -> domain
+    composites: NotRequired[dict[str, CompositeSnap]]  # "schema.name" -> composite type
 
 
 def key(schema: str, name: str) -> str:

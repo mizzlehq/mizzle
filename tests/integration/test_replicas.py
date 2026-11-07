@@ -1,9 +1,11 @@
 from collections.abc import AsyncGenerator
+from contextlib import AsyncExitStack
+from typing import Any
 
 import asyncpg
 import pytest
 
-from mizzle import Database, QueryTimeout, eq, sql
+from mizzle import Database, DatabaseError, QueryTimeout, eq, sql
 from mizzle.dialects.postgres.driver import PostgresDriver
 from tests.models import Posts, Users
 
@@ -52,16 +54,19 @@ async def test_query_timeout(pg_url: str, driver: PostgresDriver) -> None:
         # The pool's only connection still works after the cancel.
         assert await db.execute(sql("select 1 as one")) == [{"one": 1}]
         await db.with_timeout(5).execute(sql("select pg_sleep(0.3)"))
-        async with db.transaction() as tx:
-            with pytest.raises(QueryTimeout):
-                await tx.with_timeout(0.1).execute(sql("select pg_sleep(2)"))
+        # A caught timeout still aborts the transaction, so it cannot commit (C10).
+        with pytest.raises(DatabaseError, match="aborted the transaction"):
+            async with db.transaction() as tx:
+                with pytest.raises(QueryTimeout):
+                    await tx.with_timeout(0.1).execute(sql("select pg_sleep(2)"))
 
 
 async def test_server_statement_timeout_is_query_timeout(db: Database) -> None:
-    async with db.transaction() as tx:
-        await tx.execute(sql("set local statement_timeout = 50"))
-        with pytest.raises(QueryTimeout):
-            await tx.execute(sql("select pg_sleep(2)"))
+    with pytest.raises(DatabaseError, match="aborted the transaction"):
+        async with db.transaction() as tx:
+            await tx.execute(sql("set local statement_timeout = 50"))
+            with pytest.raises(QueryTimeout):
+                await tx.execute(sql("select pg_sleep(2)"))
 
 
 async def test_pool_settings(pg_url: str, driver: PostgresDriver) -> None:
@@ -131,3 +136,83 @@ async def test_unreachable_replica_falls_back_to_primary(
     ) as db:
         await db.insert(Users).values(email="a@example.com")
         assert [u.email for u in await db.select().from_(Users)] == ["a@example.com"]
+
+
+async def test_a_select_calling_func_is_not_run_again_after_a_lost_connection(
+    db: Database, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # R6: a func() call may write (nextval, a user function), but a select using one was
+    # run again after a lost connection, so its side effect happened twice.
+    from mizzle import ConnectionError, func
+    from mizzle.db import Session
+
+    sent: list[str] = []
+    send = Session._send
+
+    def lose_first(self: Session, conn: Any, query: Any, kind: Any) -> Any:
+        sent.append(query.sql)
+        if len(sent) == 1:
+            error = ConnectionError("lost")
+            error.lost = True
+            raise error
+        return send(self, conn, query, kind)
+
+    monkeypatch.setattr(Session, "_send", lose_first)
+    await db.select().from_(Users)  # a plain read runs again
+    assert len(sent) == 2
+    sent.clear()
+    with pytest.raises(ConnectionError):  # on the primary it may have written
+        await db.primary.select({"e": func("lower", Users.email)}).from_(Users)
+    assert len(sent) == 1
+    sent.clear()
+    await db.select({"e": func("lower", Users.email)}).from_(Users)  # a replica cannot write
+    assert len(sent) == 2
+
+
+async def test_a_busy_replica_sends_the_read_to_the_primary_without_marking_it_down(
+    db: Database,
+) -> None:
+    # R4-7: a busy replica pool waited acquire_timeout, then was marked down for 30 s.
+    import time
+
+    replica = db._replicas[0]
+    size = replica.stats().max_size
+    await db.insert(Users).values(email="primary@example.com")
+    async with AsyncExitStack() as stack:
+        for _ in range(size):  # hold every replica connection
+            await stack.enter_async_context(replica.acquire())
+        start = time.perf_counter()
+        assert await emails(await db.select().from_(Users)) == ["primary@example.com"]
+        assert time.perf_counter() - start < 1
+    assert db._replica_down == {}
+    assert await emails(await db.select().from_(Users)) == ["replica@example.com"]
+
+
+async def test_a_hung_replica_is_skipped_after_one_timeout(pg_url: str) -> None:
+    # R7: a replica that accepts TCP but never answers made every read wait 60 s.
+    import asyncio
+    import time
+
+    hung: list[asyncio.StreamWriter] = []
+
+    async def accept(_: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        hung.append(writer)  # never answers
+
+    server = await asyncio.start_server(accept, "127.0.0.1", 0)
+    port = server.sockets[0].getsockname()[1]
+    try:
+        async with await Database.connect(
+            pg_url,
+            schema=[Users, Posts],
+            replicas=[f"postgresql://mizzle:mizzle@127.0.0.1:{port}/mizzle"],
+            pool_min_size=0,
+            connect_timeout=0.3,
+        ) as db:
+            await db.select().from_(Users)  # waits connect_timeout, then the primary
+            start = time.perf_counter()
+            await db.select().from_(Users)
+            assert time.perf_counter() - start < 0.2
+    finally:
+        for writer in hung:
+            writer.close()
+        server.close()

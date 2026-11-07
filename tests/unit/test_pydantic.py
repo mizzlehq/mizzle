@@ -108,3 +108,94 @@ def test_include_is_an_allowlist() -> None:
     assert "id" in update_model(Users, include=["id", "bio"]).model_fields  # explicit opt-in
     with pytest.raises(SchemaError):
         insert_model(Users, include=["nope"])
+
+
+def test_models_accept_every_value_the_column_holds() -> None:
+    # C35: inet/cidr were IPv4-only; Range, Point, Box and BitString broke schema building.
+    import ipaddress
+
+    from asyncpg import BitString, Box, Point, Range
+
+    from mizzle.pg import box, cidr, inet, int4range, point, varbit
+
+    class Net(Table, name="net"):
+        id = serial().primary_key()
+        ip = inet().not_null()
+        net = cidr()
+        r = int4range()
+        p = point()
+        b = box()
+        bits = varbit()
+
+    Model = select_model(Net)
+    for ip in ("::1", "10.1.2.3", "10.1.2.3/24"):
+        Model.model_validate(
+            {
+                "id": 1,
+                "ip": ip,
+                "net": "2001:db8::/32",
+                "r": None,
+                "p": None,
+                "b": None,
+                "bits": None,
+            }
+        )
+    row = Model.model_validate(
+        {
+            "id": 1,
+            "ip": ipaddress.ip_interface("10.1.2.3/24"),
+            "net": ipaddress.ip_network("10.0.0.0/8"),
+            "r": Range(1, 5),
+            "p": Point(1, 2),
+            "b": Box((0, 0), (1, 1)),
+            "bits": BitString.from_int(5, 3),
+        }
+    )
+    assert row.model_dump()["r"] == Range(1, 5)
+    with pytest.raises(pydantic.ValidationError):
+        Model.model_validate(
+            {"id": 1, "ip": "::1", "net": None, "r": "[1,5)", "p": None, "b": None, "bits": None}
+        )
+    insert_model(Net).model_validate({"ip": "::1"})
+
+
+def test_dict_composites_write_and_validate() -> None:
+    # Q9: pg_composite(name, dict) read dicts but only accepted tuples (writes and models).
+    from mizzle.pg import pg_composite
+
+    class Home(Table, name="home"):
+        id = serial().primary_key()
+        at = pg_composite("addr", dict)
+
+    Home.at.validate({"city": "Oslo"})
+    row = select_model(Home).model_validate({"id": 1, "at": {"city": "Oslo"}})
+    assert row.model_dump()["at"] == {"city": "Oslo"}
+
+
+def test_ranges_and_bit_strings_round_trip_json() -> None:
+    # Q14: Range and BitString had no serializer and no JSON input form.
+    import datetime
+
+    from asyncpg import BitString, Range
+
+    from mizzle.pg import daterange, numrange, varbit
+
+    class Spans(Table, name="spans"):
+        id = serial().primary_key()
+        days = daterange()
+        nums = numrange()
+        bits = varbit()
+
+    Model = select_model(Spans)
+    row = Model(
+        id=1,
+        days=Range(datetime.date(2026, 1, 1), None),
+        nums=Range(Decimal("1.25"), Decimal("2.5"), upper_inc=True),
+        bits=BitString.from_int(5, 4),
+    )
+    assert Model.model_validate_json(row.model_dump_json()) == row
+    assert row.model_dump(mode="json")["bits"] == "0101"
+    empty = Model(id=1, days=Range(empty=True), nums=None, bits=None)
+    assert Model.model_validate_json(empty.model_dump_json()).model_dump()["days"] == Range(
+        empty=True
+    )

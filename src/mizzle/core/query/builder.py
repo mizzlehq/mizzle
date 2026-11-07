@@ -8,8 +8,9 @@ from typing import cast, overload
 from mizzle.core.errors import QueryError
 from mizzle.core.query.base import Runner
 from mizzle.core.query.insert import Insert
+from mizzle.core.query.merge import Merge
 from mizzle.core.query.relational import RelationalQuery
-from mizzle.core.query.select import Cte, Projection, Select, Slot
+from mizzle.core.query.select import Compound, Cte, Projection, Recursive, Select, Slot
 from mizzle.core.query.update import Delete, Update
 from mizzle.core.schema.table import Table
 from mizzle.core.sql.nodes import Expr, ExprBase
@@ -65,18 +66,36 @@ class QueryBuilder:
         """``WITH`` clause: ``db.with_(cte).select(...).from_(cte)``."""
         return QueryBuilder(self.runner, (*self.ctes, *ctes))
 
+    def recursive[R](self, name: str, seed: Select[R] | Compound[R]) -> Recursive[R]:
+        """Build a ``WITH RECURSIVE`` CTE without naming it twice::
+
+        reports = db.recursive(
+            "reports", db.select({"id": Users.id}).from_(Users).where(eq(Users.manager_id, 1))
+        ).step(
+            lambda reports: db.select({"id": Users.id})
+            .from_(Users)
+            .join(reports, eq(Users.manager_id, reports.c("id", int)))
+        )
+        await db.with_(reports).select(reports.c("id", int)).from_(reports)
+        """
+        return Recursive(name, seed)
+
     def query[T: Table](self, table: type[T]) -> RelationalQuery[T]:
         """Relational queries: ``db.query(Users).find_many(with_={"posts": True})``."""
-        return RelationalQuery(self.runner, table)
+        return RelationalQuery(self.runner, table, self.ctes)
 
     def insert[T: Table](self, table: type[T]) -> Insert[T]:
-        return Insert(self.runner, table)
+        return Insert(self.runner, table, ctes=self.ctes)
 
     def update[T: Table](self, table: type[T]) -> Update[T]:
-        return Update(self.runner, table)
+        return Update(self.runner, table, ctes=self.ctes)
 
     def delete[T: Table](self, table: type[T]) -> Delete[T]:
-        return Delete(self.runner, table)
+        return Delete(self.runner, table, ctes=self.ctes)
+
+    def merge[T: Table](self, table: type[T]) -> Merge[T]:
+        """``MERGE INTO table USING source ON ... WHEN ...`` (PostgreSQL 15+)."""
+        return Merge(self.runner, table, ctes=self.ctes)
 
     @overload
     def select(self) -> SelectAll: ...

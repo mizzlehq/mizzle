@@ -102,6 +102,18 @@ UPDATE users SET full_name = initcap(full_name);
 UPDATE posts SET body = trim(body);
 ```
 
+Each migration runs in one transaction, so do not write `BEGIN`, `COMMIT` or `ROLLBACK`:
+`migrate` refuses a migration that does. A statement that cannot run in a transaction
+(`CREATE INDEX CONCURRENTLY`) goes in its own chunk, marked `-- mizzle:no-transaction`:
+
+```sql
+-- mizzle:breakpoint
+-- mizzle:no-transaction
+CREATE INDEX CONCURRENTLY posts_body_idx ON posts (body);
+```
+
+Such a chunk cannot be rolled back if a later statement fails, so keep it last.
+
 `check` does not warn about edits to custom migrations. `mizzle drop` deletes the latest
 migration if it has not been applied yet.
 
@@ -269,6 +281,13 @@ posts_touch = trigger("posts_touch", on=Posts, execute=touch, events=["update"])
 before anything else. `schema=` and `version=` pin where and which version. Columns that
 need an extension (pgvector's `vector`) add it on their own; see
 [Extensions](extensions.md).
+
+### Domains
+
+`domain("email", as_="text", check="VALUE ~ '@'")` is `CREATE DOMAIN`. Declare it at module
+level and use it with `pg_domain("email", str)`; migrations create it before the tables that
+use it. `as_` is the base type, `default=`, `not_null=`, `check=`/`checks=` and `collation=`
+map to the same clauses. See [Schema](schema.md#domains).
 
 ### Views
 

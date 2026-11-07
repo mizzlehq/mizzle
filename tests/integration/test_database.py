@@ -201,6 +201,7 @@ async def test_unique_violation_hides_values(db: Database) -> None:
     with pytest.raises(UniqueViolation) as info:
         await add_user(db, secret)
     assert info.value.constraint == "users_email_key"
+    assert info.value.table == "users"
     assert secret not in str(info.value)
     # Logged tracebacks must not print the chained driver error (its DETAIL has the value).
     assert secret not in "".join(traceback.format_exception(info.value))
@@ -211,11 +212,13 @@ async def test_other_violations(db: Database) -> None:
     with pytest.raises(ForeignKeyViolation):
         await db.insert(Posts).values(author_id=999, title="x")
     ann = await add_user(db, "ann")
-    with pytest.raises(CheckViolation):
+    with pytest.raises(CheckViolation) as info:
         await db.insert(Posts).values(author_id=ann.id, title="")
+    assert info.value.table == "posts"
     with pytest.raises(NotNullViolation) as info:
         await db.execute(sql("insert into users (email) values (null)"))
     assert info.value.column == "email"
+    assert info.value.table == "users"
     assert info.value.sqlstate == "23502"
 
 
@@ -252,6 +255,16 @@ async def test_bad_logger_does_not_break_queries(pg_url: str, driver: object) ->
 
     async with await Database.connect(pg_url, logger=bad) as db:
         assert await db.select(Users.id).from_(Users) == []
+
+
+async def test_tags_reach_the_logger(pg_url: str, driver: object) -> None:
+    events: list[QueryEvent] = []
+    async with await Database.connect(pg_url, logger=events.append) as db:
+        tagged = db.tag(request_id="r1").tag(route="/users")
+        await tagged.select(Users.id).from_(Users)
+        await db.select(Users.id).from_(Users)  # the original session has no tags
+    assert events[-2].tags == {"request_id": "r1", "route": "/users"}
+    assert events[-1].tags == {}
 
 
 async def test_connection_errors() -> None:

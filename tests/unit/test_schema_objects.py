@@ -13,14 +13,18 @@ from mizzle import (
     SchemaError,
     Table,
     View,
+    check,
     count,
     eq,
+    exclusion,
     extension,
+    foreign_key,
     function,
     policy,
     rls,
     sql,
     trigger,
+    unique,
     unique_index,
 )
 from mizzle.core.schema.objects import SchemaObject
@@ -29,7 +33,40 @@ from mizzle.dialects.postgres import PostgresDialect
 from mizzle.kit.codegen import render_schema_module, render_types_module
 from mizzle.kit.diff import diff
 from mizzle.kit.snapshot import build_snapshot
-from mizzle.pg import bigint, boolean, integer, serial, text, timestamp, vector
+from mizzle.pg import (
+    array,
+    bigint,
+    bit,
+    boolean,
+    box,
+    cidr,
+    circle,
+    citext,
+    daterange,
+    hstore,
+    int4multirange,
+    int4range,
+    int8range,
+    integer,
+    line,
+    lseg,
+    ltree,
+    macaddr,
+    macaddr8,
+    money,
+    numrange,
+    path,
+    point,
+    polygon,
+    serial,
+    text,
+    timestamp,
+    tstzmultirange,
+    tstzrange,
+    varbit,
+    vector,
+    xml,
+)
 
 dialect = PostgresDialect()
 
@@ -147,8 +184,8 @@ def test_snapshot() -> None:
 def test_create_order_and_sql() -> None:
     assert described(empty_snapshot("postgresql"), snap()) == [
         "create extension pg_trgm",
+        "create function touch",  # before the tables: a CHECK or DEFAULT may call it (K1)
         "create table users",
-        "create function touch",
         "create view active_users",
         "create materialized view user_counts",
         "create index user_counts_active",
@@ -160,7 +197,7 @@ def test_create_order_and_sql() -> None:
     ]
     statements = sqls(empty_snapshot("postgresql"), snap())
     assert statements[0] == "CREATE EXTENSION IF NOT EXISTS pg_trgm"
-    assert statements[2] == (
+    assert statements[1] == (
         'CREATE OR REPLACE FUNCTION "touch"() RETURNS trigger LANGUAGE plpgsql '
         "AS $mizzle$BEGIN NEW.updated_at = now(); RETURN NEW; END$mizzle$"
     )
@@ -185,8 +222,8 @@ def test_drop_order_is_reversed() -> None:
         "drop view emails",
         "drop materialized view user_counts",
         "drop view active_users",
-        "drop function touch",
         "drop table users",
+        "drop function touch",  # after the tables (K1)
         "drop extension pg_trgm",
     ]
 
@@ -264,11 +301,11 @@ def test_function_changes() -> None:
     moved = trigger("users_touch", on=Users, execute=args, events=["update"])
     assert described(snap(objects=[new_trigger]), snap(objects=[moved])) == [
         "drop trigger users_touch on users",
-        "drop function touch",
-        "create function touch",
+        "create function touch",  # another overload: both exist for a moment (K1)
         "create trigger users_touch on users",
+        "drop function touch",
     ]
-    assert sqls(snap(objects=[new_trigger]), snap(objects=[moved]))[1] == (
+    assert sqls(snap(objects=[new_trigger]), snap(objects=[moved]))[3] == (
         'DROP FUNCTION "touch"()'
     )
 
@@ -395,3 +432,384 @@ def test_pull_round_trip(tmp_path: Path) -> None:
     ]
     objects = [v for v in members if isinstance(v, type(trgm) | type(touch) | type(users_touch))]
     assert diff(original, build_snapshot(tables, dialect, objects=objects)) == []
+
+
+@final
+class RefPk(Table, name="ref_pk"):
+    id = integer().primary_key()
+
+
+@final
+class Curve(Table, name="curve"):
+    id = integer().primary_key(deferrable=True, initially_deferred=True)
+    pair = text().unique(nulls_not_distinct=True, deferrable=True)
+    tag = text()
+    ptr = integer()
+
+    @classmethod
+    @override
+    def config(cls) -> list[Constraint]:
+        return [
+            unique(cls.tag, name="curve_tag_uniq", deferrable=True),
+            foreign_key(
+                [cls.ptr],
+                lambda: [RefPk.id],
+                name="curve_ptr_fkey",
+                deferrable=True,
+                initially_deferred=True,
+                not_valid=True,
+            ),
+            check("curve_ptr_pos", sql("ptr > 0"), not_valid=True),
+        ]
+
+
+def test_constraint_modifiers_sql() -> None:
+    statements = sqls(empty_snapshot("postgresql"), snap([RefPk, Curve], objects=[]))
+    create = next(s for s in statements if s.startswith('CREATE TABLE "curve"'))
+    assert 'CONSTRAINT "curve_pkey" PRIMARY KEY ("id") DEFERRABLE INITIALLY DEFERRED' in create
+    assert 'CONSTRAINT "curve_pair_key" UNIQUE NULLS NOT DISTINCT ("pair") DEFERRABLE' in create
+    assert "curve_ptr_pos" not in create  # NOT VALID is added afterwards, not in CREATE TABLE
+    assert 'CONSTRAINT "curve_tag_uniq" UNIQUE ("tag") DEFERRABLE' in create
+    assert (
+        'ALTER TABLE "curve" ADD CONSTRAINT "curve_ptr_fkey" FOREIGN KEY ("ptr") '
+        'REFERENCES "ref_pk" ("id") DEFERRABLE INITIALLY DEFERRED NOT VALID' in statements
+    )
+    assert (
+        'ALTER TABLE "curve" ADD CONSTRAINT "curve_ptr_pos" CHECK (ptr > 0) NOT VALID' in statements
+    )
+
+
+def test_constraint_modifiers_snapshot_and_pull(tmp_path: Path) -> None:
+    original = snap([RefPk, Curve], objects=[])
+    curve = original["tables"]["public.curve"]
+    assert curve["primary_key"] is not None
+    assert curve["primary_key"].get("deferrable") and curve["primary_key"].get("initially_deferred")
+    assert curve["uniques"]["curve_pair_key"].get("nulls_not_distinct")
+    assert curve["uniques"]["curve_pair_key"].get("deferrable")
+    assert curve["foreign_keys"]["curve_ptr_fkey"].get("not_valid")
+    assert curve["checks"]["curve_ptr_pos"].get("not_valid")
+
+    source = render_schema_module(original)
+    assert ".primary_key(deferrable=True, initially_deferred=True)" in source
+    assert ".unique(nulls_not_distinct=True, deferrable=True)" in source
+    assert "not_valid=True" in source
+
+    path = tmp_path / "pulled_modifiers.py"
+    path.write_text(source)
+    spec = importlib.util.spec_from_file_location("pulled_modifiers", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["pulled_modifiers"] = module
+    spec.loader.exec_module(module)
+    members = list(vars(module).values())
+    tables = [
+        v
+        for v in members
+        if isinstance(v, type) and issubclass(v, Table) and "__table__" in vars(v)
+    ]
+    assert diff(original, build_snapshot(tables, dialect)) == []
+
+
+@final
+class Annotated(Table, name="annotated", comment="a well-documented table"):
+    id = integer().not_null().comment("the primary id")
+    note = text().comment("free text notes")
+
+
+def test_comments_sql_and_pull(tmp_path: Path) -> None:
+    original = snap([Annotated], objects=[])
+    table = original["tables"]["public.annotated"]
+    assert table.get("comment") == "a well-documented table"
+    assert table["columns"]["id"].get("comment") == "the primary id"
+    assert table["columns"]["note"].get("comment") == "free text notes"
+
+    statements = sqls(empty_snapshot("postgresql"), original)
+    assert "COMMENT ON TABLE \"annotated\" IS 'a well-documented table'" in statements
+    assert 'COMMENT ON COLUMN "annotated"."id" IS \'the primary id\'' in statements
+    assert 'COMMENT ON COLUMN "annotated"."note" IS \'free text notes\'' in statements
+
+    source = render_schema_module(original)
+    assert "comment='a well-documented table'" in source
+    assert ".comment('the primary id')" in source
+
+    path = tmp_path / "pulled_comments.py"
+    path.write_text(source)
+    spec = importlib.util.spec_from_file_location("pulled_comments", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["pulled_comments"] = module
+    spec.loader.exec_module(module)
+    members = list(vars(module).values())
+    tables = [
+        v
+        for v in members
+        if isinstance(v, type) and issubclass(v, Table) and "__table__" in vars(v)
+    ]
+    assert diff(original, build_snapshot(tables, dialect)) == []
+
+
+@final
+class Collated(Table, name="collated"):
+    label = text().collate("C")
+    plain = text()
+
+
+def test_column_collation_sql_and_pull(tmp_path: Path) -> None:
+    original = snap([Collated], objects=[])
+    columns = original["tables"]["public.collated"]["columns"]
+    assert columns["label"].get("collation") == "C"
+    assert "collation" not in columns["plain"]
+
+    create = next(
+        s
+        for s in sqls(empty_snapshot("postgresql"), original)
+        if s.startswith('CREATE TABLE "collated"')
+    )
+    assert '"label" text COLLATE "C"' in create
+
+    source = render_schema_module(original)
+    assert ".collate('C')" in source
+
+    path = tmp_path / "pulled_collation.py"
+    path.write_text(source)
+    spec = importlib.util.spec_from_file_location("pulled_collation", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["pulled_collation"] = module
+    spec.loader.exec_module(module)
+    members = list(vars(module).values())
+    tables = [
+        v
+        for v in members
+        if isinstance(v, type) and issubclass(v, Table) and "__table__" in vars(v)
+    ]
+    assert diff(original, build_snapshot(tables, dialect)) == []
+
+
+@final
+class Unlogged(Table, name="unlogged", unlogged=True, storage={"fillfactor": 70}):
+    id = integer().not_null()
+    blob = text()
+
+
+def test_unlogged_and_storage_sql_and_pull(tmp_path: Path) -> None:
+    original = snap([Unlogged], objects=[])
+    table = original["tables"]["public.unlogged"]
+    assert table.get("unlogged") is True
+    assert table.get("options") == {"fillfactor": "70"}
+
+    create = next(s for s in sqls(empty_snapshot("postgresql"), original) if "unlogged" in s)
+    assert create.startswith('CREATE UNLOGGED TABLE "unlogged"')
+    assert "WITH (fillfactor=70)" in create
+
+    source = render_schema_module(original)
+    assert "unlogged=True" in source
+    assert "storage={'fillfactor': '70'}" in source
+
+    path = tmp_path / "pulled_unlogged.py"
+    path.write_text(source)
+    spec = importlib.util.spec_from_file_location("pulled_unlogged", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["pulled_unlogged"] = module
+    spec.loader.exec_module(module)
+    members = list(vars(module).values())
+    tables = [
+        v
+        for v in members
+        if isinstance(v, type) and issubclass(v, Table) and "__table__" in vars(v)
+    ]
+    assert diff(original, build_snapshot(tables, dialect)) == []
+
+
+@final
+class Spans(Table, name="spans"):
+    id = integer().primary_key()
+    ints = int4range()
+    big = int8range()
+    nums = numrange()
+    stamps = tstzrange()
+    days = daterange()
+    multi = int4multirange()
+    stampmulti = tstzmultirange()
+
+
+def test_range_and_multirange_types_sql_snapshot_and_pull(tmp_path: Path) -> None:
+    original = snap([Spans], objects=[])
+    columns = original["tables"]["public.spans"]["columns"]
+    assert columns["ints"]["type"] == "int4range"
+    assert columns["big"]["type"] == "int8range"
+    assert columns["nums"]["type"] == "numrange"
+    assert columns["stamps"]["type"] == "tstzrange"
+    assert columns["days"]["type"] == "daterange"
+    assert columns["multi"]["type"] == "int4multirange"
+    assert columns["stampmulti"]["type"] == "tstzmultirange"
+
+    create = next(s for s in sqls(empty_snapshot("postgresql"), original) if "CREATE TABLE" in s)
+    assert '"ints" int4range' in create
+    assert '"nums" numrange' in create
+    assert '"stamps" tstzrange' in create
+    assert '"days" daterange' in create
+    assert '"multi" int4multirange' in create
+
+    source = render_schema_module(original)
+    assert "int4range()" in source
+    assert "numrange()" in source
+    assert "tstzmultirange()" in source
+
+    path = tmp_path / "pulled_ranges.py"
+    path.write_text(source)
+    spec = importlib.util.spec_from_file_location("pulled_ranges", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["pulled_ranges"] = module
+    spec.loader.exec_module(module)
+    members = list(vars(module).values())
+    tables = [
+        v
+        for v in members
+        if isinstance(v, type) and issubclass(v, Table) and "__table__" in vars(v)
+    ]
+    assert diff(original, build_snapshot(tables, dialect)) == []
+
+
+@final
+class Reserved(Table, name="reserved"):
+    id = serial().primary_key()
+    room = text().not_null()
+    slot = integer().not_null()
+
+    @classmethod
+    @override
+    def config(cls) -> list[Constraint]:
+        return [
+            exclusion(
+                (cls.room, "="),
+                (cls.slot, "="),
+                name="reserved_booked",
+                using="btree",
+                deferrable=True,
+                initially_deferred=True,
+            ),
+            exclusion(
+                (sql("lower(room)"), "="),
+                name="reserved_lower_room",
+                using="btree",
+                where=sql("slot > 0"),
+            ),
+        ]
+
+
+def test_exclusion_constraints_sql_snapshot_and_pull(tmp_path: Path) -> None:
+    original = snap([Reserved], objects=[])
+    exclusions = original["tables"]["public.reserved"].get("exclusions", {})
+    booked = exclusions["reserved_booked"]
+    assert booked["method"] == "btree"
+    assert booked.get("deferrable") and booked.get("initially_deferred")
+    assert [(e.get("column"), e["operator"]) for e in booked["elements"]] == [
+        ("room", "="),
+        ("slot", "="),
+    ]
+    lower = exclusions["reserved_lower_room"]
+    assert lower["elements"][0].get("expression") == "lower(room)"
+    assert lower.get("where") == "slot > 0"
+
+    create = next(s for s in sqls(empty_snapshot("postgresql"), original) if "CREATE TABLE" in s)
+    assert (
+        'CONSTRAINT "reserved_booked" EXCLUDE USING btree ("room" WITH =, "slot" WITH =) '
+        "DEFERRABLE INITIALLY DEFERRED" in create
+    )
+    assert 'CONSTRAINT "reserved_lower_room" EXCLUDE USING btree (lower(room) WITH =)' in create
+    assert "WHERE (slot > 0)" in create
+
+    source = render_schema_module(original)
+    assert "exclusion(" in source
+    assert "using='btree'" in source
+    assert "where=sql('slot > 0')" in source
+
+    path = tmp_path / "pulled_exclusion.py"
+    path.write_text(source)
+    spec = importlib.util.spec_from_file_location("pulled_exclusion", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["pulled_exclusion"] = module
+    spec.loader.exec_module(module)
+    members = list(vars(module).values())
+    tables = [
+        v
+        for v in members
+        if isinstance(v, type) and issubclass(v, Table) and "__table__" in vars(v)
+    ]
+    assert diff(original, build_snapshot(tables, dialect)) == []
+
+
+@final
+class Assorted(Table, name="assorted"):
+    id = integer().primary_key()
+    net = cidr()
+    mac = macaddr()
+    mac8 = macaddr8()
+    flags = bit(4)
+    variable = varbit(8)
+    doc = xml()
+    amount = money()
+    pt = point()
+    ln = line()
+    seg = lseg()
+    rect = box()
+    trace = path()
+    area = polygon()
+    disc = circle()
+    attrs = hstore()
+    label = citext()
+    tree = ltree()
+    embeddings = array(vector(3))
+
+
+def test_more_column_types_sql_snapshot_and_pull(tmp_path: Path) -> None:
+    original = snap([Assorted], objects=[])
+    columns = original["tables"]["public.assorted"]["columns"]
+    assert columns["net"]["type"] == "cidr"
+    assert columns["mac"]["type"] == "macaddr"
+    assert columns["mac8"]["type"] == "macaddr8"
+    assert columns["flags"]["type"] == "bit(4)"
+    assert columns["variable"]["type"] == "bit varying(8)"
+    assert columns["doc"]["type"] == "xml"
+    assert columns["amount"]["type"] == "money"
+    assert columns["pt"]["type"] == "point"
+    assert columns["ln"]["type"] == "line"
+    assert columns["seg"]["type"] == "lseg"
+    assert columns["rect"]["type"] == "box"
+    assert columns["trace"]["type"] == "path"
+    assert columns["area"]["type"] == "polygon"
+    assert columns["disc"]["type"] == "circle"
+    assert columns["attrs"]["type"] == "hstore"
+    assert columns["label"]["type"] == "citext"
+    assert columns["tree"]["type"] == "ltree"
+    assert columns["embeddings"]["type"] == "vector(3)[]"
+    assert original.get("extensions") == {"vector": {"name": "vector"}}  # vector[] needs pgvector
+
+    create = next(s for s in sqls(empty_snapshot("postgresql"), original) if "CREATE TABLE" in s)
+    assert '"flags" bit(4)' in create
+    assert '"variable" bit varying(8)' in create
+    assert '"embeddings" vector(3)[]' in create
+
+    source = render_schema_module(original)
+    assert "bit(4)" in source
+    assert "varbit(8)" in source
+    assert "array(vector(3))" in source
+
+    path = tmp_path / "pulled_more_types.py"
+    path.write_text(source)
+    spec = importlib.util.spec_from_file_location("pulled_more_types", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["pulled_more_types"] = module
+    spec.loader.exec_module(module)
+    members = list(vars(module).values())
+    tables = [
+        v
+        for v in members
+        if isinstance(v, type) and issubclass(v, Table) and "__table__" in vars(v)
+    ]
+    assert diff(original, build_snapshot(tables, dialect)) == []

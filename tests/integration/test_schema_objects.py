@@ -353,3 +353,60 @@ async def test_normalize_twice_on_one_connection(driver: PostgresDriver) -> None
             # The server's text (14-15 qualify columns).
             assert re.match(r"SELECT (so_accounts\.)?id,", definition), definition
             assert ("owner" in definition) == (tables[1] is Active2), definition
+
+
+async def test_view_options_survive_recreate_and_pull(driver: PostgresDriver) -> None:
+    """(K6) security_invoker / security_barrier / check option: written, read back,
+    kept when the view is re-created, and written by pull."""
+    async with driver.acquire() as conn:
+        [row] = await conn.fetch("SHOW server_version_num", [])
+    if int(str(row[0])) < 150000:
+        pytest.skip("security_invoker needs PostgreSQL 15")
+
+    @final
+    class Secure(
+        View,
+        name="so_secure",
+        schema="so_app",
+        security_invoker=True,
+        security_barrier=True,
+        check_option="local",
+    ):
+        id = integer().not_null()
+        email = text().not_null()
+
+        @classmethod
+        @override
+        def query(cls, db: QueryBuilder):
+            return db.select(Accounts.id, Accounts.email).from_(Accounts)
+
+    @final
+    class Secure2(  # a new query: dropped and created again
+        View,
+        name="so_secure",
+        schema="so_app",
+        security_invoker=True,
+        security_barrier=True,
+        check_option="local",
+    ):
+        id = integer().not_null()
+
+        @classmethod
+        @override
+        def query(cls, db: QueryBuilder):
+            return db.select(Accounts.id).from_(Accounts)
+
+    one = build_snapshot([Accounts, Secure], dialect, objects=[trgm])
+    two = build_snapshot([Accounts, Secure2], dialect, objects=[trgm])
+    await migrate(driver, empty_snapshot("postgresql"), one)
+    await migrate(driver, one, two)
+    live, expected = await live_and_expected(driver, two)
+    assert_no_drift(live, expected)
+    view = live.get("views", {})["so_app.so_secure"]
+    assert view.get("security_invoker") and view.get("security_barrier")
+    assert view.get("check_option") == "local"
+    # An option no longer declared is a change.
+    del expected.get("views", {})["so_app.so_secure"]["security_invoker"]
+    assert diff(live, expected)
+    source = render_schema_module(live)
+    assert "security_invoker=True, security_barrier=True, check_option='local'" in source

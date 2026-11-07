@@ -1261,7 +1261,7 @@ def assert_no_drift(live: Snapshot, expected: Snapshot) -> None:
     note(f"expected: {expected['tables']}\nlive: {live['tables']}")
     for part in ("views", "functions", "extensions"):
         note(f"expected {part}: {expected.get(part)}\nlive {part}: {live.get(part)}")
-    remaining = diff(live, expected, compare_expressions=False)
+    remaining = diff(live, expected, compare_expressions=False, normalized=True)
     assert remaining == [], [s.describe() for s in remaining]
     # compare_expressions=False leaves undeclared extensions alone; they must be gone too.
     installed = {e for e in live.get("extensions", {}) if e in EXTENSIONS}
@@ -1485,7 +1485,9 @@ def test_evolve_has_no_drift(
             event(f"kept rows checked: {sum(map(len, before.values())) > 0}")
             assert await kept_data(driver, s1, s2, after=True) == before
         # Running the migration again would find nothing to do.
-        assert dialect.render(diff(live, expected, compare_expressions=False)) == []
+        assert (
+            dialect.render(diff(live, expected, compare_expressions=False, normalized=True)) == []
+        )
 
     loop.run(scenario())
 
@@ -1613,8 +1615,8 @@ def test_regressions_found_by_fuzzing() -> None:
         s.sql for s in migration(snapshot_of(Spec(["happy", "sad"], moods)), snapshot_of(grown))
     ]
     assert sqls == [
-        """ALTER TYPE "fz_mood" ADD VALUE 'it''s' BEFORE 'happy'""",
-        """ALTER TYPE "fz_mood" ADD VALUE 'glad' AFTER 'it''s'""",
+        """ALTER TYPE "fz_mood" ADD VALUE IF NOT EXISTS 'it''s' BEFORE 'happy'""",
+        """ALTER TYPE "fz_mood" ADD VALUE IF NOT EXISTS 'glad' AFTER 'it''s'""",
     ]
 
     # Long generated names keep their suffix, so a unique and a foreign key on the same

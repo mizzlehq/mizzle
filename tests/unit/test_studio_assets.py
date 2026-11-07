@@ -3,6 +3,8 @@ and Windows in CI (job `studio-assets`)."""
 
 import hashlib
 import stat
+import sys
+import urllib.request
 import zipfile
 from pathlib import Path
 
@@ -157,8 +159,6 @@ def test_non_https_download_is_refused() -> None:
 
 
 def test_install_root_prefers_the_venv(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    import sys
-
     monkeypatch.setattr(sys, "prefix", str(tmp_path / "venv"))
     monkeypatch.setattr(sys, "base_prefix", str(tmp_path / "python"))
     assert assets.install_root() == tmp_path / "venv" / "share" / "mizzle" / "studio"
@@ -166,3 +166,163 @@ def test_install_root_prefers_the_venv(tmp_path: Path, monkeypatch: pytest.Monke
     assert assets.install_root() == assets.cache_root()
     monkeypatch.setattr(sys, "prefix", sys.base_prefix)  # no venv
     assert assets.install_root() == assets.cache_root()
+
+
+def test_manifest_rejects_wrong_shapes(tmp_path: Path) -> None:
+    path = tmp_path / "ui.json"
+    path.write_text("[]")
+    with pytest.raises(StudioUIError, match="JSON object"):
+        read_manifest(path)
+    path.write_text('{"version": "1", "url": "https://x/ui.zip"}')
+    with pytest.raises(StudioUIError, match="string fields"):
+        read_manifest(path)
+
+
+def test_cache_root_per_platform(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "local"))
+    assert assets.cache_root() == tmp_path / "local" / "mizzle" / "studio"
+    monkeypatch.delenv("LOCALAPPDATA")
+    # Path.home() reads USERPROFILE on Windows and HOME elsewhere: patch it directly.
+    monkeypatch.setattr(Path, "home", lambda: tmp_path / "home")
+    assert assets.cache_root() == tmp_path / "home" / "AppData" / "Local" / "mizzle" / "studio"
+    monkeypatch.setattr(sys, "platform", "darwin")
+    assert assets.cache_root() == tmp_path / "home" / "Library" / "Caches" / "mizzle" / "studio"
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "xdg"))
+    assert assets.cache_root() == tmp_path / "xdg" / "mizzle" / "studio"
+
+
+class FakeResponse:
+    def __init__(self, body: bytes) -> None:
+        self._body = body
+
+    def read(self, _size: int = -1) -> bytes:
+        return self._body
+
+    def __enter__(self) -> "FakeResponse":
+        return self
+
+    def __exit__(self, *_args: object) -> bool:
+        return False
+
+
+def test_https_fetch_reads_and_caps(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(urllib.request, "urlopen", lambda *_a, **_k: FakeResponse(b"hello"))
+    assert assets._https_fetch(URL) == b"hello"
+    big = b"a" * (assets.MAX_ARCHIVE_BYTES + 1)
+    monkeypatch.setattr(urllib.request, "urlopen", lambda *_a, **_k: FakeResponse(big))
+    with pytest.raises(StudioUIError, match="larger"):
+        assets._https_fetch(URL)
+
+
+def test_unpacked_size_limit(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(assets, "MAX_UNPACKED_BYTES", 3)
+    body = zip_with(tmp_path / "ui.zip", {"index.html": b"12345"})
+    with pytest.raises(StudioUIError, match="unpacks to more"):
+        download(manifest_for(body), tmp_path / "cache", lambda _: body)
+
+
+def test_directory_entries_are_created(tmp_path: Path) -> None:
+    path = tmp_path / "ui.zip"
+    with zipfile.ZipFile(path, "w") as zf:
+        zf.writestr(zipfile.ZipInfo("assets/"), b"")
+        zf.writestr("index.html", b"x")
+        zf.writestr("assets/app.js", b"1")
+    body = path.read_bytes()
+    ui = download(manifest_for(body), tmp_path / "cache", lambda _: body)
+    assert (ui / "assets").is_dir() and (ui / "assets" / "app.js").exists()
+
+
+def test_rename_race_keeps_the_other_process_result(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    body = zip_with(tmp_path / "ui.zip", {"index.html": b"x"})
+    manifest = manifest_for(body)
+    real_rename = Path.rename
+
+    def flaky(self: Path, target: str | Path) -> Path:
+        if self.name == "ui":  # the freshly unpacked folder: pretend another process won
+            Path(target).mkdir(parents=True, exist_ok=True)
+            (Path(target) / "index.html").write_text("x")
+            raise OSError("busy")
+        return real_rename(self, target)
+
+    monkeypatch.setattr(Path, "rename", flaky)
+    ui = download(manifest, tmp_path / "cache", lambda _: body)
+    assert (ui / "index.html").exists()
+
+
+def test_rename_failure_without_a_winner_reraises(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    body = zip_with(tmp_path / "ui.zip", {"index.html": b"x"})
+    manifest = manifest_for(body)
+    real_rename = Path.rename
+
+    def broken(self: Path, target: str | Path) -> Path:
+        if self.name == "ui":
+            raise OSError("disk full")
+        return real_rename(self, target)
+
+    monkeypatch.setattr(Path, "rename", broken)
+    with pytest.raises(OSError, match="disk full"):
+        download(manifest, tmp_path / "cache", lambda _: body)
+
+
+def test_ui_path_uses_dev_build(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    dev = make_dist(tmp_path)
+    monkeypatch.setattr(assets, "DEV_BUILD", dev)
+    monkeypatch.delenv(assets.ENV_UI_PATH, raising=False)
+    assert assets.ui_path() == dev
+
+
+def test_ui_path_wraps_download_oserror(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(assets, "DEV_BUILD", tmp_path / "no-dev-build")
+    monkeypatch.setattr(assets, "read_manifest", lambda *_a, **_k: Manifest("1.0.0", URL, "a" * 64))
+    monkeypatch.delenv(assets.ENV_UI_PATH, raising=False)
+
+    def boom(*_args: object, **_kwargs: object) -> Path:
+        raise OSError("no route to host")
+
+    monkeypatch.setattr(assets, "download", boom)
+    with pytest.raises(StudioUIError, match="could not download"):
+        assets.ui_path()
+
+
+def test_build_archive_needs_index(tmp_path: Path) -> None:
+    (tmp_path / "dist").mkdir()
+    with pytest.raises(StudioUIError, match=r"no index\.html"):
+        build_archive(tmp_path / "dist", tmp_path / "a.zip")
+
+
+def test_build_archive_rejects_links(tmp_path: Path) -> None:
+    dist = make_dist(tmp_path)
+    try:
+        (dist / "link.js").symlink_to(dist / "index.html")
+    except (OSError, NotImplementedError):
+        pytest.skip("symlinks are not supported here")
+    with pytest.raises(StudioUIError, match="links"):
+        build_archive(dist, tmp_path / "a.zip")
+
+
+def test_main_packages_the_ui(tmp_path: Path) -> None:
+    dist = make_dist(tmp_path)
+    archive = tmp_path / "ui.zip"
+    manifest = tmp_path / "ui.json"
+    assets._main(
+        [
+            str(dist),
+            str(archive),
+            "--version",
+            "1.0.0",
+            "--url",
+            URL,
+            "--manifest",
+            str(manifest),
+        ]
+    )
+    assert archive.exists()
+    assert read_manifest(manifest) == Manifest(
+        "1.0.0", URL, hashlib.sha256(archive.read_bytes()).hexdigest()
+    )

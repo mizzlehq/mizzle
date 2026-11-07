@@ -9,16 +9,21 @@ otherwise they are cast to the SQL type of the Python value, so functions that t
 from __future__ import annotations
 
 import datetime
+import enum
+import math
 import re
 import uuid
 from collections.abc import Iterable, Sequence
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
+from dataclasses import replace as _replace
 from decimal import Decimal
 from typing import Literal, overload
+from typing import cast as _cast
 
 from mizzle.core.errors import QueryError
 from mizzle.core.schema.column import Column, ColumnBase
 from mizzle.core.sql.nodes import (
+    Aggregate,
     BinaryOp,
     Cast,
     Condition,
@@ -35,6 +40,7 @@ from mizzle.core.sql.nodes import (
     Over,
     Param,
     Placeholder,
+    PostfixOp,
     TypedCast,
     TypedFragment,
     TypedFunc,
@@ -57,7 +63,7 @@ _SQL_TYPES: tuple[tuple[type[object], str], ...] = (
 )
 
 
-def _sql_type(value: object) -> str | None:
+def sql_type_of(value: object) -> str | None:
     if isinstance(value, datetime.datetime):
         return "timestamp" if value.tzinfo is None else "timestamptz"
     return next((name for kind, name in _SQL_TYPES if isinstance(value, kind)), None)
@@ -73,12 +79,26 @@ def column_of(node: object) -> ColumnBase | None:
             return column_of(node.expr)
         case Cast():
             return node.column
+        case Aggregate(keeps_type=True, returns_array=True):
+            column = _first_column(node.args)
+            return None if column is None else column.array_column()
+        case Aggregate(keeps_type=True):
+            grouped: list[object] = [
+                item.expr if isinstance(item, OrderBy) else item for item in node.within_group_
+            ]
+            return _first_column((*node.args, *grouped))
+        case Func(name="unnest", keeps_type=True):  # one element of the array (C31)
+            column = _first_column(node.args)
+            return None if column is None else column.item
         case Func(keeps_type=True):
             return _first_column(node.args)
         case Over():
             return column_of(node.func)
         case CteColumn():
             return node.cte.source_column(node.name)
+        case PostfixOp(op="->" | "#>"):
+            # A jsonb extraction returns jsonb: the source column carries the type.
+            return column_of(node.item)
         case CaseBase():
             return _first_column((*(v for _, v in node.whens), node.default))
         case _:
@@ -127,14 +147,35 @@ def bind(value: object, like: Iterable[object] = ()) -> Node:
     become parameters encoded by a column among ``like``, or else cast to their SQL type."""
     if isinstance(value, Placeholder):
         column = None if value.column is not None else _first_column(like)
-        return value if column is None else replace(value, column=column)
+        return value if column is None else _replace(value, column=column)
     if isinstance(value, Node):
         return value
     column = _first_column(like)
     if column is not None:
         return Param(value, column)
-    sql_type = _sql_type(value)
+    if isinstance(value, enum.Enum):
+        return _enum_value(value)
+    # untyped, CASE and jsonb builders failed (Q8); a plain tuple too, not Point & co (Q4-13)
+    if isinstance(value, (dict, list)) or type(value) is tuple:
+        return Cast(Param(_cast(object, value)), "jsonb")
+    sql_type = sql_type_of(value)
     return Param(value) if sql_type is None else Cast(Param(value), sql_type)
+
+
+def _enum_value(member: enum.Enum) -> Node:
+    """An enum member with no column to type it: its value's SQL type (else text, as its
+    label), decoded back into a member; an IntEnum in a CASE came back as int (Q8)."""
+    enum_cls = type(member)
+    raw = _cast(object, member.value)
+    sql_type = sql_type_of(raw)
+    by_label: dict[str, enum.Enum] = {str(_cast(object, m.value)): m for m in enum_cls}
+
+    def decode(value: object) -> object:
+        found = by_label.get(value) if isinstance(value, str) else None
+        return found if found is not None else enum_cls(value)
+
+    column = Column[object](sql_type or "text", (enum_cls,), decoder=decode)
+    return Cast(Param(raw if sql_type else str(raw)), sql_type or "text", column)
 
 
 def _func(name: str, *args: object, keeps_type: bool = False) -> TypedFunc[object]:
@@ -153,7 +194,16 @@ def _identifier(kind: str, name: str) -> str:
 def _whole(name: str, value: int) -> int:
     if isinstance(value, bool) or not isinstance(value, int):  # pyright: ignore[reportUnnecessaryIsInstance]
         raise QueryError(f"{name} must be an int; got {value!r}")
-    return value
+    return int(value)  # a subclass (IntEnum) must not write its own repr
+
+
+def _number(name: str, value: int | float) -> int | float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):  # pyright: ignore[reportUnnecessaryIsInstance]
+        raise QueryError(f"{name} must be a number; got {value!r}")
+    number = float(value) if isinstance(value, float) else int(value)
+    if isinstance(number, float) and not math.isfinite(number):
+        raise QueryError(f"{name} must be a finite number; got {value!r}")
+    return number
 
 
 # -- CASE -----------------------------------------------------------------------------
@@ -701,3 +751,402 @@ def _rank(
     if norm:
         args += (Fragment((str(_whole("normalization", norm)),)),)
     return TypedFunc[float](name, args)
+
+
+# -- more strings (EX5) ---------------------------------------------------------------
+
+
+def substring[S: (str, str | None)](
+    expr: Expr[S], start: int, length: int | None = None
+) -> Expr[S]:
+    """``substr(expr, start, length)``: ``start`` is 1-based; without ``length`` it runs to
+    the end of the string."""
+    args: tuple[Node, ...] = (expr, Fragment((str(_whole("start", start)),)))
+    if length is not None:
+        args += (Fragment((str(_whole("length", length)),)),)
+    return TypedFunc[S]("substr", args)
+
+
+def replace[S: (str, str | None)](expr: Expr[S], old: str, new: str) -> Expr[S]:
+    """Replace every occurrence of ``old`` with ``new``."""
+    return TypedFunc[S]("replace", (expr, bind(old), bind(new)))
+
+
+@overload
+def strpos(expr: Expr[str], needle: str | Expr[str]) -> Expr[int]: ...
+@overload
+def strpos(expr: Expr[str | None], needle: str | Expr[str]) -> Expr[int | None]: ...
+def strpos(expr: Expr[str] | Expr[str | None], needle: str | Expr[str]) -> ExprBase:
+    """1-based position of ``needle`` in ``expr``, or 0 when absent."""
+    return TypedFunc[object]("strpos", (expr, bind(needle)))
+
+
+def left[S: (str, str | None)](expr: Expr[S], n: int) -> Expr[S]:
+    """The first ``n`` characters."""
+    return TypedFunc[S]("left", (expr, Fragment((str(_whole("n", n)),))))
+
+
+def right[S: (str, str | None)](expr: Expr[S], n: int) -> Expr[S]:
+    """The last ``n`` characters."""
+    return TypedFunc[S]("right", (expr, Fragment((str(_whole("n", n)),))))
+
+
+def lpad[S: (str, str | None)](expr: Expr[S], length: int, fill: str = " ") -> Expr[S]:
+    """Pad on the left with ``fill`` until ``length`` characters."""
+    return TypedFunc[S]("lpad", (expr, Fragment((str(_whole("length", length)),)), bind(fill)))
+
+
+def rpad[S: (str, str | None)](expr: Expr[S], length: int, fill: str = " ") -> Expr[S]:
+    """Pad on the right with ``fill`` until ``length`` characters."""
+    return TypedFunc[S]("rpad", (expr, Fragment((str(_whole("length", length)),)), bind(fill)))
+
+
+def repeat[S: (str, str | None)](expr: Expr[S], n: int) -> Expr[S]:
+    """``expr`` repeated ``n`` times."""
+    return TypedFunc[S]("repeat", (expr, Fragment((str(_whole("n", n)),))))
+
+
+def reverse[S: (str, str | None)](expr: Expr[S]) -> Expr[S]:
+    """The string with its characters in reverse order."""
+    return TypedFunc[S]("reverse", (expr,))
+
+
+def split_part[S: (str, str | None)](expr: Expr[S], delimiter: str | Expr[str], n: int) -> Expr[S]:
+    """The ``n``-th field of ``expr`` split on ``delimiter`` (1-based)."""
+    return TypedFunc[S]("split_part", (expr, bind(delimiter), Fragment((str(_whole("n", n)),))))
+
+
+@overload
+def starts_with(expr: Expr[str], prefix: str | Expr[str]) -> Expr[bool]: ...
+@overload
+def starts_with(expr: Expr[str | None], prefix: str | Expr[str]) -> Expr[bool | None]: ...
+def starts_with(expr: Expr[str] | Expr[str | None], prefix: str | Expr[str]) -> ExprBase:
+    """Whether ``expr`` begins with ``prefix``."""
+    return TypedFunc[object]("starts_with", (expr, bind(prefix)))
+
+
+def regexp_replace[S: (str, str | None)](
+    expr: Expr[S], pattern: str | Expr[str], replacement: str | Expr[str], *, flags: str = ""
+) -> Expr[S]:
+    """Replace the first match of ``pattern`` (all with the ``g`` flag). ``flags`` combines
+    ``g``, ``i``, ``m``, ``n``, ``p``, ``s``, ``x`` and ``w``."""
+    args: tuple[Node, ...] = (expr, bind(pattern), bind(replacement))
+    if flags:
+        args += (bind(flags),)
+    return TypedFunc[S]("regexp_replace", args)
+
+
+def regexp_match(
+    expr: Expr[str] | Expr[str | None], pattern: str | Expr[str], *, flags: str = ""
+) -> Expr[list[str] | None]:
+    """The captured groups of the first match, or NULL when there is none."""
+    args: tuple[Node, ...] = (expr, bind(pattern))
+    if flags:
+        args += (bind(flags),)
+    return TypedFunc[list[str] | None]("regexp_match", args)
+
+
+def md5[S: (str, str | None)](expr: Expr[S]) -> Expr[S]:
+    """The MD5 hash of the string, as 32 hex digits."""
+    return TypedFunc[S]("md5", (expr,))
+
+
+# -- more numbers (EX6) ---------------------------------------------------------------
+
+
+def ceil[N: (float, float | None, Decimal, Decimal | None)](expr: Expr[N]) -> Expr[N]:
+    """Round up to the nearest integer."""
+    return TypedFunc[N]("ceil", (expr,))
+
+
+def floor[N: (float, float | None, Decimal, Decimal | None)](expr: Expr[N]) -> Expr[N]:
+    """Round down to the nearest integer."""
+    return TypedFunc[N]("floor", (expr,))
+
+
+def sqrt[N: (float, float | None, Decimal, Decimal | None)](expr: Expr[N]) -> Expr[N]:
+    """Square root (NaN for negative numbers)."""
+    return TypedFunc[N]("sqrt", (expr,))
+
+
+@overload
+def power(base: Expr[int], exponent: int | Expr[int]) -> Expr[float]: ...
+@overload
+def power(base: Expr[int | None], exponent: int | Expr[int]) -> Expr[float | None]: ...
+@overload
+def power[N: (float, float | None, Decimal, Decimal | None)](
+    base: Expr[N], exponent: N | Expr[N]
+) -> Expr[N]: ...
+def power(base: ExprBase, exponent: object) -> ExprBase:
+    """``base`` raised to ``exponent``. Integers and floats give ``double precision``;
+    ``numeric`` stays ``numeric``."""
+    return TypedFunc[object]("power", (base, bind(exponent, (base,))))
+
+
+def ln[N: (float, float | None, Decimal, Decimal | None)](expr: Expr[N]) -> Expr[N]:
+    """Natural logarithm."""
+    return TypedFunc[N]("ln", (expr,))
+
+
+def exp[N: (float, float | None, Decimal, Decimal | None)](expr: Expr[N]) -> Expr[N]:
+    """``e`` raised to ``expr``."""
+    return TypedFunc[N]("exp", (expr,))
+
+
+@overload
+def log(base: Expr[int], value: int | Expr[int]) -> Expr[Decimal]: ...
+@overload
+def log(base: Expr[int | None], value: int | Expr[int]) -> Expr[Decimal | None]: ...
+@overload
+def log[N: (float, float | None, Decimal, Decimal | None)](
+    base: Expr[N], value: N | Expr[N]
+) -> Expr[N]: ...
+def log(base: ExprBase, value: object) -> ExprBase:
+    """Logarithm of ``value`` to ``base``. Two-argument ``log`` always returns ``numeric``,
+    whatever the arguments' type."""
+    return TypedFunc[object]("log", (base, bind(value, (base,))))
+
+
+def mod[N: (int, int | None, Decimal, Decimal | None)](
+    value: Expr[N], divisor: N | Expr[N]
+) -> Expr[N]:
+    """``value`` modulo ``divisor`` (integers and ``numeric``; no float overload)."""
+    return TypedFunc[N]("mod", (value, bind(divisor, (value,))))
+
+
+def sign[N: (float, float | None, Decimal, Decimal | None)](expr: Expr[N]) -> Expr[N]:
+    """-1, 0 or 1 according to the sign of ``expr``."""
+    return TypedFunc[N]("sign", (expr,))
+
+
+def random() -> Expr[float]:
+    """A random value between 0.0 and 1.0."""
+    return TypedFunc[float]("random", ())
+
+
+# -- arrays (EX3) ---------------------------------------------------------------------
+
+
+# An array expression, nullable or not: array columns and ``array_agg`` are nullable.
+type Array[T] = Expr[list[T]] | Expr[list[T] | None]
+
+
+def unnest[T](array: Array[T]) -> Expr[T]:
+    """Expands an array to one row per element (a set-returning function)."""
+    return TypedFunc[T]("unnest", (array,), keeps_type=True)
+
+
+def array_length[T](array: Array[T], dimension: int = 1) -> Expr[int | None]:
+    """The length of ``array`` along ``dimension`` (NULL when that dimension is empty)."""
+    return TypedFunc[int | None](
+        "array_length", (array, Fragment((str(_whole("dimension", dimension)),)))
+    )
+
+
+def _array_element(value: object, array: object) -> Node:
+    """Bind ``value`` as an element of ``array``: the element column types and encodes it
+    (``array_remove(colors, Role.ADMIN)`` -> ``array_remove(role[], role)``)."""
+    column = column_of(array)
+    item = column.item if column is not None else None
+    return bind(value, () if item is None else (item,))
+
+
+def array_position[T](array: Array[T], value: T | Expr[T]) -> Expr[int | None]:
+    """1-based position of ``value`` in ``array``, or NULL when absent."""
+    return TypedFunc[int | None]("array_position", (array, _array_element(value, array)))
+
+
+def array_append[T](array: Array[T], value: T | Expr[T]) -> Expr[list[T]]:
+    """``array`` with ``value`` appended at the end."""
+    # keeps_type: the array column decodes the result, so enum elements come back as
+    # members, not labels (C31).
+    return TypedFunc[list[T]](
+        "array_append", (array, _array_element(value, array)), keeps_type=True
+    )
+
+
+def array_remove[T](array: Array[T], value: T | Expr[T]) -> Expr[list[T]]:
+    """``array`` with every element equal to ``value`` removed."""
+    return TypedFunc[list[T]](
+        "array_remove", (array, _array_element(value, array)), keeps_type=True
+    )
+
+
+def array_cat[T](left: Array[T], right: Array[T]) -> Expr[list[T]]:
+    """The two arrays concatenated."""
+    return TypedFunc[list[T]]("array_cat", (left, right), keeps_type=True)
+
+
+# -- json (EX4) -----------------------------------------------------------------------
+
+
+def _jsonb(value: object) -> Node:
+    # Any Python value is JSON: a dict/list encode as before, a scalar (int, str, bool)
+    # encodes as a jsonb scalar too (``jsonb_set(meta, ["a"], 5)``), not as bigint/text.
+    # ``None`` is the JSON literal ``null``, not SQL NULL: ``jsonb_set`` with a NULL value
+    # returns NULL and would wipe the whole column (B10).
+    if isinstance(value, Node):
+        return value
+    if value is None:
+        # A literal SQL NULL keeps jsonb_set's "return NULL" behaviour, so send the JSON
+        # text `null` and cast it. Binding the Python string "null" would instead store the
+        # JSON *string* "null".
+        return Fragment(("CAST('null' AS jsonb)",))
+    return Cast(Param(value), "jsonb")
+
+
+def path_keys(path: Iterable[str], name: str) -> list[str]:
+    """A JSON path or key list. Reject a bare string: iterating it would give characters."""
+    if isinstance(path, (str, bytes)):
+        raise QueryError(f"{name}() takes a list of keys, not a single string")
+    return list(path)
+
+
+def jsonb_set(
+    target: ExprBase, path: Sequence[str], value: object, *, create: bool = True
+) -> ExprBase:
+    """``jsonb_set(target, path, value, create)``: set the value at a text-array path."""
+    return _func(
+        "jsonb_set",
+        target,
+        Cast(Param(path_keys(path, "jsonb_set")), "text[]"),
+        _jsonb(value),
+        Fragment(("true" if create else "false",)),
+    )
+
+
+def jsonb_build_object(*pairs: object) -> Expr[dict[str, object]]:
+    """Build a jsonb object from alternating keys and values:
+    ``jsonb_build_object("name", Users.email, "n", count())``."""
+    if len(pairs) % 2:
+        raise QueryError("jsonb_build_object() takes key/value pairs")
+    return TypedFunc[dict[str, object]]("jsonb_build_object", tuple(_json_arg(p) for p in pairs))
+
+
+def jsonb_build_array(*values: object) -> Expr[list[object]]:
+    """Build a jsonb array from the values."""
+    return TypedFunc[list[object]]("jsonb_build_array", tuple(_json_arg(v) for v in values))
+
+
+def _json_arg(value: object) -> Node:
+    """An argument of a ``variadic "any"`` JSON builder. PostgreSQL cannot type a bare NULL
+    parameter there, so ``None`` is sent as ``NULL::text``, which becomes JSON null (B50)."""
+    return Cast(Param(None), "text") if value is None else bind(value)
+
+
+# -- dates and times, extras (EX10) ---------------------------------------------------
+
+
+# A date or timestamp expression, non-null or nullable (B13: age/to_char keep nullability).
+type _Moment = Expr[datetime.datetime] | Expr[datetime.date]
+type _MaybeMoment = Expr[datetime.datetime | None] | Expr[datetime.date | None]
+
+
+@overload
+def age(value: _Moment, start: _Moment | None = None) -> Expr[datetime.timedelta]: ...
+@overload
+def age(
+    value: _MaybeMoment, start: _Moment | _MaybeMoment | None = None
+) -> Expr[datetime.timedelta | None]: ...
+@overload
+def age(value: _Moment, start: _MaybeMoment) -> Expr[datetime.timedelta | None]: ...
+def age(value: ExprBase, start: ExprBase | None = None) -> ExprBase:
+    """The interval between two timestamps, or from ``value`` to today (at midnight).
+    NULL when either timestamp is NULL."""
+    args: tuple[Node, ...] = (value,) if start is None else (value, start)
+    return TypedFunc[datetime.timedelta | None]("age", args)
+
+
+@overload
+def to_char(
+    value: _Moment | Expr[datetime.timedelta] | Expr[int] | Expr[float] | Expr[Decimal],
+    template: str,
+) -> Expr[str]: ...
+@overload
+def to_char(
+    value: _MaybeMoment
+    | Expr[datetime.timedelta | None]
+    | Expr[int | None]
+    | Expr[float | None]
+    | Expr[Decimal | None],
+    template: str,
+) -> Expr[str | None]: ...
+def to_char(value: ExprBase, template: str) -> ExprBase:
+    """Format a value as text with a template: ``to_char(Users.created_at, "YYYY-MM")``.
+    NULL when the value is NULL."""
+    return TypedFunc[str | None]("to_char", (value, bind(template)))
+
+
+@overload
+def to_date(text: str | Expr[str], format: str) -> Expr[datetime.date]: ...
+@overload
+def to_date(text: Expr[str | None], format: str) -> Expr[datetime.date | None]: ...
+def to_date(text: str | ExprBase, format: str) -> ExprBase:
+    """Parse ``text`` as a date with a template: ``to_date("2024-01-02", "YYYY-MM-DD")``.
+    NULL when the text is NULL."""
+    return TypedFunc[datetime.date | None]("to_date", (bind(text), bind(format)))
+
+
+def to_timestamp(value: float | ExprBase) -> Expr[datetime.datetime]:
+    """A Unix epoch (seconds since 1970) as ``timestamptz``."""
+    return TypedFunc[datetime.datetime]("to_timestamp", (bind(value),))
+
+
+def make_interval(
+    *,
+    years: int = 0,
+    months: int = 0,
+    weeks: int = 0,
+    days: int = 0,
+    hours: int = 0,
+    mins: int = 0,
+    secs: float = 0.0,
+) -> Expr[datetime.timedelta]:
+    """Build an interval from named parts: ``make_interval(days=7)``."""
+    parts: tuple[tuple[str, int | float], ...] = (
+        ("years", _whole("years", years)),
+        ("months", _whole("months", months)),
+        ("weeks", _whole("weeks", weeks)),
+        ("days", _whole("days", days)),
+        ("hours", _whole("hours", hours)),
+        ("mins", _whole("mins", mins)),
+        ("secs", _number("secs", secs)),
+    )
+    for name, value in parts[:-1]:  # PostgreSQL takes these as 32-bit integers
+        if not -(2**31) <= value < 2**31:
+            raise QueryError(f"make_interval() {name} must fit in 32 bits; got {value}")
+    # ``!r`` on an int subclass (an IntEnum, or one with a crafted __repr__) is not SQL:
+    # format the plain number instead (B21).
+    args = [Fragment((f"{name} => {value}",)) for name, value in parts if value]
+    return TypedFunc[datetime.timedelta]("make_interval", tuple(args))
+
+
+def current_timestamp() -> Expr[datetime.datetime]:
+    """The start time of the transaction as ``timestamptz`` (SQL standard spelling)."""
+    return TypedFragment[datetime.datetime](("CURRENT_TIMESTAMP",))
+
+
+def localtime() -> Expr[datetime.time]:
+    """The current time of day without a time zone."""
+    return TypedFragment[datetime.time](("LOCALTIME",))
+
+
+# -- collation and time zone (EX11) ---------------------------------------------------
+
+
+def collate[T](expr: Expr[T], name: str) -> Expr[T]:
+    """``expr COLLATE name``: sort/compare ``expr`` with the named collation."""
+    quoted = '"' + name.replace('"', '""') + '"'
+    return PostfixOp[T](expr, "COLLATE", Fragment((quoted,)))
+
+
+def at_time_zone[
+    T: (
+        datetime.datetime,
+        datetime.datetime | None,
+        datetime.time,
+        datetime.time | None,
+    )
+](expr: Expr[T], zone: str | Expr[str]) -> Expr[T]:
+    """``expr AT TIME ZONE zone``: convert between ``timestamp`` and ``timestamptz``."""
+    return PostfixOp[T](expr, "AT TIME ZONE", bind(zone))

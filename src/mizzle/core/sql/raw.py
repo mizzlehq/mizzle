@@ -44,7 +44,11 @@ class _Sql:
             return Raw((template,))
         parts: list[str | Node] = []
         used = 0
-        for literal, field, spec, conversion in string.Formatter().parse(template):
+        try:
+            fields = list(string.Formatter().parse(template))
+        except ValueError as exc:  # a lone { or } (C43)
+            raise QueryError(f"sql(): {exc}; use {{{{ and }}}} for braces") from None
+        for literal, field, spec, conversion in fields:
             if literal:
                 parts.append(literal)
             if field is None:

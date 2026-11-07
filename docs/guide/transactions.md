@@ -3,6 +3,12 @@
 The examples use these two tables:
 
 ```python
+from typing import final, override
+
+from mizzle import Constraint, Table, check, many, one, sql
+from mizzle.pg import integer, serial, text
+
+
 @final
 class Accounts(Table, name="txdoc_accounts"):
     id = serial().primary_key()
@@ -40,7 +46,9 @@ async with db.transaction() as tx:
 transaction, on other connections.
 
 Statements on one `tx` never overlap, so `asyncio.gather` on it is safe; they run one
-after another:
+after another. While a savepoint is open, only the code inside it (and tasks it starts) may
+use the transaction: a statement from another task would be undone with the savepoint, so
+it raises `QueryError` instead.
 
 ```python
 async with db.transaction() as tx:
@@ -65,6 +73,41 @@ async with db.transaction() as tx:
     except CheckViolation:
         pass  # only the savepoint rolled back; the entry is still there
 ```
+
+### Side effects after commit
+
+`transaction(after_commit=..., after_rollback=...)` runs a callback outside the transaction,
+so a write that did not commit does not send an email or enqueue a job:
+
+```python
+async with db.transaction(after_commit=notify_warehouse) as tx:
+    await tx.insert(Orders).values(...)
+```
+
+Two rules keep hook errors from confusing the outcome:
+
+- In a **savepoint**, `after_commit` is queued, not run: releasing a savepoint is not a
+  commit, and the outer transaction can still roll back. Queued hooks run after the
+  outermost `COMMIT`, and are dropped if either level rolls back. In the same way, a
+  savepoint's `after_rollback` fires if an enclosing savepoint or the outer transaction
+  rolls back even though the savepoint itself was released. Rollback drops only the hooks
+  of the savepoint that failed, not those of siblings that already released.
+- An `after_commit` hook that raises raises `AfterCommitError`. The data **is** committed:
+  the message says so, so a retry does not insert it twice. Every queued hook still runs;
+  one failure does not skip the rest. The first failure is the error's `__cause__`; later
+  ones are only logged. An `after_rollback` hook that raises does not hide the error that
+  caused the rollback: the original error is raised. When it had no visible context, its
+  `__context__` is an `AfterRollbackError` whose `__cause__` is the hook's failure (with its
+  traceback); otherwise a note on the original names the failure.
+- A cancel or timeout that arrives after `COMMIT`, while the connection goes back to the
+  pool, still propagates, but the `after_commit` hooks run, the `after_rollback` hooks do
+  not, and a note on the error says the transaction was committed. Do not retry it.
+- Savepoints on one transaction run one at a time, from the task that opened them. A
+  savepoint started from another task while one is open raises `QueryError`.
+- A statement that fails aborts the whole transaction in PostgreSQL, even if you catch the
+  error. Leaving the block then raises `DatabaseError` ("aborted the transaction"), the
+  `after_rollback` hooks run, and nothing is committed. To go on after an expected failure,
+  run the statement in a savepoint (`tx.transaction()`).
 
 ## Isolation levels and read-only
 

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import copy
 import re
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Literal, Protocol
 
@@ -12,6 +12,10 @@ from mizzle.core.errors import MigrationError
 from mizzle.core.snapshot import (
     CheckSnap,
     ColumnSnap,
+    CompositeSnap,
+    DomainSnap,
+    ExclusionSnap,
+    FunctionSnap,
     GrantsSnap,
     IndexSnap,
     Snapshot,
@@ -25,10 +29,13 @@ from mizzle.core.snapshot import (
 from mizzle.core.steps import (
     AddCheck,
     AddColumn,
+    AddDomainChecks,
     AddEnumValue,
+    AddExclusion,
     AddForeignKey,
     AddPrimaryKey,
     AddUnique,
+    AlterColumnCollation,
     AlterColumnDefault,
     AlterColumnGenerated,
     AlterColumnIdentity,
@@ -37,11 +44,16 @@ from mizzle.core.steps import (
     AlterExtension,
     AlterPolicy,
     AlterRole,
+    AlterTableStorage,
+    CheckColumnFreed,
     ConstraintKind,
+    CreateComposite,
+    CreateDomain,
     CreateEnum,
     CreateExtension,
     CreateFunction,
     CreateIndex,
+    CreatePartition,
     CreatePolicy,
     CreateRole,
     CreateSchema,
@@ -49,11 +61,15 @@ from mizzle.core.steps import (
     CreateTrigger,
     CreateView,
     DropColumn,
+    DropComposite,
     DropConstraint,
+    DropDomain,
+    DropDomainChecks,
     DropEnum,
     DropExtension,
     DropFunction,
     DropIndex,
+    DropPartition,
     DropPolicy,
     DropRole,
     DropTable,
@@ -66,7 +82,10 @@ from mizzle.core.steps import (
     RenameTable,
     RestoreGrants,
     SaveGrants,
+    SetColumnComment,
     SetRowLevelSecurity,
+    SetTableComment,
+    SetTableLogged,
     SetTableSchema,
     Step,
 )
@@ -79,8 +98,7 @@ class RenameResolver(Protocol):
 
     ``scope`` is ``"schema"`` for tables and ``"schema.table"`` for columns. Returns
     ``{old: new}``; anything not in the result is a real drop/add. Scope ``"*"`` asks
-    whether tables moved to another schema: names are then ``"schema.table"``, and only
-    tables with the same name and columns are offered.
+    whether tables moved to another schema: names are then ``"schema.table"``.
     """
 
     def __call__(
@@ -100,16 +118,23 @@ class StrictRenames:
     default_schema: str = "public"
     # Called for leftovers instead of raising (the CLI asks the user when on a terminal).
     ask: RenameResolver | None = None
+    # The renames that matched something; any other was a typo or a stale flag (C20).
+    used: set[str] = field(default_factory=set[str])
+
+    def unused(self) -> list[str]:
+        return [old for old in self.renames if old not in self.used]
 
     def _lookup(self, scope: str, old: str) -> str | None:
         if scope == "*":  # a move: "schema.table" names
-            return self.renames.get(old)
-        full = f"{scope}.{old}"
-        if full in self.renames:
-            return self.renames[full]
-        prefix = f"{self.default_schema}."
-        if full.startswith(prefix) and full.removeprefix(prefix) in self.renames:
-            return self.renames[full.removeprefix(prefix)]
+            keys = [old]
+        else:
+            full = f"{scope}.{old}"
+            prefix = f"{self.default_schema}."
+            keys = [full, full.removeprefix(prefix)] if full.startswith(prefix) else [full]
+        for k in keys:
+            if k in self.renames:
+                self.used.add(k)
+                return self.renames[k]
         return None
 
     def __call__(
@@ -151,32 +176,52 @@ class _Plan:
     schemas: list[Step] = field(default_factory=list[Step])
     extensions: list[Step] = field(default_factory=list[Step])
     enums: list[Step] = field(default_factory=list[Step])
+    domains: list[Step] = field(default_factory=list[Step])
+    composites: list[Step] = field(default_factory=list[Step])
     renames: list[Step] = field(default_factory=list[Step])
     drop_triggers: list[Step] = field(default_factory=list[Step])
     drop_policies: list[Step] = field(default_factory=list[Step])
+    drop_calls: list[Step] = field(default_factory=list[Step])
     drop_views: list[Step] = field(default_factory=list[Step])
     drop_functions: list[Step] = field(default_factory=list[Step])
+    # Names of functions whose result type changes: dropped and created again (K4-26).
+    retyped: set[str] = field(default_factory=set[str])
+    create_functions_early: list[Step] = field(default_factory=list[Step])  # (K1)
+    domain_calls_early: list[Step] = field(default_factory=list[Step])  # (K4-27)
+    drop_functions_late: list[Step] = field(default_factory=list[Step])  # (K1)
+    # Functions that use a table or view: ordered with the views (K4-13).
+    create_with_views: list[FunctionSnap] = field(default_factory=list[FunctionSnap])
+    drop_with_views: list[FunctionSnap] = field(default_factory=list[FunctionSnap])
+    # Functions dropped and created again: their privileges, owner and comment are saved
+    # before the drop and put back after the create (function_key).
+    keep_grants: set[str] = field(default_factory=set[str])
     drop_fks: list[Step] = field(default_factory=list[Step])
     drop_constraints: list[Step] = field(default_factory=list[Step])
     drop_indexes: list[Step] = field(default_factory=list[Step])
     drop_rebuilt: list[Step] = field(default_factory=list[Step])  # columns added again
     drop_early: list[Step] = field(default_factory=list[Step])  # tables whose names are reused
     create_tables: list[Step] = field(default_factory=list[Step])
+    create_partitions: list[Step] = field(default_factory=list[Step])
     add_columns: list[Step] = field(default_factory=list[Step])
     alter_columns: list[Step] = field(default_factory=list[Step])
+    table_options: list[Step] = field(default_factory=list[Step])
     drop_columns: list[Step] = field(default_factory=list[Step])
     add_constraints: list[Step] = field(default_factory=list[Step])
     create_indexes: list[Step] = field(default_factory=list[Step])
     add_fks: list[Step] = field(default_factory=list[Step])
-    create_functions: list[Step] = field(default_factory=list[Step])
     drop_replaced: list[Step] = field(default_factory=list[Step])  # tables a view replaces
     create_views: list[Step] = field(default_factory=list[Step])
+    create_calls: list[Step] = field(default_factory=list[Step])
     rls: list[Step] = field(default_factory=list[Step])
     create_policies: list[Step] = field(default_factory=list[Step])
     create_triggers: list[Step] = field(default_factory=list[Step])
+    comments: list[Step] = field(default_factory=list[Step])
     revokes: list[Step] = field(default_factory=list[Step])
     grants: list[Step] = field(default_factory=list[Step])
+    drop_partitions: list[Step] = field(default_factory=list[Step])
     drop_tables: list[Step] = field(default_factory=list[Step])
+    drop_composites: list[Step] = field(default_factory=list[Step])
+    drop_domains: list[Step] = field(default_factory=list[Step])
     drop_enums: list[Step] = field(default_factory=list[Step])
     drop_extensions: list[Step] = field(default_factory=list[Step])
     roles: list[Step] = field(default_factory=list[Step])
@@ -192,32 +237,44 @@ class _Plan:
             *self.schemas,
             *self.extensions,
             *self.enums,
+            *self.domains,  # a domain's base type can be an enum
+            *self.composites,  # a composite's fields can be enums or domains
             *self.renames,
             *self.drop_triggers,
             *self.drop_policies,
+            *self.drop_calls,  # CHECKs and DEFAULTs calling functions dropped next (K4-19)
             *self.drop_views,
-            *self.drop_functions,
             *self.drop_fks,
             *self.drop_constraints,
             *self.drop_indexes,
             *self.drop_rebuilt,
             *self.drop_early,
+            *self.drop_functions,  # after the indexes and columns using them (K4-26)
+            *self.create_functions_early,  # a CHECK or DEFAULT may call them (K1)
+            *self.domain_calls_early,  # domain CHECKs and DEFAULTs calling those (K4-27)
             *self.create_tables,
+            *self.create_partitions,
             *self.add_columns,
             *self.alter_columns,
+            *self.table_options,
             *self.drop_columns,
             *self.add_constraints,
             *self.create_indexes,
             *self.add_fks,
-            *self.create_functions,
             *self.drop_replaced,
-            *self.create_views,
+            *self.create_views,  # and the functions using tables or views (K4-13)
+            *self.create_calls,  # CHECKs and DEFAULTs calling those functions (K4-19)
             *self.rls,
             *self.create_policies,
             *self.create_triggers,
+            *self.comments,
             *self.revokes,
             *self.grants,
+            *self.drop_partitions,
             *self.drop_tables,
+            *self.drop_functions_late,  # after the CHECKs and DEFAULTs calling them (K1)
+            *self.drop_composites,
+            *self.drop_domains,
             *self.drop_enums,
             *self.drop_extensions,
             *self.drop_roles,  # after the policies that named them are gone
@@ -259,6 +316,81 @@ def _diff_enums(old: Snapshot, new: Snapshot, plan: _Plan) -> None:
             plan.drop_enums.append(DropEnum(enum["schema"], enum["name"]))
 
 
+def _domain_changed(old: DomainSnap, new: DomainSnap, compare_expressions: bool) -> bool:
+    if any(
+        old.get(field) != new.get(field)
+        for field in ("base_type", "not_null", "default", "collation")
+    ):
+        return True
+    if compare_expressions:
+        return sorted(old.get("checks", [])) != sorted(new.get("checks", []))
+    return len(old.get("checks", [])) != len(new.get("checks", []))
+
+
+def _diff_domains(old: Snapshot, new: Snapshot, plan: _Plan, compare_expressions: bool) -> None:
+    old_domains = old.get("domains", {})
+    new_domains = new.get("domains", {})
+    for k, domain in new_domains.items():
+        before = old_domains.get(k)
+        if before is None:
+            plan.domains.append(CreateDomain(domain))
+        elif _domain_changed(before, domain, compare_expressions):
+            raise MigrationError(
+                f"domain {domain['name']}: changing its definition needs a custom migration"
+            )
+    for k, domain in old_domains.items():
+        if k not in new_domains:
+            plan.drop_domains.append(DropDomain(domain["schema"], domain["name"]))
+
+
+def _diff_composites(old: Snapshot, new: Snapshot, plan: _Plan) -> None:
+    """A composite type is created or dropped whole; changing its fields needs a custom
+    migration (PostgreSQL can ALTER TYPE ADD/DROP/ALTER ATTRIBUTE, but not atomically from a
+    snapshot)."""
+    old_types = old.get("composites", {})
+    new_types = new.get("composites", {})
+    created = {k: composite for k, composite in new_types.items() if k not in old_types}
+    for k in _composite_order(created):  # a composite's fields must exist before it does
+        plan.composites.append(CreateComposite(created[k]))
+    for k, composite in new_types.items():
+        before = old_types.get(k)
+        if before is not None and before["fields"] != composite["fields"]:
+            raise MigrationError(
+                f"composite type {composite['name']}: changing its fields needs a custom migration"
+            )
+    dropped = {k: composite for k, composite in old_types.items() if k not in new_types}
+    for k in reversed(_composite_order(dropped)):  # the dependants drop first
+        plan.drop_composites.append(DropComposite(dropped[k]["schema"], dropped[k]["name"]))
+
+
+def _composite_order(composites: Mapping[str, CompositeSnap]) -> list[str]:
+    """Keys in an order where a composite comes after every composite its fields use (a
+    cycle is impossible in PostgreSQL, but is finished off rather than looping)."""
+    by_name: dict[str, list[str]] = {}
+    for k, composite in composites.items():
+        by_name.setdefault(composite["name"], []).append(k)
+
+    def resolve(sql_type: str) -> str | None:
+        if sql_type in composites:
+            return sql_type
+        matches = by_name.get(sql_type, [])
+        return matches[0] if len(matches) == 1 else None
+
+    needs = {
+        k: {r for f in composite["fields"] if (r := resolve(f["type"])) is not None} - {k}
+        for k, composite in composites.items()
+    }
+    order: list[str] = []
+    done: set[str] = set()
+    while len(order) < len(composites):
+        ready = [k for k in sorted(composites) if k not in done and needs[k] <= done]
+        if not ready:
+            ready = [k for k in sorted(composites) if k not in done]
+        order.append(ready[0])
+        done.add(ready[0])
+    return order
+
+
 def _rename_columns_in(table: TableSnap, mapping: Mapping[str, str]) -> None:
     def rn(cols: list[str]) -> list[str]:
         return [mapping.get(c, c) for c in cols]
@@ -274,6 +406,10 @@ def _rename_columns_in(table: TableSnap, mapping: Mapping[str, str]) -> None:
         i["columns"] = rn(i["columns"])
     for fk in table["foreign_keys"].values():
         fk["columns"] = rn(fk["columns"])
+    for e in table.get("exclusions", {}).values():
+        for el in e["elements"]:
+            if "column" in el:
+                el["column"] = mapping.get(el["column"], el["column"])
 
 
 def _apply_renames(
@@ -297,20 +433,19 @@ def _apply_renames(
             tables[key(schema, new_name)] = table
             _follow(tables, schema, old_name, schema, new_name)
 
-    # Tables that left one schema for another with the same name and columns: moves.
-    gone = [k for k in tables if k not in new["tables"]]
-    came = [k for k in new["tables"] if k not in tables]
-    pairs = [
-        (o, n)
-        for o in gone
-        for n in came
-        if tables[o]["name"] == new["tables"][n]["name"]
-        and _columns_only(tables[o]) == _columns_only(new["tables"][n])
-    ]
-    if pairs:
-        moves = resolve(
-            "table", "*", _dedupe([o for o, _ in pairs]), _dedupe([n for _, n in pairs])
-        )
+    # Tables that left one schema for another (maybe renamed, maybe with other columns):
+    # every leftover pair across schemas is offered, so an explicit "schema.table" rename
+    # is honoured and an unresolved pair is asked about, not dropped and created (C20).
+    # Same-schema pairs were settled above, so only a table with a partner in another
+    # schema is offered.
+    gone_all = [k for k in tables if k not in new["tables"]]
+    came_all = [k for k in new["tables"] if k not in tables]
+    gone_schemas = {tables[k]["schema"] for k in gone_all}
+    came_schemas = {new["tables"][k]["schema"] for k in came_all}
+    gone = [k for k in gone_all if came_schemas - {tables[k]["schema"]}]
+    came = [k for k in came_all if gone_schemas - {new["tables"][k]["schema"]}]
+    if gone and came:
+        moves = resolve("table", "*", gone, came)
         for old_key, new_key in moves.items():
             moved, dest = tables.pop(old_key), new["tables"][new_key]
             old_schema, old_name = moved["schema"], moved["name"]
@@ -365,14 +500,6 @@ def _relation_names(*tables: TableSnap) -> set[str]:
     return names
 
 
-def _columns_only(table: TableSnap) -> dict[str, ColumnSnap]:
-    return table["columns"]
-
-
-def _dedupe(items: list[str]) -> list[str]:
-    return list(dict.fromkeys(items))
-
-
 def _rebuilt(before: ColumnSnap, after: ColumnSnap) -> bool:
     """Whether a column must be dropped and added again: PostgreSQL cannot make a column
     generated, switch STORED/VIRTUAL, or make a VIRTUAL column a plain one."""
@@ -382,6 +509,13 @@ def _rebuilt(before: ColumnSnap, after: ColumnSnap) -> bool:
     return (new is None and not old["stored"]) or (
         new is not None and old["stored"] != new["stored"]
     )
+
+
+def _calls(before: ColumnSnap, after: ColumnSnap, functions: set[str]) -> bool:
+    """Whether a column stays generated by an expression calling ``functions``, which are
+    dropped and created again: the column must go first (K4-26)."""
+    old = before.get("generated")
+    return old is not None and "generated" in after and _mentions(old["expression"], functions)
 
 
 def _without_columns(table: TableSnap, names: list[str]) -> TableSnap:
@@ -403,6 +537,12 @@ def _without_columns(table: TableSnap, names: list[str]) -> TableSnap:
         for n, i in out["indexes"].items()
         if not uses(i["columns"], i.get("expression"), i["where"])
     }
+    if exclusions := out.get("exclusions"):
+        out["exclusions"] = {
+            n: e
+            for n, e in exclusions.items()
+            if not uses([el.get("column", "") for el in e["elements"]], e.get("where"))
+        }
     return out
 
 
@@ -432,12 +572,61 @@ def _diff_named[T: Mapping[str, object]](
         on_add(new[name])
 
 
-def _diff_table(old: TableSnap, new: TableSnap, plan: _Plan, compare_expressions: bool) -> None:
+# A quoted date or timestamp with no offset after it: '2026-01-01' or '2026-01-01 10:00'.
+_NAIVE_MOMENT = re.compile(r"'\d{4}-\d{2}-\d{2}(?: [\d:.]+)?'")
+
+
+def _diff_partitions(old: TableSnap, new: TableSnap, plan: _Plan) -> None:
+    """Partitions of an existing table: add the new ones, drop the gone ones. A change to
+    the key or to a partition's bound is not expressible (it needs a detach/attach)."""
     schema, name = new["schema"], new["name"]
+    if old.get("partition_by") != new.get("partition_by"):
+        raise MigrationError(f"table {name}: changing the partition key needs a custom migration")
+    before, after = old.get("partitions", {}), new.get("partitions", {})
+    for pname, bound in after.items():
+        if pname not in before:
+            plan.create_partitions.append(CreatePartition(schema, name, pname, bound))
+        elif before[pname] != bound:
+            # A date or time literal without a UTC offset is read in the session TimeZone,
+            # so a changed database timezone looks like a changed bound (B64).
+            hint = (
+                ". A timestamp bound without a UTC offset is read in the session TimeZone; "
+                "if the database timezone changed, write the offset (for example "
+                "'2026-01-01 00:00:00+00')"
+                if _NAIVE_MOMENT.search(bound)
+                else ""
+            )
+            raise MigrationError(
+                f"table {name}: changing the bound of partition {pname} needs a custom "
+                f"migration (database: {before[pname]}; schema: {bound}){hint}"
+            )
+    for pname in before:
+        if pname not in after:
+            plan.drop_partitions.append(DropPartition(schema, pname))
+
+
+# A type's size or precision: ``(40)``, ``(10, 2)``.
+_TYPMOD = re.compile(r"\(\s*\d+\s*(?:,\s*-?\d+\s*)?\)")
+
+
+def _diff_table(
+    old: TableSnap,
+    new: TableSnap,
+    plan: _Plan,
+    compare_expressions: bool,
+    enums: frozenset[str] | None = None,
+    normalized: bool = False,
+) -> None:
+    schema, name = new["schema"], new["name"]
+    # Checks, index predicates and generated expressions are compared when both sides are as
+    # the database prints them (normalized), even with compare_expressions off (C24).
+    expressions = compare_expressions or normalized
+    _diff_partitions(old, new, plan)
     if rebuilt := [
         c
         for c, col in new["columns"].items()
-        if c in old["columns"] and _rebuilt(old["columns"][c], col)
+        if c in old["columns"]
+        and (_rebuilt(old["columns"][c], col) or _calls(old["columns"][c], col, plan.retyped))
     ]:
         plan.drop_rebuilt += [DropColumn(schema, name, c) for c in rebuilt]
         kept = _without_columns(old, rebuilt)
@@ -449,6 +638,7 @@ def _diff_table(old: TableSnap, new: TableSnap, plan: _Plan, compare_expressions
             ("unique", old["uniques"], kept["uniques"]),
             ("check", old["checks"], kept["checks"]),
             ("foreign_key", old["foreign_keys"], kept["foreign_keys"]),
+            ("exclusion", old.get("exclusions", {}), kept.get("exclusions", {})),
         ]
         for kind, was, now in groups:
             bucket = plan.drop_fks if kind == "foreign_key" else plan.drop_constraints
@@ -481,11 +671,13 @@ def _diff_table(old: TableSnap, new: TableSnap, plan: _Plan, compare_expressions
                     before["type"],
                     column["type"],
                     generated="generated" in before,
+                    collation=column.get("collation"),
+                    via_text=before["type"].removesuffix("[]") in (enums or ()),
                 )
             )
         old_generated, new_generated = before.get("generated"), column.get("generated")
         if old_generated != new_generated and (
-            compare_expressions  # else only whether it is generated, and how, counts
+            expressions  # else only whether it is generated, and how, counts
             or old_generated is None
             or new_generated is None
             or old_generated["stored"] != new_generated["stored"]
@@ -499,6 +691,10 @@ def _diff_table(old: TableSnap, new: TableSnap, plan: _Plan, compare_expressions
             )
         if _default(old_default) != _default(column["default"]):
             plan.alter_columns.append(AlterColumnDefault(schema, name, cname, column["default"]))
+        if before.get("collation") != column.get("collation") and before["type"] == column["type"]:
+            plan.alter_columns.append(
+                AlterColumnCollation(schema, name, cname, column["type"], column.get("collation"))
+            )
         if new_identity is not None and old_identity != new_identity:  # after SET NOT NULL
             plan.alter_columns.append(
                 AlterColumnIdentity(schema, name, cname, old_identity, new_identity, column["type"])
@@ -507,9 +703,39 @@ def _diff_table(old: TableSnap, new: TableSnap, plan: _Plan, compare_expressions
         if cname not in new["columns"]:
             plan.drop_columns.append(DropColumn(schema, name, cname))
 
+    if bool(old.get("unlogged")) != bool(new.get("unlogged")):
+        plan.table_options.append(SetTableLogged(schema, name, bool(new.get("unlogged"))))
+    old_options, new_options = old.get("options", {}), new.get("options", {})
+    changed_options = {k: v for k, v in new_options.items() if old_options.get(k) != v}
+    removed_options = tuple(k for k in old_options if k not in new_options)
+    if changed_options or removed_options:
+        plan.table_options.append(AlterTableStorage(schema, name, changed_options, removed_options))
+
     def drop(kind: ConstraintKind) -> Callable[[str], None]:
         bucket = plan.drop_fks if kind == "foreign_key" else plan.drop_constraints
         return lambda n: bucket.append(DropConstraint(schema, name, n, kind))
+
+    # A type change makes PostgreSQL store the checks and index expressions using the column
+    # with casts (`(c)::numeric >= (0)::numeric`): drop them first and add them again after
+    # it, as written (K4-21). Not when only the size changes (varchar(40) -> varchar(64)):
+    # the expression reads the same, and adding a check again scans the whole table.
+    if retyped := [
+        c
+        for c, col in new["columns"].items()
+        if c in old["columns"]
+        and _TYPMOD.sub("", old["columns"][c]["type"]) != _TYPMOD.sub("", col["type"])
+    ]:
+        old = copy.copy(old)
+        stale = [n for n, c in old["checks"].items() if _mentions(c["expression"], retyped)]
+        plan.drop_constraints += [DropConstraint(schema, name, n, "check") for n in stale]
+        old["checks"] = {n: c for n, c in old["checks"].items() if n not in stale}
+        stale = [
+            n
+            for n, i in old["indexes"].items()
+            if _mentions(f"{i.get('expression') or ''} {i['where'] or ''}", retyped)
+        ]
+        plan.drop_indexes += [DropIndex(schema, n) for n in stale]
+        old["indexes"] = {n: i for n, i in old["indexes"].items() if n not in stale}
 
     def rename(old_name: str, new_name: str) -> None:
         plan.renames.append(RenameConstraint(schema, name, old_name, new_name))
@@ -518,7 +744,25 @@ def _diff_table(old: TableSnap, new: TableSnap, plan: _Plan, compare_expressions
         return _without_name(a) == _without_name(b)
 
     def same_check(a: CheckSnap, b: CheckSnap) -> bool:
-        return not compare_expressions or a["expression"] == b["expression"]
+        if a.get("not_valid") != b.get("not_valid"):
+            return False
+        return not expressions or a["expression"] == b["expression"]
+
+    def same_exclusion(a: ExclusionSnap, b: ExclusionSnap) -> bool:
+        if a["method"] != b["method"] or len(a["elements"]) != len(b["elements"]):
+            return False
+        if a.get("deferrable") != b.get("deferrable"):
+            return False
+        if a.get("initially_deferred") != b.get("initially_deferred"):
+            return False
+        for x, y in zip(a["elements"], b["elements"], strict=True):
+            if x["operator"] != y["operator"] or x.get("column") != y.get("column"):
+                return False
+        if not compare_expressions:  # the database reformats expressions
+            return ("where" in a) == ("where" in b)
+        return a.get("where") == b.get("where") and [
+            e.get("expression") for e in a["elements"]
+        ] == [e.get("expression") for e in b["elements"]]
 
     old_pk = {old["primary_key"]["name"]: old["primary_key"]} if old["primary_key"] else {}
     new_pk = {new["primary_key"]["name"]: new["primary_key"]} if new["primary_key"] else {}
@@ -554,14 +798,22 @@ def _diff_table(old: TableSnap, new: TableSnap, plan: _Plan, compare_expressions
         lambda fk: plan.add_fks.append(AddForeignKey(schema, name, fk)),
         rename,
     )
+    _diff_named(
+        old.get("exclusions", {}),
+        new.get("exclusions", {}),
+        same_exclusion,
+        drop("exclusion"),
+        lambda e: plan.add_constraints.append(AddExclusion(schema, name, e)),
+        rename,
+    )
 
     def same_index(a: IndexSnap, b: IndexSnap) -> bool:
         if a["columns"] != b["columns"] or a["unique"] != b["unique"]:
             return False
-        for extra in ("method", "opclasses", "options"):
+        for extra in ("method", "opclasses", "options", "nulls_not_distinct"):
             if a.get(extra) != b.get(extra):
                 return False
-        if not compare_expressions:  # the database reformats expressions; compare shapes
+        if not expressions:  # the database reformats expressions; compare shapes
             return ("expression" in a) == ("expression" in b)
         return a["where"] == b["where"] and a.get("expression") == b.get("expression")
 
@@ -581,31 +833,55 @@ def diff(
     resolve: RenameResolver = no_renames,
     *,
     compare_expressions: bool = True,
+    normalized: bool = False,
 ) -> list[Step]:
     """Steps that turn the ``old`` schema into the ``new`` one.
 
     ``compare_expressions=False`` ignores CHECK expressions and index predicates, whose text
     a database reformats; use it when ``old`` comes from introspection (``push``).
+    ``normalized=True`` says ``new`` went through ``normalize_snapshot``, so checks, index
+    predicates and generated expressions are compared after all.
     """
     plan = _Plan()
     plan.schemas = [CreateSchema(s) for s in new["schemas"] if s not in old["schemas"]]
     _diff_enums(old, new, plan)
+    # Columns of these types change type through text (C23). A type in the default schema
+    # may be spelled without it, so the bare name counts too.
+    enum_names = frozenset(old["enums"]) | frozenset(e["name"] for e in old["enums"].values())
+    _diff_domains(old, new, plan, compare_expressions)
+    _diff_composites(old, new, plan)
     old_tables = _apply_renames(old, new, resolve, plan)
+    old_fns = {function_key(f): f for f in old.get("functions", {}).values()}
+    plan.retyped = {
+        f["name"]
+        for f in new.get("functions", {}).values()
+        if (was := old_fns.get(function_key(f))) is not None and was["returns"] != f["returns"]
+    }
 
     for k, table in new["tables"].items():
         before = old_tables.get(k)
         if before is None:
             plan.create_tables.append(CreateTable(table))
+            plan.create_partitions += [
+                CreatePartition(table["schema"], table["name"], pname, bound)
+                for pname, bound in table.get("partitions", {}).items()
+            ]
             plan.create_indexes += [
                 CreateIndex(table["schema"], table["name"], i) for i in table["indexes"].values()
+            ]
+            plan.add_constraints += [
+                AddCheck(table["schema"], table["name"], c)
+                for c in table["checks"].values()
+                if c.get("not_valid")  # CREATE TABLE cannot declare it NOT VALID
             ]
             plan.add_fks += [
                 AddForeignKey(table["schema"], table["name"], fk)
                 for fk in table["foreign_keys"].values()
             ]
         else:
-            _diff_table(before, table, plan, compare_expressions)
+            _diff_table(before, table, plan, compare_expressions, enum_names, normalized)
         _diff_grants(table, before.get("grants", {}) if before else {}, plan, compare_expressions)
+        _diff_comments(before if before is not None else _empty_like(table), table, plan)
 
     def new_in(schema: str) -> list[TableSnap]:
         return [t for t in new["tables"].values() if t["schema"] == schema]
@@ -636,6 +912,10 @@ def diff(
     touched = _diff_functions(old, new, plan)
     touched |= _changed_tables(plan)
     touched |= _diff_views(old, new, plan, touched, compare_expressions)
+    _defer_calls(plan, old_tables, new)
+    _defer_domain_calls(plan, old, new)
+    plan.create_functions_early = _restore_after(plan.create_functions_early, plan.keep_grants)
+    plan.create_views = _restore_after(plan.create_views, plan.keep_grants)
     for k, table in new["tables"].items():
         if (before := old_tables.get(k)) is not None:
             _diff_security(before, table, plan, touched)
@@ -652,7 +932,8 @@ def _mentions(text: str | None, names: Iterable[str]) -> bool:
     over-report, which recreates an object that did not need it."""
     if not text:
         return False
-    return any(re.search(rf"(?<![\w$]){re.escape(n)}(?![\w$])", text) for n in names)
+    # Unquoted identifiers fold to lower case (K4-2).
+    return any(re.search(rf"(?<![\w$]){re.escape(n)}(?![\w$])", text, re.I) for n in names)
 
 
 def _empty_like(table: TableSnap) -> TableSnap:
@@ -666,6 +947,19 @@ def _empty_like(table: TableSnap) -> TableSnap:
         foreign_keys={},
         indexes={},
     )
+
+
+def _diff_comments(before: TableSnap, after: TableSnap, plan: _Plan) -> None:
+    """``COMMENT ON`` for the table and every column whose comment changed (a new column has
+    no old comment, so its comment is set too). Comments on dropped objects go with them."""
+    schema, name = after["schema"], after["name"]
+    if before.get("comment") != after.get("comment"):
+        plan.comments.append(SetTableComment(schema, name, after.get("comment")))
+    for cname, column in after["columns"].items():
+        old = before["columns"].get(cname)
+        old_comment = old.get("comment") if old is not None else None
+        if old_comment != column.get("comment"):
+            plan.comments.append(SetColumnComment(schema, name, cname, column.get("comment")))
 
 
 def _diff_roles(old: Snapshot, new: Snapshot, plan: _Plan, drop_unlisted: bool) -> None:
@@ -699,6 +993,18 @@ def _diff_extensions(old: Snapshot, new: Snapshot, plan: _Plan, drop_unlisted: b
         plan.drop_extensions += [DropExtension(n) for n in before if n not in after]
 
 
+def _restore_after(steps: list[Step], keep: set[str]) -> list[Step]:
+    """Each CreateFunction of a function dropped and created again, followed by putting
+    its privileges, owner and comment back."""
+    out: list[Step] = []
+    for step in steps:
+        out.append(step)
+        if isinstance(step, CreateFunction) and function_key(step.function) in keep:
+            f = step.function
+            out.append(RestoreGrants(f["schema"], f["name"], False, f["args"]))
+    return out
+
+
 def _diff_functions(old: Snapshot, new: Snapshot, plan: _Plan) -> set[str]:
     """Returns the names of functions that are dropped (also to be created again).
     Functions are matched by name and arguments: overloads are separate functions, and
@@ -707,19 +1013,289 @@ def _diff_functions(old: Snapshot, new: Snapshot, plan: _Plan) -> set[str]:
     before = {function_key(f): f for f in old.get("functions", {}).values()}
     after = {function_key(f): f for f in new.get("functions", {}).values()}
     dropped: set[str] = set()
+    # (K1) Created before the tables and dropped after them, as a CHECK or DEFAULT may call
+    # them; unless they use a table or view (a row type, a SQL body): those are created and
+    # dropped in order with the views (K4-13).
+    late, early_drop = _uses_relations(after, new), _uses_relations(before, old)
+    early: list[FunctionSnap] = []
     for k, fn in after.items():
         prev = before.get(k)
         if prev is not None and prev["returns"] != fn["returns"]:
             # CREATE OR REPLACE cannot change it.
-            plan.drop_functions.append(DropFunction(prev["schema"], prev["name"], prev["args"]))
+            plan.drop_functions += [
+                SaveGrants(prev["schema"], prev["name"], prev["args"]),
+                DropFunction(prev["schema"], prev["name"], prev["args"]),
+            ]
+            plan.keep_grants.add(k)
             dropped.add(prev["name"])
         if prev != fn:
-            plan.create_functions.append(CreateFunction(fn))
+            (plan.create_with_views if k in late else early).append(fn)
+    plan.create_functions_early += [CreateFunction(f) for f in _topo(_function_nodes(early))]
     for k, prev in before.items():
         if k not in after:
-            plan.drop_functions.append(DropFunction(prev["schema"], prev["name"], prev["args"]))
+            if k in early_drop:
+                plan.drop_with_views.append(prev)
+            else:
+                plan.drop_functions_late.append(
+                    DropFunction(prev["schema"], prev["name"], prev["args"])
+                )
             dropped.add(prev["name"])
     return dropped
+
+
+def _checked(f: FunctionSnap) -> str:
+    """What CREATE FUNCTION resolves: the argument and result types, and a SQL body.
+    Other bodies (plpgsql) are only checked when called (K4-3)."""
+    body = f["body"] if f["language"].lower() == "sql" else ""
+    return f"{f['args']} {f['returns']} {body}"
+
+
+_SQL_STANDARD_BODY = re.compile(r"\s*(?:RETURN\b|BEGIN\s+ATOMIC\b)", re.IGNORECASE)
+
+
+def _bound(f: FunctionSnap) -> str:
+    """What a function records a dependency on: the argument and result types, and a
+    SQL-standard body (RETURN, BEGIN ATOMIC); a quoted body is only text (K4-20)."""
+    standard = f["language"].lower() == "sql" and _SQL_STANDARD_BODY.match(f["body"])
+    return f"{f['args']} {f['returns']} {f['body'] if standard else ''}"
+
+
+def _function_nodes(functions: Iterable[FunctionSnap]) -> list[tuple[str, str, FunctionSnap]]:
+    return [(f["name"], _checked(f), f) for f in functions]
+
+
+def _topo[T](nodes: Sequence[tuple[str, str, T]]) -> list[T]:
+    """The items of ``nodes`` (name, SQL text, item), those whose name the text of another
+    one mentions first (K4-9). Stable; a cycle (or a false match) keeps the given order."""
+    pending, done = list(nodes), list[T]()
+    while pending:
+        ready = [
+            n for n in pending if not any(o is not n and _mentions(n[1], [o[0]]) for o in pending)
+        ]
+        ready = ready or pending[:1]
+        done += [n[2] for n in ready]
+        pending = [n for n in pending if not any(n is r for r in ready)]
+    return done
+
+
+def _uses_relations(functions: Mapping[str, FunctionSnap], snapshot: Snapshot) -> set[str]:
+    """Keys of the functions whose creation may need a table or view of ``snapshot``, or
+    such a function (K1). A word search: it can only over-report."""
+    names = {t["name"] for t in snapshot["tables"].values()}
+    names |= {v["name"] for v in snapshot.get("views", {}).values()}
+    found: set[str] = set()
+    while more := {
+        k for k, f in functions.items() if k not in found and _mentions(_checked(f), names)
+    }:
+        found |= more
+        names |= {functions[k]["name"] for k in more}
+    return found
+
+
+def _defer_calls(plan: _Plan, old_tables: Mapping[str, TableSnap], new: Snapshot) -> None:
+    """CHECKs and DEFAULTs calling a function created with the views (its SQL body reads a
+    table, so it comes after the tables) are added after it; those calling a function
+    dropped with the views go before it, and come back after it if they stay (K4-19)."""
+    created = {f["name"] for f in plan.create_with_views}
+    dropped = {f["name"] for f in plan.drop_with_views}
+    dropped |= {s.name for s in plan.drop_functions if isinstance(s, DropFunction)}
+    later: list[Step] = []
+
+    def calls(text: str | None) -> bool:
+        return _mentions(text, created)
+
+    for i, step in enumerate(plan.create_tables):
+        if not isinstance(step, CreateTable):
+            continue
+        table = copy.deepcopy(step.table)
+        schema, name = table["schema"], table["name"]
+        # A NOT VALID check is added after CREATE TABLE already (in add_constraints).
+        checks = [
+            c for c in table["checks"].values() if calls(c["expression"]) and not c.get("not_valid")
+        ]
+        defaults = [c for c in table["columns"].values() if calls(c["default"])]
+        if not checks and not defaults:
+            continue
+        for c in checks:
+            del table["checks"][c["name"]]
+            later.append(AddCheck(schema, name, c))
+        for col in defaults:
+            later.append(AlterColumnDefault(schema, name, col["name"], col["default"]))
+            col["default"] = None
+        plan.create_tables[i] = CreateTable(table)
+    for i, step in enumerate(plan.add_columns):
+        if isinstance(step, AddColumn) and calls(default := step.column["default"]):
+            column = copy.copy(step.column)
+            column["default"] = None
+            plan.add_columns[i] = AddColumn(step.schema, step.table, column)
+            later.append(AlterColumnDefault(step.schema, step.table, column["name"], default))
+
+    def moved(step: Step) -> bool:
+        match step:
+            case AddCheck(check=check) if calls(check["expression"]):
+                later.append(step)
+                return True
+            case AlterColumnDefault(default=default) if calls(default):
+                later.append(step)
+                return True
+            case _:
+                return False
+
+    plan.add_constraints = [s for s in plan.add_constraints if not moved(s)]
+    plan.alter_columns = [s for s in plan.alter_columns if not moved(s)]
+
+    for table in old_tables.values():
+        schema, name = table["schema"], table["name"]
+        after = new["tables"].get(key(schema, name))
+        steps = [*plan.add_constraints, *plan.alter_columns, *later]
+        for c in table["checks"].values():
+            if not _mentions(c["expression"], dropped):
+                continue
+            drop = DropConstraint(schema, name, c["name"], "check")
+            plan.drop_constraints = [s for s in plan.drop_constraints if s != drop]
+            plan.drop_calls.append(drop)
+            again = after["checks"].get(c["name"]) if after else None
+            if again is not None and not any(
+                isinstance(s, AddCheck)
+                and (s.schema, s.table, s.check["name"]) == (schema, name, c["name"])
+                for s in steps
+            ):
+                later.append(AddCheck(schema, name, again))
+        for ix in table["indexes"].values():  # an index on mg.f(a), or WHERE mg.f(a) (K4-26)
+            if not _mentions(" ".join(filter(None, [ix.get("expression"), ix["where"]])), dropped):
+                continue
+            drop_ix = DropIndex(schema, ix["name"])
+            plan.drop_indexes = [s for s in plan.drop_indexes if s != drop_ix]
+            plan.drop_calls.append(drop_ix)
+            ix_again = after["indexes"].get(ix["name"]) if after else None
+            if ix_again is not None and not any(
+                isinstance(s, CreateIndex) and (s.schema, s.index["name"]) == (schema, ix["name"])
+                for s in plan.create_indexes
+            ):
+                later.append(CreateIndex(schema, name, ix_again))
+        for ex in table.get("exclusions", {}).values():  # as the indexes (K4-28)
+            texts = [ex.get("where"), *(el.get("expression") for el in ex["elements"])]
+            if not _mentions(" ".join(filter(None, texts)), dropped):
+                continue
+            drop_ex = DropConstraint(schema, name, ex["name"], "exclusion")
+            plan.drop_constraints = [s for s in plan.drop_constraints if s != drop_ex]
+            plan.drop_calls.append(drop_ex)
+            ex_again = after.get("exclusions", {}).get(ex["name"]) if after else None
+            if ex_again is not None and not any(
+                isinstance(s, AddExclusion)
+                and (s.schema, s.table, s.exclusion["name"]) == (schema, name, ex["name"])
+                for s in plan.add_constraints
+            ):
+                later.append(AddExclusion(schema, name, ex_again))
+        for col in table["columns"].values():  # no longer generated, or dropped (K4-26)
+            gen = col.get("generated")
+            col_after = after["columns"].get(col["name"]) if after else None
+            if (
+                gen is None
+                or "generated" in (col_after or {})
+                or not _mentions(gen["expression"], dropped)
+            ):
+                continue
+            if after is not None and col_after is None:
+                # Dropped before the function, after the views reading it (K4-30, K4-32);
+                # also when STORED: PostgreSQL 14 would drop it with the function anyway.
+                drop_col = DropColumn(schema, name, col["name"])
+                plan.drop_columns = [s for s in plan.drop_columns if s != drop_col]
+                plan.drop_rebuilt.append(drop_col)
+                continue
+            if not gen["stored"]:  # cannot be made plain: rebuilt, or its table dropped (K4-30)
+                continue
+            plain = AlterColumnGenerated(schema, name, col["name"], gen, None, col_after)
+            plan.alter_columns = [s for s in plan.alter_columns if s != plain]
+            plan.drop_calls.append(plain)
+            if col_after is not None:  # kept as a plain column
+                plan.drop_calls.append(CheckColumnFreed(schema, name, col["name"]))
+        for col in table["columns"].values():
+            if not _mentions(col["default"], dropped):
+                continue
+            plan.drop_calls.append(AlterColumnDefault(schema, name, col["name"], None))
+            col_again = after["columns"].get(col["name"]) if after else None
+            if (
+                col_again is not None
+                and col_again["default"] is not None
+                and not any(
+                    isinstance(s, AlterColumnDefault)
+                    and (s.schema, s.table, s.column) == (schema, name, col["name"])
+                    and s.default is not None
+                    for s in steps
+                )
+            ):
+                later.append(AlterColumnDefault(schema, name, col["name"], col_again["default"]))
+    plan.create_calls += later
+
+
+def _domain_calls(d: DomainSnap) -> str:
+    return " ".join([*d.get("checks", []), d.get("default") or ""])
+
+
+def _defer_domain_calls(plan: _Plan, old: Snapshot, new: Snapshot) -> None:
+    """A domain is created before the functions (which may take it), so its CHECKs and
+    DEFAULT calling a function created here are added after it. Those calling a function
+    dropped here go first (the domain itself is dropped last), and come back after it if
+    the domain stays (K4-27)."""
+    early = [s.function for s in plan.create_functions_early if isinstance(s, CreateFunction)]
+    made = [*early, *(s.function for s in plan.create_views if isinstance(s, CreateFunction))]
+    added = [s for s in plan.add_columns if isinstance(s, AddColumn)]
+
+    def add_back(d: DomainSnap) -> None:
+        # Before the tables change when every function it calls is created early, so a
+        # column of the domain added to a table with rows gets the domain's DEFAULT.
+        calls = [f for f in made if _mentions(_domain_calls(d), [f["name"]])]
+        if all(f in early for f in calls):
+            plan.domain_calls_early.append(AddDomainChecks(d))
+            return
+        if d.get("default") and (
+            column := next(
+                (
+                    s
+                    for s in added
+                    if s.column["default"] is None and _mentions(s.column["type"], [d["name"]])
+                ),
+                None,
+            )
+        ):
+            raise MigrationError(
+                f"column {column.table}.{column.column['name']} is added with domain "
+                f"{d['name']}, whose DEFAULT calls a function created after the tables: its "
+                "rows would get NULL. Give the column its own DEFAULT, or add it in a "
+                "custom migration"
+            )
+        plan.create_calls.append(AddDomainChecks(d))
+
+    for i, step in enumerate(plan.domains):
+        if not isinstance(step, CreateDomain):
+            continue
+        d = step.domain
+        calls = [f for f in made if _mentions(_domain_calls(d), [f["name"]])]
+        if not calls:
+            continue
+        if takes := [f for f in calls if _mentions(f"{f['args']} {f['returns']}", [d["name"]])]:
+            raise MigrationError(
+                f"domain {d['name']} calls function {takes[0]['name']}, which takes or returns "
+                "the domain: one cannot be created before the other"
+            )
+        bare = copy.copy(d)
+        bare.pop("checks", None)
+        bare.pop("default", None)
+        plan.domains[i] = CreateDomain(bare)
+        add_back(d)
+    dropped = {
+        s.name
+        for s in [*plan.drop_functions, *plan.drop_views, *plan.drop_functions_late]
+        if isinstance(s, DropFunction)
+    }
+    new_domains = new.get("domains", {})
+    for k, d in old.get("domains", {}).items():
+        if not _mentions(_domain_calls(d), dropped):
+            continue
+        plan.drop_calls.append(DropDomainChecks(d["schema"], d["name"]))
+        if (again := new_domains.get(k)) is not None:
+            add_back(again)
 
 
 def _changed_tables(plan: _Plan) -> set[str]:
@@ -755,21 +1331,25 @@ def _changed_tables(plan: _Plan) -> set[str]:
     return names
 
 
-def _ordered(views: Mapping[str, ViewSnap], keys: Iterable[str]) -> list[str]:
-    """``keys`` with views another one uses first."""
-    pending, done = list(keys), list[str]()
-    while pending:
-        ready = [
-            k
-            for k in pending
-            if not any(
-                o != k and _mentions(views[k]["definition"], [views[o]["name"]]) for o in pending
-            )
-        ]
-        ready = ready or pending[:1]  # a cycle (or a false match): keep the given order
-        done += ready
-        pending = [k for k in pending if k not in ready]
-    return done
+def _ordered(
+    views: Mapping[str, ViewSnap], keys: Iterable[str], functions: Iterable[FunctionSnap]
+) -> list[str | FunctionSnap]:
+    """``keys`` of views and ``functions``, those another one uses first (K4-13)."""
+    nodes: list[tuple[str, str, str | FunctionSnap]] = [
+        (views[k]["name"], views[k]["definition"], k) for k in keys
+    ]
+    return _topo([*nodes, *_function_nodes(functions)])
+
+
+def _view_key(v: ViewSnap) -> tuple[str, bool, bool, bool, str | None]:
+    # Options too (K6): a change re-creates the view with them.
+    return (
+        v["definition"],
+        v["materialized"],
+        v.get("security_invoker", False),
+        v.get("security_barrier", False),
+        v.get("check_option"),
+    )
 
 
 def _diff_views(
@@ -779,32 +1359,62 @@ def _diff_views(
     remove or retype columns. Their privileges, owner and comment are kept across that.
     Returns the names of views that are dropped."""
     before, after = old.get("views", {}), new.get("views", {})
-    redo = {
-        k
-        for k, v in before.items()
-        if k not in after
-        or (after[k]["definition"], after[k]["materialized"])
-        != (v["definition"], v["materialized"])
-    }
+    redo = {k for k, v in before.items() if k not in after or _view_key(after[k]) != _view_key(v)}
+    # Functions that depend on a view (a SQL-standard body, a row type) go and come back
+    # with it (K4-20); those dropped anyway already do.
+    functions = {function_key(f): f for f in old.get("functions", {}).values()}
+    gone = {function_key(f) for f in plan.drop_with_views}
+    redo_fns: set[str] = set()
     names = set(touched)
-    while True:  # views using what changes, and views using those
-        names |= {before[k]["name"] for k in redo}
+    while True:  # views using what changes, and views and functions using those
+        recreated = {before[k]["name"] for k in redo} | {functions[k]["name"] for k in redo_fns}
+        names |= recreated
         more = {k for k, v in before.items() if k not in redo and _mentions(v["definition"], names)}
-        if not more:
+        more_fns = {
+            k
+            for k, f in functions.items()
+            if k not in redo_fns and k not in gone and _mentions(_bound(f), recreated)
+        }
+        if not more and not more_fns:
             break
         redo |= more
-    for k in reversed(_ordered(before, [k for k in before if k in redo])):
-        v = before[k]
-        if k in after:
+        redo_fns |= more_fns
+    created = {function_key(f) for f in plan.create_with_views}
+    for k in sorted(redo_fns):
+        old_fn = functions[k]
+        plan.drop_with_views.append(old_fn)
+        drop = DropFunction(old_fn["schema"], old_fn["name"], old_fn["args"])
+        save = SaveGrants(old_fn["schema"], old_fn["name"], old_fn["args"])
+        plan.drop_functions = [s for s in plan.drop_functions if s not in (drop, save)]
+        fn = next((f for f in new.get("functions", {}).values() if function_key(f) == k), None)
+        if (
+            fn is not None and fn == old_fn and k not in created
+        ):  # else created (or not) by _diff_functions
+            plan.create_with_views.append(fn)
+    dropping = _ordered(before, [k for k in before if k in redo], plan.drop_with_views)
+    kept = {function_key(f) for f in new.get("functions", {}).values()}
+    for item in reversed(dropping):
+        if not isinstance(item, str):
+            if function_key(item) in kept:
+                plan.drop_views.append(SaveGrants(item["schema"], item["name"], item["args"]))
+                plan.keep_grants.add(function_key(item))
+            plan.drop_views.append(DropFunction(item["schema"], item["name"], item["args"]))
+            continue
+        v = before[item]
+        if item in after:
             plan.drop_views.append(SaveGrants(v["schema"], v["name"]))
         plan.drop_views.append(DropView(v["schema"], v["name"], v["materialized"]))
-    for k in _ordered(after, [k for k in after if k in redo or k not in before]):
-        v = after[k]
+    creating = [k for k in after if k in redo or k not in before]
+    for item in _ordered(after, creating, plan.create_with_views):
+        if not isinstance(item, str):
+            plan.create_views.append(CreateFunction(item))
+            continue
+        v = after[item]
         plan.create_views.append(CreateView(v))
         plan.create_views += [
             CreateIndex(v["schema"], v["name"], i) for i in v.get("indexes", {}).values()
         ]
-        if k in before:
+        if item in before:
             plan.create_views.append(RestoreGrants(v["schema"], v["name"], v["materialized"]))
     for k, v in after.items():
         prev = before.get(k)
@@ -814,7 +1424,7 @@ def _diff_views(
         _diff_grants(v, prev.get("grants", {}) if prev else {}, plan, drop_unlisted)
         old_triggers = prev.get("triggers", {}) if prev is not None and k not in redo else {}
         _diff_triggers(v["schema"], v["name"], old_triggers, v.get("triggers", {}), plan, touched)
-    return {before[k]["name"] for k in redo}
+    return {before[k]["name"] for k in redo} | {functions[k]["name"] for k in redo_fns}
 
 
 def _diff_grants(

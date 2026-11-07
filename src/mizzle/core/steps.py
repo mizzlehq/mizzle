@@ -9,7 +9,10 @@ from typing import Literal, override
 from mizzle.core.snapshot import (
     CheckSnap,
     ColumnSnap,
+    CompositeSnap,
+    DomainSnap,
     EnumSnap,
+    ExclusionSnap,
     ExtensionSnap,
     ForeignKeySnap,
     FunctionSnap,
@@ -25,11 +28,11 @@ from mizzle.core.snapshot import (
     ViewSnap,
 )
 
-type ConstraintKind = Literal["primary_key", "unique", "check", "foreign_key"]
+type ConstraintKind = Literal["primary_key", "unique", "check", "foreign_key", "exclusion"]
 
 _TEXT = ("text", "character varying")
 _INTS = ("smallint", "integer", "bigint")
-_SIZED = re.compile(r"(character varying|numeric)(?:\((\d+)(?:,(\d+))?\))?")
+_SIZED = re.compile(r"(character varying|character|numeric)(?:\((\d+)(?:,(\d+))?\))?")
 
 
 def widens(old: str, new: str) -> bool:
@@ -39,7 +42,7 @@ def widens(old: str, new: str) -> bool:
         return widens(old[:-2], new[:-2])
     if new == "text":  # every value as its exact text
         return old in (*_TEXT, *_INTS, "boolean", "uuid") or old.startswith(
-            ("character varying(", "numeric")
+            ("character varying(", "character(", "numeric")
         )
     if old in _INTS and new in _INTS:
         return _INTS.index(old) <= _INTS.index(new)
@@ -48,6 +51,10 @@ def widens(old: str, new: str) -> bool:
     a, b = _SIZED.fullmatch(old), _SIZED.fullmatch(new)
     if a is None or b is None or a.group(1) != b.group(1):
         return False
+    # ``character`` without a length is ``character(1)``; only ``character varying`` and
+    # ``numeric`` are unbounded when no length is written.
+    if a.group(1) == "character":
+        return int(b.group(2) or 1) >= int(a.group(2) or 1)
     if b.group(2) is None:  # unbounded
         return True
     if a.group(2) is None:
@@ -110,6 +117,68 @@ class DropEnum(Step):
 
 
 @dataclass(frozen=True)
+class CreateDomain(Step):
+    domain: DomainSnap
+
+    @override
+    def describe(self) -> str:
+        return f"create domain {self.domain['name']}"
+
+
+@dataclass(frozen=True)
+class DropDomain(Step):
+    schema: str
+    name: str
+
+    @override
+    def describe(self) -> str:
+        return f"drop domain {self.name}"
+
+
+@dataclass(frozen=True)
+class DropDomainChecks(Step):
+    """Drop a domain's CHECKs and DEFAULT, which call a function about to be dropped (and
+    maybe created again); ``AddDomainChecks`` puts them back (K4-27)."""
+
+    schema: str
+    name: str
+
+    @override
+    def describe(self) -> str:
+        return f"drop checks of domain {self.name}"
+
+
+@dataclass(frozen=True)
+class AddDomainChecks(Step):
+    """The CHECKs and DEFAULT of ``domain``, once the functions they call exist (K4-27)."""
+
+    domain: DomainSnap
+
+    @override
+    def describe(self) -> str:
+        return f"add checks to domain {self.domain['name']}"
+
+
+@dataclass(frozen=True)
+class CreateComposite(Step):
+    composite: CompositeSnap
+
+    @override
+    def describe(self) -> str:
+        return f"create type {self.composite['name']}"
+
+
+@dataclass(frozen=True)
+class DropComposite(Step):
+    schema: str
+    name: str
+
+    @override
+    def describe(self) -> str:
+        return f"drop type {self.name}"
+
+
+@dataclass(frozen=True)
 class CreateTable(Step):
     """Columns, primary key, uniques and checks. Indexes and foreign keys are separate steps."""
 
@@ -133,6 +202,35 @@ class DropTable(Step):
     @override
     def describe(self) -> str:
         return f"drop table {self.name}"
+
+
+@dataclass(frozen=True)
+class CreatePartition(Step):
+    """``CREATE TABLE name PARTITION OF parent bound``."""
+
+    schema: str
+    parent: str
+    name: str
+    bound: str  # as PostgreSQL prints it: "FOR VALUES FROM (...) TO (...)" or "DEFAULT"
+
+    @override
+    def describe(self) -> str:
+        return f"create partition {self.name} of {self.parent}"
+
+
+@dataclass(frozen=True)
+class DropPartition(Step):
+    schema: str
+    name: str
+
+    @property
+    @override
+    def data_loss(self) -> bool:
+        return True
+
+    @override
+    def describe(self) -> str:
+        return f"drop partition {self.name}"
 
 
 @dataclass(frozen=True)
@@ -171,6 +269,20 @@ class AddColumn(Step):
 
 
 @dataclass(frozen=True)
+class CheckColumnFreed(Step):
+    """Stop the migration if a column made plain still depends on a function (PostgreSQL
+    14 keeps that after DROP EXPRESSION): dropping the function would drop the column."""
+
+    schema: str
+    table: str
+    name: str
+
+    @override
+    def describe(self) -> str:
+        return f"check {self.table}.{self.name} no longer depends on a function"
+
+
+@dataclass(frozen=True)
 class DropColumn(Step):
     schema: str
     table: str
@@ -206,6 +318,9 @@ class AlterColumnType(Step):
     old_type: str
     new_type: str
     generated: bool = False  # a generated column: recomputed, so no USING cast
+    collation: str | None = None  # keep the column's COLLATE across the type change
+    # Cast through text: there is no direct cast from an enum to another type (C23).
+    via_text: bool = False
 
     @property
     @override
@@ -217,6 +332,84 @@ class AlterColumnType(Step):
     @override
     def describe(self) -> str:
         return f"change type of {self.table}.{self.column} from {self.old_type} to {self.new_type}"
+
+
+@dataclass(frozen=True)
+class AlterColumnCollation(Step):
+    """Change (or drop) a column's ``COLLATE``. ``sql_type`` is part of the ALTER: PostgreSQL
+    spells a collation change as ``ALTER COLUMN c TYPE <type> COLLATE <name>``."""
+
+    schema: str
+    table: str
+    column: str
+    sql_type: str
+    collation: str | None  # None: the collation the type uses by default
+
+    @override
+    def describe(self) -> str:
+        return f"change collation of {self.table}.{self.column} to {self.collation or 'default'}"
+
+
+@dataclass(frozen=True)
+class SetTableComment(Step):
+    """``COMMENT ON TABLE``; ``None`` removes the comment."""
+
+    schema: str
+    table: str
+    comment: str | None
+
+    @override
+    def describe(self) -> str:
+        what = "comment" if self.comment is not None else "remove comment"
+        return f"{what} on table {self.table}"
+
+
+@dataclass(frozen=True)
+class SetColumnComment(Step):
+    """``COMMENT ON COLUMN``; ``None`` removes the comment."""
+
+    schema: str
+    table: str
+    column: str
+    comment: str | None
+
+    @override
+    def describe(self) -> str:
+        what = "comment" if self.comment is not None else "remove comment"
+        return f"{what} on {self.table}.{self.column}"
+
+
+@dataclass(frozen=True)
+class SetTableLogged(Step):
+    """``ALTER TABLE ... SET LOGGED`` / ``SET UNLOGGED``."""
+
+    schema: str
+    table: str
+    unlogged: bool
+
+    @override
+    def describe(self) -> str:
+        return f"set {self.table} {'unlogged' if self.unlogged else 'logged'}"
+
+
+@dataclass(frozen=True)
+class AlterTableStorage(Step):
+    """Change a table's storage parameters: ``SET (...)`` for the new or changed ones and
+    ``RESET (...)`` for the removed ones."""
+
+    schema: str
+    table: str
+    set_options: dict[str, str]
+    reset_options: tuple[str, ...] = ()
+
+    @override
+    def describe(self) -> str:
+        parts: list[str] = []
+        if self.set_options:
+            parts.append("set " + ", ".join(f"{k}={v}" for k, v in self.set_options.items()))
+        if self.reset_options:
+            parts.append("reset " + ", ".join(self.reset_options))
+        return f"storage of {self.table}: {'; '.join(parts)}"
 
 
 @dataclass(frozen=True)
@@ -309,6 +502,17 @@ class AddCheck(Step):
     @override
     def describe(self) -> str:
         return f"add check {self.check['name']}"
+
+
+@dataclass(frozen=True)
+class AddExclusion(Step):
+    schema: str
+    table: str
+    exclusion: ExclusionSnap
+
+    @override
+    def describe(self) -> str:
+        return f"add exclusion {self.exclusion['name']}"
 
 
 @dataclass(frozen=True)
@@ -486,10 +690,12 @@ class DropView(Step):
 @dataclass(frozen=True)
 class SaveGrants(Step):
     """Remember the privileges, owner and comment of a view about to be dropped and
-    created again (they go with the view), for ``RestoreGrants``."""
+    created again (they go with the view), for ``RestoreGrants``. With ``args``: of that
+    function (a new function can be run by PUBLIC, and is owned by whoever creates it)."""
 
     schema: str
     name: str
+    args: str | None = None
 
     @override
     def describe(self) -> str:
@@ -501,6 +707,7 @@ class RestoreGrants(Step):
     schema: str
     name: str
     materialized: bool
+    args: str | None = None  # a function's (see SaveGrants)
 
     @override
     def describe(self) -> str:

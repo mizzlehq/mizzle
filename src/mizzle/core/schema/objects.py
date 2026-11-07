@@ -66,7 +66,28 @@ class Trigger:
     new_table: str | None = None
 
 
-type SchemaObject = Extension | Function | Trigger | Role
+@dataclass(frozen=True)
+class Domain:
+    name: str
+    base_type: str  # as PostgreSQL prints it: integer, character varying(255), ...
+    schema: str | None = None
+    not_null: bool = False
+    default: str | None = None  # an SQL expression
+    checks: tuple[str, ...] = ()  # CHECK expressions; VALUE is the domain's value
+    collation: str | None = None
+
+
+@dataclass(frozen=True)
+class Composite:
+    """``CREATE TYPE name AS (field type, ...)``: a named row type."""
+
+    name: str
+    fields: tuple[tuple[str, str], ...]  # (field name, SQL type in PostgreSQL's spelling)
+    schema: str | None = None
+
+
+# A module-level pg_enum(...) column declares an enum type no table uses (K4-5).
+type SchemaObject = Extension | Function | Trigger | Role | Domain | Composite | ColumnBase
 
 
 def extension(name: str, *, schema: str | None = None, version: str | None = None) -> Extension:
@@ -145,3 +166,39 @@ def trigger(
     return Trigger(
         name, on, execute, timing, ordered, for_each, when, tuple(update_of), old_table, new_table
     )
+
+
+def domain(
+    name: str,
+    *,
+    as_: str,
+    schema: str | None = None,
+    not_null: bool = False,
+    default: str | None = None,
+    check: str | None = None,
+    checks: Sequence[str] = (),
+    collation: str | None = None,
+) -> Domain:
+    """``CREATE DOMAIN name AS as_``. ``as_`` is the base SQL type; ``check``/``checks`` add
+    CHECK constraints, where ``VALUE`` is the domain's value. A column uses the domain by
+    name (see ``pg_domain``)."""
+    return Domain(
+        name,
+        as_,
+        schema,
+        not_null,
+        default,
+        (*checks, *([check] if check is not None else [])),
+        collation,
+    )
+
+
+def composite(
+    name: str, fields: Sequence[tuple[str, str]], *, schema: str | None = None
+) -> Composite:
+    """``CREATE TYPE name AS (field type, ...)``. Field types use PostgreSQL's spelling
+    (``character varying(255)``, not ``varchar``) and their order is kept. A column uses the
+    type by name (see ``mizzle.pg.pg_composite``)."""
+    if not fields:
+        raise SchemaError(f"composite {name!r} needs at least one field")
+    return Composite(name, tuple((f, t) for f, t in fields), schema)

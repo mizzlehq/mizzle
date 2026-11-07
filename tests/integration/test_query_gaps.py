@@ -282,3 +282,88 @@ async def test_auto_reset_after_a_user_named_function(db: Database, pg_url: str)
             .limit(1)
         )
         assert name != "leaked"
+
+
+async def test_a_select_with_a_data_modifying_cte_runs_on_the_primary(db: Database) -> None:
+    # Q1: the DELETE inside the WITH actually runs, and the outer SELECT returns its rows.
+    await seed(db)
+    moved = db.delete(Posts).where(eq(Posts.author_id, 1)).returning(Posts.id).cte("moved")
+    # The main query reads the pre-delete snapshot (PostgreSQL semantics); selecting from
+    # the CTE returns the rows the DELETE removed.
+    deleted = db.with_(moved).select(moved.c("id", int)).from_(moved)
+    assert sorted(await deleted) == [(1,), (2,)]
+    assert await db.select(count(Posts.id)).from_(Posts) == [(1,)]  # one post (author 3) left
+
+
+async def test_ctes_run_on_insert_update_and_delete(db: Database) -> None:
+    # Q2: with_() is emitted before every write, not only SELECT.
+    await seed(db)
+    keep = db.select(Users.id).from_(Users).cte("keep")
+    updated = db.with_(keep).update(Posts).set({"title": "renamed"}).where(eq(Posts.author_id, 1))
+    assert await updated == 2
+    assert await db.select(Posts.title).from_(Posts).where(eq(Posts.title, "renamed")) == [
+        ("renamed",),
+        ("renamed",),
+    ]
+    deleted = db.with_(keep).delete(Posts).where(eq(Posts.author_id, 3))
+    assert await deleted == 1
+
+
+async def test_relational_query_keeps_the_with_clause(db: Database) -> None:
+    # B9: query() dropped the CTEs, so a data-modifying CTE never ran (silently).
+    await seed(db)
+    moved = db.delete(Posts).where(eq(Posts.author_id, 3)).returning(Posts.id).cte("moved")
+    rows = await db.with_(moved).query(Users).find_many(order_by=Users.id)
+    assert [u.email for u in rows] == ["ann@x", "bob@y", "cid@x"]
+    # The DELETE inside the WITH ran.
+    assert await db.select(count(Posts.id)).from_(Posts) == [(2,)]
+    found = await db.with_(moved).query(Users).find_first(where=eq(Users.id, 1))
+    assert found is not None and found.email == "ann@x"
+
+
+async def test_lateral_join_without_a_condition(db: Database) -> None:
+    # T6: ON true is written for you, so no sql("true") is needed (and the query stays
+    # session-safe).
+    await seed(db)
+    # ON true pairs every outer row with the subquery's rows, so scope the subquery.
+    posts = db.select(Posts.id).from_(Posts).where(eq(Posts.author_id, 1)).subquery("p")
+    rows = await (
+        db.select(Users.email, posts.c("id", int))
+        .from_(Users)
+        .join_lateral(posts)
+        .order_by(Users.id, posts.c("id", int))
+    )
+    assert rows == [
+        ("ann@x", 1),
+        ("ann@x", 2),
+        ("bob@y", 1),
+        ("bob@y", 2),
+        ("cid@x", 1),
+        ("cid@x", 2),
+    ]
+
+
+async def test_one_keeps_a_tighter_user_limit(db: Database) -> None:
+    # T4: one() must not rewrite a limit the caller already set to be exact.
+    await seed(db)
+    row = await db.select(Users.email).from_(Users).order_by(Users.email).limit(1).one()
+    assert row == ("ann@x",)
+
+
+async def test_as_rows_names_a_projection(db: Database) -> None:
+    from typing import TypedDict
+
+    class UserRow(TypedDict):
+        id: int
+        email: str
+
+    await seed(db)
+    rows = (
+        await db.select({"id": Users.id, "email": Users.email})
+        .from_(Users)
+        .as_rows(UserRow)
+        .order_by(Users.id)
+    )
+    assert rows[0] == {"id": 1, "email": "ann@x"}
+    with pytest.raises(QueryError, match="projection has"):
+        db.select({"id": Users.id}).from_(Users).as_rows(UserRow)

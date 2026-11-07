@@ -1,4 +1,6 @@
 import copy
+import hashlib
+import re
 from pathlib import Path
 
 import pytest
@@ -17,8 +19,10 @@ from mizzle.dialects.postgres import PostgresDialect
 from mizzle.dialects.postgres.ddl import normalize_default, normalize_type
 from mizzle.kit.config import load_config
 from mizzle.kit.diff import StrictRenames, diff
-from mizzle.kit.journal import BREAKPOINT, MigrationsDir, format_sql, parse_sql
+from mizzle.kit.journal import BREAKPOINT, Migration, MigrationsDir, format_sql, parse_sql
+from mizzle.kit.migrate import pending_migrations
 from mizzle.kit.snapshot import build_snapshot
+from mizzle.kit.sqltext import transaction_control
 from tests.models import Posts, Users
 
 dialect = PostgresDialect()
@@ -33,6 +37,9 @@ dialect = PostgresDialect()
         ("'x'::character varying", "'x'"),
         ("'{}'::jsonb", "'{}'"),
         ("('2'::numeric)", "2"),
+        ('\'happy\'::"App"."Mood"', "'happy'"),  # K4-4
+        ("'happy'::app.\"Mood\"", "'happy'"),
+        ("'happy'::\"App\".mood", "'happy'"),
         (None, None),
     ],
 )
@@ -48,6 +55,10 @@ def test_normalize_default(raw: str | None, expected: str | None) -> None:
         ("timestamptz", "timestamp with time zone"),
         ("text[]", "text[]"),
         ("varchar(5)[]", "character varying(5)[]"),
+        ("char(4)", "character(4)"),
+        ("char(1)", "character(1)"),
+        ("char", "character"),
+        ("bpchar(2)", "character(2)"),
     ],
 )
 def test_normalize_type(raw: str, expected: str) -> None:
@@ -179,6 +190,31 @@ def test_pulled_names_cannot_inject_code() -> None:
     compile(source, "pulled.py", "exec")
 
 
+def test_pulled_class_names_are_unique_identifiers() -> None:
+    # (K9) T, t, t_, table/Table, none and 2fa need distinct, valid, non-shadowing classes.
+    from mizzle.kit.codegen import render_schema_module
+
+    snapshot = empty_snapshot("postgresql")
+    names = ["T", "t", "t_", "table", "Table", "none", "2fa"]
+    for name in names:
+        snapshot["tables"][f"public.{name}"] = {
+            "schema": "public",
+            "name": name,
+            "columns": {"a": {"name": "a", "type": "integer", "not_null": False, "default": None}},
+            "primary_key": None,
+            "uniques": {},
+            "checks": {},
+            "foreign_keys": {},
+            "indexes": {},
+        }
+    source = render_schema_module(snapshot)
+    exec(compile(source, "pulled.py", "exec"), {})
+    classes = re.findall(r"^class (\w+)\(Table, name='([^']*)'", source, re.M)
+    assert sorted(n for _, n in classes) == sorted(names)
+    assert len({c for c, _ in classes}) == len(names)
+    assert "Table" not in {c for c, _ in classes}
+
+
 def test_init_creates_config_schema_and_folder(tmp_path: Path) -> None:
     from mizzle.kit.init import init_project
 
@@ -286,3 +322,107 @@ def test_schema_file(tmp_path: Path) -> None:
     (tmp_path / "app" / "db").mkdir(parents=True)
     (tmp_path / "app" / "db" / "schema.py").write_text("")
     assert config.schema_file().resolve() == (tmp_path / "app" / "db" / "schema.py").resolve()
+
+
+def test_domain_with_two_checks_renders_as_a_list() -> None:
+    # S7: `check=..., check=...` is a SyntaxError; a domain with several CHECKs uses
+    # checks=[...] so the pulled module compiles.
+    from mizzle.kit.codegen import render_schema_module
+
+    snapshot = empty_snapshot("postgresql")
+    snapshot["schemas"] = ["billing"]
+    snapshot["domains"] = {
+        "billing.price": {
+            "schema": "billing",
+            "name": "price",
+            "base_type": "numeric",
+            "checks": ["VALUE > 0", "VALUE < 1000000"],
+        }
+    }
+    source = render_schema_module(snapshot)
+    compile(source, "pulled.py", "exec")
+    assert "checks=['VALUE > 0', 'VALUE < 1000000']" in source
+
+
+def test_domain_with_one_check_stays_a_keyword() -> None:
+    from mizzle.kit.codegen import render_schema_module
+
+    snapshot = empty_snapshot("postgresql")
+    snapshot["domains"] = {
+        "public.email": {
+            "schema": "public",
+            "name": "email",
+            "base_type": "text",
+            "checks": ["VALUE ~ '@'"],
+        }
+    }
+    source = render_schema_module(snapshot)
+    assert "check=\"VALUE ~ '@'\"" in source
+
+
+@pytest.mark.parametrize(
+    ("sql", "expected"),
+    [
+        # K2: CASE ... END inside a BEGIN ATOMIC body does not close the body.
+        (
+            "CREATE FUNCTION f(x int) RETURNS int LANGUAGE sql BEGIN ATOMIC\n"
+            "  SELECT CASE WHEN x > 0 THEN 1 ELSE 0 END;\nEND;\nSELECT 1;",
+            None,
+        ),
+        (
+            "CREATE FUNCTION f() RETURNS int BEGIN ATOMIC SELECT CASE 1 WHEN 1 THEN 2 END; END;"
+            "\nCOMMIT;",
+            "COMMIT",
+        ),
+        # K3: "begin atomic" in a string, comment or quoted name hides nothing.
+        ("SELECT 'begin atomic';\nCOMMIT;", "COMMIT"),
+        ("-- begin atomic\nCOMMIT;", "COMMIT"),
+        ("/* begin atomic */ SELECT 1;\nCOMMIT;", "COMMIT"),
+        ('SELECT 1 AS "begin atomic";\nCOMMIT;', "COMMIT"),
+        ("SELECT $$begin atomic$$;\nCOMMIT;", "COMMIT"),
+    ],
+)
+def test_transaction_control_reads_atomic_bodies(sql: str, expected: str | None) -> None:
+    assert transaction_control(sql) == expected
+
+
+def test_migration_hash_ignores_crlf(tmp_path: Path) -> None:
+    # K12: a CRLF checkout of an applied migration must not look edited.
+    (tmp_path / "migration.sql").write_bytes(b"SELECT 1;\nSELECT 2;\n")
+    migration = Migration(index=1, name="0001_x", path=tmp_path)
+    lf = migration.hash()
+    (tmp_path / "migration.sql").write_bytes(b"SELECT 1;\r\nSELECT 2;\r\n")
+    assert migration.hash() == lf
+
+
+def test_crlf_migration_sql_and_old_hash(tmp_path: Path) -> None:
+    # K4-7: sql() gives LF, so a function body does not keep \r.
+    raw = b"CREATE FUNCTION f() RETURNS int LANGUAGE sql AS $$\r\nSELECT 1\r\n$$;\r\n"
+    (tmp_path / "migration.sql").write_bytes(raw)
+    migration = Migration(index=1, name="0001_x", path=tmp_path)
+    assert "\r" not in migration.sql()
+    # K4-16: a hash an older mizzle stored (sha256 of the CRLF bytes) still matches.
+    old = hashlib.sha256(raw).hexdigest()
+    assert pending_migrations([migration], {"0001_x": old}) == []
+    with pytest.raises(MigrationError):
+        pending_migrations([migration], {"0001_x": "0" * 64})
+
+
+def test_commit_after_a_breakpoint_is_transaction_control(tmp_path: Path) -> None:
+    # K4-17: no ';' before the breakpoint, so the COMMIT did not start a statement.
+    sql = (
+        "INSERT INTO t VALUES (1)\n-- mizzle:breakpoint\nCOMMIT\n"
+        "-- mizzle:breakpoint\nINSERT INTO t VALUES (1)\n"
+    )
+    (tmp_path / "migration.sql").write_text(sql)
+    migration = Migration(index=1, name="0001_x", path=tmp_path)
+    with pytest.raises(MigrationError, match="contains COMMIT"):
+        pending_migrations([migration], {})
+
+
+def test_non_migration_folders_are_not_unlisted(tmp_path: Path) -> None:
+    # K4-11: .cache or __pycache__ in migrations/ blocked every command.
+    directory = MigrationsDir(tmp_path, "postgresql")
+    for name in (".cache", "__pycache__", "meta", "0001_merged"):
+        (tmp_path / name).mkdir()
+    assert directory.unlisted() == ["0001_merged"]

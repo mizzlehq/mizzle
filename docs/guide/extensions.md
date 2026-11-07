@@ -64,6 +64,30 @@ CREATE INDEX "vecdoc_items_embedding_idx" ON "vecdoc_items" USING hnsw ("embeddi
 
 The server needs pgvector installed.
 
+### Types from other extensions
+
+Only pgvector's types are detected from a column: `vector`, `halfvec` and `sparsevec` make
+the migration create `vector` for you. The other extension types are plain names to
+PostgreSQL, so declare their extension yourself:
+
+```python
+from mizzle import extension
+from mizzle.pg import citext, hstore, ltree
+
+exts = [extension("hstore"), extension("citext"), extension("ltree")]
+
+
+@final
+class Document(Table):
+    labels = hstore()
+    slug = citext()
+    path = ltree()
+```
+
+Without the `extension(...)` entry the migration fails with
+`type "hstore" does not exist` (and so on). `pull` reads an existing extension back into the
+schema module as an `extension(...)`, so an adopted database keeps working.
+
 ## Writing and reading vectors
 
 ```python

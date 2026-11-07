@@ -14,8 +14,8 @@ await db.primary.select().from_(Users)  # read your own write right away
 await db.retry(transfer)  # re-run a transaction on a serialization conflict
 ```
 
-- Writes, transactions and `FOR UPDATE` always use the primary. A replica that is down is
-  skipped.
+- Writes, transactions and `FOR UPDATE` always use the primary. A replica that goes down
+  while the app runs is skipped; every replica must be reachable when `connect()` runs.
 - A lost connection is replaced. A read that fails because the connection dropped is tried
   once more.
 - Database errors map to mizzle errors (`UniqueViolation`, `ForeignKeyViolation`,
@@ -25,7 +25,7 @@ await db.retry(transfer)  # re-run a transaction on a serialization conflict
 ## Connection reset
 
 When a connection goes back to the pool, mizzle resets its session state (`RESET ALL`,
-`UNLISTEN *`, advisory locks, cursors) only after a statement that may have changed it: raw
+`UNLISTEN *`, advisory locks, cursors, temp tables) only after a statement that may have changed it: raw
 `sql(...)`, a function you name with `func()`, `listen()`, or direct connection use. After
 the statements mizzle builds itself it skips the reset, which saves a round trip per query
 (2x on a real network). Open transactions are always rolled back.

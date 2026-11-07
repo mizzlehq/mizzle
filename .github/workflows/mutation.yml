@@ -1,0 +1,49 @@
+name: Mutation testing
+
+# Slow enough to keep off every pull request: weekly, and on demand. It answers a different
+# question from the normal suite (does a test fail when the code is subtly wrong?), so a
+# surviving mutant is a weak test, not a regressed feature.
+on:
+  schedule:
+    - cron: "0 6 * * 1"  # Mondays, 06:00 UTC
+  workflow_dispatch:
+    inputs:
+      scope:
+        description: space-separated mutmut wildcards limiting the run
+        required: false
+        default: >-
+          mizzle.core.compiler* mizzle.core.naming* mizzle.core.errors*
+          mizzle.core.steps* mizzle.core.snapshot*
+
+jobs:
+  mutmut:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e  # v6
+      - run: uv sync --python 3.12 --group mutation
+      - name: Run mutation tests
+        # The scope goes through env, never into run: directly — a workflow_dispatch input
+        # interpolated into a shell command is code execution for anyone who can trigger it.
+        env:
+          SCOPE: ${{ inputs.scope || 'mizzle.core.compiler* mizzle.core.naming* mizzle.core.errors* mizzle.core.steps* mizzle.core.snapshot*' }}
+        # Each space-separated wildcard becomes one argument, and only module-path
+        # characters are allowed, so the input cannot add mutmut options (B23) or glob
+        # against the checkout.
+        run: |
+          if [[ ! "$SCOPE" =~ ^[A-Za-z0-9_.*\ ]+$ ]]; then
+            echo "scope may only hold module wildcards (letters, digits, _ . *)" >&2
+            exit 1
+          fi
+          read -ra scope <<< "$SCOPE"
+          uv run --group mutation mutmut run "${scope[@]}"
+      - name: Mutation score
+        run: |
+          uv run --group mutation mutmut export-cicd-stats
+          uv run python scripts/mutation_score.py --min 70
+      - if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: mutants
+          path: mutants/

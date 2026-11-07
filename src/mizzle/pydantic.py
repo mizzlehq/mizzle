@@ -23,13 +23,17 @@ Models only carry the fields a client sent: ``values(model)`` / ``set(model)`` u
 from __future__ import annotations
 
 import re
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
+from datetime import date
 from decimal import Decimal
 from types import GenericAlias
 from typing import Annotated, Any, Literal, cast
 
+from asyncpg import BitString, Box, Circle, Line, LineSegment, Path, Point, Polygon, Range
+
 try:
     import pydantic
+    from pydantic_core import to_jsonable_python
 except ImportError as exc:  # pragma: no cover - exercised only without the extra
     raise ImportError('mizzle.pydantic needs pydantic: pip install "mizzle[pydantic]"') from exc
 
@@ -42,6 +46,15 @@ type Mode = Literal["select", "insert", "update"]
 _VARCHAR = re.compile(r"(?:varchar|character varying)\((\d+)\)")
 _NUMERIC = re.compile(r"numeric\((\d+)(?:,\s*(\d+))?\)")
 _VECTOR = re.compile(r"(?:vector|halfvec)\((\d+)\)")
+
+
+def _nan_only(value: Decimal) -> Decimal:
+    if not value.is_nan():
+        raise ValueError("expected NaN")
+    return value
+
+
+_NAN = Annotated[Decimal, pydantic.Field(allow_inf_nan=True), pydantic.AfterValidator(_nan_only)]
 
 
 def column_type(column: ColumnBase) -> object:
@@ -57,15 +70,83 @@ def column_type(column: ColumnBase) -> object:
         return Annotated[list[float], pydantic.Field(min_length=size, max_length=size)]
     if column.sql_type.startswith("sparsevec("):
         return dict[int, float]
+    if column.accepts == (list,) and (decode := column.json_decoder) is not None:
+        # a multirange: a list of Range fields, each parsed like one range of it (Q4-9)
+        one = _pydantic_type(Range, lambda v: cast(list[object], decode([v]))[0])
+        return GenericAlias(list, (one,))
     base = column.accepts[0]
     if base is str and (m := _VARCHAR.fullmatch(column.sql_type)):
         return Annotated[str, pydantic.Field(max_length=int(m.group(1)))]
     if base is Decimal and (m := _NUMERIC.fullmatch(column.sql_type)):
         digits, places = int(m.group(1)), int(m.group(2) or 0)
-        return Annotated[Decimal, pydantic.Field(max_digits=digits, decimal_places=places)]
+        fits = Annotated[Decimal, pydantic.Field(max_digits=digits, decimal_places=places)]
+        return fits | _NAN  # NaN fits any numeric; Infinity only an unbounded one (Q4-13)
+    if base is Decimal:
+        return Annotated[Decimal, pydantic.Field(allow_inf_nan=True)]  # NaN, Infinity (Q4-13)
     if base is float:
         return float
-    return base
+    kinds = tuple(_pydantic_type(kind, column.json_decoder) for kind in column.accepts)
+    # inet holds addresses, interfaces and networks of both IP versions (C35).
+    union = kinds[0]
+    for kind in kinds[1:]:
+        union = cast(type[object], union) | cast(type[object], kind)
+    return union
+
+
+def _json_form(value: object) -> object:
+    """A value as JSON, in the form its column's json_decoder reads back: the form a
+    relational query nests it as (Q14). Lists cover multiranges and arrays (Q4-9)."""
+    match value:
+        case Range():
+            r = cast("Range[int | Decimal | date]", value)
+            return [_json_form(r.lower), _json_form(r.upper), r.lower_inc, r.upper_inc, r.isempty]
+        case BitString():
+            return value.as_string().replace(" ", "")  # spaced every 4 bits (Q4-10)
+        case Path():  # not a tuple; the brackets keep it open or closed (Q4-13)
+            points = ",".join(f"({x},{y})" for x, y in value.points)
+            return f"({points})" if value.is_closed else f"[{points}]"
+        case list() | tuple():  # Point, Box, Line, LineSegment, Circle are tuples
+            return [_json_form(v) for v in cast(Sequence[object], value)]
+        case _:
+            return cast(object, to_jsonable_python(value))
+
+
+# The JSON type each special value dumps to, which its field parses back (Q14, Q4-13).
+_JSON_FORMS: dict[type, type] = {
+    Range: list,
+    BitString: str,
+    Path: str,
+    Polygon: str,
+    Point: list,
+    Line: list,
+    LineSegment: list,
+    Box: list,
+    Circle: list,
+}
+
+
+def _pydantic_type(kind: type, parse: Callable[[object], object] | None) -> object:
+    """``kind``, or an isinstance check when pydantic has no schema for it (asyncpg's
+    Range, geometry, BitString): such fields accept those objects as they are, and also
+    their JSON form (``_json_form``) when the column can parse it."""
+    try:
+        pydantic.TypeAdapter(kind)
+    except pydantic.PydanticSchemaGenerationError:
+        form = _JSON_FORMS.get(kind) if parse is not None else None
+
+        def check(value: object) -> object:
+            if isinstance(value, kind):
+                return value
+            if form is not None and parse is not None and isinstance(value, form):
+                try:
+                    return parse(value)
+                except (ValueError, TypeError, IndexError) as exc:
+                    raise ValueError(f"invalid {kind.__qualname__}: {exc}") from exc
+            raise ValueError(f"expected {kind.__module__}.{kind.__qualname__}")
+
+        dump = pydantic.PlainSerializer(_json_form, when_used="json")
+        return Annotated[object, pydantic.PlainValidator(check), dump]
+    return kind
 
 
 def _field(column: ColumnBase, mode: Mode, override: object) -> tuple[object, object]:
@@ -116,7 +197,14 @@ def _model(
     suffix = {"select": "", "insert": "Insert", "update": "Update"}[mode]
     return pydantic.create_model(
         name or f"{table.__name__}{suffix}Model",
-        __config__=pydantic.ConfigDict(from_attributes=True, extra="forbid"),
+        # JSON that reads back: inf/NaN floats and non-UTF-8 bytes did not (Q4-13)
+        __config__=pydantic.ConfigDict(
+            from_attributes=True,
+            extra="forbid",
+            ser_json_inf_nan="strings",
+            ser_json_bytes="base64",
+            val_json_bytes="base64",
+        ),
         # **kwargs are also checked against create_model's named options (__doc__, ...),
         # so only Any values fit; the definitions are (type form, default) pairs.
         **cast(dict[str, Any], fields),  # pyright: ignore[reportAny]

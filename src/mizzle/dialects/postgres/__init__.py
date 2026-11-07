@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from collections.abc import Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 
 from mizzle.core.errors import MigrationLockTimeout
 from mizzle.core.naming import Casing
@@ -14,7 +14,12 @@ from mizzle.dialects.base import Connection, ResetMode
 from mizzle.dialects.postgres import ddl
 from mizzle.dialects.postgres.compiler import PostgresCompiler
 from mizzle.dialects.postgres.driver import PostgresDriver
-from mizzle.dialects.postgres.introspect import MIGRATIONS_TABLE, introspect, normalize_snapshot
+from mizzle.dialects.postgres.introspect import (
+    MIGRATIONS_TABLE,
+    introspect,
+    normalize_snapshot,
+    skipped_objects,
+)
 
 # Fixed key for pg_advisory_lock so concurrent `migrate` runs serialize.
 MIGRATION_LOCK_KEY = 0x6D697A7A6C65  # "mizzle"
@@ -37,6 +42,10 @@ class PostgresDialect:
         max_idle: float = 300.0,
         query_timeout: float | None = None,
         reset_connections: ResetMode = "auto",
+        on_connect: Callable[[Connection], Awaitable[None]] | None = None,
+        server_settings: Mapping[str, str] | None = None,
+        connect_timeout: float = 10.0,
+        acquire_timeout: float | None = 30.0,
     ) -> PostgresDriver:
         return await PostgresDriver.connect(
             url,
@@ -46,6 +55,10 @@ class PostgresDialect:
             max_idle=max_idle,
             query_timeout=query_timeout,
             reset_connections=reset_connections,
+            on_connect=on_connect,
+            server_settings=server_settings,
+            connect_timeout=connect_timeout,
+            acquire_timeout=acquire_timeout,
         )
 
     def column_type(self, column: ColumnBase) -> str:
@@ -53,6 +66,12 @@ class PostgresDialect:
 
     def column_default(self, column: ColumnBase, casing: Casing | None) -> str | None:
         return ddl.column_default(column, casing)
+
+    def normalize_default(self, text: str | None) -> str | None:
+        return ddl.normalize_default(text)
+
+    def normalize_type(self, sql_type: str) -> str:
+        return ddl.normalize_type(sql_type)
 
     def expression(self, node: Node, casing: Casing | None) -> str:
         return ddl.expression(node, casing)
@@ -73,6 +92,9 @@ class PostgresDialect:
 
     async def normalize_snapshot(self, conn: Connection, snapshot: Snapshot) -> Snapshot:
         return await normalize_snapshot(conn, snapshot)
+
+    async def skipped_objects(self, conn: Connection, schemas: Sequence[str]) -> list[str]:
+        return await skipped_objects(conn, schemas)
 
     def render(self, steps: Sequence[Step]) -> list[Statement]:
         return ddl.render(steps)
@@ -102,6 +124,10 @@ class PostgresDialect:
             [],
         )
 
+    async def drop_migrations_table(self, conn: Connection, schema: str) -> None:
+        table = ddl.qualified(schema, MIGRATIONS_TABLE)
+        await conn.execute(f"DROP TABLE IF EXISTS {table}", [])
+
     async def applied_migrations(self, conn: Connection, schema: str) -> dict[str, str]:
         table = ddl.qualified(schema, MIGRATIONS_TABLE)
         rows = await conn.fetch_dicts(f"SELECT name, hash FROM {table} ORDER BY id", [])
@@ -110,3 +136,7 @@ class PostgresDialect:
     def record_migration(self, schema: str, name: str, hash: str) -> tuple[str, list[object]]:
         table = ddl.qualified(schema, MIGRATIONS_TABLE)
         return f"INSERT INTO {table} (name, hash) VALUES ($1, $2)", [name, hash]
+
+    def forget_migration(self, schema: str, name: str) -> tuple[str, list[object]]:
+        table = ddl.qualified(schema, MIGRATIONS_TABLE)
+        return f"DELETE FROM {table} WHERE name = $1", [name]

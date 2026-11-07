@@ -15,7 +15,7 @@ from mizzle import (
     exists,
     placeholder,
 )
-from mizzle.dialects.base import Connection, Driver
+from mizzle.dialects.base import Connection, Driver, PoolStats
 from tests.models import Posts, Users
 
 
@@ -35,6 +35,11 @@ class FakeConnection:
             self.seen.append((sql, params))
         return []
 
+    async def execute(
+        self, sql: str, params: object, timeout: float | None = None, *, session_safe: bool = False
+    ) -> int:
+        return 0
+
 
 class FakeDriver:
     def __init__(
@@ -53,6 +58,9 @@ class FakeDriver:
         self.log.append(self.name)
         # Only fetch() and fetch_dicts() are used here.
         yield cast(Connection, cast(object, FakeConnection(self.name, self.seen)))
+
+    def stats(self) -> PoolStats:
+        return PoolStats(size=1, idle=1, in_use=0, max_size=1, min_size=1, wait_ms=0.0)
 
     async def close(self) -> None:
         pass
@@ -147,6 +155,9 @@ class FlakyListenDriver:
             raise ConnectionError("down")
         yield cast(Connection, cast(object, self))
 
+    def stats(self) -> PoolStats:
+        return PoolStats(size=1, idle=1, in_use=0, max_size=1, min_size=1, wait_ms=0.0)
+
     async def notify_unpooled(self, channel: str, payload: str = "") -> None:
         pass
 
@@ -181,3 +192,14 @@ async def test_listen_reconnect_retries_until_the_database_is_back() -> None:
         Notification("c", "3", 1),
     ]
     assert driver.down == 0 and driver.expired == 2
+
+
+async def test_ping_and_pool_stats() -> None:
+    log: list[str] = []
+    db = database(log)
+    assert await db.ping() is True
+    stats = db.pool_stats()
+    assert stats == PoolStats(size=1, idle=1, in_use=0, max_size=1, min_size=1, wait_ms=0.0)
+
+    down = Database(driver=cast(Driver, FakeDriver("x", log, down=True)))
+    assert await down.ping() is False

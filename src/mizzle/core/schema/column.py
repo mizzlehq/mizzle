@@ -3,15 +3,16 @@
 from __future__ import annotations
 
 import enum
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Final, Literal, Self, overload, override
+from typing import TYPE_CHECKING, Final, Literal, Self, cast, overload, override
 
 from mizzle.core.errors import QueryError
 from mizzle.core.naming import Casing, snake_case
 from mizzle.core.sql.nodes import Condition, Expr, ExprBase, Node, Raw
 
 if TYPE_CHECKING:
+    from mizzle.core.query.base import Runner
     from mizzle.core.schema.table import Table
 
 type ReferentialAction = Literal["cascade", "restrict", "no action", "set null", "set default"]
@@ -33,6 +34,9 @@ class Reference:
     target: Callable[[], ColumnBase]
     on_delete: ReferentialAction | None = None
     on_update: ReferentialAction | None = None
+    deferrable: bool = False
+    initially_deferred: bool = False
+    not_valid: bool = False
 
 
 @dataclass(frozen=True)
@@ -76,9 +80,25 @@ class ColumnBase(ExprBase):
     enum: type[enum.Enum] | None
     enum_schema: str | None  # the enum type's schema; None: the default one
     item: ColumnBase | None
+    # Turns the JSON a relational query nests this column as back into its Python value,
+    # for types JSON cannot carry (ranges, geometry, cidr, bit strings).
+    json_decoder: Callable[[object], object] | None
+    # A domain or composite: how its nested JSON is built and read (its base type, or its
+    # fields), looked up by json_load before a relational query nests it (Q4-6).
+    json_type: ColumnBase | None
+    json_load: Callable[[Runner], Awaitable[ColumnBase]] | None
+    json_fields: tuple[tuple[str, ColumnBase], ...] | None  # a composite's fields, in order
+    json_range: ColumnBase | None  # a user-defined range's subtype: its bounds nest like it
     is_primary_key: bool
     is_unique: bool
     unique_name: str | None
+    unique_nulls_not_distinct: bool
+    pk_deferrable: bool
+    pk_initially_deferred: bool
+    unique_deferrable: bool
+    unique_initially_deferred: bool
+    collation: str | None
+    comment_text: str | None
     default_value: object
     default_factory: Callable[[], object] | None
     reference: Reference | None
@@ -111,9 +131,21 @@ class ColumnBase(ExprBase):
         self.enum = None
         self.enum_schema = None
         self.item = None  # element column of an array
+        self.json_decoder = None
+        self.json_type = None
+        self.json_load = None
+        self.json_fields = None
+        self.json_range = None
         self.is_primary_key = False
         self.is_unique = False
         self.unique_name = None
+        self.unique_nulls_not_distinct = False
+        self.pk_deferrable = False
+        self.pk_initially_deferred = False
+        self.unique_deferrable = False
+        self.unique_initially_deferred = False
+        self.collation = None
+        self.comment_text = None
         self.default_value = MISSING  # a value, an SQL expression, or MISSING
         self.default_factory = None
         self.reference = None
@@ -184,6 +216,29 @@ class ColumnBase(ExprBase):
     def decode(self, value: object) -> object:
         return value if value is None or self.decoder is None else self.decoder(value)
 
+    def array_column(self) -> ColumnBase:
+        """This column's array type (``integer[]``, ``color[]``), encoding and decoding each
+        element through the column. ``mizzle.pg.array`` delegates here."""
+        item = self
+
+        def encode(values: object) -> object:
+            return [item.encode(v) for v in cast(Iterable[object], values)]
+
+        def decode(values: object) -> object:
+            return [item.decode(v) for v in cast(Iterable[object], values)]
+
+        column: ColumnBase = Column[list[object] | None](
+            f"{self.sql_type}[]",
+            (list, tuple),
+            self.name,
+            encoder=encode if self.encoder else None,
+            decoder=decode if self.decoder else None,
+        )
+        column.enum = self.enum
+        column.enum_schema = self.enum_schema
+        column.item = self
+        return column
+
     @override
     def __repr__(self) -> str:
         return f"Column({self.qualified_name}: {self.sql_type})"
@@ -200,6 +255,13 @@ class ColumnBase(ExprBase):
         primary_key: bool | None = None,
         unique_name: str | None = None,
         unique: bool | None = None,
+        nulls_not_distinct: bool | None = None,
+        pk_deferrable: bool | None = None,
+        pk_initially_deferred: bool | None = None,
+        unique_deferrable: bool | None = None,
+        unique_initially_deferred: bool | None = None,
+        collate: str | None = None,
+        comment: str | None = None,
         default: object = MISSING,
         default_factory: Callable[[], object] | None = None,
         reference: Reference | None = None,
@@ -223,6 +285,20 @@ class ColumnBase(ExprBase):
         if unique is not None:
             self.is_unique = unique
             self.unique_name = unique_name
+        if nulls_not_distinct is not None:
+            self.unique_nulls_not_distinct = nulls_not_distinct
+        if pk_deferrable is not None:
+            self.pk_deferrable = pk_deferrable
+        if pk_initially_deferred is not None:
+            self.pk_initially_deferred = pk_initially_deferred
+        if unique_deferrable is not None:
+            self.unique_deferrable = unique_deferrable
+        if unique_initially_deferred is not None:
+            self.unique_initially_deferred = unique_initially_deferred
+        if collate is not None:
+            self.collation = collate
+        if comment is not None:
+            self.comment_text = comment
         if default is not MISSING:
             self.default_value = default
         if default_factory is not None:
@@ -258,16 +334,53 @@ class Column[T](ColumnBase, Expr[T]):
         self._set(nullable=False)
         return self
 
-    @overload
-    def primary_key[U](self: Column[U | None]) -> Column[U]: ...
-    @overload
-    def primary_key(self) -> Self: ...
-    def primary_key(self) -> ColumnBase:
-        self._set(primary_key=True, nullable=False)
+    def collate(self, name: str) -> Self:
+        """``COLLATE "name"``: the collation used for comparisons and sorting of this column's
+        values (PostgreSQL). Built-in examples: ``C``, ``POSIX``, ``en_US.utf8``."""
+        self._set(collate=name)
         return self
 
-    def unique(self, name: str | None = None) -> Self:
-        self._set(unique=True, unique_name=name)
+    def comment(self, text: str) -> Self:
+        """``COMMENT ON COLUMN ...``: a note stored in the database and shown by ``\\d+``."""
+        self._set(comment=text)
+        return self
+
+    @overload
+    def primary_key[U](
+        self: Column[U | None], *, deferrable: bool = False, initially_deferred: bool = False
+    ) -> Column[U]: ...
+    @overload
+    def primary_key(
+        self, *, deferrable: bool = False, initially_deferred: bool = False
+    ) -> Self: ...
+    def primary_key(
+        self, *, deferrable: bool = False, initially_deferred: bool = False
+    ) -> ColumnBase:
+        self._set(
+            primary_key=True,
+            nullable=False,
+            pk_deferrable=deferrable,
+            pk_initially_deferred=initially_deferred,
+        )
+        return self
+
+    def unique(
+        self,
+        name: str | None = None,
+        *,
+        nulls_not_distinct: bool = False,
+        deferrable: bool = False,
+        initially_deferred: bool = False,
+    ) -> Self:
+        """A unique constraint on this column. ``nulls_not_distinct=True`` treats NULLs as
+        equal (PostgreSQL 15+), so two rows cannot both be NULL."""
+        self._set(
+            unique=True,
+            unique_name=name,
+            nulls_not_distinct=nulls_not_distinct,
+            unique_deferrable=deferrable,
+            unique_initially_deferred=initially_deferred,
+        )
         return self
 
     def default(self, value: T | ExprBase) -> Self:
@@ -286,8 +399,15 @@ class Column[T](ColumnBase, Expr[T]):
         *,
         on_delete: ReferentialAction | None = None,
         on_update: ReferentialAction | None = None,
+        deferrable: bool = False,
+        initially_deferred: bool = False,
+        not_valid: bool = False,
     ) -> Self:
-        self._set(reference=Reference(target, on_delete, on_update))
+        self._set(
+            reference=Reference(
+                target, on_delete, on_update, deferrable, initially_deferred, not_valid
+            )
+        )
         return self
 
     def check(self, condition: Condition) -> Self:

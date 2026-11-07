@@ -12,22 +12,36 @@ from mizzle.core.naming import Casing
 from mizzle.core.schema.column import ColumnBase, Identity, ReferentialAction
 from mizzle.core.schema.constraints import (
     Check,
+    Exclusion,
     ForeignKey,
     Grant,
     Index,
+    Partition,
     Policy,
     PrimaryKey,
     Role,
     RowLevelSecurity,
     UniqueConstraint,
 )
-from mizzle.core.schema.objects import Extension, Function, SchemaObject, Trigger
+from mizzle.core.schema.objects import (
+    Composite,
+    Domain,
+    Extension,
+    Function,
+    SchemaObject,
+    Trigger,
+)
 from mizzle.core.schema.table import Table, validate_tables
 from mizzle.core.schema.view import View
 from mizzle.core.snapshot import (
     CheckSnap,
     ColumnSnap,
+    CompositeFieldSnap,
+    CompositeSnap,
+    DomainSnap,
     EnumSnap,
+    ExclusionElementSnap,
+    ExclusionSnap,
     ExtensionSnap,
     ForeignKeySnap,
     FunctionSnap,
@@ -100,6 +114,14 @@ def build_snapshot(
             foreign_keys={},
             indexes={},
         )
+        if info.comment is not None:
+            snap["comment"] = info.comment
+        if info.unlogged:
+            snap["unlogged"] = True
+        if info.storage:
+            snap["options"] = dict(info.storage)
+        if info.partition_by is not None:
+            snap["partition_by"] = info.partition_by
         for column in info.columns.values():
             cname = column.db_name(casing)
             if column.enum is not None:
@@ -118,11 +140,27 @@ def build_snapshot(
                     expression=dialect.expression(computed.expression, casing),
                     stored=computed.stored,
                 )
+            if column.collation is not None:
+                col["collation"] = column.collation
+            if column.comment_text is not None:
+                col["comment"] = column.comment_text
             if column.is_primary_key:
-                snap["primary_key"] = PrimaryKeySnap(name=trunc(f"{tname}_pkey"), columns=[cname])
+                col_pk = PrimaryKeySnap(name=trunc(f"{tname}_pkey"), columns=[cname])
+                if column.pk_deferrable:
+                    col_pk["deferrable"] = True
+                if column.pk_initially_deferred:
+                    col_pk["initially_deferred"] = True
+                snap["primary_key"] = col_pk
             if column.is_unique:
                 name = column.unique_name or trunc(f"{tname}_{cname}_key")
-                snap["uniques"][name] = UniqueSnap(name=name, columns=[cname])
+                u = UniqueSnap(name=name, columns=[cname])
+                if column.unique_nulls_not_distinct:
+                    u["nulls_not_distinct"] = True
+                if column.unique_deferrable:
+                    u["deferrable"] = True
+                if column.unique_initially_deferred:
+                    u["initially_deferred"] = True
+                snap["uniques"][name] = u
             for i, condition in enumerate(column.checks):
                 name = trunc(f"{tname}_{cname}_check{i or ''}")
                 expression = dialect.expression(condition, casing)
@@ -131,7 +169,7 @@ def build_snapshot(
                 target = column.reference.target()
                 assert target.table is not None  # checked by validate_tables
                 name = trunc(f"{tname}_{cname}_fkey")
-                snap["foreign_keys"][name] = ForeignKeySnap(
+                fk = ForeignKeySnap(
                     name=name,
                     columns=[cname],
                     ref_schema=schema_of(target.table),
@@ -140,6 +178,13 @@ def build_snapshot(
                     on_delete=_action(column.reference.on_delete),
                     on_update=_action(column.reference.on_update),
                 )
+                if column.reference.deferrable:
+                    fk["deferrable"] = True
+                if column.reference.initially_deferred:
+                    fk["initially_deferred"] = True
+                if column.reference.not_valid:
+                    fk["not_valid"] = True
+                snap["foreign_keys"][name] = fk
 
         for constraint in table.config():
             match constraint:
@@ -148,12 +193,22 @@ def build_snapshot(
                 case UniqueConstraint():
                     cols = names(constraint.columns)
                     name = constraint.name or trunc(f"{tname}_{'_'.join(cols)}_key")
-                    snap["uniques"][name] = UniqueSnap(name=name, columns=cols)
+                    u = UniqueSnap(name=name, columns=cols)
+                    if constraint.nulls_not_distinct:
+                        u["nulls_not_distinct"] = True
+                    if constraint.deferrable:
+                        u["deferrable"] = True
+                    if constraint.initially_deferred:
+                        u["initially_deferred"] = True
+                    snap["uniques"][name] = u
                 case PrimaryKey():
                     name = constraint.name or trunc(f"{tname}_pkey")
-                    snap["primary_key"] = PrimaryKeySnap(
-                        name=name, columns=names(constraint.columns)
-                    )
+                    tbl_pk = PrimaryKeySnap(name=name, columns=names(constraint.columns))
+                    if constraint.deferrable:
+                        tbl_pk["deferrable"] = True
+                    if constraint.initially_deferred:
+                        tbl_pk["initially_deferred"] = True
+                    snap["primary_key"] = tbl_pk
                     for cname in names(constraint.columns):  # the database enforces this
                         snap["columns"][cname]["not_null"] = True
                 case ForeignKey():
@@ -165,7 +220,7 @@ def build_snapshot(
                             f"{table.__name__}: a foreign key must reference one table"
                         )
                     name = constraint.name or trunc(f"{tname}_{'_'.join(cols)}_fkey")
-                    snap["foreign_keys"][name] = ForeignKeySnap(
+                    fk = ForeignKeySnap(
                         name=name,
                         columns=cols,
                         ref_schema=schema_of(ref_table),
@@ -174,11 +229,47 @@ def build_snapshot(
                         on_delete=_action(constraint.on_delete),
                         on_update=_action(constraint.on_update),
                     )
+                    if constraint.deferrable:
+                        fk["deferrable"] = True
+                    if constraint.initially_deferred:
+                        fk["initially_deferred"] = True
+                    if constraint.not_valid:
+                        fk["not_valid"] = True
+                    snap["foreign_keys"][name] = fk
                 case Check():
                     expression = dialect.expression(constraint.condition, casing)
-                    snap["checks"][constraint.name] = CheckSnap(
-                        name=constraint.name, expression=expression
+                    c = CheckSnap(name=constraint.name, expression=expression)
+                    if constraint.not_valid:
+                        c["not_valid"] = True
+                    snap["checks"][constraint.name] = c
+                case Exclusion():
+                    elements: list[ExclusionElementSnap] = []
+                    colnames: list[str] = []
+                    for elem_key, operator in constraint.elements:
+                        if isinstance(elem_key, ColumnBase):
+                            cname = elem_key.db_name(casing)
+                            colnames.append(cname)
+                            elements.append(ExclusionElementSnap(operator=operator, column=cname))
+                        else:
+                            elements.append(
+                                ExclusionElementSnap(
+                                    operator=operator,
+                                    expression=dialect.expression(elem_key, casing),
+                                )
+                            )
+                    derived = f"{tname}_{'_'.join(colnames)}_excl" if colnames else f"{tname}_excl"
+                    excl = ExclusionSnap(
+                        name=constraint.name or trunc(derived),
+                        method=constraint.method,
+                        elements=elements,
                     )
+                    if constraint.predicate is not None:
+                        excl["where"] = dialect.expression(constraint.predicate, casing)
+                    if constraint.deferrable:
+                        excl["deferrable"] = True
+                    if constraint.initially_deferred:
+                        excl["initially_deferred"] = True
+                    snap.setdefault("exclusions", {})[excl["name"]] = excl
                 case Policy():
                     snap.setdefault("policies", {})[constraint.name] = _policy(
                         constraint, dialect, casing
@@ -192,6 +283,8 @@ def build_snapshot(
                     _add_grant(snap.setdefault("grants", {}), constraint)
                     for declared in constraint.declared_roles:
                         _add_role(snapshot, declared)
+                case Partition():
+                    snap.setdefault("partitions", {})[constraint.name] = constraint.for_values
 
         if pk := snap["primary_key"]:  # CREATE TABLE drops a UNIQUE that repeats the key
             snap["uniques"] = {
@@ -203,6 +296,7 @@ def build_snapshot(
             if (needed := dialect.type_extension(column.sql_type)) is not None:
                 snapshot.setdefault("extensions", {}).setdefault(needed, ExtensionSnap(name=needed))
 
+    declared_exts: dict[str, ExtensionSnap] = {}
     for obj in [*objects, *(o.execute for o in objects if isinstance(o, Trigger))]:
         match obj:
             case Role():
@@ -213,6 +307,13 @@ def build_snapshot(
                     ext["schema"] = obj.schema
                 if obj.version is not None:
                     ext["version"] = obj.version
+                # Two declarations that disagree silently kept the last one. One a column
+                # type implied (no options) may be replaced by the declared one.
+                if declared_exts.get(obj.name, ext) != ext:
+                    raise SchemaError(
+                        f"extension {obj.name!r} is declared twice with different options"
+                    )
+                declared_exts[obj.name] = ext
                 snapshot.setdefault("extensions", {})[obj.name] = ext
             case Function():
                 fn = _function(obj, default_schema)
@@ -222,6 +323,13 @@ def build_snapshot(
                     raise SchemaError(f"function {fn['name']!r} is declared twice")
                 functions[function_key(fn)] = fn
                 add_schema(fn["schema"])
+            case Domain():
+                _add_domain(snapshot, obj, default_schema, dialect)
+            case Composite():
+                _add_composite(snapshot, obj, default_schema, dialect)
+            case ColumnBase():  # pg_enum(...) on its own: the enum type (K4-5)
+                _add_enum(snapshot, obj.enum_schema or default_schema, obj)
+                add_schema(obj.enum_schema or default_schema)
             case Trigger():
                 k = key(schema_of(obj.on), obj.on.__table__.name)
                 on = snapshot["tables"].get(k) or snapshot.get("views", {}).get(k)
@@ -247,7 +355,26 @@ def build_snapshot(
                 if obj.new_table is not None:
                     trg["new_table"] = obj.new_table
                 on.setdefault("triggers", {})[obj.name] = trg
+    _imply_deferrable(snapshot)
     return snapshot
+
+
+def _imply_deferrable(snapshot: Snapshot) -> None:
+    """INITIALLY DEFERRED requires DEFERRABLE (PostgreSQL rejects it alone), and the
+    database always reports both; store both so a declared schema does not drift."""
+    for table in snapshot["tables"].values():
+        pk = table["primary_key"]
+        if pk is not None and pk.get("initially_deferred"):
+            pk["deferrable"] = True
+        for unique in table["uniques"].values():
+            if unique.get("initially_deferred"):
+                unique["deferrable"] = True
+        for fk in table["foreign_keys"].values():
+            if fk.get("initially_deferred"):
+                fk["deferrable"] = True
+        for excl in table.get("exclusions", {}).values():
+            if excl.get("initially_deferred"):
+                excl["deferrable"] = True
 
 
 def _check_trigger(trigger: Trigger) -> None:
@@ -286,6 +413,8 @@ def _index(constraint: Index, dialect: Dialect, casing: Casing | None) -> IndexS
         index["method"] = constraint.method
     if constraint.options:
         index["options"] = dict(constraint.options)
+    if constraint.nulls_not_distinct:
+        index["nulls_not_distinct"] = True
     return index
 
 
@@ -374,6 +503,12 @@ def _add_view(
         materialized=view.__materialized__,
         columns={},
     )
+    if view.__security_invoker__:  # (K6)
+        snap["security_invoker"] = True
+    if view.__security_barrier__:
+        snap["security_barrier"] = True
+    if view.__check_option__:
+        snap["check_option"] = view.__check_option__
     for column in info.columns.values():
         name = column.db_name(casing)
         snap["columns"][name] = ColumnSnap(
@@ -406,6 +541,52 @@ def _add_enum(snapshot: Snapshot, schema: str, column: ColumnBase) -> None:
     if existing is not None and existing["values"] != values:
         raise SchemaError(f"enum type {name!r} is declared twice with different values")
     snapshot["enums"][key(schema, name)] = EnumSnap(schema=schema, name=name, values=values)
+
+
+def _add_domain(snapshot: Snapshot, obj: Domain, default_schema: str, dialect: Dialect) -> None:
+    schema = obj.schema or default_schema
+    snap = DomainSnap(
+        schema=schema,
+        name=obj.name,
+        base_type=dialect.normalize_type(obj.base_type),
+    )
+    if obj.not_null:
+        snap["not_null"] = True
+    if obj.default is not None:
+        normalized = dialect.normalize_default(obj.default)
+        snap["default"] = normalized if normalized is not None else obj.default
+    if obj.checks:
+        snap["checks"] = list(obj.checks)
+    if obj.collation is not None:
+        snap["collation"] = obj.collation
+    domains = snapshot.setdefault("domains", {})
+    existing = domains.get(key(schema, obj.name))
+    if existing is not None and existing != snap:
+        raise SchemaError(f"domain {obj.name!r} is declared twice")
+    domains[key(schema, obj.name)] = snap
+    if schema != default_schema and schema not in snapshot["schemas"]:
+        snapshot["schemas"].append(schema)
+
+
+def _add_composite(
+    snapshot: Snapshot, obj: Composite, default_schema: str, dialect: Dialect
+) -> None:
+    schema = obj.schema or default_schema
+    snap = CompositeSnap(
+        schema=schema,
+        name=obj.name,
+        fields=[
+            CompositeFieldSnap(name=name, type=dialect.normalize_type(sql_type))
+            for name, sql_type in obj.fields
+        ],
+    )
+    composites = snapshot.setdefault("composites", {})
+    existing = composites.get(key(schema, obj.name))
+    if existing is not None and existing != snap:
+        raise SchemaError(f"composite {obj.name!r} is declared twice")
+    composites[key(schema, obj.name)] = snap
+    if schema != default_schema and schema not in snapshot["schemas"]:
+        snapshot["schemas"].append(schema)
 
 
 def _add_role(snapshot: Snapshot, role: Role) -> None:
