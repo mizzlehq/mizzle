@@ -6,6 +6,7 @@ dialect compiler) and are converted back into typed table instances here.
 
 from __future__ import annotations
 
+import copy
 import datetime
 import ipaddress
 import struct
@@ -18,7 +19,15 @@ from typing import TypedDict, cast, override
 
 from mizzle.core.compiler import CompiledQuery
 from mizzle.core.errors import QueryError
-from mizzle.core.query.base import Converter, Executable, Row, Runner, column_decoder, row_decoder
+from mizzle.core.query.base import (
+    Converter,
+    Executable,
+    Row,
+    Runner,
+    column_decoder,
+    evolve,
+    row_decoder,
+)
 from mizzle.core.query.select import Cte
 from mizzle.core.schema.column import ColumnBase
 from mizzle.core.schema.relations import Link
@@ -245,43 +254,65 @@ class RelationalStatement(Node):
     # A WITH clause passed with db.with_(...): emitted before the SELECT (B9).
     ctes: tuple[Cte, ...] = ()
 
-    async def _typed(self, compiled: CompiledQuery) -> CompiledQuery:
-        """``compiled`` again once the nested domains and composites are looked up (Q4-6);
-        nesting adds no parameters, so the (bound) ones carry over."""
-        if not await _load_json_types(self.runner, self.plan):
-            return compiled
-        fresh = self.runner.compile(self)
-        return replace(fresh, params=compiled.params, placeholders=compiled.placeholders)
+    async def _typed(self, compiled: CompiledQuery) -> tuple[CompiledQuery, LoadPlan]:
+        """``compiled`` and the plan again once the nested domains and composites are looked
+        up (Q4-6); nesting adds no parameters, so the (bound) ones carry over."""
+        plan = await _typed_plan(self.runner, self.plan)
+        if plan is self.plan:
+            return compiled, plan
+        fresh = self.runner.compile(evolve(self, plan=plan))
+        return replace(fresh, params=compiled.params, placeholders=compiled.placeholders), plan
 
 
-async def _load_json_types(runner: Runner, plan: LoadPlan) -> bool:
-    """Look up the types of nested domain and composite columns; True if there are any."""
-    found = False
-    for _, _, child in plan.children:
-        for _, column in child.columns:
-            item: ColumnBase | None = column
-            while item is not None:
-                if item.json_load is not None:
-                    found = True
-                    if item.json_type is None:
-                        item.json_type = await item.json_load(runner)
-                item = item.item
-        found = await _load_json_types(runner, child) or found
-    return found
+async def _typed_plan(runner: Runner, plan: LoadPlan, *, nested: bool = False) -> LoadPlan:
+    """``plan`` with its nested domain and composite columns typed for ``runner``'s database
+    (the same plan if there are none). Typed copies: a table's columns are shared by every
+    database, where a type name can mean another type (Q4-17)."""
+    columns = plan.columns
+    if nested:
+        columns = tuple([(attr, await _typed_column(runner, c)) for attr, c in columns])
+    children = tuple(
+        [(name, link, await _typed_plan(runner, c, nested=True)) for name, link, c in plan.children]
+    )
+    if all(a[1] is b[1] for a, b in zip(columns, plan.columns, strict=True)) and all(
+        a[2] is b[2] for a, b in zip(children, plan.children, strict=True)
+    ):
+        return plan
+    return replace(plan, columns=columns, children=children)
+
+
+async def _typed_column(runner: Runner, column: ColumnBase) -> ColumnBase:
+    """``column``, or its copy (one per database) with ``json_type`` set where needed."""
+    if not _has_json_load(column):
+        return column
+    if (known := runner.json_types.get(column)) is not None:
+        return known
+    typed = copy.copy(column)
+    if column.json_load is not None:
+        typed.json_type = await column.json_load(runner)
+    if column.item is not None:
+        typed.item = await _typed_column(runner, column.item)
+    runner.json_types[column] = typed
+    return typed
+
+
+def _has_json_load(column: ColumnBase) -> bool:
+    return column.json_load is not None or (column.item is not None and _has_json_load(column.item))
 
 
 @dataclass(frozen=True, eq=False)
 class RelationalSelect[T: Table](RelationalStatement, Executable[list[T]]):
     @override
     async def run_compiled(self, compiled: CompiledQuery) -> list[T]:
-        rows = await self.runner.fetch(await self._typed(compiled), read_only=True)
-        decode = plan_decoder(self.plan)
+        compiled, plan = await self._typed(compiled)
+        rows = await self.runner.fetch(compiled, read_only=True)
+        decode = plan_decoder(plan)
         return cast(list[T], [decode(row) for row in rows])
 
     async def stream(self, batch_size: int = 1000) -> AsyncGenerator[T]:
         """Like ``Select.stream()``: rows from a server-side cursor, ``batch_size`` at a time."""
-        compiled = await self._typed(self._compile_for_run())
-        decode = plan_decoder(self.plan)
+        compiled, plan = await self._typed(self._compile_for_run())
+        decode = plan_decoder(plan)
         async with aclosing(self.runner.stream(compiled, batch_size, read_only=True)) as batches:
             async for batch in batches:
                 for row in batch:
@@ -292,8 +323,9 @@ class RelationalSelect[T: Table](RelationalStatement, Executable[list[T]]):
 class RelationalFirst[T: Table](RelationalStatement, Executable[T | None]):
     @override
     async def run_compiled(self, compiled: CompiledQuery) -> T | None:
-        rows = await self.runner.fetch(await self._typed(compiled), read_only=True)
-        return cast(T, plan_decoder(self.plan)(rows[0])) if rows else None
+        compiled, plan = await self._typed(compiled)
+        rows = await self.runner.fetch(compiled, read_only=True)
+        return cast(T, plan_decoder(plan)(rows[0])) if rows else None
 
 
 class RelationalQuery[T: Table]:

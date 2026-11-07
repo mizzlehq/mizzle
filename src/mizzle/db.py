@@ -229,6 +229,7 @@ class Session(QueryBuilder):
     # it starts) carries its marker in _SAVEPOINT; anything else would run inside a
     # savepoint it does not own, and is refused (B39, C11).
     _savepoints: list[object]
+    json_types: dict[str | ColumnBase, ColumnBase]  # Runner; shared by views, transactions
 
     def __init__(
         self,
@@ -265,6 +266,7 @@ class Session(QueryBuilder):
         self._deferred = []
         self._rollbacks = []
         self._savepoints = []
+        self.json_types = {}
 
     # -- Runner protocol --------------------------------------------------------------
 
@@ -816,6 +818,7 @@ class Session(QueryBuilder):
                         connection=conn,
                     )
                     tx._timeout = self._timeout
+                    tx.json_types = self.json_types
                     deferred = tx._deferred
                     rollbacks = tx._rollbacks
                     block = conn.transaction(isolation, readonly)
@@ -916,6 +919,7 @@ class Session(QueryBuilder):
         view._replica_down = self._replica_down
         view._use_primary = self._use_primary
         view._timeout = self._timeout
+        view.json_types = self.json_types
         return view
 
     def _require_driver(self) -> Driver:

@@ -45,6 +45,10 @@ def evolve[N: Node](node: N, **changes: object) -> N:
 class Runner(Protocol):
     """What a statement needs to run: a compiler and a connection. ``Session`` implements it."""
 
+    # One per database: the types relational queries nest domains and composites as, by
+    # type name, and the typed copies of columns that use them (Q4-6, Q4-17).
+    json_types: dict[str | ColumnBase, ColumnBase]
+
     def compile(self, node: Node) -> CompiledQuery: ...
     def fetch(self, query: CompiledQuery, *, read_only: bool = False) -> Awaitable[list[Row]]:
         """``read_only=True`` marks a read that may go to a read replica, unless the
