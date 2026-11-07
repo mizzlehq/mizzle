@@ -26,6 +26,7 @@ from mizzle.kit.config import Config, load_config
 from mizzle.kit.diff import RenameKind, RenameResolver, StrictRenames, diff, no_renames
 from mizzle.kit.init import init_project
 from mizzle.kit.journal import (
+    BASELINE,
     JournalEntry,
     Migration,
     MigrationsDir,
@@ -640,6 +641,8 @@ def cmd_pull(config: Config, args: Args) -> int:
 
     async def run(driver: Driver, dialect: Dialect) -> Snapshot:
         async with driver.acquire() as conn:
+            for what in await dialect.skipped_objects(conn, config.schema_filter):
+                print(f"warning: pull skips {what} (not supported)", file=sys.stderr)  # (K8)
             return await dialect.introspect(conn, config.schema_filter)
 
     snapshot = asyncio.run(_with_driver(config, run))
@@ -661,8 +664,15 @@ def cmd_pull(config: Config, args: Args) -> int:
     out.write_text(render_schema_module(snapshot), encoding="utf-8")
     print(f"Wrote {out} ({len(snapshot['tables'])} tables)")
     if not directory.migrations():
-        header = "-- Baseline pulled from an existing database. Nothing to run.\n"
-        migration = directory.write("pull", [], snapshot, header)
+        # (K7) The baseline creates what was pulled: migrate only records it on a
+        # database that has these objects, and runs it on an empty one.
+        empty = empty_snapshot(config.dialect_name)
+        steps = diff(empty, snapshot, no_renames, compare_expressions=False)
+        header = (
+            f"{BASELINE}\n-- Pulled from an existing database. migrate records it as applied "
+            "where these objects exist, and creates them on an empty database.\n"
+        )
+        migration = directory.write("pull", config.dialect().render(steps), snapshot, header)
         print(f"Created baseline {migration.path}")
     return 0
 

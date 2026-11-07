@@ -14,7 +14,12 @@ from mizzle.dialects.base import Connection, ResetMode
 from mizzle.dialects.postgres import ddl
 from mizzle.dialects.postgres.compiler import PostgresCompiler
 from mizzle.dialects.postgres.driver import PostgresDriver
-from mizzle.dialects.postgres.introspect import MIGRATIONS_TABLE, introspect, normalize_snapshot
+from mizzle.dialects.postgres.introspect import (
+    MIGRATIONS_TABLE,
+    introspect,
+    normalize_snapshot,
+    skipped_objects,
+)
 
 # Fixed key for pg_advisory_lock so concurrent `migrate` runs serialize.
 MIGRATION_LOCK_KEY = 0x6D697A7A6C65  # "mizzle"
@@ -83,6 +88,9 @@ class PostgresDialect:
 
     async def normalize_snapshot(self, conn: Connection, snapshot: Snapshot) -> Snapshot:
         return await normalize_snapshot(conn, snapshot)
+
+    async def skipped_objects(self, conn: Connection, schemas: Sequence[str]) -> list[str]:
+        return await skipped_objects(conn, schemas)
 
     def render(self, steps: Sequence[Step]) -> list[Statement]:
         return ddl.render(steps)

@@ -806,7 +806,12 @@ def render_step(step: Step) -> Statement:
         case CreateView(view=view):
             kind = "MATERIALIZED VIEW" if view["materialized"] else "VIEW"
             name = qualified(view["schema"], view["name"])
-            return Statement(f"CREATE {kind} {name} AS\n{view['definition']}")
+            # Options and check option are written each time, so a re-create keeps them (K6).
+            opts = [o for o in ("security_invoker", "security_barrier") if view.get(o)]
+            with_ = f" WITH ({', '.join(f'{o}=true' for o in opts)})" if opts else ""
+            check = view.get("check_option")
+            tail = f"\nWITH {check.upper()} CHECK OPTION" if check else ""
+            return Statement(f"CREATE {kind} {name}{with_} AS\n{view['definition']}{tail}")
         case DropView(schema=schema, name=name, materialized=materialized):
             kind = "MATERIALIZED VIEW" if materialized else "VIEW"
             return Statement(f"DROP {kind} {qualified(schema, name)}")

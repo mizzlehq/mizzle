@@ -6,9 +6,10 @@ import logging
 from collections.abc import Callable, Mapping, Sequence
 
 from mizzle.core.errors import MigrationError, MigrationTampered
+from mizzle.core.snapshot import Snapshot
 from mizzle.core.steps import Statement
 from mizzle.dialects.base import Connection, Dialect, Driver
-from mizzle.kit.journal import Migration, MigrationsDir
+from mizzle.kit.journal import BASELINE, Migration, MigrationsDir
 from mizzle.kit.sqltext import transaction_control
 
 log = logging.getLogger("mizzle")
@@ -150,6 +151,16 @@ def pending_migrations(
     return pending
 
 
+async def _has_objects(conn: Connection, dialect: Dialect, snapshot: Snapshot) -> bool:
+    """Whether the database already has a pulled baseline's tables, views and enums."""
+    live = await dialect.introspect(conn, [dialect.default_schema, *snapshot["schemas"]])
+    return (
+        set(snapshot["tables"]) <= set(live["tables"])
+        and set(snapshot.get("views", {})) <= set(live.get("views", {}))
+        and set(snapshot["enums"]) <= set(live["enums"])
+    )
+
+
 async def run_migrations(
     driver: Driver,
     dialect: Dialect,
@@ -183,7 +194,12 @@ async def run_migrations(
                 if on_apply is not None:
                     on_apply(migration)
                 record = dialect.record_migration(schema, migration.name, migration.hash())
-                await apply_statements(conn, migration.statements(), record)
+                statements = migration.statements()
+                if migration.sql().startswith(BASELINE) and await _has_objects(
+                    conn, dialect, migration.snapshot()
+                ):
+                    statements = []  # pulled from this database: only recorded (K7)
+                await apply_statements(conn, statements, record)
                 done.append(migration.name)
             return done
         finally:

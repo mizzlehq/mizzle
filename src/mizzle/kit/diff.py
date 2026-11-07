@@ -1027,6 +1027,17 @@ def _ordered(views: Mapping[str, ViewSnap], keys: Iterable[str]) -> list[str]:
     return done
 
 
+def _view_key(v: ViewSnap) -> tuple[str, bool, bool, bool, str | None]:
+    # Options too (K6): a change re-creates the view with them.
+    return (
+        v["definition"],
+        v["materialized"],
+        v.get("security_invoker", False),
+        v.get("security_barrier", False),
+        v.get("check_option"),
+    )
+
+
 def _diff_views(
     old: Snapshot, new: Snapshot, plan: _Plan, touched: set[str], drop_unlisted: bool
 ) -> set[str]:
@@ -1034,13 +1045,7 @@ def _diff_views(
     remove or retype columns. Their privileges, owner and comment are kept across that.
     Returns the names of views that are dropped."""
     before, after = old.get("views", {}), new.get("views", {})
-    redo = {
-        k
-        for k, v in before.items()
-        if k not in after
-        or (after[k]["definition"], after[k]["materialized"])
-        != (v["definition"], v["materialized"])
-    }
+    redo = {k for k, v in before.items() if k not in after or _view_key(after[k]) != _view_key(v)}
     names = set(touched)
     while True:  # views using what changes, and views using those
         names |= {before[k]["name"] for k in redo}

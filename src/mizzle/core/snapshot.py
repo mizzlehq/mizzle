@@ -9,7 +9,7 @@ schema and the database it created compare equal.
 from __future__ import annotations
 
 import re
-from typing import NotRequired, TypedDict
+from typing import Literal, NotRequired, TypedDict
 
 SNAPSHOT_VERSION = 1
 
@@ -247,6 +247,10 @@ class ViewSnap(TypedDict):
     indexes: NotRequired[dict[str, IndexSnap]]  # materialized views only
     triggers: NotRequired[dict[str, TriggerSnap]]  # INSTEAD OF triggers (plain views)
     grants: NotRequired[GrantsSnap]
+    # View options (K6); absent when off, so older snapshots compare equal.
+    security_invoker: NotRequired[bool]
+    security_barrier: NotRequired[bool]
+    check_option: NotRequired[Literal["local", "cascaded"]]
 
 
 class Snapshot(TypedDict):

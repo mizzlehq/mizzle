@@ -256,12 +256,50 @@ _NOT_EXTENSION = """NOT EXISTS (SELECT 1 FROM pg_depend d WHERE d.classid = {cat
 
 _VIEWS = f"""
 SELECT c.oid, n.nspname AS schema, c.relname AS name, c.relkind = 'm' AS materialized,
-       pg_get_viewdef(c.oid) AS definition
+       pg_get_viewdef(c.oid) AS definition, coalesce(c.reloptions, '{{}}') AS options
 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
 WHERE c.relkind IN ('v', 'm') AND n.nspname = ANY($1::text[])
   AND {_NOT_EXTENSION.format(catalog="'pg_class'", oid="c.oid")}
 ORDER BY n.nspname, c.relname
 """
+
+# What pull cannot write yet, to warn about instead of dropping it silently (K8).
+_SKIPPED = f"""
+SELECT 'procedure ' || p.oid::regprocedure::text AS what
+FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+WHERE p.prokind = 'p' AND n.nspname = ANY($1::text[])
+  AND {_NOT_EXTENSION.format(catalog="'pg_proc'", oid="p.oid")}
+UNION ALL
+SELECT 'sequence ' || c.oid::regclass::text
+FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+WHERE c.relkind = 'S' AND n.nspname = ANY($1::text[])
+  AND {_NOT_EXTENSION.format(catalog="'pg_class'", oid="c.oid")}
+  AND NOT EXISTS (SELECT 1 FROM pg_depend d WHERE d.classid = 'pg_class'::regclass
+                  AND d.objid = c.oid AND d.refobjsubid > 0 AND d.deptype IN ('a', 'i'))
+UNION ALL
+SELECT CASE WHEN c.relispartition THEN 'partition ' ELSE 'table inheritance ' END
+       || c.oid::regclass::text || ' of ' || i.inhparent::regclass::text
+FROM pg_inherits i JOIN pg_class c ON c.oid = i.inhrelid
+JOIN pg_namespace n ON n.oid = c.relnamespace
+WHERE n.nspname = ANY($1::text[])
+UNION ALL
+SELECT 'column grant ' || lower(g.privilege_type) || ' on ' || c.oid::regclass::text
+       || '(' || quote_ident(a.attname) || ') to '
+       || CASE WHEN g.grantee = 0 THEN 'public' ELSE pg_get_userbyid(g.grantee) END
+FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped,
+     aclexplode(a.attacl) AS g
+WHERE c.relkind IN ('r', 'p', 'v', 'm') AND n.nspname = ANY($1::text[])
+  AND g.grantee <> c.relowner
+ORDER BY 1
+"""
+
+
+async def skipped_objects(conn: Connection, schemas: Sequence[str]) -> list[str]:
+    """Objects introspection does not read: procedures, standalone sequences, table
+    inheritance and partitions, column-level grants (K8)."""
+    return [str(row["what"]) for row in await conn.fetch_dicts(_SKIPPED, [list(schemas)])]
+
 
 _FUNCTION_COLUMNS = """
 pg_get_function_arguments(p.oid) AS args, pg_get_function_result(p.oid) AS returns,
@@ -430,6 +468,19 @@ def _column(row: _Row) -> ColumnSnap:
 def _view_definition(text: str) -> str:
     # pg_get_viewdef: " SELECT id,\n    name\n   FROM t;"
     return text.strip().removesuffix(";")
+
+
+def _view_options(view: ViewSnap, options: list[str]) -> None:
+    """pg_class.reloptions of a view: "security_invoker=true", "check_option=local" (K6)."""
+    for option in options:
+        name, _, value = option.partition("=")
+        on = value.lower() in ("true", "on", "yes", "1", "t", "y")
+        if name == "security_invoker" and on:
+            view["security_invoker"] = True
+        elif name == "security_barrier" and on:
+            view["security_barrier"] = True
+        elif name == "check_option" and value in ("local", "cascaded"):
+            view["check_option"] = "local" if value == "local" else "cascaded"
 
 
 def _trigger_when(definition: str) -> str | None:
@@ -828,6 +879,7 @@ async def _introspect_objects(
             materialized=bool(row["materialized"]),
             columns={},
         )
+        _view_options(view, _strs(row["options"]))
         views[_int(row["oid"])] = view
         snapshot.setdefault("views", {})[key(schema, name)] = view
         _add_schema(snapshot, schema)

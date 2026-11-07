@@ -24,6 +24,8 @@ from mizzle.core.steps import Statement
 
 BREAKPOINT = "-- mizzle:breakpoint"
 NO_TRANSACTION = "-- mizzle:no-transaction"
+# A baseline from `pull`: run only on a database that does not have its objects yet (K7).
+BASELINE = "-- mizzle:baseline"
 JOURNAL_VERSION = 1
 _INDEX = re.compile(r"^(\d+)_")
 _FOLDER = re.compile(r"\d+_[\w-]+")

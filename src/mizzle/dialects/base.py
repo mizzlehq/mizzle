@@ -222,6 +222,10 @@ class Dialect(Protocol):
         whole server, so only the ones a schema manages are ever read)."""
         ...
 
+    async def skipped_objects(self, conn: Connection, schemas: Sequence[str]) -> list[str]:
+        """Objects ``introspect`` does not read, described for a warning (K8)."""
+        ...
+
     async def normalize_snapshot(self, conn: Connection, snapshot: Snapshot) -> Snapshot:
         """``snapshot`` with view queries and other expressions as the database prints
         them back, so it compares equal to an introspected one. Nothing is changed."""

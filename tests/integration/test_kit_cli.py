@@ -556,6 +556,49 @@ async def test_pull_into_new_project_writes_the_schema_module(
     assert (fresh / module / "db" / "pulled_schema.py").exists()
 
 
+async def test_pull_baseline_creates_tables_on_an_empty_database(
+    project: Path, kit_url: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """(K7) The pulled baseline is only recorded where its tables exist."""
+    assert await cli("push", "--force") == 0
+    fresh = project / "fresh"
+    fresh.mkdir()
+    module = f"fresh_{uuid.uuid4().hex[:8]}"
+    (fresh / "mizzle.toml").write_text(f'schema = "{module}"\nout = "migrations"\n')
+    monkeypatch.chdir(fresh)
+    assert await cli("pull") == 0
+    assert await cli("migrate") == 0  # the source database: recorded, nothing run
+    # A reset database: migrate creates the pulled tables.
+    conn = await asyncpg.connect(kit_url)
+    await conn.execute("DROP SCHEMA public CASCADE; CREATE SCHEMA public")
+    await conn.close()
+    assert await cli("migrate") == 0
+    assert await columns(kit_url, "users") == ["id", "email", "name", "role", "created_at"]
+
+
+async def test_pull_warns_about_what_it_skips(
+    project: Path, kit_url: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """(K8) Procedures, standalone sequences, inheritance and column grants are named."""
+    conn = await asyncpg.connect(kit_url)
+    await conn.execute(
+        "CREATE PROCEDURE p_noop() LANGUAGE sql AS 'SELECT 1';"
+        "CREATE SEQUENCE s_alone;"
+        "CREATE TABLE base_t (id int); CREATE TABLE child_t () INHERITS (base_t);"
+        "GRANT SELECT (id) ON base_t TO public"
+    )
+    await conn.close()
+    assert await cli("pull") == 0
+    err = capsys.readouterr().err
+    for what in [
+        "procedure p_noop()",
+        "sequence s_alone",
+        "table inheritance child_t of base_t",
+        "column grant select on base_t(id) to public",
+    ]:
+        assert f"warning: pull skips {what}" in err, err
+
+
 async def test_pull_update_follows_a_schema_another_app_owns(
     project: Path, kit_url: str, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:

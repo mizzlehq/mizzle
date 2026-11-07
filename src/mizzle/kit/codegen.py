@@ -475,6 +475,11 @@ class _SchemaWriter:
             kw += f", schema={view['schema']!r}"
         if view["materialized"]:
             kw += ", materialized=True"
+        for option in ("security_invoker", "security_barrier"):  # (K6)
+            if view.get(option):
+                kw += f", {option}=True"
+        if check := view.get("check_option"):
+            kw += f", check_option={check!r}"
         attrs = {c: self.attr(c) for c in view["columns"]}
         lines = ["@final", f"class {cls}(View, {kw}):"]
         for cname, column in view["columns"].items():

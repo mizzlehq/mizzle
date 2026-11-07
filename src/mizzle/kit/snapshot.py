@@ -500,6 +500,12 @@ def _add_view(
         materialized=view.__materialized__,
         columns={},
     )
+    if view.__security_invoker__:  # (K6)
+        snap["security_invoker"] = True
+    if view.__security_barrier__:
+        snap["security_barrier"] = True
+    if view.__check_option__:
+        snap["check_option"] = view.__check_option__
     for column in info.columns.values():
         name = column.db_name(casing)
         snap["columns"][name] = ColumnSnap(
