@@ -148,7 +148,10 @@ class Compiler:
     _writes: bool
     # (id(Param), SQL type it is compared with) -> its marker: a reused node reuses its
     # parameter, unless raw SQL holding it sits next to values of different types.
-    _bound: dict[tuple[int, str | None], str]
+    # Marker per (node id, context). The node is kept in the value: a temporary Param (an
+    # ``any_([...])`` array) freed mid-compile let the next one reuse its id() and so its
+    # marker, binding the wrong values (C19).
+    _bound: dict[tuple[int, str | None], tuple[Param, str]]
     _context: str | None  # the SQL type a raw operand is compared with (see operand_of)
     _scopes: list[dict[type[Table], str]]  # table -> alias, for aliased (relational) queries
     _alias_count: int
@@ -307,11 +310,11 @@ class Compiler:
         # The same node twice (an expression both selected and grouped by) binds once, so
         # PostgreSQL sees identical expressions.
         key = (id(node), self._context)
-        marker = self._bound.get(key)
-        if marker is None:
+        bound = self._bound.get(key)
+        if bound is None:
             value = node.column.encode(node.value) if node.column is not None else node.value
-            marker = self._bound[key] = self.bind(value)
-        return marker
+            bound = self._bound[key] = (node, self.bind(value))
+        return bound[1]
 
     def visit_Placeholder(self, node: Placeholder) -> str:
         return self.bind(None, node)
@@ -678,11 +681,15 @@ class Compiler:
         ):
             row = node.rows[0]
             if row and not any(isinstance(v, Node) for v in row.values()):
+                columns = node.table.__table__.columns
+                # Table order, as _insert_text lists the columns. Binding in the dict's own
+                # order swapped values once with_defaults() appended a default_fn column (C1).
+                attrs = tuple(a for a in columns if a in row)
                 key = (
                     type(self),
                     self.casing,
                     node.table,
-                    tuple(row),
+                    attrs,
                     len(self._params),
                     node.overriding,
                 )
@@ -690,8 +697,8 @@ class Compiler:
                 if text is None:
                     text = _INSERT_SQL[key] = self._insert_text(node)
                     return text
-                columns = node.table.__table__.columns
-                for attr, value in row.items():
+                for attr in attrs:
+                    value = row[attr]
                     encoder = columns[attr].encoder
                     self._params.append(
                         value if value is None or encoder is None else encoder(value)

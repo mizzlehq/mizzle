@@ -178,3 +178,30 @@ def test_the_version_guard_still_names_the_version_on_an_old_server() -> None:
     assert _needs_newer_server('syntax error at or near "RETURNING"', sql, 16) == (
         "MERGE ... RETURNING needs PostgreSQL 17 or later"
     )
+
+
+class Tok(Table, name="tok"):
+    id = serial().primary_key()
+    token = text().not_null().default_fn(lambda: "generated-token")
+    name = text().not_null()
+
+
+def test_a_cached_insert_binds_values_in_column_order(qb: QueryBuilder) -> None:
+    # C1: the second insert hit the SQL cache and bound in the dict's order, which
+    # with_defaults() changes (default_fn last), so token and name were swapped.
+    for name in ("first", "second", "third"):
+        sql, params = qb.insert(Tok).values(name=name).to_sql()
+        assert sql == 'INSERT INTO "tok" ("token", "name") VALUES ($1, $2)'
+        assert params == ("generated-token", name)
+
+
+def test_two_any_lists_never_share_a_parameter(qb: QueryBuilder) -> None:
+    # C19: markers were cached by id() of a temporary Param; a freed one's id could be
+    # reused, so both lists bound to $1 and a DELETE removed the wrong rows.
+    from mizzle import any_, or_
+
+    for _ in range(200):
+        sql, params = (
+            qb.delete(Kinds).where(or_(eq(Kinds.id, any_([1])), eq(Kinds.n, any_([99])))).to_sql()
+        )
+        assert params == ([1], [99]), sql
