@@ -186,6 +186,7 @@ class _Plan:
     # Names of functions whose result type changes: dropped and created again (K4-26).
     retyped: set[str] = field(default_factory=set[str])
     create_functions_early: list[Step] = field(default_factory=list[Step])  # (K1)
+    domain_calls_early: list[Step] = field(default_factory=list[Step])  # (K4-27)
     drop_functions_late: list[Step] = field(default_factory=list[Step])  # (K1)
     # Functions that use a table or view: ordered with the views (K4-13).
     create_with_views: list[FunctionSnap] = field(default_factory=list[FunctionSnap])
@@ -249,6 +250,7 @@ class _Plan:
             *self.drop_early,
             *self.drop_functions,  # after the indexes and columns using them (K4-26)
             *self.create_functions_early,  # a CHECK or DEFAULT may call them (K1)
+            *self.domain_calls_early,  # domain CHECKs and DEFAULTs calling those (K4-27)
             *self.create_tables,
             *self.create_partitions,
             *self.add_columns,
@@ -1224,11 +1226,35 @@ def _defer_domain_calls(plan: _Plan, old: Snapshot, new: Snapshot) -> None:
     DEFAULT calling a function created here are added after it. Those calling a function
     dropped here go first (the domain itself is dropped last), and come back after it if
     the domain stays (K4-27)."""
-    made = [
-        s.function
-        for s in [*plan.create_functions_early, *plan.create_views]
-        if isinstance(s, CreateFunction)
-    ]
+    early = [s.function for s in plan.create_functions_early if isinstance(s, CreateFunction)]
+    made = [*early, *(s.function for s in plan.create_views if isinstance(s, CreateFunction))]
+    added = [s for s in plan.add_columns if isinstance(s, AddColumn)]
+
+    def add_back(d: DomainSnap) -> None:
+        # Before the tables change when every function it calls is created early, so a
+        # column of the domain added to a table with rows gets the domain's DEFAULT.
+        calls = [f for f in made if _mentions(_domain_calls(d), [f["name"]])]
+        if all(f in early for f in calls):
+            plan.domain_calls_early.append(AddDomainChecks(d))
+            return
+        if d.get("default") and (
+            column := next(
+                (
+                    s
+                    for s in added
+                    if s.column["default"] is None and _mentions(s.column["type"], [d["name"]])
+                ),
+                None,
+            )
+        ):
+            raise MigrationError(
+                f"column {column.table}.{column.column['name']} is added with domain "
+                f"{d['name']}, whose DEFAULT calls a function created after the tables: its "
+                "rows would get NULL. Give the column its own DEFAULT, or add it in a "
+                "custom migration"
+            )
+        plan.create_calls.append(AddDomainChecks(d))
+
     for i, step in enumerate(plan.domains):
         if not isinstance(step, CreateDomain):
             continue
@@ -1245,7 +1271,7 @@ def _defer_domain_calls(plan: _Plan, old: Snapshot, new: Snapshot) -> None:
         bare.pop("checks", None)
         bare.pop("default", None)
         plan.domains[i] = CreateDomain(bare)
-        plan.create_calls.append(AddDomainChecks(d))
+        add_back(d)
     dropped = {
         s.name
         for s in [*plan.drop_functions, *plan.drop_views, *plan.drop_functions_late]
@@ -1257,7 +1283,7 @@ def _defer_domain_calls(plan: _Plan, old: Snapshot, new: Snapshot) -> None:
             continue
         plan.drop_calls.append(DropDomainChecks(d["schema"], d["name"]))
         if (again := new_domains.get(k)) is not None:
-            plan.create_calls.append(AddDomainChecks(again))
+            add_back(again)
 
 
 def _changed_tables(plan: _Plan) -> set[str]:

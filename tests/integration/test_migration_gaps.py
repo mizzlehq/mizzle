@@ -1982,6 +1982,49 @@ async def test_domain_check_calling_a_function(driver: PostgresDriver) -> None:
         diff(empty_snapshot("postgresql"), snap([], k27("integer", cycle=True)))
 
 
+async def test_domain_default_reaches_rows_of_a_column_added_with_it(
+    driver: PostgresDriver,
+) -> None:
+    # K4-27 put a domain's DEFAULT back at the end of the migration, so a column of the
+    # domain added to a table with rows in the same migration filled them with NULL.
+    @final
+    class Plain(Table, name="k27rows", schema="mg"):
+        id = integer().primary_key()
+
+    @final
+    class WithCode(Table, name="k27rows", schema="mg"):
+        id = integer().primary_key()
+        code = pg_domain("k27_code", str, schema="mg")
+
+    v1 = snap([Plain])
+    await migrate(driver, empty_snapshot("postgresql"), v1)
+    await execute(driver, "INSERT INTO mg.k27rows (id) VALUES (1)")
+    await migrate(driver, v1, snap([WithCode], k27("integer")))
+    [row] = await execute(driver, "SELECT code FROM mg.k27rows")
+    assert row["code"] == "2"  # k27_score('ab')::text, not NULL
+
+    # A DEFAULT calling a function that reads a table is only added after the tables
+    # change: refused, not NULL in silence.
+    late = [
+        function(
+            "k27_first",
+            schema="mg",
+            returns="text",
+            language="sql",
+            body="SELECT min(id)::text FROM mg.k27rows",
+        ),
+        domain("k27_late", schema="mg", as_="text", default="mg.k27_first()"),
+    ]
+
+    @final
+    class WithLate(Table, name="k27rows", schema="mg"):
+        id = integer().primary_key()
+        late = pg_domain("k27_late", str, schema="mg")
+
+    with pytest.raises(MigrationError, match="would get NULL"):
+        diff(snap([Plain]), snap([WithLate], late))
+
+
 async def test_view_recreated_under_a_sql_standard_function(driver: PostgresDriver) -> None:
     # K4-20: a RETURN / BEGIN ATOMIC body depends on the view it reads, so DROP VIEW failed
     # when the view changed and the function did not.
