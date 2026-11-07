@@ -584,8 +584,12 @@ def _diff_table(
     plan: _Plan,
     compare_expressions: bool,
     enums: frozenset[str] | None = None,
+    normalized: bool = False,
 ) -> None:
     schema, name = new["schema"], new["name"]
+    # Checks, index predicates and generated expressions are compared when both sides are as
+    # the database prints them (normalized), even with compare_expressions off (C24).
+    expressions = compare_expressions or normalized
     _diff_partitions(old, new, plan)
     if rebuilt := [
         c
@@ -641,7 +645,7 @@ def _diff_table(
             )
         old_generated, new_generated = before.get("generated"), column.get("generated")
         if old_generated != new_generated and (
-            compare_expressions  # else only whether it is generated, and how, counts
+            expressions  # else only whether it is generated, and how, counts
             or old_generated is None
             or new_generated is None
             or old_generated["stored"] != new_generated["stored"]
@@ -688,7 +692,7 @@ def _diff_table(
     def same_check(a: CheckSnap, b: CheckSnap) -> bool:
         if a.get("not_valid") != b.get("not_valid"):
             return False
-        return not compare_expressions or a["expression"] == b["expression"]
+        return not expressions or a["expression"] == b["expression"]
 
     def same_exclusion(a: ExclusionSnap, b: ExclusionSnap) -> bool:
         if a["method"] != b["method"] or len(a["elements"]) != len(b["elements"]):
@@ -755,7 +759,7 @@ def _diff_table(
         for extra in ("method", "opclasses", "options", "nulls_not_distinct"):
             if a.get(extra) != b.get(extra):
                 return False
-        if not compare_expressions:  # the database reformats expressions; compare shapes
+        if not expressions:  # the database reformats expressions; compare shapes
             return ("expression" in a) == ("expression" in b)
         return a["where"] == b["where"] and a.get("expression") == b.get("expression")
 
@@ -775,11 +779,14 @@ def diff(
     resolve: RenameResolver = no_renames,
     *,
     compare_expressions: bool = True,
+    normalized: bool = False,
 ) -> list[Step]:
     """Steps that turn the ``old`` schema into the ``new`` one.
 
     ``compare_expressions=False`` ignores CHECK expressions and index predicates, whose text
     a database reformats; use it when ``old`` comes from introspection (``push``).
+    ``normalized=True`` says ``new`` went through ``normalize_snapshot``, so checks, index
+    predicates and generated expressions are compared after all.
     """
     plan = _Plan()
     plan.schemas = [CreateSchema(s) for s in new["schemas"] if s not in old["schemas"]]
@@ -812,7 +819,7 @@ def diff(
                 for fk in table["foreign_keys"].values()
             ]
         else:
-            _diff_table(before, table, plan, compare_expressions, enum_names)
+            _diff_table(before, table, plan, compare_expressions, enum_names, normalized)
         _diff_grants(table, before.get("grants", {}) if before else {}, plan, compare_expressions)
         _diff_comments(before if before is not None else _empty_like(table), table, plan)
 

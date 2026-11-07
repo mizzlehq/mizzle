@@ -147,7 +147,7 @@ async def assert_no_drift(driver: PostgresDriver, desired: Snapshot) -> None:
     async with driver.acquire() as conn:
         current = await dialect.introspect(conn, SCHEMAS)
         expected = await dialect.normalize_snapshot(conn, desired)
-    remaining = diff(current, expected, compare_expressions=False)
+    remaining = diff(current, expected, compare_expressions=False, normalized=True)
     assert remaining == [], [s.describe() for s in remaining]
     for k, fn in expected.get("functions", {}).items():  # the parts push does not compare
         assert current.get("functions", {})[k] == fn

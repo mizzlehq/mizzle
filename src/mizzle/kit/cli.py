@@ -140,12 +140,18 @@ def _resolver(args: Args, dialect: Dialect) -> RenameResolver:
 
 
 def _diff_with_renames(
-    old: Snapshot, new: Snapshot, args: Args, dialect: Dialect, *, compare_expressions: bool = True
+    old: Snapshot,
+    new: Snapshot,
+    args: Args,
+    dialect: Dialect,
+    *,
+    compare_expressions: bool = True,
+    normalized: bool = False,
 ) -> list[Step]:
     """``diff`` with the --rename flags; one that matched nothing is an error, not a
     silent drop and create (C20)."""
     resolver = _resolver(args, dialect)
-    steps = diff(old, new, resolver, compare_expressions=compare_expressions)
+    steps = diff(old, new, resolver, compare_expressions=compare_expressions, normalized=normalized)
     if isinstance(resolver, StrictRenames) and (unused := resolver.unused()):
         raise MigrationError(
             f"--rename {', '.join(unused)} matched no removed table or column; check the "
@@ -594,7 +600,9 @@ def cmd_push(config: Config, args: Args) -> int:
             )
             # View queries and expressions as the database prints them, to compare.
             desired = await dialect.normalize_snapshot(conn, desired)
-            steps = _diff_with_renames(live, desired, args, dialect, compare_expressions=False)
+            steps = _diff_with_renames(
+                live, desired, args, dialect, compare_expressions=False, normalized=True
+            )
             if not steps:
                 print("Database is up to date.")
                 return 0
@@ -835,7 +843,7 @@ def cmd_info(config: Config, args: Args) -> int:
                 conn, _schemas(config, latest), list(latest.get("roles", {}))
             )
             desired = await dialect.normalize_snapshot(conn, latest)
-            drift = diff(live, desired, no_renames, compare_expressions=False)
+            drift = diff(live, desired, no_renames, compare_expressions=False, normalized=True)
             return str(row["v"]), applied, drift
 
     version, applied, drift = asyncio.run(_with_driver(config, inspect))

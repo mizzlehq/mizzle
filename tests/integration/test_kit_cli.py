@@ -1453,3 +1453,66 @@ async def test_a_rename_across_schemas_is_a_move_not_a_drop(
     capsys.readouterr()
     assert await cli("generate", "--rename", "app.gone=arch.x") == 1
     assert "matched no" in capsys.readouterr().err
+
+
+EXPRESSIONS = """
+from mizzle import Table, check, index, sql
+from mizzle.pg import serial, integer, text, double_precision, interval, timestamp
+
+class Item(Table, name="items"):
+    id = serial().primary_key()
+    qty = integer().not_null().default(0)
+    ratio = double_precision().default(1e-7)
+    wait = interval().default(sql("'1 day 5 seconds'::interval"))
+    label = text().default(sql("('a' || 'b')"))
+    due = timestamp(tz=True).default(sql("now() + interval '1 day'"))
+    twice = integer().generated_always_as(sql("qty * 2"))
+
+    @classmethod
+    def config(cls):
+        return [
+            check("items_qty", sql("qty >= 0")),
+            index("items_big").on(cls.qty).where(sql("qty > 10")),
+        ]
+"""
+
+
+async def test_doctor_and_push_compare_expressions(
+    project: Path, kit_url: str, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # C24: right after migrate, doctor reported drift for defaults it could not match, and
+    # push repeated them; a changed CHECK, index WHERE or generated expression was missed.
+    rewrite_schema(project, EXPRESSIONS, monkeypatch)
+    assert await cli("generate") == 0
+    assert await cli("migrate") == 0
+    capsys.readouterr()
+    assert await cli("doctor") == 0, capsys.readouterr().out
+    assert await cli("push", "--dry-run") == 0
+    assert "up to date" in capsys.readouterr().out
+
+    for change, undo in (
+        (
+            "ALTER TABLE items DROP CONSTRAINT items_qty, ADD CONSTRAINT items_qty "
+            "CHECK (qty >= 5)",
+            "ALTER TABLE items DROP CONSTRAINT items_qty, ADD CONSTRAINT items_qty "
+            "CHECK (qty >= 0)",
+        ),
+        (
+            "DROP INDEX items_big; CREATE INDEX items_big ON items (qty) WHERE qty > 99",
+            "DROP INDEX items_big; CREATE INDEX items_big ON items (qty) WHERE qty > 10",
+        ),
+        (
+            "ALTER TABLE items DROP COLUMN twice, "
+            "ADD COLUMN twice integer GENERATED ALWAYS AS (qty * 3) STORED",
+            "ALTER TABLE items DROP COLUMN twice, "
+            "ADD COLUMN twice integer GENERATED ALWAYS AS (qty * 2) STORED",
+        ),
+    ):
+        conn = await asyncpg.connect(kit_url)
+        try:
+            await conn.execute(change)
+            assert await cli("doctor") == 1, change
+            await conn.execute(undo)
+            assert await cli("doctor") == 0, undo
+        finally:
+            await conn.close()

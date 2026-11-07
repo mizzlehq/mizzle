@@ -880,7 +880,7 @@ async def _normalize_indexes(snapshot: Snapshot, read_back: _ReadBack, version: 
             for c in table["columns"].values()
         )
         for index in table["indexes"].values():
-            if "opclasses" not in index and "expression" not in index:
+            if "opclasses" not in index and "expression" not in index and index["where"] is None:
                 continue
             temp_index = copy.copy(index)
             temp_index["name"] = f"{_NORM}_index"  # not the table's name
@@ -899,6 +899,7 @@ async def _normalize_indexes(snapshot: Snapshot, read_back: _ReadBack, version: 
                 index["opclasses"] = printed["opclasses"]
             if "expression" in printed:
                 index["expression"] = printed["expression"]
+            index["where"] = printed["where"]  # as the database prints it (C24)
 
 
 async def _normalize_grants(snapshot: Snapshot, read_back: _ReadBack) -> None:
@@ -969,6 +970,39 @@ def _mentions(expression: str, column: str) -> bool:
         return True
     plain = re.escape(column)
     return re.search(rf"(?<![\w$\"]){plain}(?![\w$\"])", expression, re.IGNORECASE) is not None
+
+
+async def _normalize_column_expressions(snapshot: Snapshot, read_back: _ReadBack, rel: str) -> None:
+    """Defaults and generated expressions as the database prints them, from a temporary
+    table holding that column. Compared as written, ``1e-7`` never matched ``0.0000001``
+    nor ``'1 day 5 seconds'::interval`` its printed form, so push repeated them forever and
+    doctor reported drift right after migrate (C24)."""
+    for table in snapshot["tables"].values():
+        plain = {
+            name: f"{quote(name)} {SERIAL_TYPES.get(c['type'], c['type'])}"
+            for name, c in table["columns"].items()
+        }
+        for name, column in table["columns"].items():
+            generated = column.get("generated")
+            if column["default"] is None and generated is None:
+                continue
+            if generated is not None:
+                extra = f" GENERATED ALWAYS AS ({generated['expression']}) STORED"
+            else:
+                extra = f" DEFAULT {column['default']}"
+            columns = ", ".join(sql + (extra if n == name else "") for n, sql in plain.items())
+            row = await read_back(
+                [f"CREATE TEMP TABLE {quote(_NORM)} ({columns})"],
+                "SELECT pg_get_expr(d.adbin, d.adrelid) AS e FROM pg_attrdef d "
+                "JOIN pg_attribute a ON a.attrelid = d.adrelid AND a.attnum = d.adnum "
+                f"WHERE d.adrelid = {rel} AND a.attname = {_text(name)}",
+            )
+            if row is None or row["e"] is None:
+                continue  # cannot be created here (a type or sequence made later): as is
+            if generated is not None:
+                generated["expression"] = str(row["e"])
+            else:
+                column["default"] = normalize_default(str(row["e"]))  # as introspect does
 
 
 def _text(value: str) -> str:
@@ -1110,6 +1144,7 @@ async def _normalize(snapshot: Snapshot, read_back: _ReadBack, version: int) -> 
         snapshot["functions"] = {function_key(f): f for f in functions.values()}
 
     await _normalize_indexes(snapshot, read_back, version)
+    await _normalize_column_expressions(snapshot, read_back, f"to_regclass('{norm}')")
     await _normalize_grants(snapshot, read_back)
     await _normalize_domain_checks(snapshot, read_back)
 
