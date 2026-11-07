@@ -3,26 +3,31 @@ function bodies, operator classes, generated column rebuilds, enums in other sch
 moves and identity options: applied, introspected without drift, and pulled back."""
 
 import copy
+import datetime as dt
 import enum
 import importlib.util
 import sys
 import uuid
-from collections.abc import AsyncGenerator, Mapping, Sequence
+from collections.abc import AsyncGenerator, Callable, Mapping, Sequence
+from decimal import Decimal
 from pathlib import Path
 from typing import cast, final, override
 
 import pytest
-from asyncpg import Range
+from asyncpg import BitString, Point, Range
 
 from mizzle import (
     Constraint,
     DatabaseError,
+    Expr,
     QueryBuilder,
     Table,
     View,
     check,
     composite,
+    contains,
     domain,
+    eq,
     exclusion,
     extension,
     function,
@@ -37,7 +42,7 @@ from mizzle import (
     unique_index,
 )
 from mizzle.core.errors import MigrationError
-from mizzle.core.schema.column import Computed
+from mizzle.core.schema.column import ColumnBase, Computed
 from mizzle.core.schema.objects import (
     Composite,
     Domain,
@@ -55,9 +60,11 @@ from mizzle.kit.diff import StrictRenames, diff
 from mizzle.kit.migrate import apply_statements
 from mizzle.kit.snapshot import build_snapshot
 from mizzle.pg import (
+    array,
     bigint,
     bit,
     box,
+    bytea,
     char,
     cidr,
     circle,
@@ -69,6 +76,7 @@ from mizzle.pg import (
     int4range,
     integer,
     interval,
+    jsonb,
     line,
     lseg,
     ltree,
@@ -88,6 +96,7 @@ from mizzle.pg import (
     tsrange,
     tstzrange,
     varbit,
+    varchar,
     xml,
 )
 from tests.integration.test_generated_columns import server_version
@@ -1796,3 +1805,126 @@ async def test_raw_operator_default_is_parenthesized(driver: PostgresDriver) -> 
     v1 = snap([Stamps])
     await migrate(driver, empty_snapshot("postgresql"), v1)  # CREATE TABLE
     await migrate(driver, v1, snap([Stamps2]))  # ADD COLUMN
+
+
+# -- defaults and DDL literals of every type, as PostgreSQL prints them back ------------------
+
+
+class Q4Color(enum.StrEnum):
+    RED = "red"
+    BLUE = "blue"
+
+
+q4_price = composite("q4_price", [("amount", "numeric"), ("cur", "text")], schema="mg")
+_UTC5 = dt.timezone(dt.timedelta(hours=5))
+_T0 = dt.datetime(2020, 1, 1, tzinfo=dt.UTC)
+_D1, _D5 = dt.date(2020, 1, 1), dt.date(2020, 1, 5)
+
+type _Check = Callable[[Expr[object]], Expr[bool]] | None
+# (column with its default, a CHECK comparing it with a literal); point has no `=`.
+_TYPED_DEFAULTS: dict[str, tuple[Callable[[], ColumnBase], _Check]] = {
+    "int[]": (lambda: array(integer()).default([1, 2]), lambda v: contains(v, [1])),
+    "varchar[]": (
+        lambda: array(varchar(20)).default(["a b", 'q"\\', "NULL", "", "{x}"]),
+        lambda v: contains(v, ["a b", ""]),
+    ),
+    "enum[]": (
+        lambda: array(pg_enum(Q4Color, type_name="q4_color", schema="mg")).default([Q4Color.RED]),
+        lambda v: contains(v, [Q4Color.RED]),
+    ),
+    "date[]": (lambda: array(date()).default([_D1]), lambda v: contains(v, [_D1])),
+    "jsonb": (
+        lambda: jsonb[object]().default({"k": "\u00fcn\u00ef", "b": 1, "aa": [1e20, 1.5]}),
+        lambda v: contains(v, {"b": 1}),
+    ),
+    "jsonb list": (
+        lambda: jsonb[object]().default([1, 2, {"b": 1, "a": 2}]),
+        lambda v: contains(v, [1, 2]),
+    ),
+    "jsonb[]": (
+        lambda: array(jsonb[object]()).default([{"b": 1, "a": "\u00fc"}, [1, "x"]]),
+        lambda v: contains(v, [[1, "x"]]),
+    ),
+    "bytea[]": (lambda: array(bytea()).default([b"\x00a"]), lambda v: contains(v, [b"\x00a"])),
+    "int4range": (
+        lambda: int4range().default(Range(1, 5, lower_inc=False, upper_inc=True)),
+        lambda v: eq(v, Range(2, 6)),
+    ),
+    "daterange": (
+        lambda: daterange().default(Range(_D1, _D5, upper_inc=True)),
+        lambda v: eq(v, Range(_D1, _D5, upper_inc=True)),
+    ),
+    "tstzrange": (
+        lambda: tstzrange().default(Range(dt.datetime(2020, 1, 1, tzinfo=_UTC5), None)),
+        lambda v: eq(v, Range(dt.datetime(2019, 12, 31, 19, tzinfo=dt.UTC), None)),
+    ),
+    "tsrange": (
+        lambda: tsrange().default(Range(dt.datetime(2020, 1, 1, 0, 0, 0, 500000), None)),
+        lambda v: eq(v, Range(dt.datetime(2020, 1, 1, 0, 0, 0, 500000), None)),
+    ),
+    "int4range[]": (
+        lambda: array(int4range()).default([Range(1, 2), Range(3, 5, upper_inc=True)]),
+        lambda v: contains(v, [Range(1, 2), Range(3, 6)]),
+    ),
+    "point[]": (lambda: array(point()).default([Point(1, 2.5)]), None),
+    "varbit": (
+        lambda: varbit().default(BitString.from_int(341, length=10)),
+        lambda v: eq(v, BitString.from_int(341, length=10)),
+    ),
+    "varbit[]": (
+        lambda: array(varbit()).default([BitString.from_int(1, length=2)]),
+        lambda v: contains(v, [BitString.from_int(1, length=2)]),
+    ),
+    "timestamptz[]": (
+        lambda: array(timestamp(tz=True)).default([_T0, dt.datetime(2020, 1, 1, tzinfo=_UTC5)]),
+        lambda v: contains(v, [_T0]),
+    ),
+    "timestamp[]": (
+        lambda: array(timestamp()).default([dt.datetime(2020, 1, 1, 0, 0, 0, 500000)]),
+        lambda v: contains(v, [dt.datetime(2020, 1, 1, 0, 0, 0, 500000)]),
+    ),
+    "interval[]": (
+        lambda: array(interval()).default([dt.timedelta(hours=1), dt.timedelta(days=-1, hours=1)]),
+        lambda v: contains(v, [dt.timedelta(hours=1)]),
+    ),
+    "composite": (
+        lambda: pg_composite("q4_price", tuple, schema="mg").default((Decimal("1.5"), "u d")),
+        lambda v: eq(v, (Decimal("1.5"), "u d")),
+    ),
+    "composite dict": (
+        lambda: pg_composite("q4_price", dict, schema="mg").default({"cur": "usd", "amount": 1.5}),
+        None,
+    ),
+}
+
+
+@pytest.mark.parametrize("kind", list(_TYPED_DEFAULTS))
+async def test_typed_defaults_and_check_literals_do_not_drift(
+    driver: PostgresDriver, kind: str
+) -> None:
+    # Q4-1 varchar[]/enum[]/date[] literals were text[]; Q4-2 CAST(ARRAY[1, 2] AS jsonb);
+    # Q4-4 ranges and Q4-7 jsonb defaults drifted; Q4-11 array elements were Python repr;
+    # Q4-12 composite defaults were ARRAY[...] or JSON.
+    make, condition = _TYPED_DEFAULTS[kind]
+    column = make()
+
+    @final
+    class Typed(Table, name="q4_typed", schema="mg"):
+        id = integer().primary_key()
+        v = column
+
+        @classmethod
+        @override
+        def config(cls) -> list[Constraint]:
+            return (
+                []
+                if condition is None
+                else [check("q4_typed_ck", condition(cast(Expr[object], cast(object, cls.v))))]
+            )
+
+    desired = snap([Typed], objects=[q4_price])
+    await migrate(driver, empty_snapshot("postgresql"), desired)
+    current = await live(driver)
+    # Compared as written too: the default is what PostgreSQL prints.
+    assert diff(current, desired, compare_expressions=False) == []
+    await execute(driver, "INSERT INTO mg.q4_typed (id) VALUES (1)")
