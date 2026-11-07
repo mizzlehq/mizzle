@@ -183,7 +183,8 @@ def test_cache_root_per_platform(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "local"))
     assert assets.cache_root() == tmp_path / "local" / "mizzle" / "studio"
     monkeypatch.delenv("LOCALAPPDATA")
-    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    # Path.home() reads USERPROFILE on Windows and HOME elsewhere: patch it directly.
+    monkeypatch.setattr(Path, "home", lambda: tmp_path / "home")
     assert assets.cache_root() == tmp_path / "home" / "AppData" / "Local" / "mizzle" / "studio"
     monkeypatch.setattr(sys, "platform", "darwin")
     assert assets.cache_root() == tmp_path / "home" / "Library" / "Caches" / "mizzle" / "studio"

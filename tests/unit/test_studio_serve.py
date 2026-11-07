@@ -27,6 +27,10 @@ def config(monkeypatch: pytest.MonkeyPatch) -> Config:
 @pytest.fixture
 def no_ui(monkeypatch: pytest.MonkeyPatch) -> None:
     """Never download the UI or listen; a fake app is enough."""
+    from mizzle.studio import assets
+
+    # CI has no built UI (and no download info), so the real lookup would fail first.
+    monkeypatch.setattr(assets, "ui_path", lambda _override=None: Path("/nonexistent-ui"))
     monkeypatch.setattr(studio_server, "create_app", lambda **_kw: object())
     monkeypatch.setitem(sys.modules, "uvicorn", types.SimpleNamespace(run=_record_run))
 
