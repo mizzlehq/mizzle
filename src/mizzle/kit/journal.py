@@ -201,7 +201,13 @@ class MigrationsDir:
         self.journal_path.parent.mkdir(parents=True, exist_ok=True)
         self.journal_path.write_text(json.dumps(journal, indent=2) + "\n", encoding="utf-8")
 
-    def migrations(self) -> list[Migration]:
+    def migrations(self, *, unlisted_ok: bool = False) -> list[Migration]:
+        # (K5) a folder merged without its journal entry was skipped silently.
+        if not unlisted_ok and (unlisted := self.unlisted()):
+            raise MigrationError(
+                f"{', '.join(unlisted)} is not in the journal; run `mizzle check --fix` "
+                "(or remove the folder)"
+            )
         return [
             Migration(
                 e["index"],
