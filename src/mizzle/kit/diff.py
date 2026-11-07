@@ -94,8 +94,7 @@ class RenameResolver(Protocol):
 
     ``scope`` is ``"schema"`` for tables and ``"schema.table"`` for columns. Returns
     ``{old: new}``; anything not in the result is a real drop/add. Scope ``"*"`` asks
-    whether tables moved to another schema: names are then ``"schema.table"``, and only
-    tables with the same name and columns are offered.
+    whether tables moved to another schema: names are then ``"schema.table"``.
     """
 
     def __call__(
@@ -115,16 +114,23 @@ class StrictRenames:
     default_schema: str = "public"
     # Called for leftovers instead of raising (the CLI asks the user when on a terminal).
     ask: RenameResolver | None = None
+    # The renames that matched something; any other was a typo or a stale flag (C20).
+    used: set[str] = field(default_factory=set[str])
+
+    def unused(self) -> list[str]:
+        return [old for old in self.renames if old not in self.used]
 
     def _lookup(self, scope: str, old: str) -> str | None:
         if scope == "*":  # a move: "schema.table" names
-            return self.renames.get(old)
-        full = f"{scope}.{old}"
-        if full in self.renames:
-            return self.renames[full]
-        prefix = f"{self.default_schema}."
-        if full.startswith(prefix) and full.removeprefix(prefix) in self.renames:
-            return self.renames[full.removeprefix(prefix)]
+            keys = [old]
+        else:
+            full = f"{scope}.{old}"
+            prefix = f"{self.default_schema}."
+            keys = [full, full.removeprefix(prefix)] if full.startswith(prefix) else [full]
+        for k in keys:
+            if k in self.renames:
+                self.used.add(k)
+                return self.renames[k]
         return None
 
     def __call__(
@@ -407,20 +413,19 @@ def _apply_renames(
             tables[key(schema, new_name)] = table
             _follow(tables, schema, old_name, schema, new_name)
 
-    # Tables that left one schema for another with the same name and columns: moves.
-    gone = [k for k in tables if k not in new["tables"]]
-    came = [k for k in new["tables"] if k not in tables]
-    pairs = [
-        (o, n)
-        for o in gone
-        for n in came
-        if tables[o]["name"] == new["tables"][n]["name"]
-        and _columns_only(tables[o]) == _columns_only(new["tables"][n])
-    ]
-    if pairs:
-        moves = resolve(
-            "table", "*", _dedupe([o for o, _ in pairs]), _dedupe([n for _, n in pairs])
-        )
+    # Tables that left one schema for another (maybe renamed, maybe with other columns):
+    # every leftover pair across schemas is offered, so an explicit "schema.table" rename
+    # is honoured and an unresolved pair is asked about, not dropped and created (C20).
+    # Same-schema pairs were settled above, so only a table with a partner in another
+    # schema is offered.
+    gone_all = [k for k in tables if k not in new["tables"]]
+    came_all = [k for k in new["tables"] if k not in tables]
+    gone_schemas = {tables[k]["schema"] for k in gone_all}
+    came_schemas = {new["tables"][k]["schema"] for k in came_all}
+    gone = [k for k in gone_all if came_schemas - {tables[k]["schema"]}]
+    came = [k for k in came_all if gone_schemas - {new["tables"][k]["schema"]}]
+    if gone and came:
+        moves = resolve("table", "*", gone, came)
         for old_key, new_key in moves.items():
             moved, dest = tables.pop(old_key), new["tables"][new_key]
             old_schema, old_name = moved["schema"], moved["name"]
@@ -473,14 +478,6 @@ def _relation_names(*tables: TableSnap) -> set[str]:
         if t["primary_key"]:
             names.add(t["primary_key"]["name"])
     return names
-
-
-def _columns_only(table: TableSnap) -> dict[str, ColumnSnap]:
-    return table["columns"]
-
-
-def _dedupe(items: list[str]) -> list[str]:
-    return list(dict.fromkeys(items))
 
 
 def _rebuilt(before: ColumnSnap, after: ColumnSnap) -> bool:

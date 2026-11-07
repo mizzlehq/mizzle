@@ -139,6 +139,21 @@ def _resolver(args: Args, dialect: Dialect) -> RenameResolver:
     return StrictRenames(renames, dialect.default_schema, ask)
 
 
+def _diff_with_renames(
+    old: Snapshot, new: Snapshot, args: Args, dialect: Dialect, *, compare_expressions: bool = True
+) -> list[Step]:
+    """``diff`` with the --rename flags; one that matched nothing is an error, not a
+    silent drop and create (C20)."""
+    resolver = _resolver(args, dialect)
+    steps = diff(old, new, resolver, compare_expressions=compare_expressions)
+    if isinstance(resolver, StrictRenames) and (unused := resolver.unused()):
+        raise MigrationError(
+            f"--rename {', '.join(unused)} matched no removed table or column; check the "
+            "old name (schema.table for another schema)"
+        )
+    return steps
+
+
 def _guard_data_loss(steps: Sequence[Step], allow: bool) -> None:
     risky = [s for s in steps if s.data_loss]
     if not risky or allow:
@@ -211,7 +226,7 @@ def cmd_generate(config: Config, args: Args) -> int:
         migration = directory.write(args.name or "custom", [], current, header, custom=True)
         print(f"Created {migration.sql_path}")
         return 0
-    steps = diff(previous, current, _resolver(args, dialect))
+    steps = _diff_with_renames(previous, current, args, dialect)
     if args.sql:
         if not steps:
             print("No schema changes.")
@@ -579,7 +594,7 @@ def cmd_push(config: Config, args: Args) -> int:
             )
             # View queries and expressions as the database prints them, to compare.
             desired = await dialect.normalize_snapshot(conn, desired)
-            steps = diff(live, desired, _resolver(args, dialect), compare_expressions=False)
+            steps = _diff_with_renames(live, desired, args, dialect, compare_expressions=False)
             if not steps:
                 print("Database is up to date.")
                 return 0

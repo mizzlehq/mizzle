@@ -27,6 +27,7 @@ Run `mizzle <command> --help` for all options. Every command reads `mizzle.toml`
 mizzle generate --name add_bio
 mizzle generate --rename users=people             # a table rename, not drop + create
 mizzle generate --rename users.name=full_name     # a column rename
+mizzle generate --rename app.users=archive.people  # a move to another schema (and rename)
 mizzle generate --no-renames                      # treat changes as drop + create
 mizzle generate --allow-data-loss                 # allow drops and narrowing types
 mizzle generate --custom --name backfill          # empty migration for your own SQL
@@ -38,8 +39,9 @@ mizzle generate --custom --name backfill --sql    # print the header only, write
 `--template <file>` seeds the body of a `--custom` migration with that file's contents. With
 `--sql`, nothing is written to disk (not even a `--custom` folder) and the SQL is printed.
 
-When a column or table is gone and a new one appears, mizzle asks if it is a rename (on a
-terminal), or stops and tells you which `--rename` to pass (in CI).
+When a column or table is gone and a new one appears, also in another schema, mizzle asks
+if it is a rename (on a terminal), or stops and tells you which `--rename` to pass (in CI).
+A `--rename` that matches nothing is an error, so a typo cannot turn into a drop.
 
 In a `--custom` migration, separate statements with `-- mizzle:breakpoint`.
 

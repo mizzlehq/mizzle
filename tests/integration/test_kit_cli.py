@@ -1417,3 +1417,39 @@ async def test_status_shows_applied_migrations_missing_on_disk(
     capsys.readouterr()
     assert await cli("status", "--check") == 1
     assert f"{name}  applied but missing on disk" in capsys.readouterr().out
+
+
+TWO_SCHEMAS = """
+from mizzle import Table
+from mizzle.pg import serial, text
+
+class T(Table, name="t", schema="app"):
+    id = serial().primary_key()
+    note = text()
+"""
+
+
+async def test_a_rename_across_schemas_is_a_move_not_a_drop(
+    project: Path, kit_url: str, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # C20: --rename app.t=arch.t2 was ignored (DROP + CREATE); a --rename that matched
+    # nothing was accepted; a cross-schema drop + create was never asked about.
+    rewrite_schema(project, TWO_SCHEMAS, monkeypatch)
+    assert await cli("generate") == 0
+    assert await cli("migrate") == 0
+    await fetchval(kit_url, "INSERT INTO app.t (note) VALUES ('kept')")
+    moved = TWO_SCHEMAS.replace('name="t", schema="app"', 'name="t2", schema="arch"').replace(
+        "note = text()", "note = text()\n    extra = text()"
+    )
+    rewrite_schema(project, moved, monkeypatch)
+    capsys.readouterr()
+    assert await cli("generate") == 1  # in CI: asks for a --rename
+    assert "--rename" in capsys.readouterr().err
+    assert await cli("generate", "--rename", "app.t=nonexistent.zzz") == 1
+    assert await cli("generate", "--rename", "app.typo=arch.t2") == 1
+    assert await cli("generate", "--rename", "app.t=arch.t2") == 0
+    assert await cli("migrate") == 0
+    assert await fetchval(kit_url, "SELECT note FROM arch.t2") == "kept"
+    capsys.readouterr()
+    assert await cli("generate", "--rename", "app.gone=arch.x") == 1
+    assert "matched no" in capsys.readouterr().err
