@@ -235,7 +235,8 @@ class Session(QueryBuilder):
         # Traced per batch, not around the loop: a span made current here stayed current in
         # the caller between batches and after a break, and its token was reset from
         # another context when the generator was finalized (C16).
-        with self._logged(query, trace=False):
+        paused = [0.0]
+        with self._logged(query, trace=False, paused=paused):
             if self._conn is not None:
                 # Locked per batch, not for the whole loop: its body may run other
                 # statements in the same transaction.
@@ -250,7 +251,11 @@ class Session(QueryBuilder):
                                 batch = await anext(batches, None)
                         if batch is None:
                             return
-                        yield batch
+                        handed = time.perf_counter()
+                        try:
+                            yield batch
+                        finally:
+                            paused[0] += time.perf_counter() - handed
             try:
                 # Cursors only live inside a transaction; it ends (and closes the cursor)
                 # when the loop ends, breaks or is cancelled.
@@ -267,7 +272,11 @@ class Session(QueryBuilder):
                                 batch = await anext(batches, None)
                             if batch is None:
                                 return
-                            yield batch
+                            handed = time.perf_counter()
+                            try:
+                                yield batch
+                            finally:
+                                paused[0] += time.perf_counter() - handed
             except DbConnectionError as lost:
                 await self._after_lost_connection(query, False, lost)  # never resumed mid-stream
                 raise
@@ -901,8 +910,12 @@ class Session(QueryBuilder):
             yield
 
     @contextmanager
-    def _logged(self, query: CompiledQuery, *, trace: bool = True) -> Generator[None]:
-        """Time the block; trace it, log slow queries and pass a QueryEvent to the logger."""
+    def _logged(
+        self, query: CompiledQuery, *, trace: bool = True, paused: list[float] | None = None
+    ) -> Generator[None]:
+        """Time the block; trace it, log slow queries and pass a QueryEvent to the logger.
+        ``paused`` holds seconds the block spent outside the database (a stream's caller)
+        that do not count (R10)."""
         if self._logger is None and self._slow_query_ms is None and self._tracer is None:
             yield
             return
@@ -917,7 +930,7 @@ class Session(QueryBuilder):
                 error = exc
                 raise
             finally:
-                duration_ms = (time.perf_counter() - start) * 1000
+                duration_ms = (time.perf_counter() - start - sum(paused or ())) * 1000
                 if self._slow_query_ms is not None and duration_ms >= self._slow_query_ms:
                     log.warning("mizzle: slow query (%.1f ms): %s", duration_ms, query.sql)
                 if self._logger is not None:
