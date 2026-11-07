@@ -231,7 +231,9 @@ class Studio:
             return
         state = cast(dict[str, object], data)
         history = state.get("history")
-        if isinstance(history, list):
+        # S15: a read-only Studio does not see the read-write history (it keeps its own,
+        # in memory only).
+        if isinstance(history, list) and not self.read_only:
             self.history = [h for h in cast(list[object], history) if isinstance(h, dict)]
             del self.history[:-MAX_HISTORY]
         saved = state.get("saved")
@@ -241,7 +243,7 @@ class Studio:
             }
 
     def save_state(self) -> None:
-        if self.state_path is None:
+        if self.state_path is None or self.read_only:  # S15: read-only never writes the file
             return
         try:
             # The history holds whatever SQL was run, passwords included (C6): keep the file
@@ -890,8 +892,11 @@ async def list_saved(studio: Studio, _request: Request) -> Response:
 
 
 async def put_saved(studio: Studio, request: Request) -> Response:
+    _writable(studio)  # S15
     path: dict[str, object] = request.path_params
     name = str(path["name"])
+    if not name.strip():  # S15
+        raise StudioError("saved query name must not be empty")
     sql = (await _body(request)).get("sql")
     if not isinstance(sql, str) or not sql.strip():
         raise StudioError("sql must be a non-empty string")
@@ -900,6 +905,7 @@ async def put_saved(studio: Studio, request: Request) -> Response:
 
 
 async def delete_saved(studio: Studio, request: Request) -> Response:
+    _writable(studio)  # S15
     path: dict[str, object] = request.path_params
     name = str(path["name"])
     if not studio.delete_query(name):
