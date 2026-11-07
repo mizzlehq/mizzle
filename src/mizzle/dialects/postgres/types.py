@@ -548,10 +548,28 @@ def pg_domain[T](
     (``str`` for a text domain); declare the domain itself with ``mizzle.domain``. Give
     ``schema`` when the domain lives outside the database's default schema."""
     sql_type = type_name if schema in (None, "public") else f"{schema}.{type_name}"
+    decoder: Callable[[object], object] | None = None
+    if py_type is not None:
+        convert = cast(Callable[[object], object], py_type)
+        # asyncpg already reads a date/UUID/... domain as that type; date(date) fails (Q1).
+        decoder = lambda v: v if isinstance(v, py_type) else convert(v)  # noqa: E731
     column: Column[T | None] = Column(
-        sql_type, (py_type,) if py_type is not None else None, name, decoder=py_type
+        sql_type, (py_type,) if py_type is not None else None, name, decoder=decoder
     )
     return column
+
+
+def _composite_json(py_type: type | None) -> Callable[[object], object]:
+    """A composite nested in a relational row arrives as a JSON object of its fields (Q2):
+    keep it by name, like asyncpg's Record, unless ``py_type`` wants positional values."""
+
+    def parse(value: object) -> object:
+        fields = cast(dict[str, object], value)
+        if py_type is None or issubclass(py_type, Mapping):
+            return fields
+        return tuple(fields.values())
+
+    return parse
 
 
 def pg_composite[T](
@@ -563,8 +581,10 @@ def pg_composite[T](
 ) -> Column[T | None]:
     """A column of a PostgreSQL composite type; declare the type with ``mizzle.composite``.
     asyncpg reads a composite as an ``asyncpg.Record`` (fields by name) and writes a tuple of
-    field values in order; pass ``py_type`` (``tuple`` or ``dict``, say) to decode to that
-    instead. Give ``schema`` when the type lives outside the database's default schema."""
+    field values in order or a dict by field name; pass ``py_type`` (``tuple`` or ``dict``,
+    say) to decode to that instead. Give ``schema`` when the type lives outside the
+    database's default schema. In a relational (nested) row the field values are JSON."""
     sql_type = type_name if schema in (None, "public") else f"{schema}.{type_name}"
-    column: Column[T | None] = Column(sql_type, (tuple,), name, decoder=py_type)
-    return column
+    # dict too: the form py_type=dict reads back must be writable (Q9).
+    column: Column[T | None] = Column(sql_type, (tuple, dict), name, decoder=py_type)
+    return _json(column, _composite_json(py_type))

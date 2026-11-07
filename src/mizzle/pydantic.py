@@ -23,13 +23,17 @@ Models only carry the fields a client sent: ``values(model)`` / ``set(model)`` u
 from __future__ import annotations
 
 import re
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
+from datetime import date
 from decimal import Decimal
 from types import GenericAlias
 from typing import Annotated, Any, Literal, cast
 
+from asyncpg import BitString, Range
+
 try:
     import pydantic
+    from pydantic_core import to_jsonable_python
 except ImportError as exc:  # pragma: no cover - exercised only without the extra
     raise ImportError('mizzle.pydantic needs pydantic: pip install "mizzle[pydantic]"') from exc
 
@@ -65,7 +69,7 @@ def column_type(column: ColumnBase) -> object:
         return Annotated[Decimal, pydantic.Field(max_digits=digits, decimal_places=places)]
     if base is float:
         return float
-    kinds = tuple(_pydantic_type(kind) for kind in column.accepts)
+    kinds = tuple(_pydantic_type(kind, column.json_decoder) for kind in column.accepts)
     # inet holds addresses, interfaces and networks of both IP versions (C35).
     union = kinds[0]
     for kind in kinds[1:]:
@@ -73,19 +77,41 @@ def column_type(column: ColumnBase) -> object:
     return union
 
 
-def _pydantic_type(kind: type) -> object:
+def _range_json(value: object) -> list[object]:
+    r = cast("Range[int | Decimal | date]", value)
+    bounds = to_jsonable_python(r.lower), to_jsonable_python(r.upper)
+    return [*bounds, r.lower_inc, r.upper_inc, r.isempty]
+
+
+# JSON forms (Q14): what the field dumps to and the JSON type it reads back from. These are
+# the forms a relational query nests the values as, so the column's json_decoder parses them.
+_JSON_FORMS: dict[type, tuple[type, Callable[[object], object]]] = {
+    Range: (list, _range_json),
+    BitString: (str, lambda b: cast(BitString, b).as_string()),
+}
+
+
+def _pydantic_type(kind: type, parse: Callable[[object], object] | None) -> object:
     """``kind``, or an isinstance check when pydantic has no schema for it (asyncpg's
-    Range, Point, Box, BitString): such fields accept those objects as they are."""
+    Range, Point, Box, BitString): such fields accept those objects as they are, and Range
+    and BitString also their JSON form (``[lower, upper, lower_inc, upper_inc, empty]``,
+    ``"0101"``)."""
     try:
         pydantic.TypeAdapter(kind)
     except pydantic.PydanticSchemaGenerationError:
+        form = _JSON_FORMS.get(kind) if parse is not None else None
 
         def check(value: object) -> object:
-            if not isinstance(value, kind):
-                raise ValueError(f"expected {kind.__module__}.{kind.__qualname__}")
-            return value
+            if isinstance(value, kind):
+                return value
+            if form is not None and parse is not None and isinstance(value, form[0]):
+                return parse(value)
+            raise ValueError(f"expected {kind.__module__}.{kind.__qualname__}")
 
-        return Annotated[object, pydantic.PlainValidator(check)]
+        if form is None:
+            return Annotated[object, pydantic.PlainValidator(check)]
+        dump = pydantic.PlainSerializer(form[1], when_used="json")
+        return Annotated[object, pydantic.PlainValidator(check), dump]
     return kind
 
 
