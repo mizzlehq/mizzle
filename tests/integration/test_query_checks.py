@@ -46,8 +46,6 @@ from mizzle.pg import (
     double_precision,
     inet,
     interval,
-    json,
-    jsonb,
     numeric,
 )
 from tests.models import Users
