@@ -8,8 +8,9 @@ verified JWT. Endpoints under "signed in" run as the ``shop_authenticated`` role
 user's claims, so PostgreSQL's row-level security decides which rows they see.
 """
 
-import asyncio
+import csv
 import datetime
+import io
 import json
 import os
 import uuid
@@ -17,8 +18,7 @@ from collections.abc import AsyncGenerator, AsyncIterator
 from contextlib import asynccontextmanager
 from decimal import Decimal
 from pathlib import Path
-from typing import Annotated, Any, Literal, final
-from typing import cast as type_cast
+from typing import Annotated, final
 
 from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Query, Request, status
 from fastapi.responses import JSONResponse, Response, StreamingResponse
@@ -31,7 +31,6 @@ from mizzle import (
     Expr,
     ForeignKeyViolation,
     QueryTimeout,
-    Reconnected,
     SerializationFailure,
     Session,
     Table,
@@ -134,7 +133,6 @@ from shop.schema_types import ProductsInsert
 from shop.vectors import ProductEmbeddings
 
 ROOT = Path(__file__).resolve().parent.parent
-PRICE_CHANNEL = "shop_price"
 WAREHOUSES = ("main", "backup")  # orders take stock from these, in this order
 
 
@@ -360,17 +358,14 @@ async def bulk_products(db: DB, me: Me, store_id: int, body: list[ProductIn]) ->
 async def load_inventory(
     db: DB, me: Me, store_id: int, body: dict[int, dict[str, int]]
 ) -> BulkResult:
-    """Load stock for new products with COPY: {product_id: {warehouse: quantity}}."""
+    """Load stock for new products: {product_id: {warehouse: quantity}}, all rows or none."""
     await own_store(db, me, store_id)
     rows = [
         {"product_id": pid, "warehouse": w, "quantity": q}
         for pid, stock in body.items()
         for w, q in stock.items()
     ]
-    loaded = await db.copy_into(
-        Inventory, rows, columns=[Inventory.product_id, Inventory.warehouse, Inventory.quantity]
-    )
-    return BulkResult(rows=loaded)
+    return BulkResult(rows=await db.insert_many(Inventory, rows))
 
 
 @router.get("/products/search")
@@ -415,19 +410,17 @@ async def search(
 
 @router.get("/products/export.csv")
 async def export_csv(db: DB, store_id: int) -> Response:
-    chunks: list[bytes] = []
-
-    async def write(chunk: bytes) -> None:
-        chunks.append(chunk)
-
-    query = (
+    rows = await (
         db.select(Products.sku, Products.name, Products.price)
         .from_(Products)
         .where(eq(Products.store_id, store_id))
         .order_by(Products.sku)
     )
-    await db.copy_from(query, write, header=True)
-    return Response(b"".join(chunks), media_type="text/csv")
+    out = io.StringIO()
+    writer = csv.writer(out, lineterminator="\n")
+    writer.writerow(["sku", "name", "price"])
+    writer.writerows(rows)
+    return Response(out.getvalue(), media_type="text/csv")
 
 
 @router.get("/products/stream")
@@ -471,7 +464,7 @@ async def product_detail(db: DB, st: St, product_id: int) -> ProductDetail:
 
 @router.patch("/products/{product_id}")
 async def update_product(db: DB, me: Me, product_id: int, body: ProductPatch) -> ProductOut:
-    """A price change fires the products_price_changed trigger (NOTIFY + notification)."""
+    """A price change fires the products_price_changed trigger (a notification for the owner)."""
     owned = db.select(Stores.id).from_(Stores).where(eq(Stores.owner_id, me.id))
     updated = await (
         db.update(Products)
@@ -775,28 +768,6 @@ async def read_all(db: DB, me: Me) -> int:
     """Updates "all rows": the policy limits it to the caller's."""
     async with signed_in(db, me) as tx:
         return await tx.update(Notifications).set(read_at=sql("now()")).all_rows()
-
-
-@router.get("/events/prices")
-async def price_events(
-    db: DB,
-    n: Annotated[int, Query(ge=1, le=100)],
-    timeout: float = 5.0,
-    overflow: Literal["raise", "drop_oldest", "block"] = "block",
-) -> list[dict[str, Any]]:
-    """The next ``n`` price changes (LISTEN; reconnects if the connection drops)."""
-    got: list[dict[str, Any]] = []
-    async with (
-        asyncio.timeout(timeout),
-        db.listen(PRICE_CHANNEL, reconnect=True, max_queue=n, overflow=overflow) as events,
-    ):
-        async for event in events:
-            if isinstance(event, Reconnected):
-                continue
-            got.append(type_cast(dict[str, Any], json.loads(event.payload)))
-            if len(got) == n:
-                break
-    return got
 
 
 # -- stats ----------------------------------------------------------------------------

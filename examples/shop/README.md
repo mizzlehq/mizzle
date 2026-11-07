@@ -51,9 +51,8 @@ SHOP_URL=$P:54331/mizzle SHOP_REPLICA_URL=$P:54332/mizzle uv run pytest -s
 SHOP_URL=$P:54335/mizzle uv run pytest -s
 # TLS only, Pacific/Chatham time zone, DMY dates, extra_float_digits=0
 SHOP_URL="$P:54334/mizzle?sslmode=require" uv run pytest -s
-# PgBouncer in transaction mode (listen() refuses) and in session mode (it works)
-SHOP_URL=$P:54331/mizzle SHOP_BOUNCER_URL=$P:54333/mizzle \
-  MIZZLE_PGBOUNCER_SESSION_URL=$P:54337/mizzle uv run pytest -s
+# PgBouncer in transaction mode
+SHOP_URL=$P:54331/mizzle SHOP_BOUNCER_URL=$P:54333/mizzle uv run pytest -s
 
 # restart the primary under load, and a 10-minute soak
 SHOP_URL=$P:54331/mizzle SHOP_REPLICA_URL=$P:54332/mizzle \
@@ -67,7 +66,7 @@ uv run basedpyright
 
 - `tests/test_api.py`: every endpoint, with exact checks on the data.
 - `tests/test_runtime.py`: replicas (and a replica going away), killed connections,
-  session reset, LISTEN queue limits and reconnects, COPY, streaming, transactions,
+  session reset, bulk inserts, streaming, transactions,
   timeouts, retries, prepared statements.
 - `tests/test_migrations.py`: the CLI from zero (version 1 is rebuilt from the `# v2`
   markers in `shop/schema.py`), four processes migrating at once, the version 2 change,
