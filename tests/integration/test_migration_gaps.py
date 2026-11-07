@@ -1858,6 +1858,14 @@ def k6_table(kind: str) -> type[Table]:
                     return [index("k6t_ix").on(sql("mg.k6f(a)"))]
                 case "partial":
                     return [index("k6t_px").on(cls.a).where(sql("mg.k6f(a) > 0"))]
+                case "exclusion":
+                    return [exclusion((sql("mg.k6f(a)"), "="), name="k6t_ex", using="btree")]
+                case "exclusion where":
+                    return [
+                        exclusion(
+                            (cls.a, "="), name="k6t_xw", using="btree", where=sql("mg.k6f(a) > 0")
+                        )
+                    ]
                 case _:
                     return []
 
@@ -1867,13 +1875,16 @@ def k6_table(kind: str) -> type[Table]:
     return K6
 
 
-@pytest.mark.parametrize("kind", ["check", "default", "index", "partial", "generated"])
+@pytest.mark.parametrize(
+    "kind", ["check", "default", "index", "partial", "generated", "exclusion", "exclusion where"]
+)
 @pytest.mark.parametrize("then", ["kept", "removed", "table dropped"])
 async def test_function_result_type_changes_under_its_callers(
     driver: PostgresDriver, kind: str, then: str
 ) -> None:
     # K4-26: DROP FUNCTION (CREATE OR REPLACE cannot change the result type) came before the
-    # index or generated column calling it was dropped, or was not dropped at all.
+    # index or generated column calling it was dropped, or was not dropped at all. K4-28:
+    # an exclusion constraint too.
     v1 = snap([k6_table(kind)], [k6_function("integer")])
     await migrate(driver, empty_snapshot("postgresql"), v1)
     await execute(driver, "INSERT INTO mg.k6t (a) VALUES (3)")
@@ -1884,6 +1895,91 @@ async def test_function_result_type_changes_under_its_callers(
         assert row["a"] == 3
         if kind in ("default", "generated"):
             assert row["b"] in (1, 3)
+
+
+@pytest.mark.parametrize("then", ["removed", "table dropped"])
+async def test_virtual_column_under_a_function_whose_result_type_changes(
+    driver: PostgresDriver, then: str
+) -> None:
+    # K4-30: a VIRTUAL column (which cannot be made plain) seemingly calling a function
+    # dropped and created again stopped generate. mg.abs is never what abs(a) calls (and a
+    # VIRTUAL column cannot call a user-defined function), but the word search sees it.
+    if await server_version(driver) < 180000:
+        pytest.skip("VIRTUAL is PostgreSQL 18+")
+
+    def abs_fn(returns: str) -> Function:
+        return function(
+            "abs", schema="mg", returns=returns, args="x integer", body="BEGIN RETURN x; END"
+        )
+
+    @final
+    class Virt(Table, name="k30t", schema="mg"):
+        a = integer()
+        b = integer()
+
+    @final
+    class Plain(Table, name="k30t", schema="mg"):
+        a = integer()
+
+    Virt.__table__.columns["b"].computed = Computed(sql("abs(a)"), stored=False)
+    Virt.__table__.columns["b"].generated = True
+    v1 = snap([Virt], [abs_fn("integer")])
+    await migrate(driver, empty_snapshot("postgresql"), v1)
+    tables: list[type[Table]] = [Plain] if then == "removed" else []
+    await migrate(driver, v1, snap(tables, [abs_fn("bigint")]))
+
+
+def k27(returns: str, *, cycle: bool = False) -> list[SchemaObject]:
+    """mg.k27_code, a domain whose CHECK and DEFAULT call mg.k27_score, and mg.k27_len,
+    which takes the domain."""
+    return [
+        function(
+            "k27_score",
+            schema="mg",
+            args=f"v {'mg.k27_code' if cycle else 'text'}",
+            returns=returns,
+            volatility="immutable",
+            body="BEGIN RETURN length(v); END",
+        ),
+        domain(
+            "k27_code",
+            schema="mg",
+            as_="text",
+            default="mg.k27_score('ab'::text)::text",
+            check="mg.k27_score(VALUE) > 0",
+        ),
+        function(
+            "k27_len",
+            schema="mg",
+            args="v mg.k27_code",
+            returns="integer",
+            body="BEGIN RETURN length(v); END",
+        ),
+    ]
+
+
+async def test_domain_check_calling_a_function(driver: PostgresDriver) -> None:
+    # K4-27: domains were created before functions, so CREATE DOMAIN failed on a CHECK
+    # calling one; DROP FUNCTION failed while the domain (dropped later) or its CHECK still
+    # called it.
+    @final
+    class Coded(Table, name="k27t", schema="mg"):
+        id = integer().primary_key()
+        code = pg_domain("k27_code", str, schema="mg")
+
+    v1 = snap([Coded], k27("integer"))
+    await migrate(driver, empty_snapshot("postgresql"), v1)
+    await execute(driver, "INSERT INTO mg.k27t (id) VALUES (1)")
+    with pytest.raises(DatabaseError, match="k27_code"):
+        await execute(driver, "INSERT INTO mg.k27t (id, code) VALUES (2, '')")
+    await migrate(driver, v1, v2 := snap([Coded], k27("bigint")))  # its result type changes
+    with pytest.raises(DatabaseError, match="k27_code"):
+        await execute(driver, "INSERT INTO mg.k27t (id, code) VALUES (2, '')")
+    [row] = await execute(driver, "SELECT mg.k27_len(code) AS n FROM mg.k27t")
+    assert row["n"] == 1  # the default: k27_score('ab')::text
+    await migrate(driver, v2, snap([]))
+    with pytest.raises(MigrationError, match="k27_code"):  # each needs the other first
+        diff(empty_snapshot("postgresql"), snap([], k27("integer", cycle=True)))
 
 
 async def test_view_recreated_under_a_sql_standard_function(driver: PostgresDriver) -> None:
@@ -2290,6 +2386,37 @@ async def test_function_types_named_like_a_keyword_the_server_lacks(
         normalized = await dialect.normalize_snapshot(conn, desired)
     assert sorted(current.get("functions", {})) == sorted(normalized.get("functions", {}))
     assert diff(current, normalized, normalized=True) == []
+
+
+async def test_casts_in_defaults_to_a_type_named_like_a_keyword(
+    driver: PostgresDriver, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # K4-29: K4-22 for the ::type casts in column and function argument defaults.
+    monkeypatch.setattr(ddl, "_KEYWORDS", ddl._KEYWORDS | {"k4_word"})
+    word = 'mg."k4_word"'
+
+    @final
+    class Worded(Table, name="k4_worded", schema="mg"):
+        id = integer().primary_key()
+        v = array(pg_enum(Q4Color, type_name="k4_word", schema="mg")).default(
+            sql(f"ARRAY['red'::{word}]")
+        )
+
+    pick = function(
+        "k4_pick",
+        schema="mg",
+        args=f"v {word} DEFAULT 'blue'::{word}",
+        returns=word,
+        body="BEGIN RETURN v; END",
+    )
+    desired = snap([Worded], objects=[pick])
+    await migrate(driver, empty_snapshot("postgresql"), desired)
+    current = await live(driver)
+    assert current["tables"]["mg.k4_worded"]["columns"]["v"]["default"] == f"ARRAY['red'::{word}]"
+    assert diff(current, desired, compare_expressions=False) == []
+    assert ddl.requote_casts("'a::k4_word'::k4_word[]", ddl._KEYWORDS - {"k4_word"}) == (
+        "'a::k4_word'::\"k4_word\"[]"
+    )
 
 
 def test_requote_type() -> None:

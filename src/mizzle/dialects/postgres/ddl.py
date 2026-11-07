@@ -34,6 +34,7 @@ from mizzle.core.sql.nodes import Node
 from mizzle.core.steps import (
     AddCheck,
     AddColumn,
+    AddDomainChecks,
     AddEnumValue,
     AddExclusion,
     AddForeignKey,
@@ -66,6 +67,7 @@ from mizzle.core.steps import (
     DropComposite,
     DropConstraint,
     DropDomain,
+    DropDomainChecks,
     DropEnum,
     DropExtension,
     DropFunction,
@@ -200,9 +202,24 @@ def requote_args(args: str, server_keywords: frozenset[str]) -> str:
         match = _ARG.fullmatch(arg)
         if match is None:  # a type of several words: never a keyword
             return arg
-        return match["head"] + requote_type(match["type"], server_keywords) + match["tail"]
+        tail = requote_casts(match["tail"], server_keywords)
+        return match["head"] + requote_type(match["type"], server_keywords) + tail
 
     return ", ".join(one(a) for a in _split_args(args))
+
+
+# A string literal or quoted name (kept as is), or the type of a ::cast.
+_CAST = re.compile(rf"""'(?:[^']|'')*'|"(?:[^"]|"")*"|::(?P<type>{_TYPE_PATH.pattern})""")
+
+
+def requote_casts(text: str, server_keywords: frozenset[str]) -> str:
+    """Default text with the type of each ``::`` cast requoted (K4-29)."""
+
+    def one(match: re.Match[str]) -> str:
+        cast_type = match["type"]
+        return match[0] if cast_type is None else "::" + requote_type(cast_type, server_keywords)
+
+    return _CAST.sub(one, text)
 
 
 def requote_returns(returns: str, server_keywords: frozenset[str]) -> str:
@@ -689,6 +706,22 @@ def render_step(step: Step) -> Statement:
             return Statement(_create_domain(domain))
         case DropDomain(schema=schema, name=name):
             return Statement(f"DROP DOMAIN {qualified(schema, name)}")
+        case DropDomainChecks(schema=schema, name=name):
+            target = qualified(schema, name)
+            drop = f"ALTER DOMAIN {target} DROP CONSTRAINT %I"
+            return Statement(
+                f"DO $mizzle$ DECLARE c name; BEGIN\nALTER DOMAIN {target} DROP DEFAULT;\n"
+                "FOR c IN SELECT conname FROM pg_constraint WHERE contype = 'c' "
+                f"AND contypid = {_literal(target)}::regtype LOOP\n"
+                f"EXECUTE format({_literal(drop)}, c);\nEND LOOP;\nEND $mizzle$"
+            )
+        case AddDomainChecks(domain=domain):
+            target = qualified(domain["schema"], domain["name"])
+            changes = [f"ADD CHECK ({check})" for check in domain.get("checks", [])]
+            if default := domain.get("default"):
+                changes.insert(0, f"SET DEFAULT {default_sql(default)}")
+            body = "".join(f"ALTER DOMAIN {target} {a};\n" for a in changes)
+            return Statement(f"DO {_dollar_quote(f'BEGIN\n{body}END')}")
         case CreateComposite(composite=composite):
             return Statement(_create_composite(composite))
         case DropComposite(schema=schema, name=name):

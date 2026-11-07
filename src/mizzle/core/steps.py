@@ -136,6 +136,30 @@ class DropDomain(Step):
 
 
 @dataclass(frozen=True)
+class DropDomainChecks(Step):
+    """Drop a domain's CHECKs and DEFAULT, which call a function about to be dropped (and
+    maybe created again); ``AddDomainChecks`` puts them back (K4-27)."""
+
+    schema: str
+    name: str
+
+    @override
+    def describe(self) -> str:
+        return f"drop checks of domain {self.name}"
+
+
+@dataclass(frozen=True)
+class AddDomainChecks(Step):
+    """The CHECKs and DEFAULT of ``domain``, once the functions they call exist (K4-27)."""
+
+    domain: DomainSnap
+
+    @override
+    def describe(self) -> str:
+        return f"add checks to domain {self.domain['name']}"
+
+
+@dataclass(frozen=True)
 class CreateComposite(Step):
     composite: CompositeSnap
 

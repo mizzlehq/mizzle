@@ -50,6 +50,7 @@ from mizzle.dialects.postgres.ddl import (
     qualified,
     quote,
     requote_args,
+    requote_casts,
     requote_returns,
     requote_type,
     sql_standard_body,
@@ -664,8 +665,12 @@ def _requote_types(snapshot: Snapshot, server_keywords: frozenset[str]) -> None:
     relations = [*snapshot["tables"].values(), *snapshot.get("views", {}).values()]
     for column in (c for r in relations for c in r["columns"].values()):
         column["type"] = requote_type(column["type"], server_keywords)
+        if (default := column["default"]) is not None:  # K4-29
+            column["default"] = requote_casts(default, server_keywords)
     for domain in snapshot.get("domains", {}).values():
         domain["base_type"] = requote_type(domain["base_type"], server_keywords)
+        if (domain_default := domain.get("default")) is not None:
+            domain["default"] = requote_casts(domain_default, server_keywords)
     for field in (f for c in snapshot.get("composites", {}).values() for f in c["fields"]):
         field["type"] = requote_type(field["type"], server_keywords)
     if functions := snapshot.get("functions"):  # K4-25

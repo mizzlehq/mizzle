@@ -29,6 +29,7 @@ from mizzle.core.snapshot import (
 from mizzle.core.steps import (
     AddCheck,
     AddColumn,
+    AddDomainChecks,
     AddEnumValue,
     AddExclusion,
     AddForeignKey,
@@ -62,6 +63,7 @@ from mizzle.core.steps import (
     DropComposite,
     DropConstraint,
     DropDomain,
+    DropDomainChecks,
     DropEnum,
     DropExtension,
     DropFunction,
@@ -902,6 +904,7 @@ def diff(
     touched |= _changed_tables(plan)
     touched |= _diff_views(old, new, plan, touched, compare_expressions)
     _defer_calls(plan, old_tables, new)
+    _defer_domain_calls(plan, old, new)
     plan.create_functions_early = _restore_after(plan.create_functions_early, plan.keep_grants)
     plan.create_views = _restore_after(plan.create_views, plan.keep_grants)
     for k, table in new["tables"].items():
@@ -1161,6 +1164,20 @@ def _defer_calls(plan: _Plan, old_tables: Mapping[str, TableSnap], new: Snapshot
                 for s in plan.create_indexes
             ):
                 later.append(CreateIndex(schema, name, ix_again))
+        for ex in table.get("exclusions", {}).values():  # as the indexes (K4-28)
+            texts = [ex.get("where"), *(el.get("expression") for el in ex["elements"])]
+            if not _mentions(" ".join(filter(None, texts)), dropped):
+                continue
+            drop_ex = DropConstraint(schema, name, ex["name"], "exclusion")
+            plan.drop_constraints = [s for s in plan.drop_constraints if s != drop_ex]
+            plan.drop_calls.append(drop_ex)
+            ex_again = after.get("exclusions", {}).get(ex["name"]) if after else None
+            if ex_again is not None and not any(
+                isinstance(s, AddExclusion)
+                and (s.schema, s.table, s.exclusion["name"]) == (schema, name, ex["name"])
+                for s in plan.add_constraints
+            ):
+                later.append(AddExclusion(schema, name, ex_again))
         for col in table["columns"].values():  # no longer generated, or dropped (K4-26)
             gen = col.get("generated")
             col_after = after["columns"].get(col["name"]) if after else None
@@ -1169,6 +1186,12 @@ def _defer_calls(plan: _Plan, old_tables: Mapping[str, TableSnap], new: Snapshot
                 or "generated" in (col_after or {})
                 or not _mentions(gen["expression"], dropped)
             ):
+                continue
+            if not gen["stored"]:  # cannot be made plain: dropped now, else rebuilt (K4-30)
+                if col_after is None:
+                    drop_col = DropColumn(schema, name, col["name"])
+                    plan.drop_columns = [s for s in plan.drop_columns if s != drop_col]
+                    plan.drop_calls.append(drop_col)
                 continue
             plain = AlterColumnGenerated(schema, name, col["name"], gen, None, col_after)
             plan.alter_columns = [s for s in plan.alter_columns if s != plain]
@@ -1190,6 +1213,51 @@ def _defer_calls(plan: _Plan, old_tables: Mapping[str, TableSnap], new: Snapshot
             ):
                 later.append(AlterColumnDefault(schema, name, col["name"], col_again["default"]))
     plan.create_calls += later
+
+
+def _domain_calls(d: DomainSnap) -> str:
+    return " ".join([*d.get("checks", []), d.get("default") or ""])
+
+
+def _defer_domain_calls(plan: _Plan, old: Snapshot, new: Snapshot) -> None:
+    """A domain is created before the functions (which may take it), so its CHECKs and
+    DEFAULT calling a function created here are added after it. Those calling a function
+    dropped here go first (the domain itself is dropped last), and come back after it if
+    the domain stays (K4-27)."""
+    made = [
+        s.function
+        for s in [*plan.create_functions_early, *plan.create_views]
+        if isinstance(s, CreateFunction)
+    ]
+    for i, step in enumerate(plan.domains):
+        if not isinstance(step, CreateDomain):
+            continue
+        d = step.domain
+        calls = [f for f in made if _mentions(_domain_calls(d), [f["name"]])]
+        if not calls:
+            continue
+        if takes := [f for f in calls if _mentions(f"{f['args']} {f['returns']}", [d["name"]])]:
+            raise MigrationError(
+                f"domain {d['name']} calls function {takes[0]['name']}, which takes or returns "
+                "the domain: one cannot be created before the other"
+            )
+        bare = copy.copy(d)
+        bare.pop("checks", None)
+        bare.pop("default", None)
+        plan.domains[i] = CreateDomain(bare)
+        plan.create_calls.append(AddDomainChecks(d))
+    dropped = {
+        s.name
+        for s in [*plan.drop_functions, *plan.drop_views, *plan.drop_functions_late]
+        if isinstance(s, DropFunction)
+    }
+    new_domains = new.get("domains", {})
+    for k, d in old.get("domains", {}).items():
+        if not _mentions(_domain_calls(d), dropped):
+            continue
+        plan.drop_calls.append(DropDomainChecks(d["schema"], d["name"]))
+        if (again := new_domains.get(k)) is not None:
+            plan.create_calls.append(AddDomainChecks(again))
 
 
 def _changed_tables(plan: _Plan) -> set[str]:
