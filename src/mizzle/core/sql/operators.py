@@ -344,7 +344,10 @@ def all_[T](values: object) -> Expr[T]:
 def _container(value: object, like: object = None) -> Node:
     column = column_of(like) if like is not None else None
     on_json = column is not None and column.sql_type in ("jsonb", "json")
-    on_array = column is not None and column.item is not None
+    # A multirange is a list of ranges too, not a text[] (Q4-19).
+    on_array = column is not None and (
+        column.item is not None or column.sql_type.endswith("multirange")
+    )
     if isinstance(value, Placeholder) and value.column is None and column is not None:
         # Typed like a literal value (Q5); on a range column it is a range, as PostgreSQL
         # infers it; a scalar bound needs cast(placeholder(...), integer()).
