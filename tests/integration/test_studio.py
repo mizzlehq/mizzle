@@ -1007,3 +1007,43 @@ def test_ddl_default_refuses_a_backslash() -> None:
 
     assert not ddl._DEFAULT.fullmatch("'\\' + ' ; create table pwned(); --'")
     assert ddl._DEFAULT.fullmatch("'it''s'")
+
+
+def test_read_only_refuses_functions_that_run_a_query_string(ro_url: str) -> None:
+    # C2: ts_stat() runs its argument as SQL, so a blocked call hid inside the string.
+    with make_client(ro_url, read_only=True) as client:
+        for sql in (
+            "select * from ts_stat('select to_tsvector(pg_terminate_' || 'backend(1)::text)')",
+            "select ts_rewrite('a'::tsquery, 'select 1')",
+            "select cursor_to_xml('c', 1, true, false, '')",
+        ):
+            response = client.post("/api/sql", json={"sql": sql}, headers=AUTH)
+            assert response.status_code == 403, (sql, response.text)
+
+
+async def test_read_only_refuses_a_direct_grant_on_a_server_function(
+    pg_url: str, ro_url: str
+) -> None:
+    # C2: GRANT EXECUTE ON pg_read_file gives a plain role the server role's ability.
+    with make_client(pg_url) as admin:
+        grant = f"grant execute on function pg_read_file(text) to {RO_ROLE}"
+        admin.post("/api/sql", json={"sql": grant}, headers=AUTH)
+        try:
+            assert "EXECUTE on pg_read_file()" in await server.privileged_roles(
+                PostgresDialect(), ro_url
+            )
+        finally:
+            revoke = f"revoke execute on function pg_read_file(text) from {RO_ROLE}"
+            admin.post("/api/sql", json={"sql": revoke}, headers=AUTH)
+    assert await server.privileged_roles(PostgresDialect(), ro_url) == []
+
+
+def test_an_empty_bearer_is_not_a_failed_login(
+    pg_url: str, driver: PostgresDriver, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # C3: the UI behind --auth sent "Bearer " with no token; it must not count as a guess.
+    monkeypatch.setattr(server, "LOGIN_MAX_FAILURES", 2)
+    with make_client(pg_url, address="10.0.0.9") as client:
+        for _ in range(5):
+            assert client.get("/api/meta", headers={"Authorization": "Bearer "}).status_code == 401
+        assert client.get("/api/meta", headers=AUTH).status_code == 200

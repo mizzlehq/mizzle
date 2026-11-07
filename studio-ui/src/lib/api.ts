@@ -112,6 +112,10 @@ function readToken(): string {
 
 const token = readToken()
 
+// With no token (a remote Studio behind --auth), send no Authorization header: setting
+// one stops the browser from answering the Basic auth challenge itself.
+const auth: Record<string, string> = token ? { Authorization: `Bearer ${token}` } : {}
+
 export class ApiError extends Error {
   status: number
 
@@ -125,7 +129,7 @@ async function request<T>(method: string, path: string, body?: unknown): Promise
   const response = await fetch(path, {
     method,
     headers: {
-      Authorization: `Bearer ${token}`,
+      ...auth,
       ...(body === undefined ? {} : { "Content-Type": "application/json" }),
     },
     body: body === undefined ? undefined : JSON.stringify(body),
@@ -142,7 +146,7 @@ async function request<T>(method: string, path: string, body?: unknown): Promise
 }
 
 async function requestBlob(path: string): Promise<Blob> {
-  const response = await fetch(path, { headers: { Authorization: `Bearer ${token}` } })
+  const response = await fetch(path, { headers: auth })
   if (!response.ok) {
     const data: unknown = await response.json().catch(() => ({}))
     const message =

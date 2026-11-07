@@ -101,7 +101,9 @@ _READ_ONLY_DENIED_CALLS = re.compile(
     r"|pg_cancel_backend|pg_reload_conf|pg_rotate_logfile|pg_switch_wal|pg_promote"
     r"|pg_notify|pg_\w*replication_slot\w*|pg_logical_\w+|pg_log_backend_memory_contexts"
     r"|lo_import|lo_export|dblink|dblink_exec|pg_file_write|pg_file_rename|pg_file_unlink"
-    r"|query_to_xml\w*)\b"
+    r"|query_to_xml\w*"
+    # These run a query given as text, so any blocked call hides inside the string (C2).
+    r"|ts_stat|ts_rewrite|cursor_to_xml\w*)\b"
     r"|\bU&\"",
     re.IGNORECASE,
 )
@@ -122,6 +124,33 @@ _PRIVILEGED_SQL = (
     "WHERE (pg_has_role(session_user, oid, 'MEMBER') "
     "OR pg_has_role(current_user, oid, 'MEMBER')) AND (rolsuper OR rolreplication "
     f"OR rolname IN ({', '.join(repr(r) for r in _PRIVILEGED_ROLES)})) ORDER BY rolname"
+)
+
+# Server-side functions PostgreSQL does not grant to PUBLIC. A direct GRANT EXECUTE on one
+# gives the abilities of the server roles above without their membership (C2).
+_SERVER_FUNCTIONS = (
+    "pg_read_file",
+    "pg_read_binary_file",
+    "pg_stat_file",
+    "pg_ls_dir",
+    "pg_ls_logdir",
+    "pg_ls_waldir",
+    "pg_ls_tmpdir",
+    "pg_ls_archive_statusdir",
+    "pg_reload_conf",
+    "pg_rotate_logfile",
+    "pg_promote",
+    "pg_switch_wal",
+    "lo_import",
+    "lo_export",
+)
+_SERVER_FUNCTIONS_SQL = (
+    "SELECT DISTINCT p.proname::text FROM pg_proc p "
+    "JOIN pg_namespace n ON n.oid = p.pronamespace "
+    f"WHERE n.nspname = 'pg_catalog' AND p.proname IN "
+    f"({', '.join(repr(f) for f in _SERVER_FUNCTIONS)}) "
+    "AND (has_function_privilege(session_user, p.oid, 'EXECUTE') "
+    "OR has_function_privilege(current_user, p.oid, 'EXECUTE')) ORDER BY 1"
 )
 
 log = logging.getLogger("mizzle")
@@ -885,7 +914,7 @@ class _Guard(BaseHTTPMiddleware):
         same wrong one again, is not guessing. A tab still holding the token of an earlier
         Studio run re-sends it on every reload, and on loopback that locked out the real
         user, who shares the address (B68)."""
-        if not given:
+        if given.strip() in (b"", b"Bearer", b"Basic"):  # no credential at all (C3)
             return
         now = time.monotonic()
         digest = hashlib.sha256(given).digest()
@@ -1044,18 +1073,21 @@ def create_app(
 
 
 async def _privileged(conn: Connection) -> list[str]:
-    """The roles that give the current user server-side abilities (empty when none)."""
+    """The roles and function grants that give the current user server-side abilities
+    (empty when none)."""
     names: list[str] = []
     for name, superuser, replication in await conn.fetch(_PRIVILEGED_SQL, []):
         suffix = " (superuser)" if superuser else " (replication)" if replication else ""
         names.append(f"{name}{suffix}")
+    for (name,) in await conn.fetch(_SERVER_FUNCTIONS_SQL, []):
+        names.append(f"EXECUTE on {name}()")
     return names
 
 
 def _refuse_privileged(names: Sequence[str]) -> None:
     if names:
         raise MigrationError(
-            "refusing to start read-only Studio: the database role is or can become "
+            "refusing to start read-only Studio: the database role is, can become or has "
             f"{', '.join(names)}, which can act on the server from inside a read-only "
             "transaction (read files, run programs, signal backends). Connect as a role "
             "without these privileges."

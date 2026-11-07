@@ -272,8 +272,10 @@ matters because a browser attaches cached Basic credentials to a form post from 
 do on the server (read files, run programs, signal other backends). So read-only Studio
 refuses to start when the login role, or the role it switches to, is a superuser, has
 `REPLICATION`, or is a member of `pg_read_server_files`, `pg_write_server_files`,
-`pg_execute_server_program`, `pg_signal_backend` or `pg_maintain`. Create a plain role for
-it:
+`pg_execute_server_program`, `pg_signal_backend` or `pg_maintain`, or has a direct
+`EXECUTE` grant on a server-side function such as `pg_read_file`. Create a plain role for
+it, used by nothing else: any role may cancel or terminate the sessions of its own role, so
+a role the application also uses lets read-only Studio stop the application's sessions. For example:
 
 ```sql
 CREATE ROLE studio_ro LOGIN PASSWORD '...';
