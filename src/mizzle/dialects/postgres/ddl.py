@@ -178,14 +178,20 @@ def requote_casts(text: str, server_keywords: frozenset[str]) -> str:
     return _CAST.sub(one, text)
 
 
+_TYPE_NAME = re.compile(r"([A-Za-z_][A-Za-z0-9_$ .]*?)\s*(\(.*\))?")
+
+
 def normalize_type(sql_type: str) -> str:
     """``varchar(255)`` -> ``character varying(255)``, ``numeric(10, 2)`` -> ``numeric(10,2)``,
-    ``integer[][]`` -> ``integer[]`` (PostgreSQL has one array type per element; Q5-8)."""
-    sql_type, array = _array_base(sql_type)
-    match = re.fullmatch(r"([a-z ]+?)\s*(\(.*\))?", sql_type.strip())
+    ``integer[][]`` -> ``integer[]`` (PostgreSQL has one array type per element; Q5-8).
+    Unquoted names fold to lower case, and ``public.`` goes, as format_type() prints them
+    (K6-4): ``VARCHAR(10)``, ``int4[]``, ``public.posint``. A quoted name stays as written."""
+    sql_type, array = _array_base(sql_type.strip())
+    match = _TYPE_NAME.fullmatch(sql_type.strip())
     if match is None:
         return sql_type + array
-    base, args = match.group(1), match.group(2) or ""
+    base, args = " ".join(match.group(1).lower().split()), match.group(2) or ""
+    base = base.removeprefix("pg_catalog.").removeprefix(f"{DEFAULT_SCHEMA}.")
     base = _TYPE_ALIASES.get(base, base)
     args = args.replace(" ", "")
     if args and base.startswith(("timestamp with", "time with")):  # also "...without"
@@ -734,21 +740,37 @@ def render_step(step: Step) -> Statement:
 
 
 _SAVED = "pg_temp.__mizzle_saved"
+_SAVED_SQL = "pg_temp.__mizzle_saved_sql"
 
 
 def _save_grants(name: str) -> str:
     """Keep a relation's ACL, owner and comment in a temporary table for _restore_grants:
-    a view that is dropped and created again would lose them."""
+    a view that is dropped and created again would lose them. So would its column grants,
+    triggers and rules (not managed, K6-1): kept as the statements that make them again."""
     rel = _literal(name)
+    grantee = (
+        "CASE WHEN g.grantee = 0 THEN 'PUBLIC' ELSE quote_ident(pg_get_userbyid(g.grantee)) END"
+    )
     return (
         "DO $mizzle$ BEGIN\n"
         f"CREATE TEMP TABLE IF NOT EXISTS __mizzle_saved "
         "(rel text PRIMARY KEY, acl aclitem[], owner oid, comment text);\n"
+        "CREATE TEMP TABLE IF NOT EXISTS __mizzle_saved_sql (rel text, col name, stmt text);\n"
         f"INSERT INTO {_SAVED} SELECT {rel}, c.relacl, c.relowner, "
         "obj_description(c.oid, 'pg_class') FROM pg_class c "
         f"WHERE c.oid = {rel}::regclass\n"
         "ON CONFLICT (rel) DO UPDATE SET acl = EXCLUDED.acl, owner = EXCLUDED.owner, "
         "comment = EXCLUDED.comment;\n"
+        f"DELETE FROM {_SAVED_SQL} WHERE rel = {rel};\n"
+        f"INSERT INTO {_SAVED_SQL} SELECT {rel}, a.attname, format('GRANT %s (%I) ON %s TO %s%s', "
+        f"g.privilege_type, a.attname, {rel}, {grantee}, "
+        "CASE WHEN g.is_grantable THEN ' WITH GRANT OPTION' ELSE '' END) "
+        "FROM pg_attribute a, aclexplode(a.attacl) g "
+        f"WHERE a.attrelid = {rel}::regclass AND a.attacl IS NOT NULL;\n"
+        f"INSERT INTO {_SAVED_SQL} SELECT {rel}, NULL, pg_get_triggerdef(t.oid) "
+        f"FROM pg_trigger t WHERE t.tgrelid = {rel}::regclass AND NOT t.tgisinternal;\n"
+        f"INSERT INTO {_SAVED_SQL} SELECT {rel}, NULL, rtrim(pg_get_ruledef(r.oid), ';') "
+        f"FROM pg_rewrite r WHERE r.ev_class = {rel}::regclass AND r.rulename <> '_RETURN';\n"
         "END $mizzle$"
     )
 
@@ -779,6 +801,14 @@ def _restore_grants(name: str, kind: str) -> str:
         "IF s.comment IS NOT NULL THEN\n"
         f"  EXECUTE format('COMMENT ON {kind} %s IS %L', {rel}, s.comment);\n"
         "END IF;\n"
+        # Column grants on a column the view still has; triggers and rules fail the
+        # migration if the new view cannot carry them, never vanish.
+        f"FOR a IN SELECT stmt FROM {_SAVED_SQL} WHERE rel = {rel} AND (col IS NULL OR "
+        f"EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = {rel}::regclass "
+        "AND attname = col AND NOT attisdropped)) LOOP\n"
+        "  EXECUTE a.stmt;\n"
+        "END LOOP;\n"
+        f"DELETE FROM {_SAVED_SQL} WHERE rel = {rel};\n"
         f"DELETE FROM {_SAVED} WHERE rel = {rel};\n"
         "END $mizzle$"
     )
@@ -797,5 +827,36 @@ def _policy_body(policy: PolicySnap) -> str:
     return text
 
 
+def _rebuild_guard(step: DropColumn) -> str:
+    """Stop before a column is dropped to be added again if anything mizzle does not manage
+    uses it (column grants, exclusion constraints, triggers...): the drop would take it
+    silently (K6-7). What mizzle manages on it (keys, indexes, views) is gone by then."""
+    rel, col = _literal(qualified(step.schema, step.table)), _literal(step.name)
+    what = _literal(f"{step.table}.{step.name}")
+    return (
+        "DO $mizzle$ BEGIN\n"
+        "IF EXISTS (SELECT 1 FROM pg_attribute a WHERE a.attrelid = "
+        f"{rel}::regclass AND a.attname = {col} AND a.attacl IS NOT NULL)\n"
+        "OR EXISTS (SELECT 1 FROM pg_depend d JOIN pg_attribute a ON a.attrelid = d.refobjid "
+        "AND a.attnum = d.refobjsubid WHERE d.refclassid = 'pg_class'::regclass "
+        f"AND d.refobjid = {rel}::regclass AND a.attname = {col} AND d.deptype IN ('a', 'n') "
+        "AND d.classid <> 'pg_attrdef'::regclass "
+        "AND NOT EXISTS (SELECT 1 FROM pg_class s WHERE d.classid = 'pg_class'::regclass "
+        "AND s.oid = d.objid AND s.relkind = 'S') "
+        "AND NOT EXISTS (SELECT 1 FROM pg_constraint n WHERE d.classid = "
+        "'pg_constraint'::regclass AND n.oid = d.objid AND n.contype = 'n')) THEN\n"
+        f"  RAISE EXCEPTION 'column % is dropped and added again, which would drop the grants, "
+        "constraints or triggers on it that mizzle does not manage; this needs a custom "
+        f"migration', {what};\n"
+        "END IF;\n"
+        "END $mizzle$"
+    )
+
+
 def render(steps: Sequence[Step]) -> list[Statement]:
-    return [render_step(step) for step in steps]
+    out: list[Statement] = []
+    for step in steps:
+        if isinstance(step, DropColumn) and step.rebuilt:
+            out.append(Statement(_rebuild_guard(step)))
+        out.append(render_step(step))
+    return out

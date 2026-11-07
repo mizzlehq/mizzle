@@ -11,6 +11,8 @@ from __future__ import annotations
 import re
 from typing import Literal, NotRequired, TypedDict
 
+from mizzle.core.errors import SchemaError
+
 SNAPSHOT_VERSION = 1
 
 
@@ -177,6 +179,16 @@ class Snapshot(TypedDict):
 
 def key(schema: str, name: str) -> str:
     return f"{schema}.{name}"
+
+
+def check_schema_name(schema: str) -> None:
+    """A schema name with a dot would make keys ambiguous: public."x.y" and "public.x".y
+    are both ``public.x.y`` (K6-9)."""
+    if "." in schema:
+        raise SchemaError(
+            f"schema {schema!r}: names containing '.' are not supported in schema names; "
+            "rename or exclude the schema"
+        )
 
 
 # Defaults that are SQL keywords, not functions (current_user, current_timestamp(3)...).

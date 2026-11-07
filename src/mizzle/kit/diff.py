@@ -431,7 +431,7 @@ def _diff_table(
         for c, col in new["columns"].items()
         if c in old["columns"] and _rebuilt(old["columns"][c], col)
     ]:
-        plan.drop_rebuilt += [DropColumn(schema, name, c) for c in rebuilt]
+        plan.drop_rebuilt += [DropColumn(schema, name, c, rebuilt=True) for c in rebuilt]
         kept = _without_columns(old, rebuilt)
         # Dropped explicitly (DROP COLUMN would take them silently): keys other foreign keys
         # use are then re-created around it, and the rest is added again by the diff below.

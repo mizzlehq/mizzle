@@ -38,6 +38,7 @@ from mizzle.core.snapshot import (
     TableSnap,
     UniqueSnap,
     ViewSnap,
+    check_schema_name,
     empty_snapshot,
     key,
     sequence_defaults,
@@ -68,6 +69,7 @@ def build_snapshot(
         return [c.db_name(casing) for c in columns]
 
     def add_schema(schema: str) -> None:
+        check_schema_name(schema)
         if schema != default_schema and schema not in snapshot["schemas"]:
             snapshot["schemas"].append(schema)
 
