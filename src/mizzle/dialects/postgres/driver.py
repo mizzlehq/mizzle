@@ -239,6 +239,13 @@ def _aborted(phase: str) -> DatabaseError:
     )
 
 
+_ENDED = (
+    "the transaction was already ended by a COMMIT or ROLLBACK sent as raw SQL inside it, "
+    "so statements after that ran outside it (autocommit). Leave COMMIT and ROLLBACK to "
+    "the transaction block"
+)
+
+
 def _qualified(schema: str, name: str) -> str:
     return ".".join('"' + part.replace('"', '""') + '"' for part in (schema, name))
 
@@ -343,6 +350,9 @@ class PostgresConnection:
             except BaseException as exc:
                 body_error = exc
                 phase = "ROLLBACK TO SAVEPOINT" if nested else "ROLLBACK"
+                if not self._conn.is_in_transaction():
+                    exc.add_note(_ENDED)  # R4-4
+                    raise
                 await self._conn.execute(
                     f"ROLLBACK TO SAVEPOINT {name}; RELEASE SAVEPOINT {name}"
                     if nested
@@ -350,6 +360,8 @@ class PostgresConnection:
                 )
                 raise
             phase = "RELEASE SAVEPOINT" if nested else "COMMIT"
+            if not self._conn.is_in_transaction():
+                raise DatabaseError(_ENDED, sql=phase)  # a COMMIT here would report success (R4-4)
             if nested:
                 try:
                     await self._conn.execute(f"RELEASE SAVEPOINT {name}")

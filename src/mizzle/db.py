@@ -74,6 +74,31 @@ _REPLICA_PAUSE = 30.0
 
 # Pushed onto Session._savepoints when the transaction ends: statements are refused.
 _ENDED = object()
+# Replaces a savepoint's marker when its ROLLBACK TO / RELEASE was cancelled before or
+# while it ran: its state is unknown, so the transaction refuses statements and COMMIT (R4-1).
+_BROKEN = object()
+_ISOLATION_LEVELS: tuple[IsolationLevel, ...] = (
+    "read committed",
+    "repeatable read",
+    "serializable",
+)
+
+
+@final
+class _Marker:
+    """An open savepoint; knows its transaction, so a task holding a marker of a
+    savepoint that has ended is refused there and nowhere else (R4-3)."""
+
+    __slots__ = ("savepoints",)
+
+    def __init__(self, savepoints: list[object]) -> None:
+        self.savepoints = savepoints
+
+
+_OPEN_SAVEPOINT = (
+    "a savepoint opened inside this block (by a task it started) is still open or was "
+    "interrupted, so the block was rolled back; await such tasks inside the block"
+)
 
 
 def _timeout_ok(seconds: float | None) -> bool:
@@ -694,6 +719,10 @@ class Session(QueryBuilder):
           original is re-raised, and the hook's error is attached as its context (or, when
           the original already has a context, as a note on it).
         """
+        if isolation is not None and isolation not in _ISOLATION_LEVELS:
+            raise QueryError(  # not a bare KeyError from the driver (R4-5)
+                f"unknown isolation level {isolation!r}; use one of {', '.join(_ISOLATION_LEVELS)}"
+            )
         if self._conn is not None:
             if isolation is not None or readonly:
                 raise QueryError("isolation and readonly apply to the outermost transaction only")
@@ -703,7 +732,7 @@ class Session(QueryBuilder):
             released = len(self._rollbacks)
             started = False
             savepoint = self._conn.transaction()
-            marker = object()
+            marker = _Marker(self._savepoints)
             with self._transaction_span(isolation):
                 try:
                     # SAVEPOINT, RELEASE and ROLLBACK TO run under the statement lock, so
@@ -723,18 +752,32 @@ class Session(QueryBuilder):
                         # task's statement queued for the lock would otherwise run inside
                         # the savepoint and be undone with it (R1).
                     except BaseException as exc:
+                        broken = False
                         try:
                             async with self._lock:
                                 if not await savepoint.__aexit__(type(exc), exc, exc.__traceback__):
                                     raise
+                        except asyncio.CancelledError as cancel:
+                            broken = cancel is not exc  # cancelled before / during ROLLBACK TO
+                            raise
                         finally:
-                            self._savepoints.remove(marker)
+                            self._end_marker(marker, broken)
                     else:
+                        broken = False
                         try:
                             async with self._lock:
+                                if self._savepoints[-1] is not marker:
+                                    # A task started inside still has a savepoint open (or
+                                    # one was interrupted): roll back, never release it (R4-2).
+                                    error = QueryError(_OPEN_SAVEPOINT)
+                                    await savepoint.__aexit__(QueryError, error, None)
+                                    raise error
                                 await savepoint.__aexit__(None, None, None)
+                        except asyncio.CancelledError:
+                            broken = True  # cancelled before / during RELEASE (R4-1)
+                            raise
                         finally:
-                            self._savepoints.remove(marker)
+                            self._end_marker(marker, broken)
                 except BaseException as original:
                     del self._deferred[committed:]
                     # Savepoints released inside this one are undone with it: their
@@ -789,10 +832,17 @@ class Session(QueryBuilder):
                                 raise
                     else:
                         async with tx._lock:
+                            still_open = bool(tx._savepoints)
                             # From here on the transaction refuses statements: one sent
                             # after COMMIT would run in autocommit on this connection, or
                             # on a pooled connection someone else now uses (R3).
                             tx._savepoints.append(_ENDED)
+                            if still_open:
+                                # A task's savepoint is still open (or was interrupted):
+                                # committing would keep rows it may yet undo (R4-1, R4-2).
+                                error = QueryError(_OPEN_SAVEPOINT)
+                                await block.__aexit__(QueryError, error, None)
+                                raise error
                             committing = True
                             await block.__aexit__(None, None, None)
                     done = True
@@ -892,6 +942,12 @@ class Session(QueryBuilder):
             self._check_savepoint_owner()
             yield conn
 
+    def _end_marker(self, marker: _Marker, broken: bool) -> None:
+        if broken:
+            self._savepoints[self._savepoints.index(marker)] = _BROKEN
+        else:
+            self._savepoints.remove(marker)
+
     def _check_savepoint_owner(self) -> None:
         """Refuse a statement that would land in another task's savepoint: a rollback of
         that savepoint would undo it silently (C11). Refuse any statement once the
@@ -900,6 +956,21 @@ class Session(QueryBuilder):
             raise QueryError(
                 "this transaction has ended; run the statement inside its "
                 "`async with db.transaction()` block, or on db"
+            )
+        if _BROKEN in self._savepoints:
+            raise QueryError(
+                "a savepoint of this transaction was cancelled before its ROLLBACK TO / "
+                "RELEASE completed, so its state is unknown; the transaction must roll back"
+            )
+        current = _SAVEPOINT.get()
+        if (
+            isinstance(current, _Marker)
+            and current.savepoints is self._savepoints
+            and current not in self._savepoints
+        ):
+            raise QueryError(  # R4-3
+                "the savepoint this task was started in has ended; its statements cannot "
+                "run in the transaction any more"
             )
         if self._savepoints and _SAVEPOINT.get() is not self._savepoints[-1]:
             raise QueryError(
