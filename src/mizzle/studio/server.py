@@ -39,10 +39,11 @@ from contextlib import aclosing, asynccontextmanager
 from dataclasses import dataclass, field
 from decimal import Decimal
 from pathlib import Path
-from typing import Protocol, cast, override
+from typing import ClassVar, Protocol, cast, override
 from urllib.parse import unquote
 
 from starlette.applications import Starlette
+from starlette.convertors import PathConvertor, register_url_convertor
 from starlette.middleware import Middleware
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
 from starlette.requests import Request
@@ -55,7 +56,7 @@ from mizzle.core.errors import DatabaseError, MigrationError, MizzleError
 from mizzle.core.query.base import Row
 from mizzle.core.snapshot import ColumnSnap, Snapshot, TableSnap, key
 from mizzle.dialects.base import Connection, Dialect, Driver
-from mizzle.dialects.postgres.ddl import SERIAL_TYPES, qualified, quote
+from mizzle.dialects.postgres.ddl import SERIAL_TYPES, quote
 from mizzle.kit.config import Config
 from mizzle.kit.migrate import apply_statements
 from mizzle.kit.sqltext import first_token, split_statements
@@ -236,6 +237,17 @@ class Studio:
             c: self.bases.get(k, {}).get(c, t["type"]) for c, t in table["columns"].items()
         }
 
+    async def checked_table(self, schema: str, name: str) -> tuple[TableSnap, dict[str, str]]:
+        """For a read: the cached table, re-read when its columns changed outside Studio. A
+        stale type decoded a column changed to jsonb as JSON, and saving that wrote numbers
+        back as strings (S5-4)."""
+        table, base = await self.table(schema, name)
+        async with self.pool().acquire() as conn:
+            rows = await conn.fetch_dicts(_BASE_TYPES + " AND c.relname = $2", [[schema], name])
+        if {str(r["name"]): str(r["base"]) for r in rows} != self.bases.get(key(schema, name), {}):
+            return await self.table(schema, name, fresh=True)
+        return table, base
+
     def read_only_columns(self, table: TableSnap) -> list[str]:
         """Composite columns: the grid shows them, but does not write them (S5-2)."""
         composites = self.composites.get(key(table["schema"], table["name"]), [])
@@ -334,7 +346,18 @@ _TYPMOD = re.compile(r'"(?:[^"]|"")*"|\(-?\d+(?:\s*,\s*-?\d+)?\)')
 _UNBOUNDED = {"character": "bpchar", "bit": "bit varying"}
 
 
-def _cast_type(column: ColumnSnap) -> str:
+# The interval type as format_type() prints it: interval, interval(3), interval day to
+# second(3), and arrays of them. Not a type that merely starts with "interval" (S5-3).
+_INTERVAL = re.compile(r"interval(?:\(\d+\)| [a-z ]+(?:\(\d+\))?)?((?:\[\])*)")
+
+
+def _relation(table: TableSnap) -> str:
+    """Always schema-qualified: ddl.qualified leaves public names bare, and a bare name
+    resolves through search_path, so a "$user" schema's same-named table was used (S5-1)."""
+    return f"{quote(table['schema'])}.{quote(table['name'])}"
+
+
+def _cast_type(column: ColumnSnap, base: str) -> str:
     """The column's type without its modifier. An explicit CAST to varchar(5) or
     numeric(5,2) cuts or rounds the value silently, so an insert stored "qwert" and a key
     filter matched the wrong row (C4). Without it, the column's own assignment and
@@ -343,10 +366,10 @@ def _cast_type(column: ColumnSnap) -> str:
     full = SERIAL_TYPES.get(column["type"], column["type"])
     bare = _TYPMOD.sub(lambda m: m.group(0) if m.group(0).startswith('"') else "", full)
     arrays = bare.count("[]")
-    base = bare.replace("[]", "").strip()
-    if base.startswith("interval"):  # "interval year to month" cuts the days off too
-        base = "interval"
-    return _UNBOUNDED.get(base, base) + "[]" * arrays
+    bare = bare.replace("[]", "").strip()
+    if interval := _INTERVAL.fullmatch(base):  # "interval year to month" cuts the days off
+        return "interval" + interval.group(1)
+    return _UNBOUNDED.get(bare, bare) + "[]" * arrays
 
 
 def _as_text(value: object) -> str | None:
@@ -399,10 +422,10 @@ def _param(params: list[object], column: ColumnSnap, value: object, base: str) -
         params.append(json.dumps(value))
         return (
             "(SELECT x.v FROM jsonb_to_record(jsonb_build_object("
-            f"'v', ${len(params)}::text::jsonb)) AS x(v {_cast_type(column)}))"
+            f"'v', ${len(params)}::text::jsonb)) AS x(v {_cast_type(column, base)}))"
         )
     params.append(_as_text(value))
-    return f"CAST(${len(params)}::text AS {_cast_type(column)})"
+    return f"CAST(${len(params)}::text AS {_cast_type(column, base)})"
 
 
 def _where(
@@ -617,7 +640,10 @@ async def _table(
     parts = path.split("/")
     if len(parts) < 6:
         raise StudioError("expected /api/tables/<schema>/<table>/...", 404)
-    return await studio.table(unquote(parts[-3]), unquote(parts[-2]), fresh=fresh)
+    schema, name = unquote(parts[-3]), unquote(parts[-2])
+    if fresh:
+        return await studio.table(schema, name, fresh=True)
+    return await studio.checked_table(schema, name)
 
 
 async def meta(studio: Studio, _request: Request) -> Response:
@@ -675,7 +701,7 @@ async def list_rows(studio: Studio, request: Request) -> Response:
     params: list[object] = []
     where = _where(table, base, filters, params)
     order_sql = _order_sql(table, base, q)
-    source = f"{qualified(table['schema'], table['name'])} AS t"
+    source = f"{_relation(table)} AS t"
     async with studio.pool().acquire() as conn:
         [total] = await conn.fetch(f"SELECT count(*) FROM {source}{where}", params)
         rows = await conn.fetch(
@@ -695,6 +721,7 @@ def _download_name(schema: str, table: str, fmt: str) -> str:
     """
     name = f"{schema}.{table}.{fmt}"
     ascii_name = name.encode("ascii", "replace").decode("ascii").replace('"', "_")
+    ascii_name = re.sub(r"[\x00-\x1f\x7f]", "_", ascii_name)  # S5-8: no CR/LF in a header
     from urllib.parse import quote as url_quote
 
     return f"attachment; filename=\"{ascii_name}\"; filename*=UTF-8''{url_quote(name, safe='')}"
@@ -719,7 +746,7 @@ async def export_rows(studio: Studio, request: Request) -> Response:
     params: list[object] = []
     where = _where(table, base, filters, params)
     order_sql = _order_sql(table, base, q)
-    source = f"{qualified(table['schema'], table['name'])} AS t"
+    source = f"{_relation(table)} AS t"
     row = _row_sql(base) if fmt == "csv" else _ROW  # JSON export: the server's own JSON
     sql = f"SELECT {row} FROM {source}{where}{order_sql}"
     headers = {
@@ -794,7 +821,7 @@ async def insert_row(studio: Studio, request: Request) -> Response:
     values = _object((await _body(request)).get("values", {}), "values")
     _reject_composites(studio, table, values)
     params: list[object] = []
-    target = f"{qualified(table['schema'], table['name'])} AS t"
+    target = f"{_relation(table)} AS t"
     if values:
         columns = [_column(table, c) for c in values]
         names = ", ".join(quote(c["name"]) for c in columns)
@@ -826,7 +853,7 @@ async def update_row(studio: Studio, request: Request) -> Response:
         f"{quote(c['name'])} = {_param(params, c, values[c['name']], base[c['name']])}"
         for c in (_column(table, name) for name in values)
     )
-    target = f"{qualified(table['schema'], table['name'])} AS t"
+    target = f"{_relation(table)} AS t"
     sql = f"UPDATE {target} SET {sets} WHERE {match} RETURNING {_row_sql(base)}"
     async with studio.pool().acquire() as conn, conn.transaction():
         rows = await conn.fetch(sql, params)
@@ -864,7 +891,7 @@ async def delete_rows(studio: Studio, request: Request) -> Response:
         for k in keys:
             params: list[object] = []
             match = _key_match(table, base, k, params)
-            sql = f"DELETE FROM {qualified(table['schema'], table['name'])} AS t WHERE {match}"
+            sql = f"DELETE FROM {_relation(table)} AS t WHERE {match}"
             count = await conn.execute(sql, params)
             _one_row(count)
             deleted += count
@@ -877,6 +904,9 @@ _NO_TRANSACTION_BLOCK = "25001"
 _TX_CONTROL = re.compile(
     r"(?:BEGIN|START|COMMIT|END|ROLLBACK|ABORT|SAVEPOINT|RELEASE|PREPARE)\b", re.IGNORECASE
 )
+# A procedure call or an anonymous block: either may COMMIT, which only works outside a
+# transaction block.
+_RUNS_ALONE = re.compile(r"(?:CALL|DO)\b", re.IGNORECASE)
 
 
 def _reject_read_only(statements: Sequence[str]) -> None:
@@ -930,26 +960,39 @@ async def run_sql(studio: Studio, request: Request) -> Response:
         await conn.execute(f"CLOSE {cursor}", [])
         return rows
 
+    async def statement_rows(conn: Connection, statement: str) -> list[Row]:
+        body = statement[first_token(statement) :]
+        if studio.read_only:  # already inside the READ ONLY transaction
+            return await first_rows(conn, statement)
+        if _TX_CONTROL.match(body) or _RUNS_ALONE.match(body):
+            # S4-2: BEGIN/COMMIT/ROLLBACK/SAVEPOINT run as written, never inside a
+            # transaction of ours (which committed the rows the user rolled back). S5-5: so
+            # do CALL and DO, which may COMMIT themselves (inside a BEGIN of the user's they
+            # run in it, as in psql). They return at most one row.
+            return await conn.fetch(statement, [])
+        # A cursor needs a transaction; each statement commits on its own (a savepoint
+        # inside a BEGIN of the user's).
+        try:
+            async with conn.transaction():
+                return await first_rows(conn, statement)
+        except DatabaseError as exc:
+            if exc.sqlstate != _NO_TRANSACTION_BLOCK:
+                raise
+            # VACUUM, CREATE DATABASE, ...: refused before they started, so running them on
+            # their own is safe. They return no rows.
+            return await conn.fetch(statement, [])
+
     async def run(conn: Connection) -> list[dict[str, object]]:
         results: list[dict[str, object]] = []
         for statement in statements:
-            if studio.read_only:  # already inside the READ ONLY transaction
-                rows = await first_rows(conn, statement)
-            elif _TX_CONTROL.match(statement[first_token(statement) :]):
-                # S4-2: BEGIN/COMMIT/ROLLBACK/SAVEPOINT run as written, never inside a
-                # transaction of ours (which committed the rows the user rolled back).
-                rows = await conn.fetch(statement, [])
-            else:  # a cursor needs a transaction; each statement commits on its own (a
-                # savepoint inside a BEGIN of the user's)
-                try:
-                    async with conn.transaction():
-                        rows = await first_rows(conn, statement)
-                except DatabaseError as exc:
-                    if exc.sqlstate != _NO_TRANSACTION_BLOCK:
-                        raise
-                    # VACUUM, CREATE DATABASE, ...: refused before they started, so running
-                    # them on their own is safe. They return no rows.
-                    rows = await conn.fetch(statement, [])
+            try:
+                rows = await statement_rows(conn, statement)
+            except DatabaseError as exc:
+                if exc.sql is None or exc.sql == statement:
+                    raise
+                # S5-7: name the user's statement, not Studio's FETCH or MOVE.
+                message = str(exc).removesuffix(f"\nSQL: {exc.sql}")
+                raise DatabaseError(message, sql=statement, original=exc.original) from exc
             shown = rows[:MAX_SQL_ROWS]
             # By position: a dict would merge two columns with the same name (C9).
             columns = list(cast(_Named, cast(object, rows[0])).keys()) if rows else []
@@ -1047,7 +1090,13 @@ async def ddl_apply(studio: Studio, request: Request) -> Response:
     steps = build_steps(studio.dialect, data, await _current_table(studio, data))
     statements = studio.dialect.render(steps)
     async with studio.pool().acquire() as conn:
-        await apply_statements(conn, statements)
+        # S5-1: the rendered DDL leaves public names bare (as the migration kit does), so
+        # resolve them in public only, never in a "$user" schema or pg_temp first.
+        await conn.execute("SET search_path TO public, pg_temp", [])
+        try:
+            await apply_statements(conn, statements)
+        finally:
+            await conn.execute("RESET search_path", [])
     await studio.load_snapshot(refresh=True)
     return JSONResponse(
         {"applied": len(statements), "statements": statement_rows(studio.dialect, steps)}
@@ -1295,6 +1344,16 @@ async def _not_built(_request: Request) -> Response:
     return HTMLResponse(_NOT_BUILT)
 
 
+class _NamesConvertor(PathConvertor):
+    """A path that may hold any character: ``:path`` has no DOTALL, so a table name with a
+    newline was listed but never routed (S5-8)."""
+
+    regex: ClassVar[str] = "(?s:.*)"
+
+
+register_url_convertor("names", _NamesConvertor())
+
+
 def create_app(
     *,
     dialect: Dialect,
@@ -1322,7 +1381,7 @@ def create_app(
         finally:
             await studio.driver.close()
 
-    tables_path = "/api/tables/{names:path}/rows"
+    tables_path = "/api/tables/{names:names}/rows"
     routes: list[BaseRoute] = [
         Route("/api/meta", _api(studio, meta)),
         Route("/api/tables", _api(studio, tables)),
@@ -1332,7 +1391,7 @@ def create_app(
         Route(tables_path, _api(studio, update_row), methods=["PATCH"]),
         Route(tables_path, _api(studio, delete_rows), methods=["DELETE"]),
         Route(
-            "/api/tables/{names:path}/export",
+            "/api/tables/{names:names}/export",
             _api(studio, export_rows),
             methods=["GET"],
         ),
