@@ -1,4 +1,5 @@
 from collections.abc import AsyncGenerator
+from contextlib import AsyncExitStack
 from typing import Any
 
 import asyncpg
@@ -166,6 +167,25 @@ async def test_a_select_calling_func_is_not_run_again_after_a_lost_connection(
     sent.clear()
     await db.select({"e": func("lower", Users.email)}).from_(Users)  # a replica cannot write
     assert len(sent) == 2
+
+
+async def test_a_busy_replica_sends_the_read_to_the_primary_without_marking_it_down(
+    db: Database,
+) -> None:
+    # R4-7: a busy replica pool waited acquire_timeout, then was marked down for 30 s.
+    import time
+
+    replica = db._replicas[0]
+    size = replica.stats().max_size
+    await db.insert(Users).values(email="primary@example.com")
+    async with AsyncExitStack() as stack:
+        for _ in range(size):  # hold every replica connection
+            await stack.enter_async_context(replica.acquire())
+        start = time.perf_counter()
+        assert await emails(await db.select().from_(Users)) == ["primary@example.com"]
+        assert time.perf_counter() - start < 1
+    assert db._replica_down == {}
+    assert await emails(await db.select().from_(Users)) == ["replica@example.com"]
 
 
 async def test_a_hung_replica_is_skipped_after_one_timeout(pg_url: str) -> None:

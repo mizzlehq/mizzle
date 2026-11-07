@@ -940,9 +940,25 @@ async def test_acquire_gives_up_after_acquire_timeout(pg_url: str) -> None:
 
 @pytest.mark.parametrize(
     "args",
-    [{"pool_size": 0}, {"pool_min_size": 5, "pool_size": 2}, {"connect_timeout": 0}],
+    [
+        {"pool_size": 0},
+        {"pool_min_size": 5, "pool_size": 2},
+        {"connect_timeout": 0},
+        {"query_timeout": float("inf")},  # R4-6
+        {"acquire_timeout": float("inf")},
+        {"connect_timeout": float("nan")},
+    ],
 )
 async def test_bad_pool_args_are_a_query_error(pg_url: str, args: dict[str, Any]) -> None:
     # R11: asyncpg raised a bare ValueError.
     with pytest.raises(QueryError, match=r"Database.connect\(\) needs"):
         await Database.connect(pg_url, schema=[Users, Posts], **args)
+
+
+@pytest.mark.parametrize("seconds", [0, -1, float("nan"), float("inf")])
+async def test_bad_with_timeout_is_a_query_error(pg_url: str, seconds: float) -> None:
+    # R4-6: 0 or -1 failed every statement with QueryTimeout, NaN meant no limit.
+    async with await Database.connect(pg_url, schema=[Users, Posts]) as db:
+        with pytest.raises(QueryError, match=r"with_timeout\(\) needs"):
+            db.with_timeout(seconds)
+        await db.with_timeout(None).with_timeout(0.5).select().from_(Users)

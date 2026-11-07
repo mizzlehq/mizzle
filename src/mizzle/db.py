@@ -6,6 +6,7 @@ import asyncio
 import contextvars
 import itertools
 import logging
+import math
 import random
 import time
 from collections.abc import (
@@ -73,6 +74,18 @@ _REPLICA_PAUSE = 30.0
 
 # Pushed onto Session._savepoints when the transaction ends: statements are refused.
 _ENDED = object()
+
+
+def _timeout_ok(seconds: float | None) -> bool:
+    """A timeout is a finite number of seconds > 0, or None. 0, a negative, NaN or inf
+    failed every statement or meant no limit at all (R4-6)."""
+    return seconds is None or (math.isfinite(seconds) and seconds > 0)
+
+
+def _busy(driver: Driver) -> bool:
+    """Every pooled connection is handed out: the server is fine, just loaded (R4-7)."""
+    stats = driver.stats()
+    return stats.in_use >= stats.max_size
 
 
 def _commit_unknown(error: BaseException) -> bool:
@@ -614,6 +627,8 @@ class Session(QueryBuilder):
     def with_timeout(self, seconds: float | None) -> Session:
         """This session with a different statement timeout (None: the pool default).
         A statement that runs longer is cancelled and raises ``QueryTimeout``."""
+        if not _timeout_ok(seconds):
+            raise QueryError("with_timeout() needs seconds > 0 or None")  # R4-6
         view = self._view()
         view._timeout = seconds
         return view
@@ -898,18 +913,23 @@ class Session(QueryBuilder):
         self, replica: Driver, primary: Driver
     ) -> AsyncGenerator[Connection]:
         async with AsyncExitStack() as stack:
-            on_replica = True
-            try:
-                conn = await stack.enter_async_context(replica.acquire())
-            except DbConnectionError:
-                on_replica = False
-                # No statement ran yet, so the primary can take the read. Reads skip the
-                # replica for a while: a hung one made every read wait (R7).
-                self._replica_down[replica] = time.monotonic() + _REPLICA_PAUSE
-                log.warning(
-                    "mizzle: read replica unavailable; reading from the primary for %.0f s",
-                    _REPLICA_PAUSE,
-                )
+            # A replica whose pool is all busy is healthy: this read goes to the primary
+            # without waiting acquire_timeout, and the replica is not marked down (R4-7).
+            conn: Connection | None = None
+            if not _busy(replica):
+                try:
+                    conn = await stack.enter_async_context(replica.acquire())
+                except DbConnectionError:
+                    if not _busy(replica):  # it filled up while we waited (R4-7)
+                        # No statement ran yet, so the primary can take the read. Reads
+                        # skip the replica for a while: a hung one made every read wait (R7).
+                        self._replica_down[replica] = time.monotonic() + _REPLICA_PAUSE
+                        log.warning(
+                            "mizzle: read replica unavailable; reading from the primary for %.0f s",
+                            _REPLICA_PAUSE,
+                        )
+            on_replica = conn is not None
+            if conn is None:
                 conn = await stack.enter_async_context(primary.acquire())
             try:
                 yield conn
@@ -1283,12 +1303,12 @@ class Database(Session):
             "pool_size >= 1": pool_size >= 1,
             "0 <= pool_min_size <= pool_size": 0 <= pool_min_size <= pool_size,
             "max_idle >= 0": max_idle >= 0,
-            "query_timeout > 0 or None": query_timeout is None or query_timeout > 0,
+            "query_timeout > 0 or None": _timeout_ok(query_timeout),
             "statement_cache_size >= 0": statement_cache_size >= 0,
             "connect_retries >= 0": connect_retries >= 0,
             "connect_backoff >= 0": connect_backoff >= 0,
-            "connect_timeout > 0": connect_timeout > 0,
-            "acquire_timeout > 0 or None": acquire_timeout is None or acquire_timeout > 0,
+            "connect_timeout > 0": _timeout_ok(connect_timeout),
+            "acquire_timeout > 0 or None": _timeout_ok(acquire_timeout),
         }
         for rule, ok in rules.items():
             if not ok:
