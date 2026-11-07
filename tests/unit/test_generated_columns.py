@@ -124,7 +124,10 @@ def test_alter_identity_and_generated() -> None:
     assert """ADD COLUMN "shout" text GENERATED ALWAYS AS (lower(body)) VIRTUAL""" in change
     assert _alter("drop expression") == ['ALTER TABLE "docs" ALTER COLUMN "search" DROP EXPRESSION']
     # A VIRTUAL column has no stored values to keep: dropped and added as a plain column.
-    assert _alter("drop virtual") == [
+    # First a guard: nothing mizzle does not manage may hang on it (K6-7).
+    [guard, *rebuild] = _alter("drop virtual")
+    assert guard.startswith("DO $mizzle$") and "needs a custom migration" in guard
+    assert rebuild == [
         'ALTER TABLE "docs" DROP COLUMN "shout"',
         'ALTER TABLE "docs" ADD COLUMN "shout" text',
     ]

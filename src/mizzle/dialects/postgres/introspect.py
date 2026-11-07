@@ -25,6 +25,7 @@ from mizzle.core.snapshot import (
     TableSnap,
     UniqueSnap,
     ViewSnap,
+    check_schema_name,
     empty_snapshot,
     key,
     sequence_defaults,
@@ -47,17 +48,23 @@ MIGRATIONS_TABLE = "__mizzle_migrations"
 _ACTIONS = {"a": None, "r": "restrict", "c": "cascade", "n": "set null", "d": "set default"}
 _NEXTVAL = re.compile(r"nextval\('.*'::regclass\)")
 
-_TABLES = """
+# Objects that belong to an extension (pg_trgm's functions...) are not the schema's own.
+_NOT_EXTENSION = """NOT EXISTS (SELECT 1 FROM pg_depend d WHERE d.classid = {catalog}::regclass
+                  AND d.objid = {oid} AND d.deptype = 'e')"""
+
+_TABLES = f"""
 SELECT c.oid, n.nspname AS schema, c.relname AS name,
        c.relrowsecurity AS rls, c.relforcerowsecurity AS rls_force,
        obj_description(c.oid, 'pg_class') AS comment,
-       c.relpersistence::text AS persistence, coalesce(c.reloptions, '{}') AS options,
-       coalesce(tc.reloptions, '{}') AS toast_options
+       c.relpersistence::text AS persistence, coalesce(c.reloptions, '{{}}') AS options,
+       coalesce(tc.reloptions, '{{}}') AS toast_options
 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
 LEFT JOIN pg_class tc ON tc.oid = c.reltoastrelid
--- A partitioned table reads as a plain one; its partitions are not read (not managed).
+-- A partitioned table reads as a plain one; its partitions and inheritance children are
+-- not read (not managed, K6-6), nor are an extension's tables (K6-3).
 WHERE c.relkind IN ('r', 'p') AND n.nspname = ANY($1::text[]) AND c.relname <> $2
-  AND NOT c.relispartition
+  AND NOT EXISTS (SELECT 1 FROM pg_inherits i WHERE i.inhrelid = c.oid)
+  AND {_NOT_EXTENSION.format(catalog="'pg_class'", oid="c.oid")}
 ORDER BY n.nspname, c.relname
 """
 
@@ -105,8 +112,10 @@ SELECT con.conrelid AS table_oid, con.conname AS name, con.contype::text AS kind
 FROM pg_constraint con
 LEFT JOIN pg_class fc ON fc.oid = con.confrelid
 LEFT JOIN pg_namespace fn ON fn.oid = fc.relnamespace
--- Exclusion constraints (contype 'x') are not managed: not read.
+-- Exclusion constraints (contype 'x') are not managed: not read. Nor are the per-partition
+-- copies of an FK that references a partitioned table (K6-2).
 WHERE con.conrelid = ANY($1::oid[]) AND con.contype IN ('p', 'u', 'f', 'c')
+  AND con.conparentid = 0
 ORDER BY con.conrelid, con.conname
 """
 
@@ -149,20 +158,17 @@ WHERE i.indrelid = ANY($1::oid[])
 ORDER BY i.indrelid, ic.relname
 """
 
-_ENUMS = """
+_ENUMS = f"""
 SELECT n.nspname AS schema, t.typname AS name,
        array_agg(e.enumlabel ORDER BY e.enumsortorder) AS values
 FROM pg_type t
 JOIN pg_enum e ON e.enumtypid = t.oid
 JOIN pg_namespace n ON n.oid = t.typnamespace
 WHERE n.nspname = ANY($1::text[])
+  AND {_NOT_EXTENSION.format(catalog="'pg_type'", oid="t.oid")}
 GROUP BY n.nspname, t.typname
 ORDER BY n.nspname, t.typname
 """
-
-# Objects that belong to an extension (pg_trgm's functions...) are not the schema's own.
-_NOT_EXTENSION = """NOT EXISTS (SELECT 1 FROM pg_depend d WHERE d.classid = {catalog}::regclass
-                  AND d.objid = {oid} AND d.deptype = 'e')"""
 
 _VIEWS = f"""
 SELECT c.oid, n.nspname AS schema, c.relname AS name, c.relkind = 'm' AS materialized,
@@ -220,7 +226,7 @@ UNION ALL
 SELECT 'grants on ' || c.oid::regclass::text
 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
 WHERE c.relkind IN ('r', 'p', 'v', 'm') AND n.nspname = ANY($1::text[]) AND NOT c.relispartition
-  AND c.relname <> $2
+  AND c.relname <> $2 AND {_NOT_EXTENSION.format(catalog="'pg_class'", oid="c.oid")}
   AND (EXISTS (SELECT 1 FROM aclexplode(c.relacl) g WHERE g.grantee <> c.relowner)
        OR EXISTS (SELECT 1 FROM pg_attribute a WHERE a.attrelid = c.oid AND a.attacl IS NOT NULL))
 ORDER BY 1
@@ -438,6 +444,8 @@ async def introspect(
 ) -> Snapshot:
     """The database's schema, read in UTC: the server prints a timestamptz constant (a
     default, a check) in the session TimeZone, and a schema writes it in UTC (Q4-15)."""
+    for schema in schemas:
+        check_schema_name(schema)
     try:
         async with conn.transaction():  # rolled back, and the SET LOCAL with it
             await conn.execute("SET LOCAL TimeZone = 'UTC'", [])

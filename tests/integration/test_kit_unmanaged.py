@@ -1,0 +1,278 @@
+"""Objects mizzle does not manage are neither read, dropped nor lost (K6)."""
+
+import json
+from collections.abc import Sequence
+from pathlib import Path
+from typing import final, override
+
+import asyncpg
+import pytest
+
+from mizzle import QueryBuilder, Table, View, sql
+from mizzle.core.errors import DatabaseError, SchemaError
+from mizzle.core.snapshot import Snapshot, empty_snapshot
+from mizzle.core.sql.nodes import Node
+from mizzle.dialects.postgres import PostgresDialect, ddl
+from mizzle.dialects.postgres.driver import PostgresDriver
+from mizzle.kit.diff import diff
+from mizzle.kit.migrate import apply_statements
+from mizzle.kit.snapshot import build_snapshot
+from mizzle.pg import integer, serial, text
+from tests.integration.test_kit_cli import cli, kit_url, project, rewrite_schema
+
+__all__ = ["kit_url", "project"]  # fixtures
+
+dialect = PostgresDialect()
+
+
+async def execute(url: str, statement: str) -> None:
+    conn = await asyncpg.connect(url)
+    try:
+        await conn.execute(statement)
+    finally:
+        await conn.close()
+
+
+async def fetch_one(url: str, query: str) -> asyncpg.Record:
+    conn = await asyncpg.connect(url)
+    try:
+        [row] = await conn.fetch(query)
+        return row
+    finally:
+        await conn.close()
+
+
+async def live(url: str, schemas: Sequence[str] = ("public",)) -> Snapshot:
+    driver = await PostgresDriver.connect(url, pool_size=1)
+    try:
+        async with driver.acquire() as conn:
+            return await dialect.introspect(conn, schemas)
+    finally:
+        await driver.close()
+
+
+async def migrate(url: str, old: Snapshot, new: Snapshot) -> None:
+    driver = await PostgresDriver.connect(url, pool_size=1)
+    try:
+        async with driver.acquire() as conn:
+            await apply_statements(conn, dialect.render(diff(old, new)))
+    finally:
+        await driver.close()
+
+
+@final
+class Items(Table, name="items"):
+    id = serial().primary_key()
+    name = text().not_null()
+
+
+def items_view(where: str) -> type[View]:
+    @final
+    class VItems(View, name="v_items"):
+        id = integer()
+        name = text()
+
+        @classmethod
+        @override
+        def query(cls, db: QueryBuilder) -> Node:
+            return sql(f"SELECT id, name FROM items{where}")
+
+    return VItems
+
+
+async def test_recreated_view_keeps_triggers_rules_and_column_grants(kit_url: str) -> None:
+    # K6-1: only the view's ACL, owner and comment were kept.
+    v1 = build_snapshot([Items, items_view("")], dialect)
+    await migrate(kit_url, empty_snapshot("postgresql"), v1)
+    await execute(
+        kit_url,
+        "CREATE FUNCTION trg_v() RETURNS trigger LANGUAGE plpgsql AS "
+        "$f$ BEGIN INSERT INTO items(name) VALUES (NEW.name); RETURN NEW; END $f$; "
+        "CREATE TRIGGER t_view INSTEAD OF INSERT ON v_items FOR EACH ROW EXECUTE FUNCTION trg_v(); "
+        "GRANT UPDATE (name) ON v_items TO PUBLIC; "
+        "CREATE RULE r_del AS ON DELETE TO v_items DO INSTEAD NOTHING",
+    )
+    await migrate(kit_url, v1, build_snapshot([Items, items_view(" WHERE id > 0")], dialect))
+    row = await fetch_one(
+        kit_url,
+        "SELECT (SELECT array_agg(tgname) FROM pg_trigger WHERE tgrelid = 'v_items'::regclass) "
+        "AS triggers, (SELECT array_agg(rulename) FROM pg_rules WHERE tablename = 'v_items') "
+        "AS rules, (SELECT attacl::text FROM pg_attribute WHERE attrelid = 'v_items'::regclass "
+        "AND attname = 'name') AS acl",
+    )
+    assert row["triggers"] == ["t_view"] and row["rules"] == ["r_del"]
+    assert row["acl"] is not None and "=w/" in row["acl"]
+    await execute(kit_url, "INSERT INTO v_items (name) VALUES ('a')")  # the trigger works
+
+
+@pytest.mark.parametrize(
+    ("setup", "tables"),
+    [
+        pytest.param(  # K6-2: an FK to a partitioned table has a copy per partition
+            "CREATE TABLE events (id int, at date, PRIMARY KEY (id, at)) PARTITION BY RANGE (at); "
+            "CREATE TABLE events_2026 PARTITION OF events "
+            "FOR VALUES FROM ('2026-01-01') TO ('2027-01-01'); "
+            "CREATE TABLE refs (id int PRIMARY KEY, eid int, eat date, "
+            "FOREIGN KEY (eid, eat) REFERENCES events (id, at))",
+            ["public.events", "public.refs"],
+            id="partition-fk",
+        ),
+        pytest.param(  # K6-3: a table and an enum that belong to an extension
+            "CREATE EXTENSION pg_trgm; CREATE TABLE ext_table (id int); "
+            "CREATE TYPE ext_enum AS ENUM ('a'); ALTER EXTENSION pg_trgm ADD TABLE ext_table; "
+            "ALTER EXTENSION pg_trgm ADD TYPE ext_enum",
+            [],
+            id="extension",
+        ),
+        pytest.param(  # K6-6: a table inheritance child
+            "CREATE TABLE parent_t (id int PRIMARY KEY, x int); "
+            "CREATE TABLE child_t (y int) INHERITS (parent_t)",
+            ["public.parent_t"],
+            id="inheritance",
+        ),
+    ],
+)
+async def test_unmanaged_relations_and_constraints_are_not_read(
+    kit_url: str, setup: str, tables: list[str]
+) -> None:
+    await execute(kit_url, setup)
+    snapshot = await live(kit_url)
+    assert sorted(snapshot["tables"]) == tables
+    assert snapshot["enums"] == {}
+    if refs := snapshot["tables"].get("public.refs"):
+        [fk] = refs["foreign_keys"].values()
+        assert fk["ref_table"] == "events"
+
+
+async def test_rebuilding_a_column_refuses_to_drop_unmanaged_objects_on_it(kit_url: str) -> None:
+    # K6-7: making a column generated dropped it, and the exclusion constraint and column
+    # grants on it went silently.
+    @final
+    class Plain(Table, name="bookings"):
+        id = serial().primary_key()
+        room = integer().not_null()
+
+    @final
+    class Generated(Table, name="bookings"):
+        id = serial().primary_key()
+        room = integer().generated_always_as(sql("id % 10"))
+
+    v1, v2 = build_snapshot([Plain], dialect), build_snapshot([Generated], dialect)
+    await migrate(kit_url, empty_snapshot("postgresql"), v1)
+    for unmanaged, undo in [
+        (
+            "ALTER TABLE bookings ADD CONSTRAINT no_overlap EXCLUDE USING btree (room WITH =)",
+            "ALTER TABLE bookings DROP CONSTRAINT no_overlap",
+        ),
+        (
+            "GRANT SELECT (room) ON bookings TO PUBLIC",
+            "REVOKE SELECT (room) ON bookings FROM PUBLIC",
+        ),
+    ]:
+        await execute(kit_url, unmanaged)
+        with pytest.raises(DatabaseError, match="needs a custom migration"):
+            await migrate(kit_url, v1, v2)
+        await execute(kit_url, undo)
+    await migrate(kit_url, v1, v2)  # nothing on it: rebuilt
+
+
+def test_custom_type_spellings_normalize_as_the_server_prints_them() -> None:
+    # K6-4: digits, dots and capitals never matched format_type().
+    for written, printed in [
+        ("int4", "integer"),
+        ("int8", "bigint"),
+        ("float8", "double precision"),
+        ("int4[]", "integer[]"),
+        ("VARCHAR(10)", "character varying(10)"),
+        ("public.posint", "posint"),
+        ("s2.dom2", "s2.dom2"),
+        ('"Weird Type"', '"Weird Type"'),
+        ("numeric(10, 2)", "numeric(10,2)"),
+    ]:
+        assert ddl.normalize_type(written) == printed
+
+
+ARRAYS = """
+from mizzle import Table
+from mizzle.pg import array, integer, serial
+
+class T(Table, name="t"):
+    id = serial().primary_key()
+    xs = array(integer())
+"""
+
+
+async def test_an_old_snapshot_with_nested_array_types_is_no_change(
+    project: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # K6-5: a snapshot an older mizzle wrote holds "integer[][]".
+    rewrite_schema(project, ARRAYS, monkeypatch)
+    assert await cli("generate") == 0
+    path = next(project.glob("migrations/0001_*/snapshot.json"))
+    data = json.loads(path.read_text())
+    data["tables"]["public.t"]["columns"]["xs"]["type"] = "integer[][]"
+    path.write_text(json.dumps(data))
+    capsys.readouterr()
+    assert await cli("generate") == 0
+    assert "No schema changes." in capsys.readouterr().out
+
+
+ROLES = """
+from mizzle import Table, policy, rls, role, sql
+from mizzle.pg import integer, serial
+
+app = role("mizzle_k6_app")
+
+class Docs(Table, name="docs"):
+    id = serial().primary_key()
+    owner = integer()
+
+    @classmethod
+    def config(cls):
+        return [rls(), policy("own", to=[app], using=sql("owner = 1"))]
+"""
+
+
+async def test_pull_update_keeps_roles_and_records_no_phantom_change(
+    project: Path,
+    kit_url: str,
+    pg_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # K6-8: the policy text was compared unnormalized, and the roles were not read.
+    await execute(pg_url, "DROP ROLE IF EXISTS mizzle_k6_app")
+    try:
+        rewrite_schema(project, ROLES, monkeypatch)
+        assert await cli("generate") == 0
+        assert await cli("migrate") == 0
+        capsys.readouterr()
+        assert await cli("pull", "--update") == 0
+        assert "Up to date with the database." in capsys.readouterr().out
+        assert len(list(project.glob("migrations/0*"))) == 1
+        await execute(kit_url, "CREATE TABLE extra (id int PRIMARY KEY)")
+        assert await cli("pull", "--update") == 0
+        source = next(p for p in project.glob("schema_*.py")).read_text()
+        assert "role('mizzle_k6_app')" in source, source
+        sql_text = next(project.glob("migrations/0002_*/migration.sql")).read_text()
+        assert "POLICY" not in sql_text and "ROLE" not in sql_text, sql_text
+    finally:
+        await execute(kit_url, "DROP TABLE IF EXISTS docs")
+        await execute(pg_url, "DROP ROLE IF EXISTS mizzle_k6_app")
+
+
+async def test_schema_names_with_a_dot_are_refused(kit_url: str) -> None:
+    # K6-9: public."x.y" and "public.x".y shared the key "public.x.y".
+    @final
+    class Dotted(Table, name="y", schema="public.x"):
+        id = integer().primary_key()
+
+    with pytest.raises(SchemaError, match="not supported in schema names"):
+        build_snapshot([Dotted], dialect)
+    await execute(
+        kit_url,
+        'CREATE TABLE "x.y" (id int); CREATE SCHEMA "public.x"; CREATE TABLE "public.x".y (id int)',
+    )
+    with pytest.raises(SchemaError, match="not supported in schema names"):
+        await live(kit_url, ["public", "public.x"])
+    assert list((await live(kit_url))["tables"]) == ["public.x.y"]  # a dotted table is fine

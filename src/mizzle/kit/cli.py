@@ -196,6 +196,18 @@ def _schemas(config: Config, *snapshots: Snapshot) -> list[str]:
     return schemas
 
 
+def _latest(directory: MigrationsDir, dialect: Dialect) -> Snapshot:
+    """The newest snapshot with its column types spelled as this mizzle spells them: one an
+    older mizzle wrote (``integer[][]``) is no change (K6-5). Enum types are left as is."""
+    snapshot = directory.latest_snapshot()
+    enums = {e["name"] for e in snapshot["enums"].values()}
+    for table in snapshot["tables"].values():
+        for column in table["columns"].values():
+            if column["type"].rstrip("[]") not in enums:
+                column["type"] = dialect.normalize_type(column["type"])
+    return snapshot
+
+
 def _types_path(config: Config) -> Path:
     module = importlib.import_module(config.schema[0])
     if module.__file__ is None:
@@ -211,7 +223,7 @@ def cmd_generate(config: Config, args: Args) -> int:
     dialect = config.dialect()
     tables = config.load_tables()
     directory = MigrationsDir(config.out, dialect.name)
-    previous = directory.latest_snapshot()
+    previous = _latest(directory, dialect)
     prev_id = previous["id"] if directory.migrations() else None
     current = build_snapshot(
         tables, dialect, config.casing, prev_id=prev_id, objects=config.load_objects()
@@ -634,17 +646,25 @@ def cmd_pull(config: Config, args: Args) -> int:
     if out.exists() and not (args.force or args.update):
         raise MigrationError(f"{out} exists; pass --force to overwrite it")
 
-    async def run(driver: Driver, dialect: Dialect) -> Snapshot:
+    directory = MigrationsDir(config.out, config.dialect_name)
+    update = args.update and bool(directory.migrations())
+
+    async def run(driver: Driver, dialect: Dialect) -> tuple[Snapshot, Snapshot]:
+        previous = _latest(directory, dialect)
         async with driver.acquire() as conn:
             for what in await dialect.skipped_objects(conn, config.schema_filter):
                 print(f"warning: pull skips {what} (not managed by mizzle)", file=sys.stderr)
-            return await dialect.introspect(conn, config.schema_filter)
+            # --update keeps the roles the schema manages, and compares its policies and
+            # expressions as the database prints them (K6-8).
+            roles = list(previous.get("roles", {})) if update else []
+            live = await dialect.introspect(conn, config.schema_filter, roles)
+            if update:
+                previous = await dialect.normalize_snapshot(conn, previous)
+            return live, previous
 
-    snapshot = asyncio.run(_with_driver(config, run))
-    directory = MigrationsDir(config.out, config.dialect_name)
-    if args.update and directory.migrations():
-        previous = directory.latest_snapshot()
-        steps = diff(previous, snapshot, no_renames, compare_expressions=False)
+    snapshot, previous = asyncio.run(_with_driver(config, run))
+    if update:
+        steps = diff(previous, snapshot, no_renames, compare_expressions=False, normalized=True)
         if not steps:
             print("Up to date with the database.")
             return 0
@@ -844,7 +864,7 @@ def cmd_info(config: Config, args: Args) -> int:
     async def inspect(driver: Driver, dialect: Dialect) -> tuple[str, dict[str, str], list[Step]]:
         async with driver.acquire() as conn:
             [row] = await conn.fetch_dicts("SELECT current_setting('server_version') AS v", [])
-            latest = directory.latest_snapshot()
+            latest = _latest(directory, dialect)
             try:
                 applied = await dialect.applied_migrations(conn, config.migrations_schema)
             except DatabaseError as exc:

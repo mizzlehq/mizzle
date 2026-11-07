@@ -176,6 +176,9 @@ class DropColumn(Step):
     schema: str
     table: str
     name: str
+    # Dropped to be added again (made generated...): refused at migrate time when objects
+    # mizzle does not manage hang on it (K6-7).
+    rebuilt: bool = False
 
     @property
     @override
