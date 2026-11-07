@@ -5,6 +5,7 @@ from __future__ import annotations
 import datetime
 import re
 from collections.abc import Mapping, Sequence
+from typing import cast
 
 from mizzle.core.compiler import no_nul
 from mizzle.core.errors import MigrationError, SchemaError
@@ -116,7 +117,8 @@ _TYPE_ALIASES = {
 }
 _PLAIN_IDENT = re.compile(r"[a-z_][a-z0-9_$]*")
 # Keywords quote_ident()/format_type() quote (K4-8): PostgreSQL 18's pg_get_keywords()
-# where catcode <> 'U'; older servers have a few less (json_table, merge_action).
+# where catcode <> 'U'; older servers have a few less (json_table, merge_action), which
+# introspect quotes back with requote_type() (K4-22).
 _KEYWORDS = frozenset(
     """
     all analyse analyze and any array as asc asymmetric authorization between bigint
@@ -160,6 +162,27 @@ def truncate_name(name: str) -> str:
 def type_ident(name: str) -> str:
     """A type name as format_type() prints it: quoted only when necessary."""
     return name if _PLAIN_IDENT.fullmatch(name) and name not in _KEYWORDS else quote(name)
+
+
+_IDENT_PART = r'"(?:[^"]|"")+"|[a-z_][a-z0-9_$]*'
+_TYPE_PATH = re.compile(rf"(?:({_IDENT_PART})\.)?({_IDENT_PART})((?:\[\])*)")
+
+
+def requote_type(text: str, server_keywords: frozenset[str]) -> str:
+    """A type name as format_type() printed it, quoted as type_ident() quotes it: a server
+    older than PostgreSQL 18 leaves a few of _KEYWORDS bare (json_table before 17), so a
+    type named so differed from the schema there (K4-22)."""
+    match = _TYPE_PATH.fullmatch(text)
+    if match is None:
+        return text
+    schema, name, dims = cast(tuple[str | None, str, str], match.groups())
+    if schema is None and name == "json":  # the built-in type, bare on every server
+        return text
+    stale = _KEYWORDS - server_keywords
+    name = quote(name) if name in stale else name
+    if schema is None:
+        return name + dims
+    return f"{quote(schema) if schema in stale else schema}.{name}{dims}"
 
 
 def normalize_type(sql_type: str) -> str:

@@ -53,7 +53,7 @@ from mizzle.core.schema.objects import (
 )
 from mizzle.core.snapshot import Snapshot, empty_snapshot
 from mizzle.core.steps import DropExtension, Statement, Step
-from mizzle.dialects.postgres import PostgresDialect
+from mizzle.dialects.postgres import PostgresDialect, ddl
 from mizzle.dialects.postgres.driver import PostgresDriver
 from mizzle.kit.codegen import render_schema_module
 from mizzle.kit.diff import StrictRenames, diff
@@ -83,6 +83,7 @@ from mizzle.pg import (
     macaddr,
     macaddr8,
     money,
+    nummultirange,
     numrange,
     path,
     pg_composite,
@@ -94,6 +95,7 @@ from mizzle.pg import (
     text,
     timestamp,
     tsrange,
+    tstzmultirange,
     tstzrange,
     varbit,
     varchar,
@@ -1998,6 +2000,40 @@ _TYPED_DEFAULTS: dict[str, tuple[Callable[[], ColumnBase], _Check]] = {
         lambda: array(int4range()).default([Range(1, 2), Range(3, 5, upper_inc=True)]),
         lambda v: contains(v, [Range(1, 2), Range(3, 6)]),
     ),
+    # Q4-14: stored sorted, overlapping and adjacent ranges merged.
+    "int4multirange": (
+        lambda: int4multirange().default(
+            [Range(7, 8, upper_inc=True), Range(1, 3), Range(2, 5), Range(9, 10), Range(4, 4)]
+        ),
+        None,
+    ),
+    "nummultirange": (
+        lambda: nummultirange().default(
+            [
+                Range(Decimal(1), Decimal(3)),
+                Range(Decimal(2), Decimal(5), upper_inc=True),
+                Range(Decimal(5), Decimal(6), lower_inc=False),
+                Range(Decimal(-1), Decimal(0), upper_inc=True),
+                Range(Decimal(7), Decimal(8), lower_inc=False),
+                Range(Decimal(8), Decimal(9), lower_inc=False),
+            ]
+        ),
+        None,
+    ),
+    "tstzmultirange": (
+        lambda: tstzmultirange().default(
+            [
+                Range(dt.datetime(2020, 1, 2, tzinfo=_UTC5), dt.datetime(2020, 1, 3, tzinfo=_UTC5)),
+                Range(_T0, dt.datetime(2020, 1, 1, 19, tzinfo=dt.UTC)),
+                Range(None, dt.datetime(2019, 1, 1, tzinfo=dt.UTC)),
+            ]
+        ),
+        None,
+    ),
+    "timestamptz": (
+        lambda: timestamp(tz=True).default(dt.datetime(2020, 1, 1, tzinfo=_UTC5)),
+        lambda v: eq(v, dt.datetime(2019, 12, 31, 19, tzinfo=dt.UTC)),
+    ),
     "point[]": (lambda: array(point()).default([Point(1, 2.5)]), None),
     "varbit": (
         lambda: varbit().default(BitString.from_int(341, length=10)),
@@ -2059,4 +2095,47 @@ async def test_typed_defaults_and_check_literals_do_not_drift(
     current = await live(driver)
     # Compared as written too: the default is what PostgreSQL prints.
     assert diff(current, desired, compare_expressions=False) == []
+    # In any session TimeZone: the server prints a timestamptz constant in it (Q4-15).
+    async with driver.acquire() as conn:
+        await conn.execute("SET TimeZone = 'Asia/Dhaka'", [])
+        try:
+            current = await dialect.introspect(conn, SCHEMAS)
+            normalized = await dialect.normalize_snapshot(conn, desired)
+        finally:
+            await conn.execute("RESET TimeZone", [])
+    assert diff(current, desired, compare_expressions=False) == []
+    assert diff(current, normalized, compare_expressions=False, normalized=True) == []
     await execute(driver, "INSERT INTO mg.q4_typed (id) VALUES (1)")
+
+
+async def test_type_named_like_a_keyword_the_server_lacks(
+    driver: PostgresDriver, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # K4-22: mizzle quotes PostgreSQL 18's keywords; on 14-17 json_table is none, so
+    # format_type() printed it bare and the column type drifted. Faked here with a word
+    # mizzle takes for a keyword and this server does not.
+    keywords = ddl._KEYWORDS | {"k4_word"}
+    monkeypatch.setattr(ddl, "_KEYWORDS", keywords)
+
+    @final
+    class Worded(Table, name="k4_worded", schema="mg"):
+        id = integer().primary_key()
+        v = pg_enum(Q4Color, type_name="k4_word", schema="mg")
+        w = array(pg_enum(Q4Color, type_name="k4_word", schema="mg"))
+
+    desired = snap([Worded])
+    assert desired["tables"]["mg.k4_worded"]["columns"]["w"]["type"] == 'mg."k4_word"[]'
+    await migrate(driver, empty_snapshot("postgresql"), desired)
+    assert diff(await live(driver), desired, compare_expressions=False) == []
+
+
+def test_requote_type() -> None:
+    old = ddl._KEYWORDS - {"json", "json_table"}
+    assert ddl.requote_type("json_table", old) == '"json_table"'
+    assert ddl.requote_type("json_table.json_table[]", old) == '"json_table"."json_table"[]'
+    assert ddl.requote_type("json[]", old) == "json[]"  # the built-in type
+    assert ddl.requote_type("mg.json", old) == 'mg."json"'
+    assert ddl.requote_type('mg."json_table"', old) == 'mg."json_table"'
+    assert ddl.requote_type("timestamp(3) without time zone", old) == (
+        "timestamp(3) without time zone"
+    )
