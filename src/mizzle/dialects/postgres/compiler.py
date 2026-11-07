@@ -116,7 +116,7 @@ class PostgresCompiler(Compiler):
             ):
                 return self.literal(str(value)) + "::inet"
             case BitString():
-                return self.literal(value.as_string()) + "::varbit"
+                return self.literal(value.as_string().replace(" ", "")) + "::varbit"  # Q4-10
             case _:
                 geometry = _geometry_text(value)
                 if geometry is None:

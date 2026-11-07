@@ -307,3 +307,16 @@ def test_in_a_placeholder_is_an_array_typed_by_the_column(qb: QueryBuilder) -> N
         compiled = qb.select(Kinds.id).from_(Kinds).where(cond).prepare().compiled
         assert compiled.sql.endswith(f'"kinds"."level" {op}')
         assert compiled.bind({"p": [Level.HIGH]}).params == (["2"],)
+
+
+def test_bit_string_literals_have_no_spaces() -> None:
+    # Q4-10: as_string() spaces every 4 bits, so DEFAULT '1010 1' failed CREATE TABLE.
+    from asyncpg import BitString
+
+    from mizzle.dialects.postgres.ddl import column_default, compiler
+    from mizzle.dialects.postgres.types import varbit
+
+    assert (
+        compiler(None).literal(BitString.from_int(0b101011001, length=9)) == "'101011001'::varbit"
+    )
+    assert column_default(varbit().default(BitString.from_int(0b10101, length=5))) == "'10101'"
