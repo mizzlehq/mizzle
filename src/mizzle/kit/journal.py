@@ -90,7 +90,8 @@ class Migration:
         return self._read(self.sql_path).decode("utf-8")
 
     def hash(self) -> str:
-        return hashlib.sha256(self._read(self.sql_path)).hexdigest()
+        # A CRLF checkout hashes as the LF file did, so it does not look edited (K12).
+        return hashlib.sha256(self._read(self.sql_path).replace(b"\r\n", b"\n")).hexdigest()
 
     def statements(self) -> list[Statement]:
         return parse_sql(self.sql())

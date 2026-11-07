@@ -761,17 +761,21 @@ def cmd_status(config: Config, args: Args) -> int:
     superseded = superseded_names(migrations)
 
     rows: list[dict[str, object]] = []
-    counts = {"applied": 0, "pending": 0, "changed": 0, "unknown": 0}
+    counts = {"applied": 0, "pending": 0, "unknown": 0}
+    changed: list[str] = []  # applied, then edited on disk; still counted applied (K13)
     for migration in migrations:
         if applied is None:
             state = "unknown"
         elif migration.name in applied:
-            state = "changed" if applied[migration.name] != migration.hash() else "applied"
+            state = "applied"
+            if applied[migration.name] != migration.hash():
+                state = "changed"
+                changed.append(migration.name)
         elif squash_adopted(migration, applied):
             state = "applied"  # a squash whose replaced history is applied
         else:
             state = "pending"
-        counts[state] += 1
+        counts["applied" if state == "changed" else state] += 1
         rows.append({"name": migration.name, "state": state})
     known = {m.name for m in migrations} | superseded
     missing = [name for name in (applied or {}) if name not in known]
@@ -783,6 +787,7 @@ def cmd_status(config: Config, args: Args) -> int:
                     "migrations": rows,
                     "applied": counts["applied"],
                     "pending": counts["pending"],
+                    "changed": changed,
                     "missing": missing,
                 }
             )
@@ -807,7 +812,7 @@ def cmd_status(config: Config, args: Args) -> int:
                 print(f"  {name:<{width}}  applied but missing on disk")
             print(f"\n{counts['applied']} applied, {counts['pending']} pending.")
     # An applied migration edited on disk is a failure, exactly as `migrate` treats it.
-    failed = applied is None or counts["pending"] or counts["changed"] or missing
+    failed = applied is None or counts["pending"] or changed or missing
     if args.check and failed:
         return 1
     return 0
