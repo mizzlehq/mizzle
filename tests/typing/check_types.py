@@ -310,6 +310,14 @@ def json_aggregates_are_json() -> None:
     assert_type(json_agg(Users.created_at), Aggregate[list[Json] | None])
 
 
+def json_fields_are_json() -> None:
+    from mizzle import get_field, get_path
+
+    # Q15: a field of a dict[str, Any] column was typed as the whole dict.
+    assert_type(get_field(Posts.meta, "a"), Expr[Json])
+    assert_type(get_path(Posts.meta, ["a", "b"]), Expr[Json])
+
+
 def string_agg_takes_text() -> None:
     from mizzle import string_agg
 

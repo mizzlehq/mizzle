@@ -135,6 +135,8 @@ rows = await db.select().from_(Users).where(
 Comparing with `None` raises, because `= NULL` is never true in SQL:
 
 ```python
+from mizzle import QueryError
+
 try:
     eq(Users.nickname, None)
 except QueryError as error:

@@ -434,4 +434,4 @@ def test_values_get_sql_types() -> None:
     assert compiled(datetime.datetime(2020, 1, 1)) == "CAST($1 AS timestamp)"
     assert compiled(datetime.datetime.now(datetime.UTC)) == "CAST($1 AS timestamptz)"
     assert compiled(datetime.date(2020, 1, 1)) == "CAST($1 AS date)"
-    assert compiled({"a": 1}) == "$1"
+    assert compiled({"a": 1}) == "CAST($1 AS jsonb)"  # untyped failed in CASE (Q8)

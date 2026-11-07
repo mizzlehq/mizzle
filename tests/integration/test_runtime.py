@@ -929,12 +929,14 @@ async def test_a_cancel_during_commit_runs_no_hook(pg_url: str) -> None:
 
 async def test_acquire_gives_up_after_acquire_timeout(pg_url: str) -> None:
     # R9: with every pooled connection busy, a query waited forever.
-    async with await Database.connect(
-        pg_url, schema=[Users, Posts], pool_size=1, acquire_timeout=0.2
-    ) as db:
-        async with db.transaction():  # holds the only connection
-            with pytest.raises(ConnectionError, match="in time"):
-                await db.select().from_(Users)
+    async with (
+        await Database.connect(
+            pg_url, schema=[Users, Posts], pool_size=1, acquire_timeout=0.2
+        ) as db,
+        db.transaction(),
+    ):  # holds the only connection
+        with pytest.raises(ConnectionError, match="in time"):
+            await db.select().from_(Users)
 
 
 @pytest.mark.parametrize(

@@ -9,6 +9,7 @@ otherwise they are cast to the SQL type of the Python value, so functions that t
 from __future__ import annotations
 
 import datetime
+import enum
 import math
 import re
 import uuid
@@ -17,6 +18,7 @@ from dataclasses import dataclass, field
 from dataclasses import replace as _replace
 from decimal import Decimal
 from typing import Literal, overload
+from typing import cast as _cast
 
 from mizzle.core.errors import QueryError
 from mizzle.core.schema.column import Column, ColumnBase
@@ -151,8 +153,28 @@ def bind(value: object, like: Iterable[object] = ()) -> Node:
     column = _first_column(like)
     if column is not None:
         return Param(value, column)
+    if isinstance(value, enum.Enum):
+        return _enum_value(value)
+    if isinstance(value, (dict, list)):  # untyped, CASE and jsonb builders failed (Q8)
+        return Cast(Param(_cast(object, value)), "jsonb")
     sql_type = sql_type_of(value)
     return Param(value) if sql_type is None else Cast(Param(value), sql_type)
+
+
+def _enum_value(member: enum.Enum) -> Node:
+    """An enum member with no column to type it: its value's SQL type (else text, as its
+    label), decoded back into a member; an IntEnum in a CASE came back as int (Q8)."""
+    enum_cls = type(member)
+    raw = _cast(object, member.value)
+    sql_type = sql_type_of(raw)
+    by_label: dict[str, enum.Enum] = {str(_cast(object, m.value)): m for m in enum_cls}
+
+    def decode(value: object) -> object:
+        found = by_label.get(value) if isinstance(value, str) else None
+        return found if found is not None else enum_cls(value)
+
+    column = Column[object](sql_type or "text", (enum_cls,), decoder=decode)
+    return Cast(Param(raw if sql_type else str(raw)), sql_type or "text", column)
 
 
 def _func(name: str, *args: object, keeps_type: bool = False) -> TypedFunc[object]:
