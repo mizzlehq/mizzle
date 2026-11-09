@@ -14,6 +14,9 @@ dist/
 src/mizzle/studio/static/
 src/mizzle/studio/ui.json
 
+# Studio local state (saved queries, query history)
+.mizzle/
+
 # Local secrets (database URLs, passwords)
 .env
 
@@ -23,3 +26,12 @@ docs/superpowers/
 # scripts/ci-local.sh
 .ci-local/
 site/
+
+# mutmut's working directory (mutation testing)
+mutants/
+
+# Local review notes: not part of the project, never published.
+ISSUES.md
+ISSUES-STUDIO-RUNTIME.md
+GAPS.md
+BUGS.md

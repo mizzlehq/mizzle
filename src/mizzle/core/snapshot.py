@@ -9,7 +9,9 @@ schema and the database it created compare equal.
 from __future__ import annotations
 
 import re
-from typing import NotRequired, TypedDict
+from typing import Literal, NotRequired, TypedDict
+
+from mizzle.core.errors import SchemaError
 
 SNAPSHOT_VERSION = 1
 
@@ -48,21 +50,30 @@ class ColumnSnap(TypedDict):
     # Absent unless set, so snapshots written before these fields existed compare equal.
     identity: NotRequired[IdentitySnap]
     generated: NotRequired[GeneratedSnap]
+    collation: NotRequired[str]  # COLLATE name, when not the database default
+    comment: NotRequired[str]  # COMMENT ON COLUMN
 
 
 class PrimaryKeySnap(TypedDict):
     name: str
     columns: list[str]
+    deferrable: NotRequired[bool]
+    initially_deferred: NotRequired[bool]
 
 
 class UniqueSnap(TypedDict):
     name: str
     columns: list[str]
+    # Absent when the default (NULLs are distinct), so older snapshots compare equal.
+    nulls_not_distinct: NotRequired[bool]
+    deferrable: NotRequired[bool]
+    initially_deferred: NotRequired[bool]
 
 
 class CheckSnap(TypedDict):
     name: str
     expression: str
+    not_valid: NotRequired[bool]
 
 
 class ForeignKeySnap(TypedDict):
@@ -73,6 +84,9 @@ class ForeignKeySnap(TypedDict):
     ref_columns: list[str]
     on_delete: str | None  # None means the database default (NO ACTION)
     on_update: str | None
+    deferrable: NotRequired[bool]
+    initially_deferred: NotRequired[bool]
+    not_valid: NotRequired[bool]
 
 
 class IndexSnap(TypedDict):
@@ -88,6 +102,7 @@ class IndexSnap(TypedDict):
     # Expression indexes carry theirs inside ``expression``.
     opclasses: NotRequired[list[str | None]]
     options: NotRequired[dict[str, str]]  # storage parameters: WITH (m = 16, ...)
+    nulls_not_distinct: NotRequired[bool]  # UNIQUE index: NULLs are equal
 
 
 class RlsSnap(TypedDict):
@@ -104,24 +119,6 @@ class PolicySnap(TypedDict):
     with_check: str | None
 
 
-class TriggerSnap(TypedDict):
-    name: str
-    timing: str  # "before", "after" or "instead of"
-    events: list[str]  # of "insert", "delete", "update", "truncate", in that order
-    for_each: str  # "row" or "statement"
-    function: str  # "schema.name" of a function returning trigger
-    when: str | None
-    # Absent unless used, so snapshots written before these fields existed compare equal.
-    columns: NotRequired[list[str]]  # UPDATE OF these columns (sorted)
-    old_table: NotRequired[str]  # REFERENCING OLD TABLE AS ...
-    new_table: NotRequired[str]  # REFERENCING NEW TABLE AS ...
-
-
-# Privileges per role: role name ("public": everyone) -> sorted privileges ("select", ...),
-# or ["all"] as declared (the database lists them one by one).
-type GrantsSnap = dict[str, list[str]]
-
-
 class TableSnap(TypedDict):
     schema: str
     name: str
@@ -134,8 +131,9 @@ class TableSnap(TypedDict):
     # Absent unless used, so snapshots written before these fields existed compare equal.
     rls: NotRequired[RlsSnap]
     policies: NotRequired[dict[str, PolicySnap]]
-    triggers: NotRequired[dict[str, TriggerSnap]]
-    grants: NotRequired[GrantsSnap]
+    comment: NotRequired[str]  # COMMENT ON TABLE
+    unlogged: NotRequired[bool]  # CREATE UNLOGGED TABLE
+    options: NotRequired[dict[str, str]]  # storage parameters: WITH (fillfactor=70)
 
 
 class EnumSnap(TypedDict):
@@ -152,30 +150,6 @@ class RoleSnap(TypedDict):
     inherit: bool
 
 
-class ExtensionSnap(TypedDict):
-    name: str
-    # Absent: not declared, so whatever the database has is accepted.
-    schema: NotRequired[str]
-    version: NotRequired[str]
-
-
-class FunctionSnap(TypedDict):
-    schema: str
-    name: str
-    args: str  # as pg_get_function_arguments() prints them
-    returns: str
-    language: str
-    body: str  # verbatim
-    volatility: str  # "volatile", "stable" or "immutable"
-    security_definer: bool
-    # Absent when the default, so snapshots written before these fields existed compare equal.
-    strict: NotRequired[bool]
-    leakproof: NotRequired[bool]
-    parallel: NotRequired[str]  # "safe" or "restricted" ("unsafe" is the default)
-    cost: NotRequired[float]  # absent: the language's default
-    settings: NotRequired[dict[str, str]]  # SET name = value (value as SQL)
-
-
 class ViewSnap(TypedDict):
     schema: str
     name: str
@@ -184,8 +158,10 @@ class ViewSnap(TypedDict):
     # The declared columns: only for `pull`; the diff ignores them.
     columns: dict[str, ColumnSnap]
     indexes: NotRequired[dict[str, IndexSnap]]  # materialized views only
-    triggers: NotRequired[dict[str, TriggerSnap]]  # INSTEAD OF triggers (plain views)
-    grants: NotRequired[GrantsSnap]
+    # View options (K6); absent when off, so older snapshots compare equal.
+    security_invoker: NotRequired[bool]
+    security_barrier: NotRequired[bool]
+    check_option: NotRequired[Literal["local", "cascaded"]]
 
 
 class Snapshot(TypedDict):
@@ -197,14 +173,22 @@ class Snapshot(TypedDict):
     enums: dict[str, EnumSnap]  # "schema.name" -> enum
     tables: dict[str, TableSnap]  # "schema.name" -> table
     # Absent unless used, so snapshots written before these fields existed compare equal.
-    extensions: NotRequired[dict[str, ExtensionSnap]]  # name -> extension
     roles: NotRequired[dict[str, RoleSnap]]  # name -> role (managed ones only)
-    functions: NotRequired[dict[str, FunctionSnap]]  # function_key() -> function
     views: NotRequired[dict[str, ViewSnap]]  # "schema.name" -> view
 
 
 def key(schema: str, name: str) -> str:
     return f"{schema}.{name}"
+
+
+def check_schema_name(schema: str) -> None:
+    """A schema name with a dot would make keys ambiguous: public."x.y" and "public.x".y
+    are both ``public.x.y`` (K6-9)."""
+    if "." in schema:
+        raise SchemaError(
+            f"schema {schema!r}: names containing '.' are not supported in schema names; "
+            "rename or exclude the schema"
+        )
 
 
 # Defaults that are SQL keywords, not functions (current_user, current_timestamp(3)...).
@@ -220,16 +204,6 @@ def keyword_default(text: str) -> str:
     print it back; anything else unchanged. Snapshots written before this stored them as
     declared, so the diff compares through it too."""
     return text.upper().replace(" ", "") if _KEYWORD_DEFAULT.fullmatch(text) else text
-
-
-def default_cost(language: str) -> float:
-    """PostgreSQL's COST for a function that does not give one."""
-    return 1.0 if language in ("c", "internal") else 100.0
-
-
-def function_key(fn: FunctionSnap) -> str:
-    """Overloads share a name: "schema.name(args)" tells them apart."""
-    return f"{fn['schema']}.{fn['name']}({fn['args']})"
 
 
 def empty_snapshot(dialect: str, id: str = "00000000-0000-0000-0000-000000000000") -> Snapshot:

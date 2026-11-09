@@ -18,12 +18,20 @@ from typing import TypedDict, cast, override
 
 from mizzle.core.compiler import CompiledQuery
 from mizzle.core.errors import QueryError
-from mizzle.core.query.base import Converter, Executable, Row, Runner, column_decoder, row_decoder
+from mizzle.core.query.base import (
+    Converter,
+    Executable,
+    Row,
+    Runner,
+    column_decoder,
+    row_decoder,
+)
+from mizzle.core.query.select import Cte
 from mizzle.core.schema.column import ColumnBase
 from mizzle.core.schema.relations import Link
 from mizzle.core.schema.table import Table
 from mizzle.core.sql.alias import real_table
-from mizzle.core.sql.nodes import Condition, ExprBase, Node, OrderBy
+from mizzle.core.sql.nodes import Condition, ExprBase, Json, Node, OrderBy
 
 
 class WithOptions(TypedDict, total=False):
@@ -37,8 +45,6 @@ class WithOptions(TypedDict, total=False):
 type OrderItem = ExprBase | OrderBy
 type With = Mapping[str, bool | WithOptions]
 type OrderArg = OrderItem | Sequence[OrderItem] | None
-# JSON as returned by the driver's json codec (nested rows of relational queries).
-type Json = bool | int | float | str | list[Json] | dict[str, Json] | None
 
 
 @dataclass(frozen=True)
@@ -137,6 +143,8 @@ def _from_json(column: ColumnBase, value: Json) -> object:
         if not isinstance(value, list):
             raise QueryError(f"{column.qualified_name}: expected a JSON array, got {value!r}")
         return [_from_json(column.item, v) for v in value]
+    if column.json_decoder is not None:  # point, line, cidr, bit string (C30)
+        return column.json_decoder(value)
     kind = column.accepts[0] if column.accepts else None
     if kind is None or kind in (int, str, bool) or column.enum is not None:
         return value
@@ -183,7 +191,7 @@ def _json_converter(column: ColumnBase) -> Converter | None:
     """What turns a non-NULL JSON value into the column's Python value (None: keep it)."""
     kind = column.accepts[0] if column.accepts else None
     plain = kind is None or kind in (int, str, bool) or column.enum is not None
-    if column.item is None and plain:
+    if column.item is None and plain and column.json_decoder is None:
         return column.decoder  # JSON already has the right type; enums still convert
     return lambda value: column.decode(_from_json(column, cast(Json, value)))
 
@@ -234,6 +242,8 @@ class RelationalStatement(Node):
 
     runner: Runner = field(repr=False)
     plan: LoadPlan
+    # A WITH clause passed with db.with_(...): emitted before the SELECT (B9).
+    ctes: tuple[Cte, ...] = ()
 
 
 @dataclass(frozen=True, eq=False)
@@ -246,8 +256,8 @@ class RelationalSelect[T: Table](RelationalStatement, Executable[list[T]]):
 
     async def stream(self, batch_size: int = 1000) -> AsyncGenerator[T]:
         """Like ``Select.stream()``: rows from a server-side cursor, ``batch_size`` at a time."""
-        decode = plan_decoder(self.plan)
         compiled = self._compile_for_run()
+        decode = plan_decoder(self.plan)
         async with aclosing(self.runner.stream(compiled, batch_size, read_only=True)) as batches:
             async for batch in batches:
                 for row in batch:
@@ -265,10 +275,12 @@ class RelationalFirst[T: Table](RelationalStatement, Executable[T | None]):
 class RelationalQuery[T: Table]:
     _runner: Runner
     _table: type[T]
+    _ctes: tuple[Cte, ...]
 
-    def __init__(self, runner: Runner, table: type[T]) -> None:
+    def __init__(self, runner: Runner, table: type[T], ctes: tuple[Cte, ...] = ()) -> None:
         self._runner = runner
         self._table = table
+        self._ctes = ctes
 
     def find_many(
         self,
@@ -290,7 +302,7 @@ class RelationalQuery[T: Table]:
             offset=offset,
             with_=with_,
         )
-        return RelationalSelect(self._runner, plan)
+        return RelationalSelect(self._runner, plan, self._ctes)
 
     def find_first(
         self,
@@ -303,4 +315,4 @@ class RelationalQuery[T: Table]:
         plan = build_plan(
             self._table, columns=columns, where=where, order_by=order_by, limit=1, with_=with_
         )
-        return RelationalFirst(self._runner, plan)
+        return RelationalFirst(self._runner, plan, self._ctes)

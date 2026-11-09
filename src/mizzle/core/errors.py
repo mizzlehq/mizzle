@@ -30,12 +30,14 @@ class DatabaseError(MizzleError):
         original: BaseException | None = None,
         constraint: str | None = None,
         column: str | None = None,
+        table: str | None = None,
     ) -> None:
         super().__init__(message if sql is None else f"{message}\nSQL: {sql}")
         self.sql: str | None = sql
         self.original: BaseException | None = original
         self.constraint: str | None = constraint
         self.column: str | None = column
+        self.table: str | None = table
 
     @property
     def sqlstate(self) -> str | None:
@@ -66,16 +68,34 @@ class SerializationFailure(DatabaseError):
 
 
 class ConnectionError(DatabaseError):
-    pass
+    """A connection could not be opened or was lost.
+
+    ``retryable`` is False when trying again cannot help (bad credentials, unknown database,
+    an unsupported feature), so a caller's retry loop can fail fast instead of waiting.
+    ``lost`` is False when no connection was opened (the pool could not hand one out):
+    the pooled connections are then fine and are kept. ``on_replica`` is True when the lost
+    connection was to a read replica, which cannot have written anything."""
+
+    retryable: bool = True
+    lost: bool = True
+    on_replica: bool = False
 
 
 class QueryTimeout(DatabaseError):
     """The statement ran longer than its timeout and was cancelled."""
 
 
-class ListenerOverflow(MizzleError):
-    """A ``listen()`` consumer fell ``max_queue`` notifications behind (``overflow="raise"``);
-    later notifications were not kept."""
+class AfterCommitError(MizzleError):
+    """An ``after_commit`` hook raised. The transaction **did** commit: the data is saved.
+
+    Raised instead of the hook's own error so a caller does not mistake it for a failed
+    write and run the transaction again. The hook's error is the cause."""
+
+
+class AfterRollbackError(MizzleError):
+    """An ``after_rollback`` hook raised while unwinding another error. The original error is
+    the cause, and is what the caller sees; this only exists so the hook's failure is not
+    lost (it is attached as the context of the original)."""
 
 
 class MigrationError(MizzleError):

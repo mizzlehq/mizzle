@@ -24,6 +24,7 @@ from mizzle.kit.codegen import render_schema_module
 from mizzle.kit.diff import diff
 from mizzle.kit.snapshot import build_snapshot
 from mizzle.pg import (
+    array,
     cosine_distance,
     halfvec,
     inner_product,
@@ -68,7 +69,13 @@ class Items(Table, name="items", schema=SCHEMA):
         ]
 
 
-TABLES: list[type[Table]] = [Shelves, Items]
+@final
+class Batches(Table, name="batches", schema=SCHEMA):
+    id = integer().primary_key().generated_always_as_identity()
+    embeddings = array(vector(3))
+
+
+TABLES: list[type[Table]] = [Shelves, Items, Batches]
 
 
 async def reset(db: Database) -> None:
@@ -93,7 +100,8 @@ def runner() -> Generator[tuple[asyncio.Runner, Database]]:
             await reset(db)
             async with db.driver.acquire() as conn:
                 await conn.execute("DROP EXTENSION IF EXISTS vector CASCADE", [])
-                # The migration creates the extension itself.
+                # mizzle does not manage extensions: a custom migration creates it first.
+                await conn.execute("CREATE EXTENSION vector", [])
                 for statement in dialect.render(
                     diff(empty_snapshot("postgresql"), build_snapshot(TABLES, dialect))
                 ):
@@ -119,6 +127,7 @@ def test_no_drift_and_pull_round_trip(
     source = render_schema_module(live)
     assert "embedding = vector(3)" in source and "half = halfvec(2)" in source
     assert "sparse = sparsevec(5)" in source
+    assert "embeddings = array(vector(3))" in source
     path = tmp_path / "pulled_vec.py"
     path.write_text(source)
     spec = importlib.util.spec_from_file_location("pulled_vec", path)
@@ -267,5 +276,19 @@ def test_sparse_vectors_and_array_values(runner: tuple[asyncio.Runner, Database]
             l2_distance({0: 1.0}, {1: 1.0})
         await db.delete(Items).where(eq(Items.shelf_id, shelf.id))
         await db.delete(Shelves).where(eq(Shelves.id, shelf.id))
+
+    loop.run(scenario())
+
+
+def test_arrays_of_vectors_round_trip(runner: tuple[asyncio.Runner, Database]) -> None:
+    loop, db = runner
+    vectors = [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]
+
+    async def scenario() -> None:
+        [row] = await db.insert(Batches).values(embeddings=vectors).returning()
+        assert row.embeddings == vectors  # float4 values come back exactly
+        [selected] = await db.select().from_(Batches).where(eq(Batches.id, row.id))
+        assert selected.embeddings == vectors
+        await db.delete(Batches).where(eq(Batches.id, row.id))
 
     loop.run(scenario())

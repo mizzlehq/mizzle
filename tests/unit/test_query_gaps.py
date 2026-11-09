@@ -3,6 +3,7 @@ subqueries in FROM, relational queries on an alias, ORDER BY expressions after U
 raw SQL reused next to different types, and OVERRIDING ... VALUE."""
 
 import datetime
+from decimal import Decimal
 
 import pytest
 
@@ -11,6 +12,7 @@ from mizzle import (
     alias,
     and_,
     asc,
+    between,
     cast,
     coalesce,
     count,
@@ -18,9 +20,15 @@ from mizzle import (
     eq,
     exists,
     func,
+    greatest,
+    gt,
+    in_,
     lag,
     lower,
+    max_,
     not_similar_to,
+    nullable,
+    placeholder,
     row_number,
     rows_between,
     similar_to,
@@ -36,8 +44,10 @@ from mizzle.core.query.base import row_decoder
 from mizzle.core.query.builder import QueryBuilder
 from mizzle.core.schema.table import Table
 from mizzle.core.sql.nodes import ExprBase, Node
+from mizzle.db import dialect_for_url
+from mizzle.dialects.postgres import PostgresDialect
 from mizzle.dialects.postgres.compiler import PostgresCompiler
-from mizzle.pg import date, integer, serial, text
+from mizzle.pg import custom, date, integer, serial, text
 from tests.models import Posts, Role, Users
 from tests.unit.conftest import FakeRunner
 
@@ -276,3 +286,125 @@ def test_generated_row_decoder() -> None:
     user = decode(("x", "y", 7, None, "admin"))
     assert (user.id, user.bio, user.role) == (7, None, Role.ADMIN)
     assert not hasattr(user, "email")  # not selected: absent, not None
+
+
+def test_a_select_with_a_data_modifying_cte_is_a_write(qb: QueryBuilder) -> None:
+    # Q1: a data-modifying CTE writes, so the SELECT runs on the primary, is never retried
+    # and explain(analyze=True) refuses it.
+    moved = qb.delete(Posts).where(eq(Posts.author_id, 1)).returning().cte("moved")
+    compiled = PostgresCompiler().compile(qb.with_(moved).select(Users.id).from_(Users))
+    assert compiled.writes is True
+    assert compiled.locking is False
+    assert PostgresCompiler().compile(qb.select(Users.id).from_(Users)).writes is False
+
+
+def test_ctes_reach_insert_update_delete_and_merge(qb: QueryBuilder) -> None:
+    # Q2/Q6: with_() used to be silently dropped on every write but SELECT.
+    keep = qb.select(Users.id).from_(Users).cte("keep")
+    with_ = qb.with_(keep)
+    head = 'WITH "keep" AS (SELECT "users"."id" FROM "users") '
+
+    insert_sql = with_.insert(Posts).values({"author_id": 1, "title": "x"}).to_sql()[0]
+    assert insert_sql.startswith(head + 'INSERT INTO "posts"')
+
+    update_sql = with_.update(Posts).set({"title": "y"}).where(eq(Posts.id, 1)).to_sql()[0]
+    assert update_sql.startswith(head + 'UPDATE "posts"')
+
+    delete_sql = with_.delete(Posts).where(eq(Posts.id, 1)).to_sql()[0]
+    assert delete_sql.startswith(head + 'DELETE FROM "posts"')
+
+    source = qb.select(Users.id, Users.email).from_(Users).subquery("src")
+    sid, email = source.c("id", int), source.c("email", str)
+    merge_sql = (
+        with_.merge(Posts)
+        .using(source)
+        .on(eq(Posts.author_id, sid))
+        .when_matched_then_update({"title": email})
+        .to_sql()[0]
+    )
+    assert merge_sql.startswith(head + 'MERGE INTO "posts"')
+
+
+def _dollars(cents: int) -> Decimal:
+    return Decimal(cents) / 100
+
+
+def _cents(dollars: Decimal) -> int:
+    return int(dollars * 100)
+
+
+class Priced(Table, name="priced"):
+    id = serial().primary_key()
+    price = custom("money_amount", py_type=int, decode=_cents, encode=_dollars)
+    pair = custom("price_pair")
+    flag = custom("flag_domain")  # a domain over boolean
+
+
+def test_values_next_to_cte_and_subquery_columns_are_encoded(qb: QueryBuilder) -> None:
+    # Q8-1: a value compared with a CTE or subquery column was sent raw (150, not 1.50).
+    s = qb.select(Priced.id, Priced.price).from_(Priced).subquery("s")
+    q = qb.select(s.c("id", int)).from_(s).where(eq(s.c("price", int), 150))
+    assert q.to_sql()[1] == (Decimal("1.5"),)
+    c = qb.select(Priced.id, Priced.price).from_(Priced).cte("c")
+    q = qb.with_(c).select(c.c("id", int)).from_(c)
+    assert q.where(in_(c.c("price", int), [1, 2])).to_sql()[1] == (Decimal("0.01"), Decimal("0.02"))
+    assert q.where(between(c.c("price", int), 1, 2)).to_sql()[1] == (
+        Decimal("0.01"),
+        Decimal("0.02"),
+    )
+
+
+def test_values_compared_with_custom_columns_are_not_cast(qb: QueryBuilder) -> None:
+    # R9-1: a cast to the custom type cut or rounded the value (varchar(5), numeric(10,2)).
+    sql_text, params = qb.select(Priced.id).from_(Priced).where(eq(Priced.pair, (1, 2))).to_sql()
+    assert sql_text.endswith('WHERE "priced"."pair" = $1') and params == ((1, 2),)
+    where = eq(Priced.price, placeholder("p"))
+    assert qb.select(Priced.id).from_(Priced).where(where).to_sql()[0].endswith("= $1")
+    assert qb.insert(Priced).values(pair=(1, 2)).to_sql()[0].endswith("VALUES ($1)")
+
+
+def test_untyped_custom_columns_take_booleans(qb: QueryBuilder) -> None:
+    # R8-2: a custom() column without py_type takes any value, True too.
+    assert qb.insert(Priced).values(flag=True).to_sql()[1] == (True,)
+    assert qb.update(Priced).set(flag=False).all_rows().to_sql()[1] == (False,)
+
+
+def test_url_scheme_is_case_insensitive() -> None:
+    # R8-3: RFC 3986 schemes are case-insensitive; asyncpg takes PostgreSQL:// too.
+    assert isinstance(dialect_for_url("PostgreSQL://u@h/d"), PostgresDialect)
+    assert isinstance(dialect_for_url("POSTGRES://u@h/d"), PostgresDialect)
+
+
+def test_values_next_to_expressions_of_a_column_are_encoded(qb: QueryBuilder) -> None:
+    # Q9-3: only a bare column (or CTE column) encoded the other side; an expression that
+    # keeps the column's type sent the raw value (an Enum asyncpg cannot take).
+    query = qb.select(Priced.id).from_(Priced)
+    for where in (
+        eq(nullable(Priced.price), 150),
+        eq(coalesce(Priced.price, 0), 150),
+        in_(coalesce(Priced.price, 0), [150]),
+        gt(greatest(Priced.price, 100), 150),
+    ):
+        assert Decimal("1.5") in query.where(where).to_sql()[1]
+    having = query.group_by(Priced.id).having(eq(max_(Priced.price), 150))
+    assert having.to_sql()[1] == (Decimal("1.5"),)
+
+
+def test_nested_custom_numbers_take_the_py_type() -> None:
+    # H10-1: a nested py_type=float value was a Decimal (0.1 + 1.0 raised TypeError), and a
+    # py_type=Decimal whole number an int.
+    def parse(column: object, text: str) -> object:
+        decoder = getattr(column, "json_decoder")  # noqa: B009
+        return decoder(text)
+
+    as_float, as_decimal, untyped = (
+        custom("f", py_type=float),
+        custom("d", py_type=Decimal),
+        custom("n"),
+    )
+    assert parse(as_float, "0.1") == 0.1 and type(parse(as_float, "2")) is float
+    assert parse(as_float, '"NaN"') != parse(as_float, '"NaN"')  # a float NaN
+    assert parse(as_decimal, "2") == Decimal(2) and type(parse(as_decimal, "2")) is Decimal
+    assert str(parse(as_decimal, "1.50")) == "1.50"
+    assert parse(as_decimal, '"Infinity"') == Decimal("Infinity")
+    assert parse(untyped, "2") == 2 and str(parse(untyped, "1.10")) == "1.10"

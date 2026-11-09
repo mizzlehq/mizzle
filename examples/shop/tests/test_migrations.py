@@ -70,6 +70,14 @@ async def fetch(url: str, query: str) -> list[tuple[object, ...]]:
         await conn.close()
 
 
+async def execute(url: str, script: str) -> None:
+    conn = await admin_connect(url)
+    try:
+        await conn.execute(script)
+    finally:
+        await conn.close()
+
+
 @pytest.fixture
 async def project(tmp_path: Path, admin_url: str) -> AsyncGenerator[Project]:
     yield await new_project(tmp_path, admin_url, "shop_mig")
@@ -81,24 +89,31 @@ def repo_sql(name: str) -> str:
     return (folder / "migration.sql").read_text()
 
 
+def custom_migration(p: Project, name: str) -> None:
+    """``generate --custom``, filled with the repository's SQL for it."""
+    assert p.run("generate", "--custom", "--name", name).code == 0
+    [folder] = (p.path / "migrations").glob(f"*_{name}")
+    (folder / "migration.sql").write_text(repo_sql(name))
+
+
 async def test_generate_migrate_evolve_check_drop(project: Project) -> None:
     p = project
     p.write_schema(schema_v1(SCHEMA))
+    # Extensions and the auth.uid() function first: an index and the policies use them.
+    custom_migration(p, "extensions_and_auth")
     r = p.run("generate", "--name", "shop_schema")
-    assert r.code == 0 and "(60 changes)" in r.out, r.out
+    assert r.code == 0 and "(45 changes)" in r.out, r.out
     assert p.sql("shop_schema") == repo_sql("shop_schema")  # deterministic
-    assert p.run("generate", "--custom", "--name", "auth_schema_usage").code == 0
-    custom = next((p.path / "migrations").glob("*_auth_schema_usage")) / "migration.sql"
-    custom.write_text(repo_sql("auth_schema_usage"))
+    custom_migration(p, "triggers_and_grants")  # what mizzle does not manage
 
     # Four app servers start at once: the advisory lock runs each migration exactly once.
     results = await asyncio.gather(*(p.run_async("migrate") for _ in range(4)))
     assert all(x.code == 0 for x in results), [x.out for x in results]
     outputs = "".join(x.out for x in results)
-    assert outputs.count("Applying 0001_shop_schema") == 1
-    assert outputs.count("Applying 0002_auth_schema_usage") == 1
+    for name in ("0001_extensions_and_auth", "0002_shop_schema", "0003_triggers_and_grants"):
+        assert outputs.count(f"Applying {name}") == 1
     applied = await fetch(p.url, "SELECT count(*) FROM __mizzle_migrations")
-    assert applied == [(2,)]
+    assert applied == [(3,)]
 
     # Data written under version 1 survives version 2.
     await fetch(
@@ -115,7 +130,7 @@ async def test_generate_migrate_evolve_check_drop(project: Project) -> None:
     assert r.code == 0 and "(7 changes)" in r.out, r.out
     assert p.sql("catalog_v2") == repo_sql("catalog_v2")
     r = p.run("migrate")
-    assert r.code == 0 and "Applying 0003_catalog_v2" in r.out, r.out
+    assert r.code == 0 and "Applying 0004_catalog_v2" in r.out, r.out
     rows = await fetch(p.url, "SELECT details, search::text FROM products")
     assert rows == [("boils water", "'boil':2B 'kettl':1A 'water':3B")]
     assert await fetch(p.url, "SELECT count(*) FROM top_products") == [(0,)]
@@ -128,7 +143,7 @@ async def test_generate_migrate_evolve_check_drop(project: Project) -> None:
     ) == [(64,)]
 
     r = p.run("check")
-    assert r.code == 0 and "3 migration(s) OK." in r.out, r.out
+    assert r.code == 0 and "4 migration(s) OK." in r.out, r.out
     assert p.run("generate").out.strip() == "No schema changes."
     assert p.run("migrate").out.strip() == "Database is up to date."
 
@@ -139,16 +154,16 @@ async def test_generate_migrate_evolve_check_drop(project: Project) -> None:
         )
     )
     r = p.run("generate", "--name", "nickname")
-    assert r.code == 0 and "0004_nickname" in r.out, r.out
+    assert r.code == 0 and "0005_nickname" in r.out, r.out
     r = p.run("drop")
-    assert r.code == 0 and "Dropped 0004_nickname" in r.out, r.out
-    assert not list((p.path / "migrations").glob("0004_*"))
-    assert "3 migration(s) OK." in p.run("check").out
+    assert r.code == 0 and "Dropped 0005_nickname" in r.out, r.out
+    assert not list((p.path / "migrations").glob("0005_*"))
+    assert "4 migration(s) OK." in p.run("check").out
     r = p.run("drop")
-    assert r.code == 1 and "0003_catalog_v2 is already applied" in r.out, r.out
+    assert r.code == 1 and "0004_catalog_v2 is already applied" in r.out, r.out
 
     # Editing an applied migration is caught.
-    applied_sql = next((p.path / "migrations").glob("0003_*")) / "migration.sql"
+    applied_sql = next((p.path / "migrations").glob("0004_*")) / "migration.sql"
     applied_sql.write_text(applied_sql.read_text() + "\nSELECT 1;\n")
     r = p.run("migrate")
     assert r.code == 1 and "changed after it was applied" in r.out, r.out
@@ -158,12 +173,17 @@ async def test_push_then_pull_without_drift(tmp_path: Path, admin_url: str) -> N
     p = await new_project(tmp_path / "app", admin_url, "shop_push")
     try:
         p.write_schema(SCHEMA)
+        # push applies the schema; what mizzle does not manage is SQL run around it.
+        await execute(p.url, repo_sql("extensions_and_auth"))
         r = p.run("push", "--force")
         assert r.code == 0 and "Applied" in r.out, r.out
         assert await fetch(
             p.url, "SELECT count(*) FROM pg_policies WHERE schemaname = 'public'"
         ) == [(7,)]
         r = p.run("push", "--dry-run")
+        assert r.out.strip() == "Database is up to date.", r.out
+        await execute(p.url, repo_sql("triggers_and_grants"))
+        r = p.run("push", "--dry-run")  # triggers, functions and grants are left alone
         assert r.out.strip() == "Database is up to date.", r.out
 
         # pull into a scratch project: the module imports, and generating from it (on top
@@ -178,12 +198,14 @@ async def test_push_then_pull_without_drift(tmp_path: Path, admin_url: str) -> N
         pulled = Project(scratch, p.url)
         r = pulled.run("pull")
         assert r.code == 0 and "Created baseline" in r.out, r.out
+        assert "pull skips trigger orders_audit on orders (not managed by mizzle)" in r.out, r.out
         source = (scratch / "db" / "schema.py").read_text()
         for name in (
             "class Users(Table",
             "class AuditLog(Table",
             "schema='shop_audit'",
             "class StoreSales(View",
+            "custom('tsvector')",
         ):
             assert name in source, name
         imported = subprocess.run(
@@ -211,7 +233,7 @@ async def test_vector_migrations_have_no_drift(tmp_path: Path, admin_url: str) -
         shutil.copy(ROOT / "mizzle.vector.toml", tmp_path / "mizzle.vector.toml")
         shutil.copytree(ROOT / "migrations_vector", tmp_path / "migrations_vector")
         r = p.run("migrate", config="mizzle.vector.toml")
-        assert r.code == 0 and "Applied 2 migration(s)." in r.out, r.out
+        assert r.code == 0 and "Applied 3 migration(s)." in r.out, r.out
         assert p.run("generate", config="mizzle.vector.toml").out.strip() == "No schema changes."
         r = p.run("push", "--dry-run", config="mizzle.vector.toml")
         assert r.out.strip() == "Database is up to date.", r.out

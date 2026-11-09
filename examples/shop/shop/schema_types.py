@@ -9,6 +9,18 @@ from shop.schema import OrderStatus
 from shop.schema import UserRole
 
 
+class UsersRow(TypedDict):
+    id: uuid.UUID
+    email: str
+    name: str
+    phone: str | None
+    role: UserRole
+    tags: list[Any]
+    prefs: Any
+    created_at: datetime.datetime
+    updated_at: datetime.datetime
+
+
 class UsersInsert(TypedDict):
     id: NotRequired[uuid.UUID]
     email: str
@@ -33,6 +45,14 @@ class UsersUpdate(TypedDict, total=False):
     updated_at: datetime.datetime
 
 
+class StoresRow(TypedDict):
+    id: int
+    owner_id: uuid.UUID
+    slug: str
+    name: str
+    created_at: datetime.datetime
+
+
 class StoresInsert(TypedDict):
     owner_id: uuid.UUID
     slug: str
@@ -45,6 +65,21 @@ class StoresUpdate(TypedDict, total=False):
     slug: str
     name: str
     created_at: datetime.datetime
+
+
+class ProductsRow(TypedDict):
+    id: int
+    store_id: int
+    sku: str
+    name: str
+    details: str | None
+    price: decimal.Decimal
+    tags: list[Any]
+    attrs: Any
+    active: bool
+    search: str | None
+    created_at: datetime.datetime
+    updated_at: datetime.datetime
 
 
 class ProductsInsert(TypedDict):
@@ -75,6 +110,13 @@ class ProductsUpdate(TypedDict, total=False):
     updated_at: datetime.datetime
 
 
+class InventoryRow(TypedDict):
+    product_id: int
+    warehouse: str
+    quantity: int
+    updated_at: datetime.datetime
+
+
 class InventoryInsert(TypedDict):
     product_id: int
     warehouse: str
@@ -87,6 +129,16 @@ class InventoryUpdate(TypedDict, total=False):
     warehouse: str
     quantity: int
     updated_at: datetime.datetime
+
+
+class OrdersRow(TypedDict):
+    id: int
+    user_id: uuid.UUID
+    store_id: int
+    status: OrderStatus
+    total: decimal.Decimal
+    note: str | None
+    placed_at: datetime.datetime
 
 
 class OrdersInsert(TypedDict):
@@ -107,6 +159,15 @@ class OrdersUpdate(TypedDict, total=False):
     placed_at: datetime.datetime
 
 
+class OrderItemsRow(TypedDict):
+    order_id: int
+    line: int
+    product_id: int
+    quantity: int
+    unit_price: decimal.Decimal
+    line_total: decimal.Decimal | None
+
+
 class OrderItemsInsert(TypedDict):
     order_id: int
     line: int
@@ -121,6 +182,15 @@ class OrderItemsUpdate(TypedDict, total=False):
     product_id: int
     quantity: int
     unit_price: decimal.Decimal
+
+
+class ReviewsRow(TypedDict):
+    id: int
+    product_id: int
+    user_id: uuid.UUID
+    rating: int
+    body: str
+    created_at: datetime.datetime
 
 
 class ReviewsInsert(TypedDict):
@@ -141,6 +211,15 @@ class ReviewsUpdate(TypedDict, total=False):
     created_at: datetime.datetime
 
 
+class NotificationsRow(TypedDict):
+    id: int
+    user_id: uuid.UUID
+    kind: str
+    payload: Any
+    read_at: datetime.datetime | None
+    created_at: datetime.datetime
+
+
 class NotificationsInsert(TypedDict):
     user_id: uuid.UUID
     kind: str
@@ -155,6 +234,16 @@ class NotificationsUpdate(TypedDict, total=False):
     payload: Any
     read_at: datetime.datetime | None
     created_at: datetime.datetime
+
+
+class AuditLogRow(TypedDict):
+    id: int
+    table_name: str
+    action: AuditAction
+    row_id: str
+    data: Any | None
+    actor: str
+    at: datetime.datetime
 
 
 class AuditLogInsert(TypedDict):

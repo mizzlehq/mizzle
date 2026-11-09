@@ -1,14 +1,12 @@
-"""The runtime under the app: replicas, lost connections, session resets, LISTEN queues,
-bulk I/O, transactions and the less common query features, on the app's own database."""
+"""The runtime under the app: replicas, lost connections, session resets, bulk inserts,
+streaming, transactions and the less common query features, on the app's own database."""
 
 import asyncio
 import contextlib
 import datetime
-import os
 import uuid
 from collections.abc import AsyncGenerator
 from decimal import Decimal
-from pathlib import Path
 from typing import final
 
 import asyncpg
@@ -21,11 +19,8 @@ from mizzle import (
     Database,
     DatabaseError,
     ForeignKeyViolation,
-    ListenerOverflow,
-    Notification,
     QueryError,
     QueryTimeout,
-    Reconnected,
     SerializationFailure,
     UniqueViolation,
     abs_,
@@ -236,69 +231,10 @@ async def test_session_state_never_leaks(
     assert_no_leak(db)
 
 
-# -- LISTEN / NOTIFY ---------------------------------------------------------------------
-
-
-async def send(db: Database, channel: str, n: int) -> None:
-    for i in range(n):
-        await db.notify(channel, str(i))
-    await asyncio.sleep(0.3)  # delivered to the listener's connection
-
-
-async def test_listen_queue_limits(db: Database) -> None:
-    if os_bouncer():
-        pytest.skip("LISTEN does not work through PgBouncer in transaction mode")
-    async with db.listen("shop_q1", max_queue=2, overflow="raise") as events:
-        await send(db, "shop_q1", 5)
-        got = [await anext(events), await anext(events)]
-        with pytest.raises(ListenerOverflow):
-            await anext(events)
-    assert [e.payload for e in got] == ["0", "1"]
-
-    async with db.listen("shop_q2", max_queue=2, overflow="drop_oldest") as events:
-        await send(db, "shop_q2", 5)
-        assert [e.payload for e in [await anext(events), await anext(events)]] == ["3", "4"]
-
-    async with db.listen("shop_q3", max_queue=2, overflow="block") as events:
-        await send(db, "shop_q3", 5)
-        assert [(await anext(events)).payload for _ in range(5)] == ["0", "1", "2", "3", "4"]
-    assert_no_leak(db)
-
-
-async def test_listen_reconnects(db: Database, admin_url: str) -> None:
-    if os_bouncer():
-        pytest.skip("LISTEN does not work through PgBouncer in transaction mode")
-    async with db.listen("shop_rc", reconnect=True) as events:
-        await db.notify("shop_rc", "before")
-        first = await anext(events)
-        assert isinstance(first, Notification) and first.payload == "before"
-        await terminate_app_backends(admin_url)
-        async with asyncio.timeout(10):
-            assert isinstance(await anext(events), Reconnected)
-        await db.notify("shop_rc", "after")
-        async with asyncio.timeout(5):
-            after = await anext(events)
-        assert isinstance(after, Notification) and after.payload == "after"
-
-
-def os_bouncer() -> bool:
-    return bool(os.environ.get("SHOP_BOUNCER_URL"))
-
-
-async def test_listen_through_pgbouncer_refuses(db: Database) -> None:
-    if not os_bouncer():
-        pytest.skip("only through PgBouncer")
-    with pytest.raises(DatabaseError, match="pooler_session_mode"):
-        async with db.listen("shop_pgb") as events:
-            await anext(events)
-
-
 # -- bulk I/O and streaming ---------------------------------------------------------------
 
 
-async def test_stream_and_copy_out(
-    db: Database, tmp_path: Path, seed: tuple[Users, Stores, list[Products]]
-) -> None:
+async def test_stream(db: Database, seed: tuple[Users, Stores, list[Products]]) -> None:
     store = seed[1]
     q = (
         db.select(Products.sku, Products.price)
@@ -313,15 +249,9 @@ async def test_stream_and_copy_out(
     )
     names = [p.store.slug async for p in rel.stream(batch_size=4) if p.store is not None]
     assert names == [store.slug] * 30
-    out = tmp_path / "products.csv"
-    assert await db.copy_from(q, str(out), header=True) == 30
-    lines = out.read_text().splitlines()
-    assert lines[:3] == ["sku,price", "s1,1.00", "s2,2.00"] and len(lines) == 31
-    raw = sql("SELECT sku FROM products WHERE store_id = 0")
-    assert await db.copy_from(raw, str(out)) == 0
 
 
-async def test_insert_many_batches_and_copy_into(
+async def test_insert_many_batches(
     db: Database, seed: tuple[Users, Stores, list[Products]]
 ) -> None:
     store = seed[1]
@@ -338,11 +268,6 @@ async def test_insert_many_batches_and_copy_into(
         .where(eq(Products.sku, "fresh"))
     )
     assert n == 0
-    ids = [p.id for p in seed[2]]
-    loaded = await db.copy_into(
-        Inventory, [{"product_id": i, "warehouse": "copy", "quantity": 3} for i in ids]
-    )
-    assert loaded == 30
 
 
 # -- transactions -------------------------------------------------------------------------
@@ -548,21 +473,3 @@ async def test_restrict_is_a_foreign_key_violation(
         "23001",
         "order_items_product_id_fkey",
     )
-
-
-async def test_listen_through_a_session_mode_pooler() -> None:
-    """PgBouncer in session mode keeps one server session per client: LISTEN works there
-    when the app says so (pooler_session_mode=True); otherwise listen() refuses."""
-    url = os.environ.get("MIZZLE_PGBOUNCER_SESSION_URL")
-    if not url:
-        pytest.skip("set MIZZLE_PGBOUNCER_SESSION_URL (tests/infra/compose.yml)")
-    async with await Database.connect(url, statement_cache_size=0, pool_size=2) as db:
-        with pytest.raises(DatabaseError, match="pooler_session_mode"):
-            async with db.listen("shop_session") as events:
-                await anext(events)
-        async with db.listen("shop_session", pooler_session_mode=True) as events:
-            await db.notify("shop_session", "hello")
-            async with asyncio.timeout(5):
-                event = await anext(events)
-        assert event.payload == "hello"
-        assert_no_leak(db)

@@ -1,6 +1,7 @@
 import asyncio
 import datetime
 import traceback
+from decimal import Decimal
 
 import pytest
 
@@ -144,6 +145,19 @@ async def test_server_data_error_hides_value(db: Database) -> None:
     assert "secret-x" not in str(info.value)
 
 
+async def test_jsonb_decimal_keeps_its_digits(db: Database) -> None:
+    # Q6-6: a Decimal works in a jsonb DDL default; a runtime write failed (value hidden).
+    ann = await add_user(db, "ann")
+    meta = {"p": Decimal("1.10"), "q": [Decimal("12345678901234567890.5"), 1.5, "x"]}
+    await db.insert(Posts).values(author_id=ann.id, title="t", meta=meta)
+    rows = await db.execute(sql("select meta->>'p' as p, meta->'q'->>0 as q from posts"))
+    assert rows == [{"p": "1.10", "q": "12345678901234567890.5"}]
+    # A value JSON has no form for: the encoder's reason shows, the value does not.
+    with pytest.raises(DatabaseError, match="set is not JSON serializable") as info:
+        await db.insert(Posts).values(author_id=ann.id, title="t", meta={"s": {"secret"}})
+    assert "secret" not in str(info.value)
+
+
 async def test_bad_param_type_error_hides_value(db: Database) -> None:
     with pytest.raises(DatabaseError, match="wrong type") as info:
         await db.execute(sql("select {}::int", "secret-value"))
@@ -201,6 +215,7 @@ async def test_unique_violation_hides_values(db: Database) -> None:
     with pytest.raises(UniqueViolation) as info:
         await add_user(db, secret)
     assert info.value.constraint == "users_email_key"
+    assert info.value.table == "users"
     assert secret not in str(info.value)
     # Logged tracebacks must not print the chained driver error (its DETAIL has the value).
     assert secret not in "".join(traceback.format_exception(info.value))
@@ -211,11 +226,13 @@ async def test_other_violations(db: Database) -> None:
     with pytest.raises(ForeignKeyViolation):
         await db.insert(Posts).values(author_id=999, title="x")
     ann = await add_user(db, "ann")
-    with pytest.raises(CheckViolation):
+    with pytest.raises(CheckViolation) as info:
         await db.insert(Posts).values(author_id=ann.id, title="")
+    assert info.value.table == "posts"
     with pytest.raises(NotNullViolation) as info:
         await db.execute(sql("insert into users (email) values (null)"))
     assert info.value.column == "email"
+    assert info.value.table == "users"
     assert info.value.sqlstate == "23502"
 
 
@@ -252,6 +269,16 @@ async def test_bad_logger_does_not_break_queries(pg_url: str, driver: object) ->
 
     async with await Database.connect(pg_url, logger=bad) as db:
         assert await db.select(Users.id).from_(Users) == []
+
+
+async def test_tags_reach_the_logger(pg_url: str, driver: object) -> None:
+    events: list[QueryEvent] = []
+    async with await Database.connect(pg_url, logger=events.append) as db:
+        tagged = db.tag(request_id="r1").tag(route="/users")
+        await tagged.select(Users.id).from_(Users)
+        await db.select(Users.id).from_(Users)  # the original session has no tags
+    assert events[-2].tags == {"request_id": "r1", "route": "/users"}
+    assert events[-1].tags == {}
 
 
 async def test_connection_errors() -> None:

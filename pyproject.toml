@@ -75,6 +75,9 @@ docs = [
     "mkdocstrings[python]>=0.29",
     "ruff>=0.11",  # mkdocstrings formats signatures with it
 ]
+mutation = [
+    "mutmut>=3.2",  # `uv run --group mutation mutmut run`; see .github/workflows/mutation.yml
+]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
@@ -85,7 +88,7 @@ testpaths = ["tests"]
 line-length = 100
 target-version = "py312"
 per-file-target-version = { "tests/**/*_py314.py" = "py314" }
-extend-exclude = ["docs"]
+extend-exclude = ["docs", ".claude"]  # agent worktrees
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
@@ -145,6 +148,24 @@ root = "examples/social"
 strict = true
 python_version = "3.12"
 files = ["src", "tests/typing"]
+
+[tool.mutmut]
+# Mutation testing (DI6): `uv run --group mutation mutmut run "mizzle.core.*"` mutates the
+# source and reruns the fast unit tests against each mutant. Integration tests need Postgres,
+# so they are left out; modules covered only there will show survivors. A scheduled CI job
+# (.github/workflows/mutation.yml) reports the score and fails below a threshold.
+source_paths = ["src/mizzle"]
+pytest_add_cli_args_test_selection = ["tests/unit"]
+also_copy = ["pyproject.toml"]
+# -1 disables mutmut's stack-depth walk. With a positive depth it calls
+# `Path(frame_filename).resolve(strict=True)` on every frame, which raises
+# FileNotFoundError for `<frozen importlib._bootstrap>` when a class is defined
+# during import (mutmut 3.8.1). Revisit when mutmut guards that call.
+max_stack_depth = -1
+do_not_mutate_patterns = [
+    'logger\\.\\w+',  # log messages are not behaviour
+    'raise \\w+',  # exception text is asserted elsewhere
+]
 
 [tool.coverage.run]
 source = ["mizzle"]

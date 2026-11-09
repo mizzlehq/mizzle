@@ -19,11 +19,14 @@ from typing import cast
 
 from mizzle.core.errors import MigrationError
 from mizzle.core.naming import Casing
+from mizzle.core.schema.column import ColumnBase
 from mizzle.core.schema.constraints import Role
-from mizzle.core.schema.objects import Extension, Function, SchemaObject, Trigger
 from mizzle.core.schema.table import Table
 from mizzle.dialects.base import Dialect
 from mizzle.dialects.postgres import PostgresDialect
+
+# A module-level pg_enum(...) column declares an enum type no table uses (K4-5).
+type SchemaObject = Role | ColumnBase
 
 _KEYS = {
     "schema",
@@ -33,6 +36,7 @@ _KEYS = {
     "casing",
     "schema_filter",
     "migrations_schema",
+    "seed",
 }
 
 
@@ -46,6 +50,7 @@ class Config:
     casing: Casing | None = None
     schema_filter: list[str] = field(default_factory=lambda: ["public"])
     migrations_schema: str = "public"
+    seed: Path = field(default_factory=lambda: Path("seeds"))
 
     def dialect(self) -> Dialect:
         if self.dialect_name == "postgresql":
@@ -101,12 +106,31 @@ class Config:
         return tables
 
     def load_objects(self) -> list[SchemaObject]:
-        """The extensions, functions, triggers and roles the schema modules expose."""
-        objects: list[SchemaObject] = []
+        """The roles and standalone ``pg_enum(...)`` enum types the schema modules expose,
+        also inside a top-level list or tuple (``roles = [role("reader"), ...]``)."""
+        candidates: list[object] = []
         for value in self._members():
-            if isinstance(value, Extension | Function | Trigger | Role) and value not in objects:
+            if isinstance(value, list | tuple):
+                candidates += cast("list[object] | tuple[object, ...]", value)
+            else:
+                candidates.append(value)
+        objects: list[SchemaObject] = []
+        enums: list[ColumnBase] = []  # pg_enum(...) on its own (K4-5); == builds SQL, so `is`
+        for value in candidates:
+            if isinstance(value, ColumnBase):
+                if value.enum is not None and all(value is not e for e in enums):
+                    enums.append(value)
+            elif isinstance(value, Role) and value not in objects:
                 objects.append(value)
-        return objects
+        return [*objects, *enums]
+
+
+def load_toml(path: Path) -> dict[str, object]:
+    """A TOML file; a broken one is a clean MigrationError naming it (C27)."""
+    try:
+        return tomllib.loads(path.read_text(encoding="utf-8"))
+    except tomllib.TOMLDecodeError as exc:
+        raise MigrationError(f"{path} is not valid TOML: {exc}") from None
 
 
 def _str(data: dict[str, object], name: str, default: str, source: Path) -> str:
@@ -168,6 +192,7 @@ def _from_mapping(root: Path, data: dict[str, object], source: Path) -> Config:
         casing=None if casing is None else "snake_case",
         schema_filter=_str_list(data, "schema_filter", ["public"], source),
         migrations_schema=_str(data, "migrations_schema", "public", source),
+        seed=root / _str(data, "seed", "seeds", source),
     )
 
 
@@ -179,17 +204,17 @@ def load_config(path: Path | None = None, cwd: Path | None = None) -> Config:
     """
     cwd = cwd or Path.cwd()
     if path is not None:
-        data: dict[str, object] = tomllib.loads(path.read_text(encoding="utf-8"))
+        data: dict[str, object] = load_toml(path)
         if path.name == "pyproject.toml":
             data = _table(_table(data.get("tool", {}), path).get("mizzle", {}), path)
         return _from_mapping(path.parent.resolve(), data, path)
     for directory in [cwd]:
         own = directory / "mizzle.toml"
         if own.exists():
-            return _from_mapping(directory, tomllib.loads(own.read_text(encoding="utf-8")), own)
+            return _from_mapping(directory, load_toml(own), own)
         pyproject = directory / "pyproject.toml"
         if pyproject.exists():
-            document: dict[str, object] = tomllib.loads(pyproject.read_text(encoding="utf-8"))
+            document: dict[str, object] = load_toml(pyproject)
             tool = _table(document.get("tool", {}), pyproject)
             if "mizzle" in tool:
                 return _from_mapping(directory, _table(tool["mizzle"], pyproject), pyproject)

@@ -61,7 +61,7 @@ def crud_policy(
     read: Condition | bool | None = None,
     modify: Condition | bool | None = None,
 ) -> list[Policy]:
-    """Policies for the usual cases, like Drizzle's ``crudPolicy``: ``read`` controls
+    """Policies for the usual cases: ``read`` controls
     SELECT; ``modify`` controls INSERT, UPDATE and DELETE. ``True`` allows every row,
     ``False`` none, and ``None`` adds no policy (so, with RLS on, nothing is allowed).
     Names are ``{name}_select``, ``{name}_insert``, ``{name}_update`` and ``{name}_delete``."""

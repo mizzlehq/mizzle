@@ -1,9 +1,8 @@
 """Random schemas through the migration engine.
 
-Schemas also get random extensions, views (plain and materialized) over their tables,
-row-level security, policies, grants, a trigger function with triggers (UPDATE OF columns,
-transition tables, INSTEAD OF on views), and a SQL function some views call; mutations
-change all of them, rename and move tables, rename columns, and make columns generated.
+Schemas also get random views (plain and materialized) over their tables, row-level
+security and policies; mutations change all of them, rename and move tables, rename
+columns, and make columns generated.
 Half of the schemas use ``casing="snake_case"`` (camelCase attributes), and the enum type
 may live in the other schema.
 
@@ -16,7 +15,6 @@ The CLI test runs the same evolution through ``mizzle generate`` and ``mizzle mi
 import asyncio
 import contextlib
 import copy
-import dataclasses
 import datetime as dt
 import enum
 import os
@@ -40,17 +38,13 @@ from mizzle import (
     Table,
     View,
     check,
-    extension,
     foreign_key,
-    function,
-    grant,
     index,
     is_not_null,
     policy,
     primary_key,
     rls,
     sql,
-    trigger,
     unique,
     unique_index,
 )
@@ -58,8 +52,7 @@ from mizzle.core.errors import DatabaseError
 from mizzle.core.naming import Casing
 from mizzle.core.query.select import Select
 from mizzle.core.schema.column import ColumnBase, Computed, Identity, Reference, ReferentialAction
-from mizzle.core.schema.constraints import Constraint, PolicyCommand, Privilege
-from mizzle.core.schema.objects import SchemaObject, TriggerEvent
+from mizzle.core.schema.constraints import Constraint, PolicyCommand
 from mizzle.core.snapshot import Snapshot, empty_snapshot
 from mizzle.core.sql.nodes import ExprBase
 from mizzle.core.steps import Statement
@@ -93,7 +86,6 @@ from mizzle.pg import (
     text,
     time,
     timestamp,
-    tsvector,
     varchar,
 )
 from mizzle.pg import uuid as uuid_col
@@ -155,13 +147,6 @@ KINDS: dict[str, Kind] = {
     "varchar(20)": _k(lambda: varchar(20), "", "abc", samples=STRS, check=TEXTCHECK, text=True),
     "varchar": _k(varchar, "z", samples=STRS, check=TEXTCHECK, text=True),
     "boolean": _k(boolean, True, False, samples=("true", "false", "true"), generated="true"),
-    "tsvector": _k(
-        tsvector,
-        "'a' 'b'",  # as PostgreSQL prints it back
-        sql("to_tsvector('simple'::regconfig, 'x y'::text)"),  # defaults compare as printed
-        samples=("'a b'", "'c:1A'", "''"),
-        generated="to_tsvector('english', 'cats sat')",
-    ),
     "date": _k(
         date,
         dt.date(2020, 1, 2),
@@ -286,24 +271,15 @@ ACTIONS: list[ReferentialAction | None] = [
 ]
 TABLE_NAMES = ["alpha", "beta", "gamma", "delta", "Odd Name", "t_" + "long" * 11]
 VIEW_NAMES = ["v_one", "v_two", "Odd View"]
-EXTENSIONS = ["pg_trgm", "citext", "hstore"]
 FZ_ROLE = "mizzle_fz_role"
-TRIGGER_EVENTS: list[TriggerEvent] = ["insert", "delete", "update", "truncate"]
 COMMANDS: list[PolicyCommand] = ["all", "select", "insert", "update", "delete"]
 ENUM_EXTRAS = ["glad", "it's", "Mixed Case", "z"]
-PRIVILEGES: list[Privilege] = ["select", "insert", "update", "delete", "all"]
 # Sequence options of identity columns (start 10, increment 3 and more).
 # (min_value, max_value, cache, cycle)
 SEQ_OPTIONS: list[tuple[int | None, int | None, int | None, bool]] = [
     (None, None, None, False),
     (None, 30000, 5, False),
     (2, None, None, True),
-]
-# Options of fz_calc (Function fields): settings and planner options.
-CALC_OPTIONS: list[dict[str, object]] = [
-    {},
-    {"strict": True, "parallel": "safe", "cost": 7.0},
-    {"settings": (("search_path", "public, pg_temp"),), "parallel": "restricted"},
 ]
 SERVER = {"virtual": False}  # VIRTUAL generated columns: PostgreSQL 18+ (set by the runner)
 
@@ -362,23 +338,6 @@ class Pol:
 
 
 @dataclass
-class Trg:
-    name: str
-    events: list[TriggerEvent]
-    after: bool = False
-    statement: bool = False  # FOR EACH STATEMENT
-    when: str | None = None  # column: WHEN (NEW.col IS NOT NULL)
-    update_of: list[str] = field(default_factory=list[str])  # UPDATE OF columns
-    transition: bool = False  # REFERENCING NEW/OLD TABLE (AFTER, one event)
-
-
-@dataclass
-class Grt:
-    privileges: list[Privilege]
-    public: bool = False  # TO PUBLIC, else the fuzz role
-
-
-@dataclass
 class Tbl:
     name: str
     schema: str | None
@@ -390,8 +349,6 @@ class Tbl:
     fks: list[Fk] = field(default_factory=list[Fk])
     rls: int = 0  # 0 off, 1 enabled, 2 enabled and forced, 3 only forced
     policies: list[Pol] = field(default_factory=list[Pol])
-    triggers: list[Trg] = field(default_factory=list[Trg])
-    grants: list[Grt] = field(default_factory=list[Grt])
     uid: str = ""  # stays the same when the table is renamed or moved
 
     def __post_init__(self) -> None:
@@ -419,20 +376,13 @@ class Vw:
     where: str | None = None  # column: WHERE col IS NOT NULL
     materialized: bool = False
     indexed: bool = False  # materialized: an index on its first column
-    calc: bool = False  # a column calling fz_calc()
-    grants: list[Grt] = field(default_factory=list[Grt])
-    instead: bool = False  # plain view: an INSTEAD OF INSERT trigger
 
 
 @dataclass
 class Spec:
     enum_values: list[str]
     tables: list[Tbl]
-    extensions: list[str] = field(default_factory=list[str])
     views: list[Vw] = field(default_factory=list[Vw])
-    fn_variant: int = 0  # body of the trigger function
-    calc: int | None = None  # fz_calc(): None absent, else its number of arguments
-    calc_options: int = 0  # CALC_OPTIONS[calc_options]
     enum_schema: str | None = None  # the enum type's schema (None: public)
     snake: bool = False  # casing="snake_case": attributes are camelCase
 
@@ -552,7 +502,6 @@ def sanitize(spec: Spec) -> Spec:
 
 
 def sanitize_objects(spec: Spec) -> None:
-    spec.extensions = _dedupe(spec.extensions)
     for t in spec.tables:
         policies: list[Pol] = []
         for pol in t.policies:
@@ -565,35 +514,6 @@ def sanitize_objects(spec: Spec) -> None:
             if pol.name not in [q.name for q in policies]:
                 policies.append(pol)
         t.policies = policies
-        triggers: list[Trg] = []
-        for trg in t.triggers:
-            trg.events = [e for e in TRIGGER_EVENTS if e in trg.events] or ["insert"]
-            trg.statement = trg.statement or "truncate" in trg.events
-            col = t.col(trg.when) if trg.when is not None else None
-            if (
-                col is None
-                or trg.statement
-                or not set(trg.events) <= {"insert", "update"}  # NEW is there
-                or (col.generated and not trg.after)  # not yet computed in BEFORE
-                or col.virtual
-            ):
-                trg.when = None
-            trg.update_of = (
-                _dedupe([n for n in trg.update_of if (c := t.col(n)) and not c.generated])
-                if "update" in trg.events
-                else []
-            )
-            # Transition tables: AFTER triggers with one event and no column list.
-            trg.transition = (
-                trg.transition
-                and trg.after
-                and len(trg.events) == 1
-                and trg.events[0] != "truncate"
-                and not trg.update_of
-            )
-            if trg.name not in [u.name for u in triggers]:
-                triggers.append(trg)
-        t.triggers = triggers
     views: list[Vw] = []
     for v in spec.views:
         t = spec.table(v.table)
@@ -605,8 +525,6 @@ def sanitize_objects(spec: Spec) -> None:
         if v.where is not None and t.col(v.where) is None:
             v.where = None
         v.indexed = v.indexed and v.materialized and KINDS[_kind(t, v.cols[0])].btree
-        v.calc = v.calc and spec.calc is not None
-        v.instead = v.instead and not v.materialized
         views.append(v)
     spec.views = views
 
@@ -615,11 +533,7 @@ def sanitize_objects(spec: Spec) -> None:
 
 
 def build_tables(spec: Spec) -> list[type[Table]]:
-    return build_schema(spec)[0]
-
-
-def build_schema(spec: Spec) -> tuple[list[type[Table]], list[SchemaObject]]:
-    """Tables and views, and the extensions, functions and triggers of ``spec``."""
+    """Tables and views of ``spec``."""
     members = [(f"V{i}", v) for i, v in enumerate(spec.enum_values)]
     mood = cast(type[enum.Enum], enum.Enum("FzMood", members))
     classes: dict[str, type[Table]] = {}
@@ -710,7 +624,6 @@ def build_schema(spec: Spec) -> tuple[list[type[Table]], list[SchemaObject]]:
                 for fk in t.fks
                 if not fk.inline
             ]
-            out += [grant(g.privileges, to=["public"] if g.public else [FZ_ROLE]) for g in t.grants]
             return out
 
         attrs["config"] = classmethod(config)
@@ -722,40 +635,6 @@ def build_schema(spec: Spec) -> tuple[list[type[Table]], list[SchemaObject]]:
         )
         classes[t.name] = cast(type[Table], cls)
 
-    objects: list[SchemaObject] = [extension(e) for e in spec.extensions]
-    trigger_fn = function(
-        "fz_trg", returns="trigger", body=f"BEGIN PERFORM {spec.fn_variant}; RETURN NEW; END"
-    )
-    calc_args = ["a integer", "b integer"][: spec.calc or 0]
-    calc_fn = function(
-        "fz_calc",
-        returns="integer",
-        language="sql",
-        args=", ".join(calc_args),
-        body="SELECT " + " + ".join(arg.split()[0] for arg in calc_args),
-        volatility="immutable",
-    )
-    calc_fn = dataclasses.replace(calc_fn, **CALC_OPTIONS[spec.calc_options])
-    if spec.calc is not None:
-        objects.append(calc_fn)
-    for t in spec.tables:
-        for trg in t.triggers:
-            when = sql(f"NEW.{quote(trg.when)} IS NOT NULL") if trg.when else None
-            objects.append(
-                trigger(
-                    trg.name,
-                    on=classes[t.name],
-                    execute=trigger_fn,
-                    timing="after" if trg.after else "before",
-                    events=trg.events,
-                    for_each="statement" if trg.statement else "row",
-                    when=when,
-                    update_of=[classes[t.name].__table__.columns[a(n)] for n in trg.update_of],
-                    old_table="gone" if trg.transition and trg.events[0] != "insert" else None,
-                    new_table="came" if trg.transition and trg.events[0] != "delete" else None,
-                )
-            )
-
     views: list[type[Table]] = []
     for v in spec.views:
         source = classes[v.table]
@@ -765,23 +644,17 @@ def build_schema(spec: Spec) -> tuple[list[type[Table]], list[SchemaObject]]:
             db: QueryBuilder,
             v: Vw = v,
             source: type[Table] = source,
-            calc_args: int = spec.calc or 0,
         ) -> ExprBase | Select[dict[str, object]]:
             cols = source.__table__.columns
             fields: dict[str, ExprBase] = {c: cols[a(c)] for c in v.cols}
-            if v.calc:
-                fields["calc"] = sql(f"fz_calc({', '.join(['1'] * calc_args)})")
             select = db.select(fields).from_(source)
             return select.where(is_not_null(cols[a(v.where)])) if v.where else select
 
         def view_config(cls: type[Table], v: Vw = v) -> list[Constraint]:
             first = cls.__table__.columns[a(v.cols[0])]
-            out: list[Constraint] = [index(f"{v.name}_ix").on(first)] if v.indexed else []
-            out += [grant(g.privileges, to=["public"] if g.public else [FZ_ROLE]) for g in v.grants]
-            return out
+            return [index(f"{v.name}_ix").on(first)] if v.indexed else []
 
-        names = [*v.cols, *(["calc"] if v.calc else [])]
-        view_attrs: dict[str, object] = {a(c): text() for c in names}
+        view_attrs: dict[str, object] = {a(c): text() for c in v.cols}
         view_attrs["query"] = classmethod(query)
         view_attrs["config"] = classmethod(view_config)
         views.append(
@@ -792,18 +665,7 @@ def build_schema(spec: Spec) -> tuple[list[type[Table]], list[SchemaObject]]:
                 lambda ns, view_attrs=view_attrs: ns.update(view_attrs),
             )
         )
-    for v, view in zip(spec.views, views, strict=True):
-        if v.instead:
-            objects.append(
-                trigger(
-                    f"{v.name[:20]}_ins",
-                    on=view,
-                    execute=trigger_fn,
-                    timing="instead of",
-                    events=["insert"],
-                )
-            )
-    return [*classes.values(), *views], objects
+    return [*classes.values(), *views]
 
 
 def _kind(t: Tbl, name: str) -> str:
@@ -813,8 +675,7 @@ def _kind(t: Tbl, name: str) -> str:
 
 
 def snapshot_of(spec: Spec) -> Snapshot:
-    tables, objects = build_schema(spec)
-    return build_snapshot(tables, dialect, spec.casing, objects=objects)
+    return build_snapshot(build_tables(spec), dialect, spec.casing)
 
 
 # -- strategies ------------------------------------------------------------------------
@@ -915,14 +776,7 @@ def table_strategy(draw: st.DrawFn, name: str) -> Tbl:
     t.indexes = [
         draw(index_strategy(t, f"{name[:40]}_ix{i}")) for i in range(draw(st.integers(0, 3)))
     ]
-    t.grants = draw(st.lists(grant_strategy(), max_size=2))
     return t
-
-
-def grant_strategy() -> st.SearchStrategy[Grt]:
-    return st.builds(
-        Grt, st.lists(st.sampled_from(PRIVILEGES), min_size=1, max_size=2), st.booleans()
-    )
 
 
 def enum_values(draw: st.DrawFn, values: list[str]) -> list[str]:
@@ -954,14 +808,9 @@ def schemas(draw: st.DrawFn) -> Spec:
 
 
 def draw_objects(draw: st.DrawFn, spec: Spec) -> None:
-    spec.extensions = draw(st.lists(st.sampled_from(EXTENSIONS), unique=True, max_size=2))
-    spec.fn_variant = draw(st.integers(0, 2))
-    spec.calc = draw(st.sampled_from([None, 1, 2]))
-    spec.calc_options = draw(st.integers(0, len(CALC_OPTIONS) - 1))
     for t in spec.tables:
         t.rls = draw(st.sampled_from([0, 0, 1, 2, 3]))
         t.policies = [draw(policy_strategy(t, f"p{i}")) for i in range(draw(st.integers(0, 2)))]
-        t.triggers = [draw(trigger_strategy(t, f"tg{i}")) for i in range(draw(st.integers(0, 2)))]
     for name in draw(st.lists(st.sampled_from(VIEW_NAMES), unique=True, max_size=2)):
         spec.views.append(draw(view_strategy(spec, name)))
 
@@ -983,21 +832,6 @@ def policy_strategy(draw: st.DrawFn, t: Tbl, name: str) -> Pol:
 
 
 @st.composite
-def trigger_strategy(draw: st.DrawFn, t: Tbl, name: str) -> Trg:
-    events = draw(st.lists(st.sampled_from(TRIGGER_EVENTS), min_size=1, max_size=3, unique=True))
-    names = [c.name for c in t.cols]
-    return Trg(
-        name,
-        events,
-        draw(st.booleans()),
-        draw(st.booleans()),
-        _col_or_none(draw, t),
-        draw(st.lists(st.sampled_from(names), max_size=2)),
-        draw(st.booleans()),
-    )
-
-
-@st.composite
 def view_strategy(draw: st.DrawFn, spec: Spec, name: str) -> Vw:
     t = draw(st.sampled_from(spec.tables))
     names = [c.name for c in t.cols]
@@ -1008,9 +842,6 @@ def view_strategy(draw: st.DrawFn, spec: Spec, name: str) -> Vw:
         draw(st.lists(st.sampled_from(names), min_size=1, max_size=3, unique=True)),
         _col_or_none(draw, t),
         draw(st.booleans()),
-        draw(st.booleans()),
-        draw(st.booleans()),
-        draw(st.lists(grant_strategy(), max_size=2)),
         draw(st.booleans()),
     )
 
@@ -1056,8 +887,6 @@ def rename_column(spec: Spec, t: Tbl, old: str, new: str) -> None:
             v.cols, v.where = rn(v.cols), rn1(v.where)
     for p in t.policies:
         p.using, p.check = rn1(p.using), rn1(p.check)
-    for trg in t.triggers:
-        trg.when, trg.update_of = rn1(trg.when), rn(trg.update_of)
 
 
 def original_kind(s1: Spec, t: Tbl, c: Col) -> str:
@@ -1131,11 +960,6 @@ def mutated(draw: st.DrawFn, s1: Spec) -> Spec:
                 c.identity = draw(st.sampled_from([None, True, False]))
             case 17:
                 c.generated = False  # DROP EXPRESSION; the reverse needs a custom migration
-            case 18:
-                ext = draw(st.sampled_from(EXTENSIONS))
-                spec.extensions = [e for e in spec.extensions if e != ext] + (
-                    [] if ext in spec.extensions else [ext]
-                )
             case 19:
                 free = [n for n in VIEW_NAMES if n not in [v.name for v in spec.views]]
                 if free:
@@ -1156,18 +980,6 @@ def mutated(draw: st.DrawFn, s1: Spec) -> Spec:
                 else:  # change it in place: roles, expressions, maybe its command
                     changed = draw(policy_strategy(t, pol.name))
                     t.policies[t.policies.index(pol)] = changed
-            case 25:
-                t.triggers.append(draw(trigger_strategy(t, f"tg{uuid.uuid4().hex[:4]}")))
-            case 26 if t.triggers:
-                trg = draw(st.sampled_from(t.triggers))
-                if draw(st.booleans()):
-                    t.triggers.remove(trg)
-                else:
-                    t.triggers[t.triggers.index(trg)] = draw(trigger_strategy(t, trg.name))
-            case 27:
-                spec.fn_variant = (spec.fn_variant + 1) % 3
-            case 28:  # add, drop, or change the arguments of fz_calc
-                spec.calc = draw(st.sampled_from([None, 1, 2]))
             case 29 if spec.views:
                 v = draw(st.sampled_from(spec.views))
                 v.where = None if v.where else c.name if v.table == t.name else None
@@ -1183,15 +995,8 @@ def mutated(draw: st.DrawFn, s1: Spec) -> Spec:
                 c.generated, c.virtual = True, draw(st.booleans())  # dropped and added again
             case 33 if c.generated:
                 c.virtual = not c.virtual
-            case 34:
-                t.grants = draw(st.lists(grant_strategy(), max_size=2))
-            case 35 if spec.views:
-                v = draw(st.sampled_from(spec.views))
-                v.grants = draw(st.lists(grant_strategy(), max_size=2))
-                v.instead = draw(st.booleans())
             case 36:
                 c.seq = draw(st.integers(0, len(SEQ_OPTIONS) - 1))
-                spec.calc_options = draw(st.integers(0, len(CALC_OPTIONS) - 1))
             case 37 if t.indexes:
                 draw(st.sampled_from(t.indexes)).ops = draw(
                     st.lists(st.sampled_from(OPCLASSES), max_size=3)
@@ -1228,7 +1033,6 @@ DO $$ DECLARE r record; BEGIN
   END LOOP;
 END $$;
 DROP TYPE IF EXISTS {ENUM} CASCADE;
-DROP EXTENSION IF EXISTS {", ".join(EXTENSIONS)} CASCADE;
 """
 
 
@@ -1259,13 +1063,9 @@ async def normalized(driver: PostgresDriver, snapshot: Snapshot) -> Snapshot:
 
 def assert_no_drift(live: Snapshot, expected: Snapshot) -> None:
     note(f"expected: {expected['tables']}\nlive: {live['tables']}")
-    for part in ("views", "functions", "extensions"):
-        note(f"expected {part}: {expected.get(part)}\nlive {part}: {live.get(part)}")
-    remaining = diff(live, expected, compare_expressions=False)
+    note(f"expected views: {expected.get('views')}\nlive views: {live.get('views')}")
+    remaining = diff(live, expected, compare_expressions=False, normalized=True)
     assert remaining == [], [s.describe() for s in remaining]
-    # compare_expressions=False leaves undeclared extensions alone; they must be gone too.
-    installed = {e for e in live.get("extensions", {}) if e in EXTENSIONS}
-    assert installed == set(expected.get("extensions", {})) - {"vector"}
     for k, table in expected["tables"].items():
         live_indexes = live["tables"][k]["indexes"]
         for name, ix in table["indexes"].items():  # predicates are not compared above
@@ -1485,17 +1285,18 @@ def test_evolve_has_no_drift(
             event(f"kept rows checked: {sum(map(len, before.values())) > 0}")
             assert await kept_data(driver, s1, s2, after=True) == before
         # Running the migration again would find nothing to do.
-        assert dialect.render(diff(live, expected, compare_expressions=False)) == []
+        assert (
+            dialect.render(diff(live, expected, compare_expressions=False, normalized=True)) == []
+        )
 
     loop.run(scenario())
 
 
 def _schema_module(spec_id: str) -> str:
     return (
-        f"from {__name__} import CLI_SPECS, build_schema\n"
-        f"tables, objects = build_schema(CLI_SPECS[{spec_id!r}])\n"
+        f"from {__name__} import CLI_SPECS, build_tables\n"
+        f"tables = build_tables(CLI_SPECS[{spec_id!r}])\n"
         "globals().update({t.__name__: t for t in tables})\n"
-        "globals().update({f'object_{i}': o for i, o in enumerate(objects)})\n"
     )
 
 
@@ -1613,8 +1414,8 @@ def test_regressions_found_by_fuzzing() -> None:
         s.sql for s in migration(snapshot_of(Spec(["happy", "sad"], moods)), snapshot_of(grown))
     ]
     assert sqls == [
-        """ALTER TYPE "fz_mood" ADD VALUE 'it''s' BEFORE 'happy'""",
-        """ALTER TYPE "fz_mood" ADD VALUE 'glad' AFTER 'it''s'""",
+        """ALTER TYPE "fz_mood" ADD VALUE IF NOT EXISTS 'it''s' BEFORE 'happy'""",
+        """ALTER TYPE "fz_mood" ADD VALUE IF NOT EXISTS 'glad' AFTER 'it''s'""",
     ]
 
     # Long generated names keep their suffix, so a unique and a foreign key on the same

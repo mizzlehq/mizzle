@@ -2,12 +2,31 @@ import datetime
 import enum
 import ipaddress
 import uuid
+from collections.abc import AsyncGenerator
+from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any
 
 import pytest
+from asyncpg import Box, Range, Record
 
-from mizzle import Database, QueryError, RelationNotLoaded, Table, desc, eq, gt, like, sql
+from mizzle import (
+    Database,
+    DatabaseError,
+    QueryError,
+    RelationNotLoaded,
+    Table,
+    desc,
+    eq,
+    excluded,
+    gt,
+    in_,
+    like,
+    placeholder,
+    sql,
+)
+from mizzle.core.query.select import Select
+from mizzle.core.schema.column import Column
 from mizzle.core.schema.relations import many, one
 from mizzle.core.snapshot import empty_snapshot
 from mizzle.dialects.postgres.driver import PostgresDriver
@@ -16,6 +35,7 @@ from mizzle.kit.snapshot import build_snapshot
 from mizzle.pg import (
     array,
     bytea,
+    custom,
     date,
     inet,
     integer,
@@ -202,3 +222,244 @@ async def test_every_type_survives_json(driver: PostgresDriver, pg_url: str) -> 
 
         await db.execute(sql("DROP TABLE rel_thing, rel_owner"))
         await db.execute(sql("DROP TYPE rel_mood"))
+
+
+class CusOwner(Table, name="rel_cus_owner"):
+    id = serial().primary_key()
+    rows = many(lambda: CusRow)
+
+
+@dataclass(frozen=True)
+class Label:
+    text: str
+
+
+def _label_text(label: Label) -> str:
+    return label.text
+
+
+class CusRow(Table, name="rel_cus_row"):
+    id = serial().primary_key()
+    owner_id = integer()
+    ci = custom("citext")
+    num = custom("rel_c_num")  # a domain over numeric
+    mail = custom("rel_c_mail")  # a domain over text
+    mood = custom("rel_c_mood")  # an enum mizzle does not manage
+    doc = custom("tsvector")
+    pair = custom("rel_c_pair")  # a composite
+    span = custom("int4range")
+    rect = custom("box")
+    rects = array(custom("box"))
+    label = custom("citext", py_type=Label, decode=Label, encode=_label_text)
+    flag = custom("rel_c_yes", py_type=bool)  # a domain over boolean
+    owner = one(
+        lambda: CusOwner, fields=lambda: [CusRow.owner_id], references=lambda: [CusOwner.id]
+    )
+
+
+class CusCopy(Table, name="rel_cus_copy"):
+    id = serial().primary_key()
+    ci = custom("citext")
+    span = custom("int4range")
+
+
+_CUS_DROP = (
+    "DROP TABLE IF EXISTS rel_cus_row, rel_cus_owner, rel_cus_copy;"
+    " DROP TYPE IF EXISTS rel_c_pair, rel_c_mood;"
+    " DROP DOMAIN IF EXISTS rel_c_num, rel_c_mail, rel_c_yes"
+)
+_CUS_DDL = """
+CREATE EXTENSION IF NOT EXISTS citext;
+CREATE DOMAIN rel_c_num AS numeric;
+CREATE DOMAIN rel_c_mail AS text CHECK (VALUE LIKE '%@%');
+CREATE DOMAIN rel_c_yes AS boolean;
+CREATE TYPE rel_c_mood AS ENUM ('sad', 'ok', 'happy');
+CREATE TYPE rel_c_pair AS (amount numeric, day date);
+CREATE TABLE rel_cus_owner (id serial PRIMARY KEY);
+CREATE TABLE rel_cus_row (id serial PRIMARY KEY, owner_id int REFERENCES rel_cus_owner,
+  ci citext, num rel_c_num, mail rel_c_mail, mood rel_c_mood, doc tsvector, pair rel_c_pair,
+  span int4range, rect box, rects box[], label citext, flag rel_c_yes);
+CREATE TABLE rel_cus_copy (id serial PRIMARY KEY, ci citext, span int4range);
+"""
+_DAY = datetime.date(2020, 1, 2)
+_BOX = Box((2, 2), (0, 0))
+
+
+@pytest.fixture
+async def cus_db(driver: PostgresDriver, pg_url: str) -> AsyncGenerator[Database]:
+    """An owner with three rows: citext Abc/abc/Z, numeric domain 1.0/1.00/2."""
+    async with driver.acquire() as conn:
+        await conn.execute(_CUS_DROP + ";" + _CUS_DDL, [])
+    try:
+        async with await Database.connect(pg_url, schema=[CusOwner, CusRow, CusCopy]) as db:
+            [owner] = await db.insert(CusOwner).values({}).returning()
+            first = {
+                "owner_id": owner.id,
+                "ci": "Abc",
+                "num": Decimal("1.0"),
+                "mail": "a@x",
+                "mood": "happy",
+                "doc": "b a",
+                "pair": (Decimal("1.5"), _DAY),
+                "span": Range(1, 5),
+                "rect": _BOX,
+                "rects": [_BOX, None],
+                "label": Label("Hi"),
+                "flag": False,
+            }
+            more = [
+                {"owner_id": owner.id, "ci": "abc", "num": Decimal("1.00"), "span": Range(10, 12)},
+                {"owner_id": owner.id, "ci": "Z", "num": Decimal(2), "span": Range(2, 4)},
+            ]
+            await db.insert(CusRow).values([first, *more])  # insert_many
+            yield db
+    finally:
+        async with driver.acquire() as conn:
+            await conn.execute(_CUS_DROP + "; DROP EXTENSION IF EXISTS citext", [])
+
+
+def _check_first(row: CusRow) -> None:
+    assert (row.ci, row.num, row.mail, row.mood, row.doc) == (
+        "Abc",
+        Decimal("1.0"),
+        "a@x",
+        "happy",
+        "'a' 'b'",
+    )
+    assert isinstance(row.pair, Record) and tuple(row.pair) == (Decimal("1.5"), _DAY)
+    assert (row.span, row.rect, row.rects, row.label) == (
+        Range(1, 5),
+        _BOX,
+        [_BOX, None],
+        Label("Hi"),
+    )
+
+
+async def test_custom_values_are_the_drivers(cus_db: Database) -> None:
+    # custom(): whatever asyncpg reads and writes for the type, with no SQL around it.
+    query = cus_db.select().from_(CusRow).order_by(CusRow.id)
+    assert "::" not in query.to_sql()[0]
+    rows = await query
+    _check_first(rows[0])
+    assert [r.span for r in rows] == [Range(1, 5), Range(10, 12), Range(2, 4)]
+    found = await cus_db.query(CusRow).find_first(where=eq(CusRow.ci, "ABC"), order_by=CusRow.id)
+    assert found is not None
+    _check_first(found)
+    assert [r.span async for r in cus_db.query(CusRow).find_many(order_by=CusRow.id).stream()] == [
+        r.span for r in rows
+    ]
+    assert [r.ci async for r in query.stream()] == ["Abc", "abc", "Z"]
+    listed = await cus_db.select().from_(CusRow).where(in_(CusRow.span, [Range(2, 4), Range(7, 8)]))
+    assert [r.ci for r in listed] == ["Z"]
+    mood = await cus_db.select({"m": CusRow.mood}).from_(CusRow).where(eq(CusRow.mood, "happy"))
+    assert mood == [{"m": "happy"}]
+    labelled = await cus_db.select().from_(CusRow).where(eq(CusRow.label, Label("HI")))
+    assert [r.label for r in labelled] == [Label("Hi")]
+    # A tuple next to a composite needs the type written out: values are never cast (R9-1).
+    pair = sql("{}::rel_c_pair", (Decimal("1.5"), _DAY))
+    paired = await cus_db.select().from_(CusRow).where(eq(CusRow.pair, pair))
+    assert [r.id for r in paired] == [rows[0].id]
+    # A subquery or CTE column encodes values as the column it selects (Q8-1).
+    s = cus_db.select(CusRow.id, CusRow.label).from_(CusRow).subquery("s")
+    found_s = (
+        await cus_db.select(s.c("id", int)).from_(s).where(eq(s.c("label", Label), Label("HI")))
+    )
+    c = cus_db.select(CusRow.id, CusRow.label).from_(CusRow).cte("c")
+    in_c = in_(c.c("label", Label), [Label("hi"), Label("no")])
+    found_c = await cus_db.with_(c).select(c.c("id", int)).from_(c).where(in_c)
+    assert found_s == found_c == [(rows[0].id,)]
+
+    upd = cus_db.update(CusRow).set(span=Range(2, 3, upper_inc=True), label=Label("x"))
+    [changed] = await upd.where(eq(CusRow.ci, "Z")).returning()
+    assert (changed.span, changed.label) == (Range(2, 4), Label("x"))
+    ups = cus_db.insert(CusRow).values(id=changed.id, ci="z", rect=Box((1, 1), (3, 3)))
+    ups = ups.on_conflict_do_update(target=CusRow.id, set_={"rect": excluded(CusRow.rect)})
+    [upserted] = await ups.returning({"r": CusRow.rect, "c": CusRow.ci})
+    assert upserted == {"r": Box((3, 3), (1, 1)), "c": "Z"}
+
+
+class CusSized(Table, name="rel_cus_sized"):
+    id = serial().primary_key()
+    code = custom("varchar(5)")
+    amt = custom("rel_c_money", py_type=Decimal)  # a domain over numeric(10,2)
+
+
+async def test_custom_values_are_never_cast(driver: PostgresDriver, pg_url: str) -> None:
+    # R9-1: an explicit cast to the custom type cut or rounded the value, so a long text was
+    # stored cut, and a filter matched a row it should not.
+    async with driver.acquire() as conn:
+        await conn.execute(
+            "DROP TABLE IF EXISTS rel_cus_sized; DROP DOMAIN IF EXISTS rel_c_money;"
+            " CREATE DOMAIN rel_c_money AS numeric(10,2);"
+            " CREATE TABLE rel_cus_sized (id serial PRIMARY KEY, code varchar(5), amt rel_c_money)",
+            [],
+        )
+    try:
+        async with await Database.connect(pg_url, schema=[CusSized]) as db:
+            await db.insert(CusSized).values(code="abcde", amt=Decimal("10.00"))
+            insert = db.insert(CusSized).values(code=placeholder("c")).prepare()
+            with pytest.raises(DatabaseError):
+                await insert.execute(c="vwxyz123")
+            where = db.select(CusSized.id).from_(CusSized)
+            assert await where.where(eq(CusSized.code, "abcdefgh")) == []
+            assert await where.where(eq(CusSized.amt, Decimal("10.001"))) == []
+            assert len(await where.where(gt(CusSized.amt, Decimal("9.999")))) == 1
+            [(product,)] = await db.select(CusSized.amt * Decimal("1.005")).from_(CusSized)
+            assert product == Decimal("10.05000")
+    finally:
+        async with driver.acquire() as conn:
+            await conn.execute("DROP TABLE rel_cus_sized; DROP DOMAIN rel_c_money", [])
+
+
+async def test_custom_nested_rows_are_json(cus_db: Database) -> None:
+    # A relational query nests a custom() value as its JSON form; decode still applies.
+    # Numbers keep every digit (R8-1: a float lost them); a boolean stays a bool (Q9-2:
+    # its text 'false' was truthy).
+    [owner] = await cus_db.query(CusOwner).find_many(with_={"rows": {"order_by": CusRow.id}})
+    row = owner.rows[0]
+    assert (row.ci, row.mail, row.mood, row.doc, row.label) == (
+        "Abc",
+        "a@x",
+        "happy",
+        "'a' 'b'",
+        Label("Hi"),
+    )
+    nums = [r.num for r in owner.rows]
+    assert nums == [Decimal("1.0"), Decimal("1.00"), 2] and str(nums[1]) == "1.00"
+    assert row.flag is False and owner.rows[1].flag is None
+    assert row.pair == {"amount": Decimal("1.5"), "day": "2020-01-02"}
+    assert (row.span, row.rect, row.rects) == ("[1,5)", "(2,2),(0,0)", ["(2,2),(0,0)", None])
+
+
+async def test_custom_sorts_and_compares_as_sql(cus_db: Database, driver: PostgresDriver) -> None:
+    # DISTINCT, UNION, INTERSECT, EXCEPT and ORDER BY act on the type, as plain SQL does.
+    async def plain(text: str) -> list[object]:
+        async with driver.acquire() as conn:
+            return [r[0] for r in await conn.fetch(text, [])]
+
+    for name, column in (("ci", CusRow.ci), ("num", CusRow.num)):
+        query = cus_db.select({"v": column}).from_(CusRow).distinct()
+        assert sorted(map(str, (r["v"] for r in await query))) == sorted(
+            map(str, await plain(f"SELECT DISTINCT {name} FROM rel_cus_row"))
+        )
+        ordered = await query.order_by(desc(column))
+        sql_ordered = await plain(f"SELECT DISTINCT {name} FROM rel_cus_row ORDER BY 1 DESC")
+        assert [r["v"] for r in ordered] == sql_ordered
+
+    def one(column: Column[object], row: int) -> Select[dict[str, object]]:
+        return cus_db.select({"v": column}).from_(CusRow).where(eq(CusRow.id, row))
+
+    top = await one(CusRow.span, 1).union_all(one(CusRow.span, 2)).order_by(desc(CusRow.span))
+    assert [r["v"] for r in top] == [Range(10, 12), Range(1, 5)]
+    assert await one(CusRow.ci, 1).intersect(one(CusRow.ci, 2)) == [{"v": "Abc"}]
+    assert await one(CusRow.num, 1).except_(one(CusRow.num, 2)) == []
+
+
+async def test_custom_copies_with_from_select(cus_db: Database) -> None:
+    source = cus_db.select({"c": CusRow.ci, "s": CusRow.span}).from_(CusRow).order_by(CusRow.id)
+    assert await cus_db.insert(CusCopy).from_select([CusCopy.ci, CusCopy.span], source) == 3
+    copied = await cus_db.select({"c": CusCopy.ci, "s": CusCopy.span}).from_(CusCopy)
+    assert copied == await source
+    # A subquery selecting it compares as the type.
+    names = cus_db.select({"c": CusRow.ci}).from_(CusRow)
+    assert len(await cus_db.select().from_(CusCopy).where(in_(CusCopy.ci, names))) == 3

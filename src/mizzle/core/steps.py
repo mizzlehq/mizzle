@@ -10,9 +10,7 @@ from mizzle.core.snapshot import (
     CheckSnap,
     ColumnSnap,
     EnumSnap,
-    ExtensionSnap,
     ForeignKeySnap,
-    FunctionSnap,
     GeneratedSnap,
     IdentitySnap,
     IndexSnap,
@@ -20,7 +18,6 @@ from mizzle.core.snapshot import (
     PrimaryKeySnap,
     RoleSnap,
     TableSnap,
-    TriggerSnap,
     UniqueSnap,
     ViewSnap,
 )
@@ -29,7 +26,7 @@ type ConstraintKind = Literal["primary_key", "unique", "check", "foreign_key"]
 
 _TEXT = ("text", "character varying")
 _INTS = ("smallint", "integer", "bigint")
-_SIZED = re.compile(r"(character varying|numeric)(?:\((\d+)(?:,(\d+))?\))?")
+_SIZED = re.compile(r"(character varying|character|numeric)(?:\((\d+)(?:,(\d+))?\))?")
 
 
 def widens(old: str, new: str) -> bool:
@@ -39,7 +36,7 @@ def widens(old: str, new: str) -> bool:
         return widens(old[:-2], new[:-2])
     if new == "text":  # every value as its exact text
         return old in (*_TEXT, *_INTS, "boolean", "uuid") or old.startswith(
-            ("character varying(", "numeric")
+            ("character varying(", "character(", "numeric")
         )
     if old in _INTS and new in _INTS:
         return _INTS.index(old) <= _INTS.index(new)
@@ -48,6 +45,10 @@ def widens(old: str, new: str) -> bool:
     a, b = _SIZED.fullmatch(old), _SIZED.fullmatch(new)
     if a is None or b is None or a.group(1) != b.group(1):
         return False
+    # ``character`` without a length is ``character(1)``; only ``character varying`` and
+    # ``numeric`` are unbounded when no length is written.
+    if a.group(1) == "character":
+        return int(b.group(2) or 1) >= int(a.group(2) or 1)
     if b.group(2) is None:  # unbounded
         return True
     if a.group(2) is None:
@@ -175,11 +176,16 @@ class DropColumn(Step):
     schema: str
     table: str
     name: str
+    # Dropped to be added again (made generated...): refused at migrate time when objects
+    # mizzle does not manage hang on it (K6-7).
+    rebuilt: bool = False
+    # Generated before and after: its values are computed again, so nothing is lost.
+    computed: bool = False
 
     @property
     @override
     def data_loss(self) -> bool:
-        return True
+        return not self.computed
 
     @override
     def describe(self) -> str:
@@ -206,6 +212,9 @@ class AlterColumnType(Step):
     old_type: str
     new_type: str
     generated: bool = False  # a generated column: recomputed, so no USING cast
+    collation: str | None = None  # keep the column's COLLATE across the type change
+    # Cast through text: there is no direct cast from an enum to another type (C23).
+    via_text: bool = False
 
     @property
     @override
@@ -217,6 +226,84 @@ class AlterColumnType(Step):
     @override
     def describe(self) -> str:
         return f"change type of {self.table}.{self.column} from {self.old_type} to {self.new_type}"
+
+
+@dataclass(frozen=True)
+class AlterColumnCollation(Step):
+    """Change (or drop) a column's ``COLLATE``. ``sql_type`` is part of the ALTER: PostgreSQL
+    spells a collation change as ``ALTER COLUMN c TYPE <type> COLLATE <name>``."""
+
+    schema: str
+    table: str
+    column: str
+    sql_type: str
+    collation: str | None  # None: the collation the type uses by default
+
+    @override
+    def describe(self) -> str:
+        return f"change collation of {self.table}.{self.column} to {self.collation or 'default'}"
+
+
+@dataclass(frozen=True)
+class SetTableComment(Step):
+    """``COMMENT ON TABLE``; ``None`` removes the comment."""
+
+    schema: str
+    table: str
+    comment: str | None
+
+    @override
+    def describe(self) -> str:
+        what = "comment" if self.comment is not None else "remove comment"
+        return f"{what} on table {self.table}"
+
+
+@dataclass(frozen=True)
+class SetColumnComment(Step):
+    """``COMMENT ON COLUMN``; ``None`` removes the comment."""
+
+    schema: str
+    table: str
+    column: str
+    comment: str | None
+
+    @override
+    def describe(self) -> str:
+        what = "comment" if self.comment is not None else "remove comment"
+        return f"{what} on {self.table}.{self.column}"
+
+
+@dataclass(frozen=True)
+class SetTableLogged(Step):
+    """``ALTER TABLE ... SET LOGGED`` / ``SET UNLOGGED``."""
+
+    schema: str
+    table: str
+    unlogged: bool
+
+    @override
+    def describe(self) -> str:
+        return f"set {self.table} {'unlogged' if self.unlogged else 'logged'}"
+
+
+@dataclass(frozen=True)
+class AlterTableStorage(Step):
+    """Change a table's storage parameters: ``SET (...)`` for the new or changed ones and
+    ``RESET (...)`` for the removed ones."""
+
+    schema: str
+    table: str
+    set_options: dict[str, str]
+    reset_options: tuple[str, ...] = ()
+
+    @override
+    def describe(self) -> str:
+        parts: list[str] = []
+        if self.set_options:
+            parts.append("set " + ", ".join(f"{k}={v}" for k, v in self.set_options.items()))
+        if self.reset_options:
+            parts.append("reset " + ", ".join(self.reset_options))
+        return f"storage of {self.table}: {'; '.join(parts)}"
 
 
 @dataclass(frozen=True)
@@ -406,63 +493,6 @@ class DropRole(Step):
 
 
 @dataclass(frozen=True)
-class CreateExtension(Step):
-    extension: ExtensionSnap
-
-    @override
-    def describe(self) -> str:
-        return f"create extension {self.extension['name']}"
-
-
-@dataclass(frozen=True)
-class AlterExtension(Step):
-    name: str
-    schema: str | None = None  # move to this schema
-    version: str | None = None  # update to this version
-
-    @override
-    def describe(self) -> str:
-        what = f"schema {self.schema}" if self.schema is not None else f"version {self.version}"
-        return f"change extension {self.name} {what}"
-
-
-@dataclass(frozen=True)
-class DropExtension(Step):
-    name: str
-
-    @property
-    @override
-    def data_loss(self) -> bool:
-        return True
-
-    @override
-    def describe(self) -> str:
-        return f"drop extension {self.name}"
-
-
-@dataclass(frozen=True)
-class CreateFunction(Step):
-    """``CREATE OR REPLACE FUNCTION``."""
-
-    function: FunctionSnap
-
-    @override
-    def describe(self) -> str:
-        return f"create function {self.function['name']}"
-
-
-@dataclass(frozen=True)
-class DropFunction(Step):
-    schema: str
-    name: str
-    args: str
-
-    @override
-    def describe(self) -> str:
-        return f"drop function {self.name}"
-
-
-@dataclass(frozen=True)
 class CreateView(Step):
     view: ViewSnap
 
@@ -505,20 +535,6 @@ class RestoreGrants(Step):
     @override
     def describe(self) -> str:
         return f"restore privileges of {self.name}"
-
-
-@dataclass(frozen=True)
-class GrantPrivileges(Step):
-    schema: str
-    table: str  # a table or a view
-    role: str  # "public": everyone
-    privileges: tuple[str, ...]
-    revoke: bool = False
-
-    @override
-    def describe(self) -> str:
-        what, to = ("revoke", "from") if self.revoke else ("grant", "to")
-        return f"{what} {', '.join(self.privileges)} on {self.table} {to} {self.role}"
 
 
 @dataclass(frozen=True)
@@ -566,30 +582,6 @@ class DropPolicy(Step):
     @override
     def describe(self) -> str:
         return f"drop policy {self.name} on {self.table}"
-
-
-@dataclass(frozen=True)
-class CreateTrigger(Step):
-    schema: str
-    table: str
-    trigger: TriggerSnap
-    replace: bool = False  # CREATE OR REPLACE (PostgreSQL 14+)
-
-    @override
-    def describe(self) -> str:
-        what = "replace" if self.replace else "create"
-        return f"{what} trigger {self.trigger['name']} on {self.table}"
-
-
-@dataclass(frozen=True)
-class DropTrigger(Step):
-    schema: str
-    table: str
-    name: str
-
-    @override
-    def describe(self) -> str:
-        return f"drop trigger {self.name} on {self.table}"
 
 
 @dataclass(frozen=True)

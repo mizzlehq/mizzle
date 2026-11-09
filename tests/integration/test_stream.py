@@ -57,8 +57,15 @@ async def db(driver: PostgresDriver, pg_url: str) -> AsyncGenerator[Database]:
     ) as database:
         yield database
         assert_no_leak(database)
+
+
+@pytest.fixture(autouse=True)
+async def drop_stream_items(driver: PostgresDriver) -> AsyncGenerator[None]:
+    """Every test here may create stream_items; none may leave it behind, pass or fail
+    (a later test file on the same database would see it as drift)."""
+    yield
     async with driver.acquire() as conn:
-        await conn.execute("DROP TABLE stream_items", [])
+        await conn.execute("DROP TABLE IF EXISTS stream_items", [])
 
 
 async def released(db: Database) -> None:
@@ -253,3 +260,20 @@ async def test_plain_streams_read_from_replicas(db: Database, pg_url: str) -> No
     finally:
         async with db.driver.acquire() as conn:
             await conn.execute("DROP SCHEMA stream_replica CASCADE", [])
+
+
+async def test_stream_duration_leaves_out_the_callers_loop(
+    pg_url: str, driver: PostgresDriver
+) -> None:
+    # R10: the logged duration included the time the caller spent between batches.
+    async with driver.acquire() as conn:
+        await conn.execute(DDL, [])
+    events: list[QueryEvent] = []
+    async with await Database.connect(pg_url, schema=[Items], logger=events.append) as db:
+        rows = 0
+        async for _ in db.select().from_(Items).stream(batch_size=1000):
+            if rows % 1000 == 0:
+                await asyncio.sleep(0.2)  # once per batch: 0.6 s in the caller
+            rows += 1
+    [event] = events
+    assert event.duration_ms < 300, event.duration_ms

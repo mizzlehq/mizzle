@@ -30,6 +30,7 @@ class Index:
     # Operator class of every key, or one per key (None: the default).
     opclass: str | tuple[str | None, ...] | None = None
     options: tuple[tuple[str, str], ...] = ()  # storage parameters, as text
+    nulls_not_distinct: bool = False  # UNIQUE index: NULLs are equal (PostgreSQL 15+)
 
     def on(self, *keys: ExprBase) -> Index:
         return replace(self, columns=keys)
@@ -72,12 +73,17 @@ class Index:
 class UniqueConstraint:
     columns: tuple[ColumnBase, ...]
     name: str | None = None
+    nulls_not_distinct: bool = False  # treat NULLs as equal (PostgreSQL 15+)
+    deferrable: bool = False
+    initially_deferred: bool = False
 
 
 @dataclass(frozen=True)
 class PrimaryKey:
     columns: tuple[ColumnBase, ...]
     name: str | None = None
+    deferrable: bool = False
+    initially_deferred: bool = False
 
 
 @dataclass(frozen=True)
@@ -87,12 +93,16 @@ class ForeignKey:
     name: str | None = None
     on_delete: ReferentialAction | None = None
     on_update: ReferentialAction | None = None
+    deferrable: bool = False
+    initially_deferred: bool = False
+    not_valid: bool = False  # ADD ... NOT VALID: skip checking existing rows
 
 
 @dataclass(frozen=True)
 class Check:
     name: str
     condition: Condition
+    not_valid: bool = False  # ADD ... NOT VALID: skip checking existing rows
 
 
 type PolicyCommand = Literal["all", "select", "insert", "update", "delete"]
@@ -140,31 +150,6 @@ class Policy:
     declared_roles: tuple[Role, ...] = ()  # Role objects in ``to``, created by migrations
 
 
-_PRIVILEGES = (
-    "select",
-    "insert",
-    "update",
-    "delete",
-    "truncate",
-    "references",
-    "trigger",
-    "maintain",
-    "all",
-)
-type Privilege = Literal[
-    "select", "insert", "update", "delete", "truncate", "references", "trigger", "maintain", "all"
-]
-
-
-@dataclass(frozen=True)
-class Grant:
-    """``GRANT privileges ON table TO roles``, kept in sync by migrations."""
-
-    privileges: tuple[str, ...]  # sorted; ("all",) for ALL
-    roles: tuple[str, ...]  # sorted; "public" is everyone
-    declared_roles: tuple[Role, ...] = ()  # Role objects in ``to``, created by migrations
-
-
 @dataclass(frozen=True)
 class RowLevelSecurity:
     enabled: bool = True
@@ -172,24 +157,35 @@ class RowLevelSecurity:
 
 
 type Constraint = (
-    Index | UniqueConstraint | PrimaryKey | ForeignKey | Check | Policy | RowLevelSecurity | Grant
+    Index | UniqueConstraint | PrimaryKey | ForeignKey | Check | Policy | RowLevelSecurity
 )
 
 
-def index(name: str) -> Index:
-    return Index(name)
+def index(name: str, *, nulls_not_distinct: bool = False) -> Index:
+    return Index(name, nulls_not_distinct=nulls_not_distinct)
 
 
-def unique_index(name: str) -> Index:
-    return Index(name, unique=True)
+def unique_index(name: str, *, nulls_not_distinct: bool = False) -> Index:
+    return Index(name, unique=True, nulls_not_distinct=nulls_not_distinct)
 
 
-def unique(*columns: ColumnBase, name: str | None = None) -> UniqueConstraint:
-    return UniqueConstraint(columns, name)
+def unique(
+    *columns: ColumnBase,
+    name: str | None = None,
+    nulls_not_distinct: bool = False,
+    deferrable: bool = False,
+    initially_deferred: bool = False,
+) -> UniqueConstraint:
+    return UniqueConstraint(columns, name, nulls_not_distinct, deferrable, initially_deferred)
 
 
-def primary_key(*columns: ColumnBase, name: str | None = None) -> PrimaryKey:
-    return PrimaryKey(columns, name)
+def primary_key(
+    *columns: ColumnBase,
+    name: str | None = None,
+    deferrable: bool = False,
+    initially_deferred: bool = False,
+) -> PrimaryKey:
+    return PrimaryKey(columns, name, deferrable, initially_deferred)
 
 
 def foreign_key(
@@ -199,12 +195,24 @@ def foreign_key(
     name: str | None = None,
     on_delete: ReferentialAction | None = None,
     on_update: ReferentialAction | None = None,
+    deferrable: bool = False,
+    initially_deferred: bool = False,
+    not_valid: bool = False,
 ) -> ForeignKey:
-    return ForeignKey(tuple(columns), references, name, on_delete, on_update)
+    return ForeignKey(
+        tuple(columns),
+        references,
+        name,
+        on_delete,
+        on_update,
+        deferrable,
+        initially_deferred,
+        not_valid,
+    )
 
 
-def check(name: str, condition: Condition) -> Check:
-    return Check(name, condition)
+def check(name: str, condition: Condition, *, not_valid: bool = False) -> Check:
+    return Check(name, condition, not_valid)
 
 
 def rls(*, enabled: bool = True, force: bool = False) -> RowLevelSecurity:
@@ -230,18 +238,3 @@ def policy(
     # PostgreSQL ignores the other roles when PUBLIC is one of them.
     roles = ("public",) if "public" in names else tuple(sorted(set(names)))
     return Policy(name, for_, roles, using, with_check, as_ == "permissive", managed)
-
-
-def grant(privileges: Privilege | Sequence[Privilege], *, to: Sequence[str | Role]) -> Grant:
-    """``grant(["select", "insert"], to=[reader])`` in a table's or view's ``config()``.
-    Migrations grant what is declared and revoke what was declared before and no longer
-    is; privileges the schema never declared for a role are left alone."""
-    wanted = [privileges] if isinstance(privileges, str) else list(privileges)
-    if not wanted or not to:
-        raise SchemaError("grant() needs at least one privilege and one role")
-    if bad := [p for p in wanted if p not in _PRIVILEGES]:
-        raise SchemaError(f"grant(): unknown privileges {bad}")
-    names = sorted({r.name if isinstance(r, Role) else r for r in to})
-    managed = tuple(r for r in to if isinstance(r, Role) and not r.existing)
-    privs = ("all",) if "all" in wanted else tuple(sorted(set(wanted)))
-    return Grant(privs, tuple(names), managed)

@@ -34,7 +34,7 @@ from mizzle import Table
 from mizzle.pg import (
     array, bigint, bigserial, boolean, bytea, date, double_precision, inet, integer,
     interval, json, jsonb, numeric, real, smallint, smallserial, text, time, timestamp,
-    tsquery, tsvector, uuid, varchar,
+    uuid, varchar,
 )
 
 
@@ -62,8 +62,6 @@ class Everything(Table, name="everything"):
     tags = array(text())
     settings = jsonb[dict[str, Any]]()
     raw = json[list[int]]()
-    doc = tsvector()
-    query = tsquery()
 ```
 
 | Function | PostgreSQL type | Python type |
@@ -83,7 +81,6 @@ class Everything(Table, name="everything"):
 | `inet()` | `inet` | `IPv4Address`, `IPv6Address`, ... (`mizzle.pg.IPAddress`) |
 | `array(item)` | `item[]` | `list[item type]` |
 | `jsonb[T]()`, `json[T]()` | `jsonb`, `json` | `T` (a hint for your editor; not checked) |
-| `tsvector()`, `tsquery()` | `tsvector`, `tsquery` | `str` |
 | `pg_enum(EnumClass)` | an enum type | your `enum.Enum` class |
 | `vector(n)`, `halfvec(n)` | pgvector `vector(n)`, `halfvec(n)` | `list[float]` |
 | `sparsevec(n)` | pgvector `sparsevec(n)` | `dict[int, float]` |
@@ -93,6 +90,8 @@ class Everything(Table, name="everything"):
 - `timestamp(tz=True)` values always come back as aware datetimes in UTC.
 - `precision=` keeps 0 to 6 digits of fractional seconds (default 6).
 - The pgvector types need the `vector` extension. See [Extensions](extensions.md).
+- Other PostgreSQL types (ranges, geometry shapes other than `point` and `line`, `hstore`,
+  `citext`, `tsvector`, ...) are not built in; use `custom("type")`.
 
 ## Nullability, defaults and on_update
 
@@ -273,13 +272,101 @@ The type name is the class name in snake_case (`Status` is `status`); `type_name
 changes it, and `schema=` puts the type in another schema. Rows hold enum members:
 `page.status is Status.DRAFT`. Migrations create the type and add new members.
 
+## Columns of other types
+
+`custom("type")` (from `mizzle.pg`) is a column of any type mizzle has no column type for:
+a domain, a composite type, a range, a type from an extension. The string is the type as PostgreSQL prints it (`format_type()`), used as is
+in DDL. mizzle adds no SQL around the column: values are what the driver (asyncpg) reads
+and writes for that type, and the column compares, sorts and deduplicates as the type.
+
+```python
+from typing import final
+
+from mizzle import Table
+from mizzle.pg import custom, serial
+
+
+@final
+class Places(Table, name="places"):
+    id = serial().primary_key()
+    name = custom("citext")  # needs the citext extension
+    search = custom("tsvector", py_type=str)  # str to type checkers, as matches() takes
+    nights = custom("int4range")
+    price = custom("money_amount")  # a domain over numeric, made in a custom migration
+    pair = custom("price_pair")  # a composite type
+```
+
+| Type | Reads as | Write |
+|---|---|---|
+| `citext`, `tsvector`, an enum, a domain over `text` | `str` | a `str` |
+| a domain over `numeric` | `Decimal` (the base type's value) | a `Decimal` or `int` |
+| `int4range`, `daterange`, ... | `asyncpg.Range` | a `Range` |
+| `box` | `asyncpg.Box` | a `Box` or `((x1, y1), (x2, y2))` |
+| a composite | `asyncpg.Record` | a tuple of its fields |
+
+```python
+from asyncpg import Range
+
+await db.insert(Places).values(name="Dhaka", search="old town", nights=Range(1, 5))
+[place] = await db.select().from_(Places).where(eq(Places.name, "DHAKA"))  # citext
+place.nights  # <Range [1, 5)>
+```
+
+The value type is `object` unless you say otherwise. `py_type=` names it (for type
+checkers, `select_model` and the write check), `decode=` turns a value read into it and
+`encode=` turns one written into what the driver takes. Type checkers take the type from
+`decode`'s return type, else from `encode`'s parameter, so `py_type=` must agree with them.
+`select_model` needs `py_type=` (or a field type through `refine=`): the driver's values
+(a `Range`, a `Record`...) have no JSON form of their own.
+
+```python
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True)
+class Nights:
+    first: int
+    last: int
+
+
+def nights_of(span: Range[int]) -> Nights:
+    return Nights(span.lower or 0, (span.upper or 1) - 1)
+
+
+def span_of(nights: Nights) -> Range[int]:
+    return Range(nights.first, nights.last, upper_inc=True)
+
+
+@final
+class Stays(Table, name="stays"):
+    id = serial().primary_key()
+    nights = custom("int4range", py_type=Nights, decode=nights_of, encode=span_of)
+```
+
+`Stays.nights` is a `Column[Nights | None]`; filters encode their values too
+(`eq(Stays.nights, Nights(1, 4))`). Values are sent as they are, with no cast: PostgreSQL
+types them from the column, and checks length and precision as for any value. A tuple
+compared with a composite needs the type written out:
+`eq(Row.pair, sql("{}::price_pair", (Decimal("1.5"), day)))`.
+
+A relational query (`with_=`) nests related rows as JSON, so a custom column there holds
+its JSON form (`to_json`): a `bool` or `int` for a domain over one, a `Decimal` with all
+digits for other numbers (a `float` or `Decimal` when that is the `py_type`), a `str` such as `"[1,5)"` for a range, a `dict` such as
+`{"amount": Decimal("1.5"), "day": "2020-01-02"}` for a composite. `decode` is applied to
+that value too, so a column with `decode` and nested reads needs a `decode` that takes
+both, or read the column with a plain select.
+
+The domain, composite type or extension itself is not managed by mizzle: create it in a
+custom migration (see [Not managed by mizzle](migrations.md#not-managed-by-mizzle)).
+`pull` writes every column of such a type as `custom(...)`.
+
 ## Identity and generated columns
 
 ```python
 from typing import final
 
 from mizzle import Table, sql
-from mizzle.pg import bigint, integer, numeric, text, tsvector
+from mizzle.pg import bigint, integer, numeric, text
 
 
 @final
@@ -290,7 +377,7 @@ class Invoices(Table, name="invoices"):
     unit_price = numeric(10, 2).not_null()
     total = numeric(12, 2).generated_always_as(sql("qty * unit_price"))
     memo = text().not_null().default("")
-    search = tsvector().generated_always_as(sql("to_tsvector('english', memo)"))
+    shout = text().generated_always_as(sql("upper(memo)"))
 ```
 
 - `generated_always_as_identity()`: the database always assigns the value. An insert that
@@ -404,7 +491,7 @@ class Messages(Table, name="messages"):
 
 `config()` returns everything that belongs to the table but not to one column:
 `primary_key`, `unique`, `check`, `foreign_key`, `index`, `unique_index`, and the
-security objects `rls()`, `policy(...)` and `grant(...)`. Declare it as a
+security objects `rls()` and `policy(...)`. Declare it as a
 `@classmethod` with `@override`, typed `list[Constraint]`, as in the examples above.
 
 Columns in `config()` must belong to the same table. mizzle checks the whole schema when

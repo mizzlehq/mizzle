@@ -1,14 +1,16 @@
+from dataclasses import dataclass
 from decimal import Decimal
-from typing import Any
+from typing import Annotated, Any
 
 import pydantic
 import pytest
+from asyncpg import Point, Range
 
 from mizzle.core.errors import SchemaError
 from mizzle.core.query.builder import QueryBuilder
 from mizzle.core.schema.table import Table
-from mizzle.core.schema.types import numeric, text
-from mizzle.dialects.postgres.types import array, serial
+from mizzle.core.schema.types import integer, numeric, text
+from mizzle.dialects.postgres.types import array, custom, jsonb, point, serial
 from mizzle.pydantic import insert_model, select_model, update_model
 from tests.models import Posts, Role, Users
 from tests.unit.conftest import FakeRunner
@@ -61,6 +63,32 @@ def test_numeric_and_arrays() -> None:
     assert _errors(Model, {"amount": "1", "tags": [1]})
 
 
+def test_array_elements_may_be_null() -> None:
+    # Q5-7: any PostgreSQL array can hold NULL; a row with one failed to validate.
+    class Nulls(Table, name="nulls"):
+        id = serial().primary_key()
+        xs = array(integer())
+        pts = array(point())
+
+    Model = select_model(Nulls)
+    out = Model.model_validate({"id": 1, "xs": [1, None], "pts": [Point(1, 2), None]})
+    assert out.model_dump()["xs"] == [1, None]
+    assert Model.model_validate_json(out.model_dump_json()).model_dump() == out.model_dump()
+
+
+def test_arrays_may_have_more_dimensions() -> None:
+    # Q6-5: mizzle writes and reads [[1, 2], [3, 4]]; select_model rejected it.
+    class Grid(Table, name="grid"):
+        id = serial().primary_key()
+        cells = array(integer())
+
+    Model = select_model(Grid)
+    out = Model.model_validate({"id": 1, "cells": [[1, 2], [3, None]]})
+    assert out.model_dump()["cells"] == [[1, 2], [3, None]]
+    assert Model.model_validate({"id": 1, "cells": [[[1]], [[None]]]})
+    assert _errors(Model, {"id": 1, "cells": [[1, "x"]]})
+
+
 def test_refine_exclude_and_name() -> None:
     Model = insert_model(
         Posts, refine={"title": pydantic.constr(min_length=3)}, exclude=["meta"], name="NewPost"
@@ -108,3 +136,150 @@ def test_include_is_an_allowlist() -> None:
     assert "id" in update_model(Users, include=["id", "bio"]).model_fields  # explicit opt-in
     with pytest.raises(SchemaError):
         insert_model(Users, include=["nope"])
+
+
+def test_models_accept_every_value_the_column_holds() -> None:
+    # C35: inet/cidr were IPv4-only; Point, Line and BitString broke schema building.
+    import ipaddress
+
+    from asyncpg import BitString, Line, Point
+
+    from mizzle.pg import cidr, inet, line, point, varbit
+
+    class Net(Table, name="net"):
+        id = serial().primary_key()
+        ip = inet().not_null()
+        net = cidr()
+        p = point()
+        b = line()
+        bits = varbit()
+
+    Model = select_model(Net)
+    for ip in ("::1", "10.1.2.3", "10.1.2.3/24"):
+        Model.model_validate(
+            {
+                "id": 1,
+                "ip": ip,
+                "net": "2001:db8::/32",
+                "p": None,
+                "b": None,
+                "bits": None,
+            }
+        )
+    row = Model.model_validate(
+        {
+            "id": 1,
+            "ip": ipaddress.ip_interface("10.1.2.3/24"),
+            "net": ipaddress.ip_network("10.0.0.0/8"),
+            "p": Point(1, 2),
+            "b": Line(1, -1, 0),
+            "bits": BitString.from_int(5, 3),
+        }
+    )
+    assert row.model_dump()["p"] == Point(1, 2)
+    with pytest.raises(pydantic.ValidationError):
+        Model.model_validate(
+            {"id": 1, "ip": "::1", "net": None, "p": "(1,2)", "b": None, "bits": None}
+        )
+    insert_model(Net).model_validate({"ip": "::1"})
+
+
+def test_geometry_and_bit_strings_round_trip_json() -> None:
+    # Q14: BitString had no serializer and no JSON input form.
+    from asyncpg import BitString, Point
+
+    from mizzle.pg import point, varbit
+
+    class Spots(Table, name="spots"):
+        id = serial().primary_key()
+        at = point()
+        bits = varbit()
+
+    Model = select_model(Spots)
+    row = Model(id=1, at=Point(1.5, -2), bits=BitString.from_int(5, 4))
+    assert Model.model_validate_json(row.model_dump_json()) == row
+    assert row.model_dump(mode="json")["bits"] == "0101"
+
+
+def test_custom_fields_take_their_py_type() -> None:
+    class Odd(Table, name="odd"):
+        id = serial().primary_key()
+        anything = custom("tsvector")
+        span = custom("int4range", py_type=Range)
+
+    # Q8-4: without py_type the value (a Range, a Record...) may have no JSON form.
+    with pytest.raises(SchemaError, match=r"Odd\.anything: select_model needs .*py_type="):
+        select_model(Odd)
+    with pytest.raises(SchemaError, match="anything"):
+        select_model(Odd, include=["id", "anything"])
+    Model = select_model(Odd, refine={"anything": str})
+    model = Model(id=1, anything="'a'", span=Range(1, 2))
+    assert model.model_dump()["span"] == Range(1, 2)
+    assert select_model(Odd, exclude=["anything"]).model_fields.keys() == {"id", "span"}
+    with pytest.raises(pydantic.ValidationError):
+        Model(id=1, anything=None, span="[1,2)")
+    assert insert_model(Odd).model_fields["anything"].annotation == object | None
+
+
+@dataclass(frozen=True)
+class Nights:
+    first: int
+    last: int
+
+
+def _span(nights: Nights) -> Range[int]:
+    return Range(nights.first, nights.last)
+
+
+class Inner(pydantic.BaseModel):
+    a: int
+
+
+async def test_models_keep_custom_class_values(qb: QueryBuilder) -> None:
+    # Q8-3: model_dump() turned the dataclass into a dict, which encode= cannot take.
+    class Stay(Table, name="stay"):
+        id = serial().primary_key()
+        nights = custom("int4range", py_type=Nights, encode=_span)
+        meta = jsonb()
+
+    body = insert_model(Stay, refine={"meta": Inner}).model_validate_json(
+        '{"nights": {"first": 1, "last": 3}, "meta": {"a": 1}}'
+    )
+    assert qb.insert(Stay).values(body).to_sql()[1] == (Range(1, 3), {"a": 1})  # json: dumped
+    patch = update_model(Stay)(nights=Nights(2, 4))
+    assert qb.update(Stay).set(patch).all_rows().to_sql()[1] == (Range(2, 4),)
+
+
+class Settings(pydantic.BaseModel):
+    theme: str
+    lang: str = "en"
+
+
+class Slug:
+    def __init__(self, text: str) -> None:
+        self.text = text
+
+
+async def test_models_dump_values_but_only_set_fields(qb: QueryBuilder) -> None:
+    # R9-2: exclude_unset also dropped a nested model's defaults; Q9-4: values skipped the
+    # model's serializers. Only the top-level unset fields are left out.
+    class Account(Table, name="account"):
+        id = serial().primary_key()
+        name = text()
+        slug = text()
+        settings = jsonb()
+        stays = array(custom("int4range", py_type=Nights, encode=_span))
+
+    class Body(pydantic.BaseModel):
+        model_config = pydantic.ConfigDict(arbitrary_types_allowed=True)
+        name: str | None = None
+        slug: Annotated[Slug, pydantic.PlainSerializer(lambda v: v.text.lower())] | None = None
+        settings: Settings | None = None
+        stays: list[Nights] | None = None
+
+    body = Body(slug=Slug("Hello-W"), settings=Settings(theme="dark"), stays=[Nights(1, 3)])
+    sql_text, params = qb.insert(Account).values(body).to_sql()
+    assert "name" not in sql_text
+    assert params == ("hello-w", {"theme": "dark", "lang": "en"}, [Range(1, 3)])
+    patch = qb.update(Account).set(Body(settings=Settings(theme="x"))).all_rows()
+    assert patch.to_sql()[1] == ({"theme": "x", "lang": "en"},)

@@ -1,10 +1,13 @@
+from typing import cast
+
 import pytest
 
 from mizzle.core.errors import QueryError
 from mizzle.core.query.builder import QueryBuilder
 from mizzle.core.schema.table import Table
 from mizzle.core.schema.types import integer, text
-from mizzle.core.sql.operators import eq, excluded, gt
+from mizzle.core.sql.nodes import ExprBase
+from mizzle.core.sql.operators import count, eq, excluded, gt
 from mizzle.core.sql.raw import sql
 from mizzle.dialects.postgres.types import serial
 from tests.models import Posts, Role, Users
@@ -130,6 +133,57 @@ def test_on_conflict_validation(qb: QueryBuilder) -> None:
         q.on_conflict_do_update(target=Users.email, set_={"nope": 1})
 
 
+def test_on_conflict_on_constraint(qb: QueryBuilder) -> None:
+    q = (
+        qb.insert(Users)
+        .values(email="a")
+        .on_conflict_do_update(constraint="users_email_key", set_={"bio": "x"})
+    )
+    assert q.to_sql() == (
+        'INSERT INTO "users" ("email") VALUES ($1) '
+        'ON CONFLICT ON CONSTRAINT "users_email_key" DO UPDATE SET "bio" = $2',
+        ("a", "x"),
+    )
+    nothing = (
+        qb.insert(Users).values(email="a").on_conflict_do_nothing(constraint="users_email_key")
+    )
+    assert nothing.to_sql()[0].endswith('ON CONFLICT ON CONSTRAINT "users_email_key" DO NOTHING')
+
+
+def test_on_conflict_target_or_constraint(qb: QueryBuilder) -> None:
+    q = qb.insert(Users).values(email="a")
+    with pytest.raises(QueryError, match="not both"):
+        q.on_conflict_do_nothing(target=Users.email, constraint="users_email_key")
+    with pytest.raises(QueryError, match="needs a target or a constraint"):
+        q.on_conflict_do_update(set_={"bio": "x"})
+    with pytest.raises(QueryError, match="cannot be empty"):
+        q.on_conflict_do_nothing(constraint="")
+
+
+def test_insert_from_select(qb: QueryBuilder) -> None:
+    source = qb.select(Users.email, Users.bio).from_(Users).where(eq(Users.role, Role.ADMIN))
+    q = qb.insert(Users).from_select([Users.email, Users.bio], source)
+    assert q.to_sql() == (
+        'INSERT INTO "users" ("email", "bio") '
+        'SELECT "users"."email", "users"."bio" FROM "users" WHERE "users"."role" = $1',
+        ("admin",),
+    )
+
+
+def test_insert_from_select_validation(qb: QueryBuilder) -> None:
+    one = qb.select(Users.email).from_(Users)
+    with pytest.raises(QueryError, match="outputs 1"):
+        qb.insert(Users).from_select([Users.email, Users.bio], one)
+    with pytest.raises(QueryError, match="not a column of Users"):
+        qb.insert(Users).from_select(Posts.title, qb.select(Posts.title).from_(Posts))
+    with pytest.raises(QueryError, match="at least one target column"):
+        qb.insert(Users).from_select([], one)
+    with pytest.raises(QueryError, match="already has values"):
+        qb.insert(Users).values(email="a").from_select(Users.email, one)
+    with pytest.raises(QueryError, match="already has from_select"):
+        qb.insert(Users).from_select(Users.email, one).values(email="a")
+
+
 async def test_insert_returning(qb: QueryBuilder, runner: FakeRunner) -> None:
     q = qb.insert(Users).values(email="a").returning()
     assert q.to_sql()[0] == f'INSERT INTO "users" ("email") VALUES ($1) RETURNING {USER_COLS}'
@@ -141,6 +195,51 @@ async def test_insert_returning(qb: QueryBuilder, runner: FakeRunner) -> None:
 async def test_insert_returns_rowcount(qb: QueryBuilder, runner: FakeRunner) -> None:
     runner.rowcount = 2
     assert await qb.insert(Users).values([{"email": "a"}, {"email": "b"}]) == 2
+
+
+def test_returning_expressions_sql(qb: QueryBuilder) -> None:
+    q = qb.insert(Users).values(email="a").returning(Users.id, Users.email)
+    assert q.to_sql() == (
+        'INSERT INTO "users" ("email") VALUES ($1) RETURNING "users"."id", "users"."email"',
+        ("a",),
+    )
+    mapped = (
+        qb.update(Users)
+        .set(bio="x")
+        .where(eq(Users.id, 1))
+        .returning({"id": Users.id, "n": count()})
+    )
+    assert mapped.to_sql() == (
+        'UPDATE "users" SET "bio" = $1 WHERE "users"."id" = $2 '
+        'RETURNING "users"."id" AS "id", count(*) AS "n"',
+        ("x", 1),
+    )
+
+
+async def test_returning_expressions_decode(qb: QueryBuilder, runner: FakeRunner) -> None:
+    q = qb.delete(Users).where(eq(Users.id, 1)).returning(Users.id, Users.email)
+    runner.rows = [(1, "a@b.c"), (2, "c@d.e")]
+    assert await q == [(1, "a@b.c"), (2, "c@d.e")]
+
+
+async def test_returning_mapping_decodes(qb: QueryBuilder, runner: FakeRunner) -> None:
+    q = qb.update(Users).set(bio="x").where(eq(Users.id, 1)).returning({"id": Users.id})
+    runner.rows = [(1,)]
+    assert await q == [{"id": 1}]
+
+
+async def test_returning_projection_decodes_enum(qb: QueryBuilder, runner: FakeRunner) -> None:
+    # A projected column is decoded through its own decoder, so an enum comes back as enum.
+    q = qb.delete(Users).where(eq(Users.id, 1)).returning(Users.role)
+    runner.rows = [("admin",)]
+    assert await q == [(Role.ADMIN,)]
+
+
+def test_returning_validation(qb: QueryBuilder) -> None:
+    with pytest.raises(QueryError, match="takes expressions"):
+        qb.delete(Users).where(eq(Users.id, 1)).returning(cast("ExprBase", cast(object, Users)))
+    with pytest.raises(QueryError, match="at least one field"):
+        qb.delete(Users).where(eq(Users.id, 1)).returning({})
 
 
 # -- update / delete ------------------------------------------------------------------
@@ -181,6 +280,47 @@ def test_update_validation(qb: QueryBuilder) -> None:
         qb.update(Users).set(nope=1)
     with pytest.raises(QueryError, match="NOT NULL"):
         qb.update(Users).set(email=None)
+
+
+def test_update_from(qb: QueryBuilder) -> None:
+    q = qb.update(Posts).set(title=Users.bio).from_(Users).where(eq(Posts.author_id, Users.id))
+    assert q.to_sql() == (
+        'UPDATE "posts" SET "title" = "users"."bio" FROM "users" '
+        'WHERE "posts"."author_id" = "users"."id"',
+        (),
+    )
+    with pytest.raises(QueryError, match="at least one table"):
+        qb.update(Posts).set(title="x").from_()
+
+
+def test_update_from_and_delete_using_accept_a_cte(qb: QueryBuilder) -> None:
+    # Q14: a CTE/subquery is a valid source for UPDATE ... FROM and DELETE ... USING,
+    # not only a table.
+    sub = qb.select({"uid": Users.id}).from_(Users).subquery("u")
+    uid = sub.c("uid", int)
+    upd = qb.update(Posts).set(title="x").from_(sub).where(eq(Posts.author_id, uid))
+    assert upd.to_sql() == (
+        'UPDATE "posts" SET "title" = $1 '
+        'FROM (SELECT "users"."id" AS "uid" FROM "users") AS "u" '
+        'WHERE "posts"."author_id" = "u"."uid"',
+        ("x",),
+    )
+    dele = qb.delete(Posts).using(sub).where(eq(Posts.author_id, uid))
+    assert dele.to_sql() == (
+        'DELETE FROM "posts" USING (SELECT "users"."id" AS "uid" FROM "users") AS "u" '
+        'WHERE "posts"."author_id" = "u"."uid"',
+        (),
+    )
+
+
+def test_delete_using(qb: QueryBuilder) -> None:
+    q = qb.delete(Posts).using(Users).where(eq(Posts.author_id, Users.id))
+    assert q.to_sql() == (
+        'DELETE FROM "posts" USING "users" WHERE "posts"."author_id" = "users"."id"',
+        (),
+    )
+    with pytest.raises(QueryError, match="at least one table"):
+        qb.delete(Posts).using()
 
 
 def test_delete(qb: QueryBuilder) -> None:

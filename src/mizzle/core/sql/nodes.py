@@ -14,9 +14,11 @@ from __future__ import annotations
 
 import datetime
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from decimal import Decimal
 from typing import TYPE_CHECKING, Literal, overload
+
+from mizzle.core.errors import QueryError
 
 if TYPE_CHECKING:
     from mizzle.core.query.select import Cte
@@ -372,6 +374,47 @@ class Star(Node):
 
 
 @dataclass(frozen=True)
+class AnyAll[T](Expr[T]):
+    """``= ANY (array)`` / ``> ALL (subquery)``: the right side of a quantified comparison.
+    A Python sequence is kept raw (``values``) so the compiler can cast the array to the
+    type of the value it is compared against (an enum array, not ``text[]``)."""
+
+    quantifier: Literal["ANY", "ALL"]
+    value: Node | None = None
+    values: tuple[object, ...] | None = None
+
+
+@dataclass(frozen=True)
+class PostfixOp[T](Expr[T]):
+    """``item op right`` for operators that are not comparisons (COLLATE, AT TIME ZONE)."""
+
+    item: Node
+    op: str
+    right: Node
+
+
+@dataclass(frozen=True)
+class Rollup(Node):
+    """``GROUP BY ROLLUP (...)```."""
+
+    items: tuple[Node, ...]
+
+
+@dataclass(frozen=True)
+class Cube(Node):
+    """``GROUP BY CUBE (...)```."""
+
+    items: tuple[Node, ...]
+
+
+@dataclass(frozen=True)
+class GroupingSets(Node):
+    """``GROUP BY GROUPING SETS (...)``: one entry per set, an empty tuple for ``()``."""
+
+    sets: tuple[tuple[Node, ...], ...]
+
+
+@dataclass(frozen=True)
 class Func(ExprBase):
     name: str
     args: tuple[Node, ...]
@@ -379,6 +422,9 @@ class Func(ExprBase):
     # The result has the type of its arguments (min, coalesce, lag...): a column among them
     # decodes it (e.g. back into an enum).
     keeps_type: bool = False
+    # The result is an array of the arguments' type (array_agg): a column among them
+    # decodes each element.
+    returns_array: bool = False
     # Named by the user (func[T]("name")): mizzle cannot know it leaves the session alone
     # (set_config, pg_advisory_lock...), so reset_connections="auto" resets after it.
     opaque: bool = False
@@ -389,9 +435,34 @@ class TypedFunc[T](Func, Expr[T]):
     pass
 
 
+# JSON as returned by the driver's json codec (nested rows of relational queries, json_agg).
+type Json = bool | int | float | str | list[Json] | dict[str, Json] | None
+
+
 @dataclass(frozen=True)
 class Aggregate[T](TypedFunc[T]):
     """An aggregate (``count``, ``sum_``...); ``.over(...)`` makes it a window function."""
+
+    # ``FILTER (WHERE ...)``: only these rows feed the aggregate.
+    filter_: Node | None = None
+    # ``WITHIN GROUP (ORDER BY ...)``: the order of an ordered-set aggregate.
+    within_group_: tuple[Node, ...] = ()
+
+    def filter(self, condition: Condition) -> Aggregate[T]:
+        """``FILTER (WHERE ...)``: ``count(Users.id).filter(eq(Users.role, Role.ADMIN))``."""
+        return replace(self, filter_=condition)
+
+    def within_group(self, *exprs: ExprBase | OrderBy) -> Aggregate[T]:
+        """``WITHIN GROUP (ORDER BY ...)`` for ordered-set aggregates."""
+        if not exprs:
+            raise QueryError("within_group() needs at least one expression")
+        return replace(
+            self,
+            within_group_=tuple(
+                e if isinstance(e, OrderBy) else OrderBy(e, descending=False, nulls=None)
+                for e in exprs
+            ),
+        )
 
     def over(
         self,
@@ -522,6 +593,11 @@ class OrderBy(Node):
     expr: Node
     descending: bool = False
     nulls: Literal["first", "last"] | None = None
+
+    def __post_init__(self) -> None:
+        nulls: object = self.nulls  # written into the SQL as is (Q16)
+        if nulls not in (None, "first", "last"):
+            raise QueryError(f"nulls must be 'first' or 'last', not {nulls!r}")
 
 
 @dataclass(frozen=True)

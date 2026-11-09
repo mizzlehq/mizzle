@@ -9,7 +9,7 @@ def text(node: Node | None) -> str | None:
     return None if node is None else PostgresCompiler().compile(node).sql
 
 
-def test_crud_policy_expands_like_drizzle() -> None:
+def test_crud_policy_expands_to_one_policy_per_command() -> None:
     policies = crud_policy("notes", to=[AUTHENTICATED], read=True, modify=auth_uid())
     by_name = {p.name: p for p in policies}
     assert list(by_name) == ["notes_select", "notes_insert", "notes_update", "notes_delete"]

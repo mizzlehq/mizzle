@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import ClassVar, Self, override
 
@@ -13,7 +13,6 @@ from mizzle.core.schema.constraints import (
     Check,
     Constraint,
     ForeignKey,
-    Grant,
     Index,
     Policy,
     PrimaryKey,
@@ -29,6 +28,17 @@ class TableInfo:
     schema: str | None
     columns: dict[str, ColumnBase]  # attribute name -> column, in declaration order
     relations: dict[str, Relation] = field(default_factory=dict[str, Relation])
+    comment: str | None = None
+    unlogged: bool = False
+    storage: dict[str, str] | None = None  # WITH (fillfactor=70, ...)
+
+
+def _storage_text(value: str | int | bool) -> str:
+    """A storage option value as PostgreSQL prints it back: booleans lower-case, the rest
+    verbatim (PostgreSQL keeps ``off`` as ``off``, not ``false``)."""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    return str(value)
 
 
 class Table:
@@ -39,6 +49,9 @@ class Table:
         *,
         name: str | None = None,
         schema: str | None = None,
+        comment: str | None = None,
+        unlogged: bool = False,
+        storage: Mapping[str, str | int | bool] | None = None,
         abstract: bool = False,
         **kwargs: object,
     ) -> None:
@@ -57,7 +70,20 @@ class Table:
         if not columns:
             raise SchemaError(f"table class {cls.__name__} declares no columns")
         relations = {attr: v for attr, v in members.items() if isinstance(v, Relation)}
-        cls.__table__ = TableInfo(name or snake_case(cls.__name__), schema, columns, relations)
+        options = (
+            {k.lower(): _storage_text(v) for k, v in storage.items()}
+            if storage is not None
+            else None
+        )
+        cls.__table__ = TableInfo(
+            name or snake_case(cls.__name__),
+            schema,
+            columns,
+            relations,
+            comment,
+            unlogged,
+            options,
+        )
 
     @classmethod
     def config(cls) -> Sequence[Constraint]:
@@ -88,7 +114,7 @@ def _constraint_columns(constraint: Constraint) -> tuple[ColumnBase, ...]:
             return tuple(k for k in constraint.columns if isinstance(k, ColumnBase))
         case UniqueConstraint() | PrimaryKey() | ForeignKey():
             return constraint.columns
-        case Check() | Policy() | RowLevelSecurity() | Grant():
+        case Check() | Policy() | RowLevelSecurity():
             return ()
 
 

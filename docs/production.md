@@ -14,8 +14,8 @@ await db.primary.select().from_(Users)  # read your own write right away
 await db.retry(transfer)  # re-run a transaction on a serialization conflict
 ```
 
-- Writes, transactions and `FOR UPDATE` always use the primary. A replica that is down is
-  skipped.
+- Writes, transactions and `FOR UPDATE` always use the primary. A replica that goes down
+  while the app runs is skipped; every replica must be reachable when `connect()` runs.
 - A lost connection is replaced. A read that fails because the connection dropped is tried
   once more.
 - Database errors map to mizzle errors (`UniqueViolation`, `ForeignKeyViolation`,
@@ -25,8 +25,8 @@ await db.retry(transfer)  # re-run a transaction on a serialization conflict
 ## Connection reset
 
 When a connection goes back to the pool, mizzle resets its session state (`RESET ALL`,
-`UNLISTEN *`, advisory locks, cursors) only after a statement that may have changed it: raw
-`sql(...)`, a function you name with `func()`, `listen()`, or direct connection use. After
+`UNLISTEN *`, advisory locks, cursors, temp tables) only after a statement that may have changed it: raw
+`sql(...)`, a function you name with `func()`, or direct connection use. After
 the statements mizzle builds itself it skips the reset, which saves a round trip per query
 (2x on a real network). Open transactions are always rolled back.
 
@@ -40,9 +40,19 @@ db = await Database.connect(url, reset_connections="always")
 
 ## PgBouncer
 
-- **Transaction mode:** pass `statement_cache_size=0`. `db.listen()` refuses to run here,
-  since notifications would be lost: connect `listen()` directly to PostgreSQL.
-- **Session mode:** works as is. `db.listen(..., pooler_session_mode=True)` is allowed.
+- **Transaction mode:** pass `statement_cache_size=0`.
+- **Session mode:** works as is.
+
+## Schemas other roles can write to
+
+mizzle's own SQL (studio, migrations, introspection) calls PostgreSQL's built-in functions
+and operators as `pg_catalog.<name>`, so a function or operator another role creates in
+`public` cannot stand in for them. Studio compares a column (row keys, grid filters) with
+the operator of its type's default btree operator class, named with its schema, so an
+operator planted for a `varchar`, enum or domain column is not used either. Your queries, and the asyncpg driver's own type lookups, use the search path as
+written. Do not let untrusted roles create objects in a schema on the app's or the
+migrator's search path: this is the default from PostgreSQL 15; on older servers run
+`REVOKE CREATE ON SCHEMA public FROM PUBLIC`.
 
 ## Memory
 

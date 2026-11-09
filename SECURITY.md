@@ -52,5 +52,13 @@ reproduce with unsupported or end-of-life dependencies.
   explicitly.
 - Studio binds to `127.0.0.1`, rejects non-local `Host` headers, requires a random token on
   every API request (carried in the URL fragment, never sent to the server), sends no CORS
-  headers, and in `--read-only` runs raw SQL in a read-only transaction. The UI archive is
-  downloaded over HTTPS and verified against the SHA-256 pinned in the wheel.
+  headers, and throttles wrong credentials per client. The UI archive is downloaded over
+  HTTPS and verified against the SHA-256 pinned in the wheel.
+- Studio's `--read-only` guarantee rests on the database role: raw SQL runs in a read-only
+  transaction, and Studio refuses to start read-only as a superuser or as a role with
+  server-side privileges (`pg_read_server_files`, `pg_write_server_files`,
+  `pg_execute_server_program`, `pg_signal_backend`, `pg_maintain`, `REPLICATION`, or a direct
+  `EXECUTE` grant on a server-side function). Any role may signal its own role's sessions, so
+  use a role for read-only Studio that nothing else uses. The statement and
+  function blocklist it also applies is defence in depth, not the control: a bypass of the
+  blocklist alone, with a non-privileged role, is not a read-only break.

@@ -4,6 +4,7 @@ import {
   ArrowUpIcon,
   ChevronLeftIcon,
   ChevronRightIcon,
+  DownloadIcon,
   FilterIcon,
   PlusIcon,
   RefreshCwIcon,
@@ -66,7 +67,17 @@ const OPS: { value: FilterOp; label: string; needsValue: boolean }[] = [
   { value: "is_not_null", label: "is not null", needsValue: false },
 ]
 
-type Editing = { row: number; column: string; text: string }
+// S11: the edit carries the row's primary key, not just its index, so a save can
+// never land on whatever row now sits at that index after a reload.
+type Editing = { row: number; key: Row; column: string; text: string }
+
+function parseJson(text: string, fallback: () => unknown): unknown {
+  try {
+    return JSON.parse(text)
+  } catch {
+    return fallback()
+  }
+}
 
 function keyOf(table: TableInfo, row: Row): Row {
   return Object.fromEntries((table.primary_key?.columns ?? []).map((c) => [c, row[c]]))
@@ -86,7 +97,8 @@ function FilterBar({
   const [op, setOp] = useState<FilterOp>("eq")
   const [value, setValue] = useState("")
   const needsValue = OPS.find((o) => o.value === op)?.needsValue ?? true
-  const value_ = op === "ilike" ? `%${value}%` : value
+  // S16: escape LIKE wildcards (backslash is the default LIKE escape) so "50%" means 50%.
+  const value_ = op === "ilike" ? `%${value.replace(/[\\%_]/g, "\\$&")}%` : value
 
   const add = () => {
     if (!column || (needsValue && value === "")) return
@@ -184,9 +196,15 @@ export function DataGrid({ table, readOnly }: { table: TableInfo; readOnly: bool
         dir: order?.dir,
         filters,
       })
+      if (data.rows.length === 0 && offset > 0) {
+        // S4-12: the page is past the end (its rows were deleted): show the last page.
+        setOffset(Math.max(0, Math.floor((data.total - 1) / PAGE_SIZE) * PAGE_SIZE))
+        return
+      }
       setRows(data.rows)
       setTotal(data.total)
       setSelected(new Set())
+      setEditing(null) // S11: the open editor's row index no longer means the same row
       setError(null)
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
@@ -212,14 +230,24 @@ export function DataGrid({ table, readOnly }: { table: TableInfo; readOnly: bool
 
   const saveEdit = async (value: string | null) => {
     if (!editing) return
-    const row = rows[editing.row]
     const column = table.columns[editing.column]
+    const key = JSON.stringify(editing.key)
     try {
-      const text = value === null ? null : toDbText(column, value)
-      const { row: updated } = await api.update(table, keyOf(table, row), {
+      const original = rows[editing.row]?.[editing.column]
+      // S4-8: an array or composite cell is to_jsonb's JSON; send it parsed and the server
+      // reads it back into the column type. (JSON columns arrive as text, not objects.)
+      const text =
+        value === null
+          ? null
+          : typeof original === "object" && original !== null
+            ? parseJson(value, () => toDbText(column, value))
+            : toDbText(column, value)
+      const { row: updated } = await api.update(table, editing.key, {
         [editing.column]: text,
       })
-      setRows((current) => current.map((r, i) => (i === editing.row ? updated : r)))
+      setRows((current) =>
+        current.map((r) => (JSON.stringify(keyOf(table, r)) === key ? updated : r))
+      )
       setEditing(null)
       toast.success("Row updated")
     } catch (e) {
@@ -234,6 +262,24 @@ export function DataGrid({ table, readOnly }: { table: TableInfo; readOnly: bool
       toast.success(`Deleted ${deleted} row${deleted === 1 ? "" : "s"}`)
       setConfirmDelete(false)
       await load()
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : String(e))
+    }
+  }
+
+  const download = async (format: "csv" | "json") => {
+    try {
+      const blob = await api.export(
+        table,
+        { order: order?.column, dir: order?.dir, filters },
+        format
+      )
+      const url = URL.createObjectURL(blob)
+      const link = document.createElement("a")
+      link.href = url
+      link.download = `${table.schema}.${table.name}.${format}`
+      link.click()
+      URL.revokeObjectURL(url)
     } catch (e) {
       toast.error(e instanceof Error ? e.message : String(e))
     }
@@ -265,6 +311,14 @@ export function DataGrid({ table, readOnly }: { table: TableInfo; readOnly: bool
               Add row
             </Button>
           )}
+          <Button size="sm" variant="outline" onClick={() => void download("csv")}>
+            <DownloadIcon />
+            CSV
+          </Button>
+          <Button size="sm" variant="outline" onClick={() => void download("json")}>
+            <DownloadIcon />
+            JSON
+          </Button>
           <Button
             size="icon-sm"
             variant="ghost"
@@ -308,7 +362,8 @@ export function DataGrid({ table, readOnly }: { table: TableInfo; readOnly: bool
                   <button
                     type="button"
                     onClick={() => sortBy(c.name)}
-                    className="inline-flex items-center gap-1 font-medium font-sans"
+                    disabled={table.unsortable?.includes(c.name)}
+                    className="inline-flex items-center gap-1 font-medium font-sans disabled:cursor-default"
                     title={c.type}
                   >
                     {c.name}
@@ -352,7 +407,14 @@ export function DataGrid({ table, readOnly }: { table: TableInfo; readOnly: bool
                       className="max-w-80 truncate"
                       title={formatValue(value)}
                       onDoubleClick={() =>
-                        editable && setEditing({ row: i, column: c.name, text: editText(value) })
+                        editable &&
+                        !table.read_only?.includes(c.name) &&
+                        setEditing({
+                          row: i,
+                          key: keyOf(table, row),
+                          column: c.name,
+                          text: editText(value),
+                        })
                       }
                     >
                       {isEditing ? (

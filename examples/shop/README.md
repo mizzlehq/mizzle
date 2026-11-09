@@ -5,10 +5,13 @@ reviews. It uses every 0.2 feature in one app, and its tests run it against a st
 replica, PgBouncer, a TLS-only server with odd settings and a pgvector server.
 
 - **Schema** (`shop/schema.py`): enums (one in the `shop_audit` schema), identity and
-  generated columns, `on_update_now()`, numeric, jsonb, arrays, uuid, tsvector, composite
-  keys, checks, partial / expression / GIN / trigram indexes, a view and a materialized
-  view, row-level security with Supabase-style `auth.uid()` and `crud_policy`, a managed
-  role and an existing one, grants, an audit trigger and an `UPDATE OF price` trigger.
+  generated columns, `on_update_now()`, numeric, jsonb, arrays, uuid, `custom("tsvector")`,
+  composite keys, checks, partial / expression / GIN / trigram indexes, a view and a
+  materialized view, row-level security with Supabase-style `auth.uid()` and `crud_policy`,
+  a managed role and an existing one.
+- **Custom migrations** for what mizzle does not manage: `0001_extensions_and_auth`
+  (pg_trgm, pgcrypto and the `auth.uid()` function, before the tables) and
+  `0003_triggers_and_grants` (an audit trigger, an `UPDATE OF price` trigger, grants).
   `shop/vectors.py` adds embeddings (vector, halfvec, sparsevec, HNSW) on servers with
   pgvector.
 - **Two migration sets**: `migrations/` (`mizzle.toml`) and `migrations_vector/`
@@ -48,9 +51,8 @@ SHOP_URL=$P:54331/mizzle SHOP_REPLICA_URL=$P:54332/mizzle uv run pytest -s
 SHOP_URL=$P:54335/mizzle uv run pytest -s
 # TLS only, Pacific/Chatham time zone, DMY dates, extra_float_digits=0
 SHOP_URL="$P:54334/mizzle?sslmode=require" uv run pytest -s
-# PgBouncer in transaction mode (listen() refuses) and in session mode (it works)
-SHOP_URL=$P:54331/mizzle SHOP_BOUNCER_URL=$P:54333/mizzle \
-  MIZZLE_PGBOUNCER_SESSION_URL=$P:54337/mizzle uv run pytest -s
+# PgBouncer in transaction mode
+SHOP_URL=$P:54331/mizzle SHOP_BOUNCER_URL=$P:54333/mizzle uv run pytest -s
 
 # restart the primary under load, and a 10-minute soak
 SHOP_URL=$P:54331/mizzle SHOP_REPLICA_URL=$P:54332/mizzle \
@@ -64,7 +66,7 @@ uv run basedpyright
 
 - `tests/test_api.py`: every endpoint, with exact checks on the data.
 - `tests/test_runtime.py`: replicas (and a replica going away), killed connections,
-  session reset, LISTEN queue limits and reconnects, COPY, streaming, transactions,
+  session reset, bulk inserts, streaming, transactions,
   timeouts, retries, prepared statements.
 - `tests/test_migrations.py`: the CLI from zero (version 1 is rebuilt from the `# v2`
   markers in `shop/schema.py`), four processes migrating at once, the version 2 change,

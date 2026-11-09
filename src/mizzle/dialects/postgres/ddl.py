@@ -4,23 +4,24 @@ from __future__ import annotations
 
 import datetime
 import re
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
+from contextvars import ContextVar
 from typing import cast
 
-from mizzle.core.errors import MigrationError
+from mizzle.core.compiler import no_nul
+from mizzle.core.errors import MigrationError, SchemaError
 from mizzle.core.naming import Casing
 from mizzle.core.schema.column import MISSING, ColumnBase
 from mizzle.core.snapshot import (
     ColumnSnap,
     ForeignKeySnap,
-    FunctionSnap,
     GeneratedSnap,
     IdentitySnap,
     IndexSnap,
     PolicySnap,
     RoleSnap,
     TableSnap,
-    TriggerSnap,
+    UniqueSnap,
     keyword_default,
     sequence_defaults,
 )
@@ -32,57 +33,64 @@ from mizzle.core.steps import (
     AddForeignKey,
     AddPrimaryKey,
     AddUnique,
+    AlterColumnCollation,
     AlterColumnDefault,
     AlterColumnGenerated,
     AlterColumnIdentity,
     AlterColumnNullability,
     AlterColumnType,
-    AlterExtension,
     AlterPolicy,
     AlterRole,
+    AlterTableStorage,
     CreateEnum,
-    CreateExtension,
-    CreateFunction,
     CreateIndex,
     CreatePolicy,
     CreateRole,
     CreateSchema,
     CreateTable,
-    CreateTrigger,
     CreateView,
     DropColumn,
     DropConstraint,
     DropEnum,
-    DropExtension,
-    DropFunction,
     DropIndex,
     DropPolicy,
     DropRole,
     DropTable,
-    DropTrigger,
     DropView,
-    GrantPrivileges,
     RenameColumn,
     RenameConstraint,
     RenameIndex,
     RenameTable,
     RestoreGrants,
     SaveGrants,
+    SetColumnComment,
     SetRowLevelSecurity,
+    SetTableComment,
+    SetTableLogged,
     SetTableSchema,
     Statement,
     Step,
 )
-from mizzle.dialects.postgres.compiler import PostgresCompiler
+from mizzle.dialects.postgres.compiler import PostgresCompiler, temporal_text
 
 DEFAULT_SCHEMA = "public"
 MAX_IDENTIFIER = 63  # PostgreSQL silently truncates longer names
+
+# K8-6: the kit's own SQL (introspection, the DO blocks it writes) names every built-in,
+# catalog, catalog type and operator in pg_catalog. Unqualified, a planted function or
+# operator (an exact type match, or any match with public before pg_catalog on the path)
+# beat the built-in and ran as the migrating role. User expressions stay as written.
+EQ = "OPERATOR(pg_catalog.=)"
+NE = "OPERATOR(pg_catalog.<>)"
+REGCLASS = "::pg_catalog.regclass"
+PG_CLASS = "'pg_catalog.pg_class'::pg_catalog.regclass"
 
 SERIAL_TYPES = {"serial": "integer", "bigserial": "bigint", "smallserial": "smallint"}
 
 _TYPE_ALIASES = {
     "varchar": "character varying",
     "char": "character",
+    "bpchar": "character",
     "timestamptz": "timestamp with time zone",
     "timestamp": "timestamp without time zone",
     "timetz": "time with time zone",
@@ -94,20 +102,53 @@ _TYPE_ALIASES = {
     "float8": "double precision",
     "float4": "real",
     "bool": "boolean",
+    "varbit": "bit varying",
 }
 _PLAIN_IDENT = re.compile(r"[a-z_][a-z0-9_$]*")
-_TRAILING_CAST = re.compile(
-    r"::(?:\"[^\"]+\"|[a-z_][a-z0-9_ .\"]*)(?:\(\d+(?:,\s*\d+)?\))?(?:\[\])*$"
+# Keywords quote_ident()/format_type() quote (K4-8): PostgreSQL 18's pg_get_keywords()
+# where catcode <> 'U'; older servers have a few less (json_table, merge_action), which
+# introspect quotes back with requote_type() (K4-22).
+_KEYWORDS = frozenset(
+    """
+    all analyse analyze and any array as asc asymmetric authorization between bigint
+    binary bit boolean both case cast char character check coalesce collate collation
+    column concurrently constraint create cross current_catalog current_date
+    current_role current_schema current_time current_timestamp current_user dec decimal
+    default deferrable desc distinct do else end except exists extract false fetch float
+    for foreign freeze from full grant greatest group grouping having ilike in initially
+    inner inout int integer intersect interval into is isnull join json json_array
+    json_arrayagg json_exists json_object json_objectagg json_query json_scalar
+    json_serialize json_table json_value lateral leading least left like limit localtime
+    localtimestamp merge_action national natural nchar none normalize not notnull null
+    nullif numeric offset on only or order out outer overlaps overlay placing position
+    precision primary real references returning right row select session_user setof
+    similar smallint some substring symmetric system_user table tablesample then time
+    timestamp to trailing treat trim true union unique user using values varchar
+    variadic verbose when where window with xmlattributes xmlconcat xmlelement xmlexists
+    xmlforest xmlnamespaces xmlparse xmlpi xmlroot xmlserialize xmltable
+    """.split()  # noqa: SIM905
 )
+# A type name is dotted parts, each plain or quoted: ::"App"."Mood" too (K4-4).
+_TYPE_PART = r'(?:"(?:[^"]|"")+"|[a-z_][a-z0-9_ ]*)'
+_TRAILING_CAST = re.compile(rf"::{_TYPE_PART}(?:\.{_TYPE_PART})*(?:\(\d+(?:,\s*\d+)?\))?(?:\[\])*$")
 _NUMBER = re.compile(r"-?\d+(?:\.\d+)?(?:e[-+]?\d+)?", re.IGNORECASE)
+# Types a bare number cannot be assigned to: '5'::jsonb and '0101'::"bit" keep their quotes.
+_QUOTED_CAST = re.compile(r'::(?:jsonb?|"bit"|bit(?: varying)?|varbit)(?:\(\d+\))?$')
 
 
 def quote(ident: str) -> str:
-    return '"' + ident.replace('"', '""') + '"'
+    return '"' + no_nul(ident).replace('"', '""') + '"'
+
+
+# Studio renders with ``qualify=True``: a bare public name resolved through the role's
+# search_path, so a "$user" schema's same-named table was the one changed (S8-2).
+_QUALIFY = ContextVar("mizzle_qualify", default=False)
 
 
 def qualified(schema: str, name: str) -> str:
-    return quote(name) if schema == DEFAULT_SCHEMA else f"{quote(schema)}.{quote(name)}"
+    if schema == DEFAULT_SCHEMA and not _QUALIFY.get():
+        return quote(name)
+    return f"{quote(schema)}.{quote(name)}"
 
 
 def truncate_name(name: str) -> str:
@@ -116,30 +157,129 @@ def truncate_name(name: str) -> str:
 
 def type_ident(name: str) -> str:
     """A type name as format_type() prints it: quoted only when necessary."""
-    return name if _PLAIN_IDENT.fullmatch(name) else quote(name)
+    return name if _PLAIN_IDENT.fullmatch(name) and name not in _KEYWORDS else quote(name)
+
+
+_IDENT_PART = r'"(?:[^"]|"")+"|[a-z_][a-z0-9_$]*'
+_TYPE_PATH = re.compile(rf"(?:({_IDENT_PART})\.)?({_IDENT_PART})((?:\[\])*)")
+
+
+def requote_type(text: str, server_keywords: frozenset[str]) -> str:
+    """A type name as format_type() printed it, quoted as type_ident() quotes it: a server
+    older than PostgreSQL 18 leaves a few of _KEYWORDS bare (json_table before 17), so a
+    type named so differed from the schema there (K4-22)."""
+    match = _TYPE_PATH.fullmatch(text)
+    if match is None:
+        return text
+    schema, name, dims = cast(tuple[str | None, str, str], match.groups())
+    if schema is None and name == "json":  # the built-in type, bare on every server
+        return text
+    stale = _KEYWORDS - server_keywords
+    name = quote(name) if name in stale else name
+    if schema is None:
+        return name + dims
+    return f"{quote(schema) if schema in stale else schema}.{name}{dims}"
+
+
+# A string literal or quoted name (kept as is), or the type of a ::cast.
+_CAST = re.compile(rf"""'(?:[^']|'')*'|"(?:[^"]|"")*"|::(?P<type>{_TYPE_PATH.pattern})""")
+
+
+def requote_casts(text: str, server_keywords: frozenset[str]) -> str:
+    """Default text with the type of each ``::`` cast requoted (K4-29)."""
+
+    def one(match: re.Match[str]) -> str:
+        cast_type = match["type"]
+        return match[0] if cast_type is None else "::" + requote_type(cast_type, server_keywords)
+
+    return _CAST.sub(one, text)
+
+
+_TYPE_NAME = re.compile(r"([A-Za-z_][A-Za-z0-9_$ .]*?)\s*(\(.*\))?")
 
 
 def normalize_type(sql_type: str) -> str:
-    """``varchar(255)`` -> ``character varying(255)``, ``numeric(10, 2)`` -> ``numeric(10,2)``."""
-    array = ""
-    while sql_type.endswith("[]"):
-        sql_type, array = sql_type[:-2], array + "[]"
-    match = re.fullmatch(r"([a-z ]+?)\s*(\(.*\))?", sql_type.strip())
+    """``varchar(255)`` -> ``character varying(255)``, ``numeric(10, 2)`` -> ``numeric(10,2)``,
+    ``integer[][]`` -> ``integer[]`` (PostgreSQL has one array type per element; Q5-8).
+
+    Offline, so conservative: what the database would print is read from the database
+    (``normalize_snapshot``). Unquoted names fold to lower case, and only an unqualified
+    built-in name takes its canonical spelling; a qualified name keeps its schema
+    (``public.int4`` can be a domain named int4, K7-7), and a spelling not known here is
+    left as written."""
+    sql_type, array = _array_base(sql_type.strip())
+    match = _TYPE_NAME.fullmatch(sql_type.strip())
     if match is None:
         return sql_type + array
-    base, args = match.group(1), match.group(2) or ""
-    base = _TYPE_ALIASES.get(base, base)
+    base, args = " ".join(match.group(1).lower().split()), match.group(2) or ""
     args = args.replace(" ", "")
+    if "." in base:
+        return base + args + array
+    base = _TYPE_ALIASES.get(base, base)
     if args and base.startswith(("timestamp with", "time with")):  # also "...without"
         base = base.replace(" with", f"{args} with")
         args = ""
     return base + args + array
 
 
+# Every built-in type name a bare spelling may resolve to (with _TYPE_ALIASES and
+# _KEYWORDS): a missing one let public.jsonpath pass for the built-in (K9-4). From
+# PostgreSQL 18 (a superset of 14-17's):
+#   SELECT typname FROM pg_type WHERE typnamespace = 'pg_catalog'::regnamespace
+#   AND typtype IN ('b', 'r', 'm', 'p') AND NOT (typcategory = 'A' AND typname LIKE '\_%')
+_BUILTIN_TYPES = frozenset(
+    """
+    _record aclitem any anyarray anycompatible anycompatiblearray anycompatiblemultirange
+    anycompatiblenonarray anycompatiblerange anyelement anyenum anymultirange anynonarray
+    anyrange bit bool box bpchar bytea char cid cidr circle cstring date datemultirange
+    daterange event_trigger fdw_handler float4 float8 gtsvector index_am_handler inet int2
+    int2vector int4 int4multirange int4range int8 int8multirange int8range internal
+    interval json jsonb jsonpath language_handler line lseg macaddr macaddr8 money name
+    numeric nummultirange numrange oid oidvector path pg_brin_bloom_summary
+    pg_brin_minmax_multi_summary pg_ddl_command pg_dependencies pg_lsn pg_mcv_list
+    pg_ndistinct pg_node_tree pg_snapshot point polygon record refcursor regclass
+    regcollation regconfig regdictionary regnamespace regoper regoperator regproc
+    regprocedure regrole regtype table_am_handler text tid time timestamp timestamptz
+    timetz trigger tsm_handler tsmultirange tsquery tsrange tstzmultirange tstzrange
+    tsvector txid_snapshot unknown uuid varbit varchar void xid xid8 xml
+    """.split()  # noqa: SIM905
+)
+
+
+def same_type(a: str, b: str) -> bool:
+    """Whether two spellings name one type, offline: an older mizzle stored ``posint`` and
+    ``integer`` for ``custom('public.posint')`` and ``custom('pg_catalog.int4')`` (K8-2).
+    ``public.X`` is bare X unless X names a built-in (``public.int4`` can be a domain,
+    K7-7); ``pg_catalog.X`` is X as a built-in."""
+    return a == b or _comparable(a) == _comparable(b)
+
+
+def _comparable(sql_type: str) -> str:
+    sql_type = normalize_type(sql_type)
+    base, array = _array_base(sql_type)
+    schema, dot, rest = base.partition(".")
+    if dot and schema == "pg_catalog":
+        return normalize_type(rest) + array
+    if dot and schema == DEFAULT_SCHEMA and "." not in rest:
+        name = rest.split("(")[0].strip()
+        builtin = {*_TYPE_ALIASES, *_TYPE_ALIASES.values(), *_KEYWORDS, *_BUILTIN_TYPES}
+        if name not in builtin:
+            return rest + array
+    return sql_type
+
+
+def _array_base(sql_type: str) -> tuple[str, str]:
+    """``integer[][]`` -> ``("integer", "[]")``."""
+    base = sql_type
+    while base.endswith("[]"):
+        base = base[:-2]
+    return base, "[]" if base != sql_type else ""
+
+
 def column_type(column: ColumnBase) -> str:
     if column.enum is not None:
-        array = "[]" if column.sql_type.endswith("[]") else ""
-        name = type_ident(column.sql_type.removesuffix("[]"))
+        base, array = _array_base(column.sql_type)
+        name = type_ident(base)
         if column.enum_schema not in (None, DEFAULT_SCHEMA):  # as format_type() prints it
             name = f"{type_ident(column.enum_schema)}.{name}"
         return name + array
@@ -151,6 +291,7 @@ def normalize_default(text: str | None) -> str | None:
     if text is None:
         return None
     text = _TIMESTAMPTZ_DEFAULT.sub(_utc_timestamptz, text.strip())
+    keep_quotes = _QUOTED_CAST.search(text) is not None  # (Q10, Q12)
     while True:
         stripped = _TRAILING_CAST.sub("", text)
         if stripped.startswith("(") and stripped.endswith(")") and stripped.count("(") == 1:
@@ -158,7 +299,8 @@ def normalize_default(text: str | None) -> str | None:
         if stripped == text:
             break
         text = stripped
-    if len(text) >= 2 and text[0] == text[-1] == "'" and _NUMBER.fullmatch(text[1:-1]):
+    quoted = len(text) >= 2 and text[0] == text[-1] == "'"
+    if quoted and not keep_quotes and _NUMBER.fullmatch(text[1:-1]):
         return text[1:-1]
     return keyword_default(text)  # PostgreSQL prints current_user as CURRENT_USER
 
@@ -185,51 +327,8 @@ def column_default(column: ColumnBase, casing: Casing | None = None) -> str | No
     value = column.default_value
     c = compiler(casing)
     if isinstance(value, Node):
-        text = c.visit(value)
-    else:
-        encoded = column.encode(value)
-        if column.item is not None and isinstance(encoded, list | tuple):
-            encoded = _array_text(cast(Sequence[object], encoded))
-        if isinstance(encoded, datetime.date | datetime.time):
-            encoded = _temporal_text(encoded)
-        text = c.literal(encoded)
-    return normalize_default(text)
-
-
-def _trim_fraction(text: str) -> str:
-    """PostgreSQL prints 03:04:05.5, not 03:04:05.500000."""
-    if "." not in text:
-        return text
-    return text.rstrip("0").rstrip(".")
-
-
-def _offset_text(offset: datetime.timedelta) -> str:
-    """UTC offsets as PostgreSQL prints them: +00, +05:45, -03:30."""
-    seconds = int(offset.total_seconds())
-    sign = "-" if seconds < 0 else "+"
-    hours, rest = divmod(abs(seconds), 3600)
-    minutes, secs = divmod(rest, 60)
-    text = f"{sign}{hours:02d}"
-    if minutes or secs:
-        text += f":{minutes:02d}"
-    if secs:
-        text += f":{secs:02d}"
-    return text
-
-
-def _temporal_text(value: datetime.date | datetime.time) -> str:
-    """A date/time default exactly as PostgreSQL prints it back, so a schema and its
-    database compare equal. timestamptz values are stored as instants: written in UTC."""
-    if isinstance(value, datetime.datetime):
-        if value.tzinfo is not None:
-            utc = value.astimezone(datetime.UTC).replace(tzinfo=None)
-            return _trim_fraction(utc.isoformat(" ")) + "+00"
-        return _trim_fraction(value.isoformat(" "))
-    if isinstance(value, datetime.time):
-        text = _trim_fraction(value.replace(tzinfo=None).isoformat())
-        offset = value.utcoffset()
-        return text + _offset_text(offset) if offset is not None else text
-    return value.isoformat()
+        return normalize_default(c.visit(value))
+    return normalize_default(c.column_literal(column, column.encode(value)))
 
 
 # '2024-01-02 08:49:05+05:45'::timestamp with time zone: printed in the session time zone.
@@ -243,22 +342,7 @@ def _utc_timestamptz(match: re.Match[str]) -> str:
         return match.group(0)
     if value.tzinfo is None:
         return match.group(0)
-    return f"'{_temporal_text(value)}'"
-
-
-def _array_text(values: Sequence[object]) -> str:
-    """A 1-D array literal as PostgreSQL prints it back (``{a,"b c"}``), not JSON."""
-
-    def item(value: object) -> str:
-        if value is None:
-            return "NULL"
-        text = ("t" if value else "f") if isinstance(value, bool) else str(value)
-        special = any(ch in '{}",\\' or ch.isspace() for ch in text)
-        if special or text == "" or text.upper() == "NULL":
-            return '"' + text.replace("\\", "\\\\").replace('"', '\\"') + '"'
-        return text
-
-    return "{" + ",".join(item(v) for v in values) + "}"
+    return f"'{temporal_text(value)}'"
 
 
 # -- rendering ------------------------------------------------------------------------
@@ -306,6 +390,8 @@ def _sequence_options(new: IdentitySnap, old: IdentitySnap | None, sql_type: str
 
 def column_definition(column: ColumnSnap) -> str:
     parts = [quote(column["name"]), column["type"]]
+    if collation := column.get("collation"):
+        parts.append(f"COLLATE {quote(collation)}")
     if generated := column.get("generated"):
         kind = "STORED" if generated["stored"] else "VIRTUAL"
         parts.append(f"GENERATED ALWAYS AS ({generated['expression']}) {kind}")
@@ -314,8 +400,26 @@ def column_definition(column: ColumnSnap) -> str:
     if column["not_null"]:
         parts.append("NOT NULL")
     if column["default"] is not None:
-        parts.append(f"DEFAULT {column['default']}")
+        parts.append(f"DEFAULT {default_sql(column['default'])}")
     return " ".join(parts)
+
+
+def default_sql(text: str) -> str:
+    """``text`` ready for DEFAULT, which takes no AT TIME ZONE, AND, IS ... unless in
+    parentheses (K11): any space outside quotes and brackets adds them."""
+    depth, in_quote = 0, ""
+    for ch in text:
+        if in_quote:
+            in_quote = "" if ch == in_quote else in_quote
+        elif ch in "'\"":
+            in_quote = ch
+        elif ch in "([":
+            depth += 1
+        elif ch in ")]":
+            depth -= 1
+        elif ch.isspace() and depth == 0:
+            return f"({text})"
+    return text
 
 
 def _foreign_key(fk: ForeignKeySnap) -> str:
@@ -327,22 +431,44 @@ def _foreign_key(fk: ForeignKeySnap) -> str:
         text += f" ON DELETE {fk['on_delete'].upper()}"
     if fk["on_update"]:
         text += f" ON UPDATE {fk['on_update'].upper()}"
+    text += _deferred(fk)
+    if fk.get("not_valid"):
+        text += " NOT VALID"
     return text
+
+
+def _unique_fragment(u: UniqueSnap) -> str:
+    return "UNIQUE NULLS NOT DISTINCT " if u.get("nulls_not_distinct") else "UNIQUE "
+
+
+def _deferred(snap: Mapping[str, object]) -> str:
+    if snap.get("initially_deferred"):
+        return " DEFERRABLE INITIALLY DEFERRED"
+    return " DEFERRABLE" if snap.get("deferrable") else ""
 
 
 def _create_table(table: TableSnap) -> str:
     lines = [column_definition(c) for c in table["columns"].values()]
     if pk := table["primary_key"]:
-        lines.append(f"CONSTRAINT {quote(pk['name'])} PRIMARY KEY ({_columns(pk['columns'])})")
+        lines.append(
+            f"CONSTRAINT {quote(pk['name'])} PRIMARY KEY ({_columns(pk['columns'])}){_deferred(pk)}"
+        )
     lines += [
-        f"CONSTRAINT {quote(u['name'])} UNIQUE ({_columns(u['columns'])})"
+        f"CONSTRAINT {quote(u['name'])} {_unique_fragment(u)}({_columns(u['columns'])})"
+        f"{_deferred(u)}"
         for u in table["uniques"].values()
     ]
     lines += [
-        f"CONSTRAINT {quote(c['name'])} CHECK ({c['expression']})" for c in table["checks"].values()
+        f"CONSTRAINT {quote(c['name'])} CHECK ({c['expression']})"
+        for c in table["checks"].values()
+        if not c.get("not_valid")  # NOT VALID is only valid on ALTER TABLE ADD CONSTRAINT
     ]
     body = ",\n    ".join(lines)
-    return f"CREATE TABLE {qualified(table['schema'], table['name'])} (\n    {body}\n)"
+    kind = "CREATE UNLOGGED TABLE" if table.get("unlogged") else "CREATE TABLE"
+    text = f"{kind} {qualified(table['schema'], table['name'])} (\n    {body}\n)"
+    if options := table.get("options"):
+        text += " WITH (" + ", ".join(_storage_option(k, v) for k, v in options.items()) + ")"
+    return text
 
 
 def create_index(schema: str, table: str, index: IndexSnap) -> str:
@@ -357,8 +483,14 @@ def create_index(schema: str, table: str, index: IndexSnap) -> str:
     using = f" USING {index['method']}" if "method" in index else ""
     text = f"CREATE {unique}INDEX {quote(index['name'])} ON {qualified(schema, table)}{using}"
     text += f" ({keys})"
+    if index["unique"] and index.get("nulls_not_distinct"):
+        text += " NULLS NOT DISTINCT"
     if options := index.get("options"):
-        text += " WITH (" + ", ".join(f"{k} = {_literal(v)}" for k, v in options.items()) + ")"
+        text += (
+            " WITH ("
+            + ", ".join(f"{_option_key(k)} = {literal(v)}" for k, v in options.items())
+            + ")"
+        )
     return text + (f" WHERE {index['where']}" if index["where"] else "")
 
 
@@ -374,8 +506,66 @@ def _role_options(role: RoleSnap) -> str:
     )
 
 
-def _literal(text: str) -> str:
-    return "'" + text.replace("'", "''") + "'"
+def literal(text: str) -> str:
+    """``text`` as an SQL string literal, read the same with standard_conforming_strings
+    off. There a backslash in a plain '...' escapes the next character, so a name ending in
+    one ran the rest of the statement as SQL (S7-2): such text is an E'...' string instead."""
+    body = no_nul(text).replace("'", "''")
+    if "\\" in body:
+        return "E'" + body.replace("\\", "\\\\") + "'"
+    return f"'{body}'"
+
+
+# What a statement's text holds, left to right: only a plain '...' string is rewritten.
+# N'..' and a string continued on the next line ('a'<newline>'b') are kept as written: an
+# E cannot go there (K9-2), so with standard_conforming_strings off their backslashes are
+# still lost.
+_LEXEME = re.compile(
+    r"""(?P<keep>(?:[Ee]|[Uu]&)'(?:[^'\\]|\\.|'')*'"""  # E'..' / U&'..' (backslash escapes)
+    r"""|[Nn]'(?:[^']|'')*'"""  # a national string
+    r"""|'(?:[^']|'')*'(?:[ \t\f]*[\n\r]\s*'(?:[^']|'')*')+"""  # a continued string
+    r"""|"(?:[^"]|"")*"|--[^\n]*|/\*.*?\*/"""  # a quoted name, a comment
+    r"""|\$(?P<tag>[A-Za-z_][A-Za-z0-9_]*|)\$.*?\$(?P=tag)\$"""  # a dollar-quoted body
+    r"""|[^\W\d][\w$]*)"""  # a word, so name'...' is not an E'' string
+    r"""|'(?P<plain>(?:[^']|'')*)'""",
+    re.DOTALL,
+)
+
+
+def escape_backslashes(sql: str) -> str:
+    """``sql`` read the same with standard_conforming_strings off: each plain '...' string
+    holding a backslash becomes E'...' (as literal() writes it, K8-3). Defaults, checks,
+    views and policies are SQL text, compiled or printed by the server (pulled), where a
+    backslash in '...' was lost or escaped the closing quote; other text is unchanged."""
+
+    def one(match: re.Match[str]) -> str:
+        plain = match["plain"]
+        if plain is None or "\\" not in plain:
+            return match[0]
+        glued = re.fullmatch(r"[\w$]", sql[match.start() - 1 : match.start()]) is not None
+        return (" E'" if glued else "E'") + plain.replace("\\", "\\\\") + "'"
+
+    return _LEXEME.sub(one, sql)
+
+
+# Storage parameter names are identifiers, optionally in the toast namespace. Values are a
+# number, a boolean or a quoted literal, so a value can never end the WITH (...) clause.
+_OPTION_KEY = re.compile(r"(?:toast\.)?[a-z_][a-z0-9_]*\Z", re.IGNORECASE)
+_OPTION_NUMBER = re.compile(r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?\Z")
+
+
+def _option_key(name: str) -> str:
+    if not _OPTION_KEY.fullmatch(str(name)):
+        raise SchemaError(f"invalid storage parameter name {name!r}")
+    return str(name)
+
+
+def _storage_option(name: str, value: object) -> str:
+    key = _option_key(name)
+    text = "true" if value is True else "false" if value is False else str(value)
+    if _OPTION_NUMBER.fullmatch(text) or text in ("true", "false"):
+        return f"{key}={text}"
+    return f"{key}={literal(text)}"
 
 
 def _alter_identity(step: AlterColumnIdentity, sql_type: str) -> str:
@@ -384,7 +574,20 @@ def _alter_identity(step: AlterColumnIdentity, sql_type: str) -> str:
     if new is None:
         return f"{col} DROP IDENTITY"
     if old is None:
-        return f"{col} ADD {_identity(new, sql_type)}"
+        add = f"{col} ADD {_identity(new, sql_type)}"
+        if new["increment"] < 0:
+            return add
+        # The sequence starts at START even when the column holds rows already, so the
+        # next insert hit a duplicate key (C29). Move it past the largest value.
+        table = qualified(step.schema, step.table)
+        name = quote(step.column)
+        sequence = f"pg_catalog.pg_get_serial_sequence({literal(table)}, {literal(step.column)})"
+        start = new["start"]
+        return (
+            f"{add};\nSELECT pg_catalog.setval({sequence}, greatest(coalesce("
+            f"pg_catalog.max({name}) OPERATOR(pg_catalog.+) 1, {start}), {start}), false) "
+            f"FROM {table}"
+        )
     actions: list[str] = []
     if old["always"] != new["always"]:
         actions.append(f"SET GENERATED {'ALWAYS' if new['always'] else 'BY DEFAULT'}")
@@ -420,41 +623,66 @@ def _set_expression(step: AlterColumnGenerated, new: GeneratedSnap) -> str:
     table = qualified(step.schema, step.table)
     if step.definition is None:
         raise MigrationError(f"{step.table}.{step.column}: the column's definition is missing")
-    add = f"ALTER TABLE {table} ADD COLUMN {column_definition(step.definition)}"
-    set_expression = (
+    # EXECUTE reads them with the session's standard_conforming_strings too (K9-3).
+    add = escape_backslashes(f"ALTER TABLE {table} ADD COLUMN {column_definition(step.definition)}")
+    set_expression = escape_backslashes(
         f"ALTER TABLE {table} ALTER COLUMN {quote(step.column)} "
         f"SET EXPRESSION AS ({new['expression']})"
     )
-    rel, att = _literal(table), _literal(step.column)
+    rel, att = literal(table), literal(step.column)
+    reg = f"{rel}{REGCLASS}"
     return (
-        "DO $mizzle$ DECLARE defs text[]; refs text[]; def text; r record; BEGIN\n"
-        "IF current_setting('server_version_num')::int >= 170000 THEN\n"
-        f"  EXECUTE {_literal(set_expression)};\n"
+        "DO $mizzle$ DECLARE defs pg_catalog.text[]; refs pg_catalog.text[]; "
+        "def pg_catalog.text; r record; note pg_catalog.text; BEGIN\n"
+        "IF pg_catalog.current_setting('server_version_num')::int "
+        "OPERATOR(pg_catalog.>=) 170000 THEN\n"
+        f"  EXECUTE {literal(set_expression)};\n"
         "ELSE\n"
-        "  SELECT array_agg(d) INTO defs FROM (\n"
-        "    SELECT format('ALTER TABLE %s ADD CONSTRAINT %I %s', "
-        f"{rel}, conname, pg_get_constraintdef(c.oid)) AS d\n"
-        "    FROM pg_constraint c JOIN pg_attribute a ON a.attrelid = c.conrelid\n"
-        f"    WHERE c.conrelid = {rel}::regclass AND a.attname = {att} "
-        "AND a.attnum = ANY(c.conkey)\n"
+        # Constraints and indexes on the column are made again below; nothing else (K6-10).
+        + _unmanaged_check(
+            table,
+            step.table,
+            step.column,
+            f" AND d.classid {NE} 'pg_catalog.pg_constraint'::pg_catalog.regclass "
+            f"AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_class i WHERE d.classid {EQ} "
+            f"{PG_CLASS} AND i.oid {EQ} d.objid "
+            f"AND i.relkind {EQ} ANY ('{{i,I}}'::pg_catalog.\"char\"[]))",
+        )
+        + "  SELECT pg_catalog.array_agg(d) INTO defs FROM (\n"
+        "    SELECT pg_catalog.format('ALTER TABLE %s ADD CONSTRAINT %I %s', "
+        f"{rel}, conname, pg_catalog.pg_get_constraintdef(c.oid)) AS d\n"
+        "    FROM pg_catalog.pg_constraint c JOIN pg_catalog.pg_attribute a "
+        f"ON a.attrelid {EQ} c.conrelid\n"
+        f"    WHERE c.conrelid {EQ} {reg} AND a.attname {EQ} {att} "
+        f"AND a.attnum {EQ} ANY(c.conkey)\n"
         "    UNION ALL\n"
-        "    SELECT DISTINCT pg_get_indexdef(i.indexrelid) FROM pg_index i\n"
-        "    JOIN pg_depend dep ON dep.classid = 'pg_class'::regclass "
-        "AND dep.objid = i.indexrelid AND dep.refobjid = i.indrelid\n"
-        "    JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = dep.refobjsubid\n"
-        f"    WHERE i.indrelid = {rel}::regclass AND a.attname = {att}\n"
-        "      AND NOT EXISTS (SELECT 1 FROM pg_constraint c WHERE c.conindid = i.indexrelid)\n"
+        "    SELECT DISTINCT pg_catalog.pg_get_indexdef(i.indexrelid) FROM pg_catalog.pg_index i\n"
+        f"    JOIN pg_catalog.pg_depend dep ON dep.classid {EQ} {PG_CLASS} "
+        f"AND dep.objid {EQ} i.indexrelid AND dep.refobjid {EQ} i.indrelid\n"
+        f"    JOIN pg_catalog.pg_attribute a ON a.attrelid {EQ} i.indrelid "
+        f"AND a.attnum {EQ} dep.refobjsubid\n"
+        f"    WHERE i.indrelid {EQ} {reg} AND a.attname {EQ} {att}\n"
+        "      AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_constraint c "
+        f"WHERE c.conindid {EQ} i.indexrelid)\n"
         "  ) s;\n"
-        "  FOR r IN SELECT c.conrelid::regclass AS t, c.conname, pg_get_constraintdef(c.oid) AS d\n"
-        "    FROM pg_constraint c JOIN pg_attribute a ON a.attrelid = c.confrelid\n"
-        f"    WHERE c.contype = 'f' AND c.confrelid = {rel}::regclass AND a.attname = {att}\n"
-        "      AND a.attnum = ANY(c.confkey)\n"
-        "      AND NOT (c.conrelid = c.confrelid AND a.attnum = ANY(c.conkey)) LOOP\n"
-        "    refs := refs || format('ALTER TABLE %s ADD CONSTRAINT %I %s', r.t, r.conname, r.d);\n"
-        "    EXECUTE format('ALTER TABLE %s DROP CONSTRAINT %I', r.t, r.conname);\n"
+        f"  FOR r IN SELECT c.conrelid{REGCLASS} AS t, c.conname, "
+        "pg_catalog.pg_get_constraintdef(c.oid) AS d\n"
+        "    FROM pg_catalog.pg_constraint c JOIN pg_catalog.pg_attribute a "
+        f"ON a.attrelid {EQ} c.confrelid\n"
+        f"    WHERE c.contype {EQ} 'f' AND c.confrelid {EQ} {reg} AND a.attname {EQ} {att}\n"
+        f"      AND a.attnum {EQ} ANY(c.confkey)\n"
+        f"      AND NOT (c.conrelid {EQ} c.confrelid AND a.attnum {EQ} ANY(c.conkey)) LOOP\n"
+        "    refs := pg_catalog.array_append(refs, "
+        "pg_catalog.format('ALTER TABLE %s ADD CONSTRAINT %I %s', r.t, r.conname, r.d));\n"
+        "    EXECUTE pg_catalog.format('ALTER TABLE %s DROP CONSTRAINT %I', r.t, r.conname);\n"
         "  END LOOP;\n"
-        f"  EXECUTE {_literal(f'ALTER TABLE {table} DROP COLUMN {quote(step.column)}')};\n"
-        f"  EXECUTE {_literal(add)};\n"
+        f"  note := pg_catalog.col_description({reg}, (SELECT attnum FROM "
+        f"pg_catalog.pg_attribute WHERE attrelid {EQ} {reg} AND attname {EQ} {att}));\n"
+        f"  EXECUTE {literal(f'ALTER TABLE {table} DROP COLUMN {quote(step.column)}')};\n"
+        f"  EXECUTE {literal(add)};\n"
+        # The comment goes with the column (K7-4).
+        "  IF note IS NOT NULL THEN EXECUTE pg_catalog.format('COMMENT ON COLUMN %s.%I IS %L', "
+        f"{rel}, {att}, note); END IF;\n"
         "  FOREACH def IN ARRAY coalesce(defs, '{}') LOOP EXECUTE def; END LOOP;\n"
         "  FOREACH def IN ARRAY coalesce(refs, '{}') LOOP EXECUTE def; END LOOP;\n"
         "END IF; END $mizzle$"
@@ -467,11 +695,15 @@ def _alter_type(step: AlterColumnType) -> str:
             f"changing {step.table}.{step.column} to or from a serial type needs a custom migration"
         )
     col = quote(step.column)
+    collate = f" COLLATE {quote(step.collation)}" if step.collation else ""
     text = (
         f"ALTER TABLE {qualified(step.schema, step.table)} ALTER COLUMN {col} "
-        f"SET DATA TYPE {step.new_type}"
+        f"SET DATA TYPE {step.new_type}{collate}"
     )
-    return text if step.generated else f"{text} USING {col}::{step.new_type}"
+    cast = (
+        f"{col}::pg_catalog.text::{step.new_type}" if step.via_text else f"{col}::{step.new_type}"
+    )
+    return text if step.generated else f"{text} USING {cast}"
 
 
 def render_step(step: Step) -> Statement:
@@ -482,16 +714,18 @@ def render_step(step: Step) -> Statement:
         case CreateSchema(name=name):
             return Statement(f"CREATE SCHEMA IF NOT EXISTS {quote(name)}")
         case CreateEnum(enum=enum):
-            values = ", ".join("'" + v.replace("'", "''") + "'" for v in enum["values"])
+            values = ", ".join(literal(v) for v in enum["values"])
             return Statement(
                 f"CREATE TYPE {qualified(enum['schema'], enum['name'])} AS ENUM ({values})"
             )
         case AddEnumValue(schema=schema, name=name, value=value, after=after, before=before):
-            text = f"ALTER TYPE {qualified(schema, name)} ADD VALUE '{value.replace("'", "''")}'"
+            # IF NOT EXISTS: it commits on its own, so a migration that fails later must
+            # be able to run again (C22).
+            text = f"ALTER TYPE {qualified(schema, name)} ADD VALUE IF NOT EXISTS {literal(value)}"
             if after is not None:
-                text += f" AFTER '{after.replace("'", "''")}'"
+                text += f" AFTER {literal(after)}"
             elif before is not None:
-                text += f" BEFORE '{before.replace("'", "''")}'"
+                text += f" BEFORE {literal(before)}"
             # A new enum value cannot be used in the transaction that adds it.
             return Statement(text, transactional=False)
         case DropEnum(schema=schema, name=name):
@@ -504,6 +738,19 @@ def render_step(step: Step) -> Statement:
             return alter(schema, old, f"RENAME TO {quote(new)}")
         case SetTableSchema(schema=schema, name=name, new_schema=new_schema):
             return alter(schema, name, f"SET SCHEMA {quote(new_schema)}")
+        case SetTableLogged(schema=schema, table=table, unlogged=unlogged):
+            return alter(schema, table, "SET UNLOGGED" if unlogged else "SET LOGGED")
+        case AlterTableStorage(
+            schema=schema, table=table, set_options=set_options, reset_options=reset_options
+        ):
+            actions: list[str] = []
+            if reset_options:
+                actions.append("RESET (" + ", ".join(_option_key(k) for k in reset_options) + ")")
+            if set_options:
+                actions.append(
+                    "SET (" + ", ".join(_storage_option(k, v) for k, v in set_options.items()) + ")"
+                )
+            return alter(schema, table, ", ".join(actions))
         case AddColumn(schema=schema, table=table, column=column):
             return alter(schema, table, f"ADD COLUMN {column_definition(column)}")
         case DropColumn(schema=schema, table=table, name=name):
@@ -515,28 +762,38 @@ def render_step(step: Step) -> Statement:
         case AlterColumnNullability(schema=schema, table=table, column=column, not_null=not_null):
             action = "SET NOT NULL" if not_null else "DROP NOT NULL"
             return alter(schema, table, f"ALTER COLUMN {quote(column)} {action}")
+        case AlterColumnCollation(
+            schema=schema, table=table, column=column, sql_type=sql_type, collation=collation
+        ):
+            collate = f" COLLATE {quote(collation)}" if collation else ""
+            return alter(schema, table, f"ALTER COLUMN {quote(column)} TYPE {sql_type}{collate}")
         case AlterColumnIdentity():
             return Statement(_alter_identity(step, step.sql_type))
         case AlterColumnGenerated():
             return Statement(_alter_generated(step))
         case AlterColumnDefault(schema=schema, table=table, column=column, default=default):
-            action = "DROP DEFAULT" if default is None else f"SET DEFAULT {default}"
+            action = "DROP DEFAULT" if default is None else f"SET DEFAULT {default_sql(default)}"
             return alter(schema, table, f"ALTER COLUMN {quote(column)} {action}")
         case AddPrimaryKey(schema=schema, table=table, primary_key=pk):
             return alter(
                 schema,
                 table,
-                f"ADD CONSTRAINT {quote(pk['name'])} PRIMARY KEY ({_columns(pk['columns'])})",
+                f"ADD CONSTRAINT {quote(pk['name'])} PRIMARY KEY ({_columns(pk['columns'])})"
+                f"{_deferred(pk)}",
             )
         case AddUnique(schema=schema, table=table, unique=u):
             return alter(
                 schema,
                 table,
-                f"ADD CONSTRAINT {quote(u['name'])} UNIQUE ({_columns(u['columns'])})",
+                f"ADD CONSTRAINT {quote(u['name'])} {_unique_fragment(u)}"
+                f"({_columns(u['columns'])}){_deferred(u)}",
             )
         case AddCheck(schema=schema, table=table, check=c):
+            not_valid = " NOT VALID" if c.get("not_valid") else ""
             return alter(
-                schema, table, f"ADD CONSTRAINT {quote(c['name'])} CHECK ({c['expression']})"
+                schema,
+                table,
+                f"ADD CONSTRAINT {quote(c['name'])} CHECK ({c['expression']}){not_valid}",
             )
         case AddForeignKey(schema=schema, table=table, foreign_key=fk):
             return alter(schema, table, f"ADD {_foreign_key(fk)}")
@@ -555,36 +812,23 @@ def render_step(step: Step) -> Statement:
             # earlier run) may have made it already. ALTER then sets the options.
             name = quote(role["name"])
             return Statement(  # one statement, so migration files keep one per step
-                "DO $mizzle$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = "
-                f"{_literal(role['name'])}) THEN CREATE ROLE {name}; END IF; "
+                "DO $mizzle$ BEGIN IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname "
+                f"{EQ} {literal(role['name'])}) THEN CREATE ROLE {name}; END IF; "
                 f"ALTER ROLE {name} {_role_options(role)}; END $mizzle$"
             )
         case AlterRole(role=role):
             return Statement(f"ALTER ROLE {quote(role['name'])} {_role_options(role)}")
         case DropRole(name=name):
             return Statement(f"DROP ROLE IF EXISTS {quote(name)}")
-        case CreateExtension(extension=ext):
-            text = f"CREATE EXTENSION IF NOT EXISTS {type_ident(ext['name'])}"
-            if "schema" in ext:
-                text += f" SCHEMA {quote(ext['schema'])}"
-            if "version" in ext:
-                text += f" VERSION {_literal(ext['version'])}"
-            return Statement(text)
-        case AlterExtension(name=name, schema=schema, version=version):
-            action = (
-                f"SET SCHEMA {quote(schema)}" if schema else f"UPDATE TO {_literal(version or '')}"
-            )
-            return Statement(f"ALTER EXTENSION {type_ident(name)} {action}")
-        case DropExtension(name=name):
-            return Statement(f"DROP EXTENSION IF EXISTS {type_ident(name)}")
-        case CreateFunction(function=fn):
-            return Statement(_create_function(fn))
-        case DropFunction(schema=schema, name=name, args=args):
-            return Statement(f"DROP FUNCTION {qualified(schema, name)}({_without_defaults(args)})")
         case CreateView(view=view):
             kind = "MATERIALIZED VIEW" if view["materialized"] else "VIEW"
             name = qualified(view["schema"], view["name"])
-            return Statement(f"CREATE {kind} {name} AS\n{view['definition']}")
+            # Options and check option are written each time, so a re-create keeps them (K6).
+            opts = [o for o in ("security_invoker", "security_barrier") if view.get(o)]
+            with_ = f" WITH ({', '.join(f'{o}=true' for o in opts)})" if opts else ""
+            check = view.get("check_option")
+            tail = f"\nWITH {check.upper()} CHECK OPTION" if check else ""
+            return Statement(f"CREATE {kind} {name}{with_} AS\n{view['definition']}{tail}")
         case DropView(schema=schema, name=name, materialized=materialized):
             kind = "MATERIALIZED VIEW" if materialized else "VIEW"
             return Statement(f"DROP {kind} {qualified(schema, name)}")
@@ -595,6 +839,13 @@ def render_step(step: Step) -> Statement:
                 f"{'ENABLE' if enabled else 'DISABLE'} ROW LEVEL SECURITY, "
                 f"{'FORCE' if force else 'NO FORCE'} ROW LEVEL SECURITY",
             )
+        case SetTableComment(schema=schema, table=table, comment=comment):
+            value = "NULL" if comment is None else literal(comment)
+            return Statement(f"COMMENT ON TABLE {qualified(schema, table)} IS {value}")
+        case SetColumnComment(schema=schema, table=table, column=column, comment=comment):
+            value = "NULL" if comment is None else literal(comment)
+            target = f"{qualified(schema, table)}.{quote(column)}"
+            return Statement(f"COMMENT ON COLUMN {target} IS {value}")
         case CreatePolicy(schema=schema, table=table, policy=policy):
             kind = "PERMISSIVE" if policy["permissive"] else "RESTRICTIVE"
             text = (
@@ -609,18 +860,6 @@ def render_step(step: Step) -> Statement:
             )
         case DropPolicy(schema=schema, table=table, name=name):
             return Statement(f"DROP POLICY {quote(name)} ON {qualified(schema, table)}")
-        case CreateTrigger(schema=schema, table=table, trigger=trigger, replace=replace):
-            return Statement(_create_trigger(schema, table, trigger, replace))
-        case DropTrigger(schema=schema, table=table, name=name):
-            return Statement(f"DROP TRIGGER {quote(name)} ON {qualified(schema, table)}")
-        case GrantPrivileges(
-            schema=schema, table=table, role=role, privileges=privileges, revoke=revoke
-        ):
-            what = ", ".join(p.upper() for p in privileges)
-            on = qualified(schema, table)
-            if revoke:
-                return Statement(f"REVOKE {what} ON {on} FROM {_role(role)}")
-            return Statement(f"GRANT {what} ON {on} TO {_role(role)}")
         case SaveGrants(schema=schema, name=name):
             return Statement(_save_grants(qualified(schema, name)))
         case RestoreGrants(schema=schema, name=name, materialized=materialized):
@@ -630,113 +869,135 @@ def render_step(step: Step) -> Statement:
             raise MigrationError(f"PostgreSQL cannot render {type(step).__name__}")
 
 
-def _dollar_quote(body: str) -> str:
-    tag = "$mizzle$"
-    n = 0
-    while tag in body:
-        n += 1
-        tag = f"$mizzle{n}$"
-    return f"{tag}{body}{tag}"
-
-
 _SAVED = "pg_temp.__mizzle_saved"
+_SAVED_SQL = "pg_temp.__mizzle_saved_sql"
 
 
 def _save_grants(name: str) -> str:
     """Keep a relation's ACL, owner and comment in a temporary table for _restore_grants:
-    a view that is dropped and created again would lose them."""
-    rel = _literal(name)
+    a view that is dropped and created again would lose them. So would its column grants,
+    triggers and rules (not managed, K6-1), column comments and defaults (K7-1): kept as the
+    statements that make them again. A grant is made again by the role that made it, so
+    grant option chains hold (K7-1)."""
+    rel = literal(name)
+    reg = f"{rel}{REGCLASS}"
+    grantee = (
+        f"CASE WHEN g.grantee {EQ} 0 THEN 'PUBLIC' "
+        "ELSE pg_catalog.quote_ident(pg_catalog.pg_get_userbyid(g.grantee)) END"
+    )
     return (
         "DO $mizzle$ BEGIN\n"
-        f"CREATE TEMP TABLE IF NOT EXISTS __mizzle_saved "
-        "(rel text PRIMARY KEY, acl aclitem[], owner oid, comment text);\n"
+        # PostgreSQL has no statement to disable a view's trigger or rule (only a catalog
+        # edit does it): it would come back enabled, so stop before the view is dropped (K6-11).
+        f"IF EXISTS (SELECT 1 FROM pg_catalog.pg_trigger WHERE tgrelid {EQ} {reg} "
+        f"AND NOT tgisinternal AND tgenabled {NE} 'O') OR EXISTS (SELECT 1 FROM "
+        f"pg_catalog.pg_rewrite WHERE ev_class {EQ} {reg} AND rulename {NE} '_RETURN' "
+        f"AND ev_enabled {NE} 'O') THEN\n"
+        f"  RAISE EXCEPTION 'view % has a disabled trigger or rule, which would come back "
+        f"enabled when it is created again; this needs a custom migration', {rel};\n"
+        "END IF;\n"
+        # PostgreSQL has no GRANTED BY another role for object privileges: SET ROLE to it,
+        # which PostgreSQL 16+ allows only with the membership's SET option (K8-4).
+        "IF EXISTS (SELECT 1 FROM pg_catalog.pg_class c, LATERAL (SELECT c.relacl UNION ALL "
+        f"SELECT attacl FROM pg_catalog.pg_attribute WHERE attrelid {EQ} c.oid) x(acl), "
+        f"pg_catalog.aclexplode(x.acl) g WHERE c.oid {EQ} {reg} AND g.grantor {NE} c.relowner "
+        "AND NOT pg_catalog.pg_has_role(g.grantor, CASE WHEN "
+        "pg_catalog.current_setting('server_version_num')::int OPERATOR(pg_catalog.>=) 160000 "
+        "THEN 'SET' ELSE 'MEMBER' END)) THEN\n"
+        f"  RAISE EXCEPTION 'view % has privileges granted by a role the current user cannot "
+        f"SET ROLE to, so it cannot grant them again; this needs a custom migration', {rel};\n"
+        "END IF;\n"
+        "CREATE TEMP TABLE IF NOT EXISTS __mizzle_saved (rel pg_catalog.text PRIMARY KEY, "
+        "acl pg_catalog.aclitem[], owner pg_catalog.oid, comment pg_catalog.text);\n"
+        "CREATE TEMP TABLE IF NOT EXISTS __mizzle_saved_sql (id serial, rel pg_catalog.text, "
+        "col pg_catalog.name, stmt pg_catalog.text, grantor pg_catalog.oid);\n"
         f"INSERT INTO {_SAVED} SELECT {rel}, c.relacl, c.relowner, "
-        "obj_description(c.oid, 'pg_class') FROM pg_class c "
-        f"WHERE c.oid = {rel}::regclass\n"
+        "pg_catalog.obj_description(c.oid, 'pg_class') FROM pg_catalog.pg_class c "
+        f"WHERE c.oid {EQ} {reg}\n"
         "ON CONFLICT (rel) DO UPDATE SET acl = EXCLUDED.acl, owner = EXCLUDED.owner, "
         "comment = EXCLUDED.comment;\n"
+        f"DELETE FROM {_SAVED_SQL} WHERE rel {EQ} {rel};\n"
+        f"INSERT INTO {_SAVED_SQL} (rel, col, stmt, grantor) SELECT {rel}, a.attname, "
+        "pg_catalog.format('GRANT %s (%I) ON %s TO %s%s', "
+        f"g.privilege_type, a.attname, {rel}, {grantee}, "
+        "CASE WHEN g.is_grantable THEN ' WITH GRANT OPTION' ELSE '' END), g.grantor "
+        "FROM pg_catalog.pg_attribute a, pg_catalog.aclexplode(a.attacl) WITH ORDINALITY g "
+        f"WHERE a.attrelid {EQ} {reg} AND a.attacl IS NOT NULL "
+        "ORDER BY a.attnum, g.ordinality;\n"
+        f"INSERT INTO {_SAVED_SQL} (rel, col, stmt) SELECT {rel}, a.attname, "
+        f"pg_catalog.format('COMMENT ON COLUMN %s.%I IS %L', {rel}, a.attname, d.description) "
+        "FROM pg_catalog.pg_attribute a JOIN pg_catalog.pg_description d "
+        f"ON d.objoid {EQ} a.attrelid AND d.classoid {EQ} {PG_CLASS} "
+        f"AND d.objsubid {EQ} a.attnum WHERE a.attrelid {EQ} {reg};\n"
+        f"INSERT INTO {_SAVED_SQL} (rel, col, stmt) SELECT {rel}, a.attname, "
+        f"pg_catalog.format('ALTER VIEW %s ALTER COLUMN %I SET DEFAULT %s', {rel}, a.attname, "
+        "pg_catalog.pg_get_expr(d.adbin, d.adrelid)) FROM pg_catalog.pg_attrdef d "
+        f"JOIN pg_catalog.pg_attribute a ON a.attrelid {EQ} d.adrelid AND a.attnum {EQ} d.adnum "
+        f"WHERE d.adrelid {EQ} {reg};\n"
+        f"INSERT INTO {_SAVED_SQL} (rel, col, stmt) SELECT {rel}, NULL, "
+        "pg_catalog.pg_get_triggerdef(t.oid) FROM pg_catalog.pg_trigger t "
+        f"WHERE t.tgrelid {EQ} {reg} AND NOT t.tgisinternal;\n"
+        f"INSERT INTO {_SAVED_SQL} (rel, col, stmt) SELECT {rel}, NULL, "
+        "pg_catalog.rtrim(pg_catalog.pg_get_ruledef(r.oid), ';') FROM pg_catalog.pg_rewrite r "
+        f"WHERE r.ev_class {EQ} {reg} AND r.rulename {NE} '_RETURN';\n"
         "END $mizzle$"
     )
 
 
 def _restore_grants(name: str, kind: str) -> str:
-    rel = _literal(name)
-    return (
-        "DO $mizzle$ DECLARE s record; a record; BEGIN\n"
-        "IF to_regclass('pg_temp.__mizzle_saved') IS NULL THEN RETURN; END IF;\n"
-        f"SELECT * INTO s FROM {_SAVED} WHERE rel = {rel};\n"
-        "IF NOT FOUND THEN RETURN; END IF;\n"
-        f"IF s.owner <> (SELECT relowner FROM pg_class WHERE oid = {rel}::regclass) THEN\n"
-        f"  EXECUTE format('ALTER {kind} %s OWNER TO %I', {rel}, pg_get_userbyid(s.owner));\n"
+    rel = literal(name)
+    reg = f"{rel}{REGCLASS}"
+    grantee = (
+        f"CASE WHEN a.grantee {EQ} 0 THEN 'PUBLIC' "
+        "ELSE pg_catalog.quote_ident(pg_catalog.pg_get_userbyid(a.grantee)) END"
+    )
+    as_grantor = (
+        f"  IF a.grantor {NE} s.owner THEN "
+        "PERFORM pg_catalog.set_config('role', pg_catalog.pg_get_userbyid(a.grantor), true); "
         "END IF;\n"
-        "FOR a IN SELECT * FROM aclexplode(s.acl) WHERE grantee <> s.owner LOOP\n"
-        "  EXECUTE format('GRANT %s ON %s TO %s%s', a.privilege_type, "
-        f"{rel}, CASE WHEN a.grantee = 0 THEN 'PUBLIC' "
-        "ELSE quote_ident(pg_get_userbyid(a.grantee)) END, "
+    )
+    return (
+        "DO $mizzle$ DECLARE s record; a record; "
+        "me pg_catalog.text := pg_catalog.current_setting('role'); BEGIN\n"
+        "IF pg_catalog.to_regclass('pg_temp.__mizzle_saved') IS NULL THEN RETURN; END IF;\n"
+        f"SELECT * INTO s FROM {_SAVED} WHERE rel {EQ} {rel};\n"
+        "IF NOT FOUND THEN RETURN; END IF;\n"
+        f"IF s.owner {NE} (SELECT relowner FROM pg_catalog.pg_class WHERE oid {EQ} {reg}) THEN\n"
+        f"  EXECUTE pg_catalog.format('ALTER {kind} %s OWNER TO %I', {rel}, "
+        "pg_catalog.pg_get_userbyid(s.owner));\n"
+        "END IF;\n"
+        # Exactly the saved ACL: the new view has the schema's default privileges (K5-1).
+        "FOR a IN SELECT DISTINCT grantee FROM pg_catalog.pg_class, pg_catalog.aclexplode("
+        f"coalesce(relacl, pg_catalog.acldefault('r', relowner))) WHERE oid {EQ} {reg} LOOP\n"
+        f"  EXECUTE pg_catalog.format('REVOKE ALL ON %s FROM %s CASCADE', {rel}, {grantee});\n"
+        "END LOOP;\n"
+        # The owner's grants first, then those its grantees made, in the order they were.
+        "FOR a IN SELECT * FROM pg_catalog.aclexplode(coalesce(s.acl, "
+        "pg_catalog.acldefault('r', s.owner))) "
+        f"WITH ORDINALITY g ORDER BY g.grantor {NE} s.owner, g.ordinality LOOP\n"
+        + as_grantor
+        + "  EXECUTE pg_catalog.format('GRANT %s ON %s TO %s%s', a.privilege_type, "
+        f"{rel}, {grantee}, "
         "CASE WHEN a.is_grantable THEN ' WITH GRANT OPTION' ELSE '' END);\n"
+        "  PERFORM pg_catalog.set_config('role', me, true);\n"
         "END LOOP;\n"
         "IF s.comment IS NOT NULL THEN\n"
-        f"  EXECUTE format('COMMENT ON {kind} %s IS %L', {rel}, s.comment);\n"
+        f"  EXECUTE pg_catalog.format('COMMENT ON {kind} %s IS %L', {rel}, s.comment);\n"
         "END IF;\n"
-        f"DELETE FROM {_SAVED} WHERE rel = {rel};\n"
+        # Column grants, comments and defaults on a column the view still has; triggers
+        # and rules fail the migration if the new view cannot carry them, never vanish.
+        f"FOR a IN SELECT stmt, grantor FROM {_SAVED_SQL} WHERE rel {EQ} {rel} AND (col IS NULL "
+        f"OR EXISTS (SELECT 1 FROM pg_catalog.pg_attribute WHERE attrelid {EQ} {reg} "
+        f"AND attname {EQ} col AND NOT attisdropped)) "
+        f"ORDER BY coalesce(grantor {NE} s.owner, false), id LOOP\n"
+        + as_grantor
+        + "  EXECUTE a.stmt;\n"
+        "  PERFORM pg_catalog.set_config('role', me, true);\n"
+        "END LOOP;\n"
+        f"DELETE FROM {_SAVED_SQL} WHERE rel {EQ} {rel};\n"
+        f"DELETE FROM {_SAVED} WHERE rel {EQ} {rel};\n"
         "END $mizzle$"
     )
-
-
-def _without_defaults(args: str) -> str:
-    """Function arguments as DROP FUNCTION takes them: ``a integer DEFAULT 1`` -> ``a integer``."""
-    parts: list[str] = []
-    depth, start, quoted = 0, 0, False
-    for i, ch in enumerate(args + ","):
-        if ch == "'":
-            quoted = not quoted
-        elif not quoted and ch in "([":
-            depth += 1
-        elif not quoted and ch in ")]":
-            depth -= 1
-        elif not quoted and depth == 0 and ch == ",":
-            parts.append(args[start:i].strip())
-            start = i + 1
-    return ", ".join(re.split(r" DEFAULT | = ", p, maxsplit=1)[0] for p in parts if p)
-
-
-# A SQL-standard body (PostgreSQL 14+): written as is, not as a string.
-_SQL_BODY = re.compile(r"\s*(?:RETURN\b|BEGIN\s+ATOMIC\b)", re.IGNORECASE)
-
-
-def sql_standard_body(fn: FunctionSnap) -> bool:
-    return fn["language"] == "sql" and _SQL_BODY.match(fn["body"]) is not None
-
-
-def function_options(fn: FunctionSnap) -> str:
-    """Everything after ``LANGUAGE x`` and before the body."""
-    text = ""
-    if fn["volatility"] != "volatile":
-        text += f" {fn['volatility'].upper()}"
-    if fn.get("strict"):
-        text += " STRICT"
-    if fn["security_definer"]:
-        text += " SECURITY DEFINER"
-    if fn.get("leakproof"):
-        text += " LEAKPROOF"
-    if parallel := fn.get("parallel"):
-        text += f" PARALLEL {parallel.upper()}"
-    if (cost := fn.get("cost")) is not None:
-        text += f" COST {cost:g}"
-    for setting, value in fn.get("settings", {}).items():
-        text += f" SET {setting} = {value}"
-    return text
-
-
-def _create_function(fn: FunctionSnap) -> str:
-    text = (
-        f"CREATE OR REPLACE FUNCTION {qualified(fn['schema'], fn['name'])}({fn['args']}) "
-        f"RETURNS {fn['returns']} LANGUAGE {type_ident(fn['language'])}"
-    )
-    text += function_options(fn)
-    if sql_standard_body(fn):
-        return f"{text}\n{fn['body']}"
-    return f"{text} AS {_dollar_quote(fn['body'])}"
 
 
 def _role(name: str) -> str:
@@ -752,55 +1013,51 @@ def _policy_body(policy: PolicySnap) -> str:
     return text
 
 
-def trigger_events(trigger: TriggerSnap) -> str:
-    """``INSERT OR UPDATE OF a, b``."""
-    events: list[str] = []
-    for event in trigger["events"]:
-        if event == "update" and (columns := trigger.get("columns")):
-            events.append(f"UPDATE OF {_columns(columns)}")
-        else:
-            events.append(event.upper())
-    return " OR ".join(events)
+def _rebuild_guard(step: DropColumn) -> str:
+    """Stop before a column is dropped to be added again if anything mizzle does not manage
+    uses it (column grants, exclusion constraints, triggers...): the drop would take it
+    silently (K6-7). What mizzle manages on it (keys, indexes, views) is gone by then."""
+    table = qualified(step.schema, step.table)
+    return f"DO $mizzle$ BEGIN\n{_unmanaged_check(table, step.table, step.name)}END $mizzle$"
 
 
-def _create_trigger(schema: str, table: str, trigger: TriggerSnap, replace: bool) -> str:
-    fn_schema, _, fn_name = trigger["function"].partition(".")
-    text = (
-        f"CREATE {'OR REPLACE ' if replace else ''}TRIGGER {quote(trigger['name'])} "
-        f"{trigger['timing'].upper()} {trigger_events(trigger)} ON {qualified(schema, table)}"
+def _unmanaged_check(table: str, name: str, column: str, restored: str = "") -> str:
+    """The IF ... RAISE that refuses to drop a column something unmanaged depends on.
+    `restored` is an extra SQL condition on the dependency `d` for what the caller
+    makes again after the drop."""
+    rel, col = literal(table), literal(column)
+    reg = f"{rel}{REGCLASS}"
+    what = literal(f"{name}.{column}")
+    return (
+        f"IF EXISTS (SELECT 1 FROM pg_catalog.pg_attribute a WHERE a.attrelid {EQ} "
+        f"{reg} AND a.attname {EQ} {col} AND a.attacl IS NOT NULL)\n"
+        "OR EXISTS (SELECT 1 FROM pg_catalog.pg_depend d JOIN pg_catalog.pg_attribute a "
+        f"ON a.attrelid {EQ} d.refobjid AND a.attnum {EQ} d.refobjsubid "
+        f"WHERE d.refclassid {EQ} {PG_CLASS} AND d.refobjid {EQ} {reg} "
+        f"AND a.attname {EQ} {col} AND d.deptype {EQ} ANY ('{{a,n}}'::pg_catalog.\"char\"[]) "
+        f"AND d.classid {NE} 'pg_catalog.pg_attrdef'::pg_catalog.regclass "
+        "AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_class s "
+        f"WHERE d.classid {EQ} {PG_CLASS} AND s.oid {EQ} d.objid AND s.relkind {EQ} 'S') "
+        "AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_constraint n WHERE d.classid "
+        f"{EQ} 'pg_catalog.pg_constraint'::pg_catalog.regclass AND n.oid {EQ} d.objid "
+        f"AND n.contype {EQ} 'n'){restored}) THEN\n"
+        f"  RAISE EXCEPTION 'column % is dropped and added again, which would drop the grants, "
+        "constraints, views or triggers on it that mizzle does not manage; this needs a custom "
+        f"migration', {what};\n"
+        "END IF;\n"
     )
-    referencing = [
-        f"{side} TABLE AS {quote(name)}"
-        for side, name in (("OLD", trigger.get("old_table")), ("NEW", trigger.get("new_table")))
-        if name is not None
-    ]
-    if referencing:
-        text += f" REFERENCING {' '.join(referencing)}"
-    text += f" FOR EACH {trigger['for_each'].upper()}"
-    if trigger["when"] is not None:
-        text += f" WHEN ({trigger['when']})"
-    return f"{text} EXECUTE FUNCTION {qualified(fn_schema, fn_name)}()"
 
 
-# Column types that need an extension, and the extension.
-_EXTENSION_TYPES = re.compile(r"(?:vector|halfvec|sparsevec)(?:\(\d+\))?(?:\[\])*")
-
-
-def type_extension(sql_type: str) -> str | None:
-    return "vector" if _EXTENSION_TYPES.fullmatch(sql_type) else None
-
-
-def render(steps: Sequence[Step]) -> list[Statement]:
-    statements: list[Statement] = []
-    for step in steps:
-        # The schema an extension goes into may hold nothing else, so nothing created it.
-        match step:
-            case (
-                CreateExtension(extension={"schema": str(schema)})
-                | AlterExtension(schema=str(schema))
-            ):
-                statements.append(render_step(CreateSchema(schema)))
-            case _:
-                pass
-        statements.append(render_step(step))
-    return statements
+def render(steps: Sequence[Step], *, qualify: bool = False) -> list[Statement]:
+    """``qualify`` names public tables and types as ``"public"."t"`` too."""
+    token = _QUALIFY.set(qualify)
+    try:
+        out: list[Statement] = []
+        for step in steps:
+            if isinstance(step, DropColumn) and step.rebuilt:
+                out.append(Statement(_rebuild_guard(step)))
+            statement = render_step(step)
+            out.append(Statement(escape_backslashes(statement.sql), statement.transactional))
+        return out
+    finally:
+        _QUALIFY.reset(token)

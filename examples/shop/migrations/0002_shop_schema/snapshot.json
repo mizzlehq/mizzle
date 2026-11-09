@@ -1,11 +1,10 @@
 {
   "version": 1,
   "dialect": "postgresql",
-  "id": "048ca64c-a7d0-4e06-9616-a5007fae3fff",
-  "prev_id": "43bdd26c-6315-4c0f-bfde-64230cdf7afa",
+  "id": "bf402e58-c142-452e-a6cd-ec36fcea53b4",
+  "prev_id": "e1598ab6-a538-463e-a1e9-046e31d192d5",
   "schemas": [
-    "shop_audit",
-    "auth"
+    "shop_audit"
   ],
   "enums": {
     "public.user_role": {
@@ -190,20 +189,7 @@
           "on_update": null
         }
       },
-      "indexes": {},
-      "triggers": {
-        "stores_audit": {
-          "name": "stores_audit",
-          "timing": "after",
-          "events": [
-            "insert",
-            "delete"
-          ],
-          "for_each": "row",
-          "function": "shop_audit.log_change",
-          "when": null
-        }
-      }
+      "indexes": {}
     },
     "public.products": {
       "schema": "public",
@@ -365,21 +351,6 @@
           ],
           "unique": false,
           "where": "active"
-        }
-      },
-      "triggers": {
-        "products_price_changed": {
-          "name": "products_price_changed",
-          "timing": "after",
-          "events": [
-            "update"
-          ],
-          "for_each": "row",
-          "function": "public.price_changed",
-          "when": "OLD.price IS DISTINCT FROM NEW.price",
-          "columns": [
-            "price"
-          ]
         }
       }
     },
@@ -548,25 +519,6 @@
           ],
           "unique": false,
           "where": "status IN ('pending', 'paid')"
-        }
-      },
-      "grants": {
-        "shop_authenticated": [
-          "select"
-        ]
-      },
-      "triggers": {
-        "orders_audit": {
-          "name": "orders_audit",
-          "timing": "after",
-          "events": [
-            "insert",
-            "delete",
-            "update"
-          ],
-          "for_each": "row",
-          "function": "shop_audit.log_change",
-          "when": null
         }
       }
     },
@@ -763,14 +715,6 @@
         "enabled": true,
         "force": false
       },
-      "grants": {
-        "shop_authenticated": [
-          "delete",
-          "insert",
-          "select",
-          "update"
-        ]
-      },
       "policies": {
         "reviews_owner_select": {
           "name": "reviews_owner_select",
@@ -897,15 +841,6 @@
         "enabled": true,
         "force": true
       },
-      "grants": {
-        "shop_authenticated": [
-          "select",
-          "update"
-        ],
-        "shop_support": [
-          "select"
-        ]
-      },
       "policies": {
         "notifications_own": {
           "name": "notifications_own",
@@ -1000,11 +935,6 @@
           "unique": false,
           "where": null
         }
-      },
-      "grants": {
-        "shop_support": [
-          "select"
-        ]
       }
     }
   },
@@ -1042,11 +972,6 @@
           "not_null": false,
           "default": null
         }
-      },
-      "grants": {
-        "shop_authenticated": [
-          "select"
-        ]
       }
     },
     "public.store_sales": {
@@ -1084,49 +1009,6 @@
           "where": null
         }
       }
-    }
-  },
-  "extensions": {
-    "pg_trgm": {
-      "name": "pg_trgm"
-    },
-    "pgcrypto": {
-      "name": "pgcrypto"
-    }
-  },
-  "functions": {
-    "auth.uid()": {
-      "schema": "auth",
-      "name": "uid",
-      "args": "",
-      "returns": "uuid",
-      "language": "sql",
-      "body": "SELECT nullif(current_setting('request.jwt.claims', true)::jsonb ->> 'sub', '')::uuid",
-      "volatility": "stable",
-      "security_definer": false
-    },
-    "shop_audit.log_change()": {
-      "schema": "shop_audit",
-      "name": "log_change",
-      "args": "",
-      "returns": "trigger",
-      "language": "plpgsql",
-      "body": "\nBEGIN\n  INSERT INTO shop_audit.audit_log (table_name, action, row_id, data)\n  VALUES (\n    TG_TABLE_NAME,\n    lower(TG_OP)::shop_audit.audit_action,\n    CASE WHEN TG_OP = 'DELETE' THEN OLD.id::text ELSE NEW.id::text END,\n    CASE WHEN TG_OP = 'DELETE' THEN to_jsonb(OLD) ELSE to_jsonb(NEW) END\n  );\n  RETURN NULL;\nEND\n",
-      "volatility": "volatile",
-      "security_definer": true,
-      "settings": {
-        "search_path": "pg_catalog, pg_temp"
-      }
-    },
-    "public.price_changed()": {
-      "schema": "public",
-      "name": "price_changed",
-      "args": "",
-      "returns": "trigger",
-      "language": "plpgsql",
-      "body": "\nBEGIN\n  PERFORM pg_notify('shop_price', json_build_object(\n    'product_id', NEW.id, 'old', OLD.price, 'new', NEW.price)::text);\n  INSERT INTO notifications (user_id, kind, payload)\n  SELECT s.owner_id, 'price_changed',\n         jsonb_build_object('product_id', NEW.id, 'old', OLD.price, 'new', NEW.price)\n  FROM stores s WHERE s.id = NEW.store_id;\n  RETURN NULL;\nEND\n",
-      "volatility": "volatile",
-      "security_definer": false
     }
   }
 }

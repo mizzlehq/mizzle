@@ -5,11 +5,15 @@ from __future__ import annotations
 import datetime as _dt
 import enum
 import ipaddress
+import json as _jsonlib
 import re
 import struct
 import uuid as _uuid
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from typing import Protocol, cast, runtime_checkable
+from decimal import Decimal
+from typing import Never, Protocol, cast, overload, override, runtime_checkable
+
+from asyncpg import BitString, Line, Point
 
 from mizzle.core.errors import QueryError
 from mizzle.core.naming import snake_case
@@ -67,33 +71,108 @@ def time(
     return Column(f"time{'tz' if tz else ''}{digits}", (_dt.time,), name)
 
 
+# -- values nested in relational queries (C30) --------------------------------------
+# JSON cannot carry these types: the compiler sends their text, and these turn it back
+# into the value a plain select returns.
+
+
+def _json[T](column: Column[T], decoder: Callable[[object], object]) -> Column[T]:
+    column.json_decoder = decoder
+    return column
+
+
+_NUMBER = re.compile(r"[^\s(),<>\[\]{}]+")
+
+
+def _numbers(value: object) -> list[float]:
+    return [float(n) for n in cast("list[str]", _NUMBER.findall(str(value)))]
+
+
+def _bits(value: object) -> BitString:
+    text = str(value)
+    return BitString.from_int(int(text, 2) if text else 0, length=len(text))
+
+
+def cidr(name: str | None = None) -> Column[IPAddress | None]:
+    """An IPv4/IPv6 network, read and written as an ``ipaddress`` network object."""
+    return _json(
+        Column("cidr", (ipaddress.IPv4Network, ipaddress.IPv6Network), name),
+        lambda v: ipaddress.ip_network(str(v)),
+    )
+
+
+def macaddr(name: str | None = None) -> Column[str | None]:
+    """A 6-byte MAC address (``08:00:2b:01:02:03``), read and written as text."""
+    return Column("macaddr", (str,), name)
+
+
+def macaddr8(name: str | None = None) -> Column[str | None]:
+    """An 8-byte MAC address (``08:00:2b:01:02:03:04:05``), read and written as text."""
+    return Column("macaddr8", (str,), name)
+
+
+def bit(length: int | None = None, name: str | None = None) -> Column[BitString | None]:
+    """A fixed-length bit string. ``bit()`` is ``bit(1)``; values read and write as
+    ``asyncpg.BitString``."""
+    return _json(Column(f"bit({length or 1})", (BitString,), name), _bits)
+
+
+def varbit(length: int | None = None, name: str | None = None) -> Column[BitString | None]:
+    """A variable-length bit string (``bit varying``). Values read and write as
+    ``asyncpg.BitString``."""
+    return _json(
+        Column("varbit" if length is None else f"varbit({length})", (BitString,), name),
+        _bits,
+    )
+
+
+def point(name: str | None = None) -> Column[Point | None]:
+    """A geometric point. Values read and write as ``asyncpg.Point``."""
+    return _json(Column("point", (Point,), name), lambda v: Point(*_numbers(v)))
+
+
+def line(name: str | None = None) -> Column[Line | None]:
+    """An infinite geometric line. Values read and write as ``asyncpg.Line``."""
+    return _json(Column("line", (Line,), name), lambda v: Line(*_numbers(v)))
+
+
 def inet(name: str | None = None) -> Column[IPAddress | None]:
     return Column("inet", _IP_TYPES, name)
 
 
-class jsonb[T](Column[T | None]):
+class JsonText(str):
+    """A JSON document already serialized: the driver's json/jsonb codec sends it as is."""
+
+    __slots__: tuple[str, ...] = ()
+
+
+def _json_documents(values: object) -> object:
+    # A str is one array element to asyncpg; a list would be another array dimension (Q4-5).
+    return [
+        None if v is None else JsonText(_jsonlib.dumps(v)) for v in cast(Iterable[object], values)
+    ]
+
+
+class _JsonColumn[T](Column[T | None]):
+    @override
+    def array_column(self) -> ColumnBase:
+        column = super().array_column()
+        column.encoder = _json_documents
+        return column
+
+
+class jsonb[T](_JsonColumn[T]):
     """``jsonb[dict[str, int]]()``. ``T`` is a static hint only; it is not checked at runtime."""
 
     def __init__(self, name: str | None = None) -> None:
         super().__init__("jsonb", None, name)
 
 
-class json[T](Column[T | None]):
+class json[T](_JsonColumn[T]):
     """``json[list[str]]()``. ``T`` is a static hint only; it is not checked at runtime."""
 
     def __init__(self, name: str | None = None) -> None:
         super().__init__("json", None, name)
-
-
-def tsvector(name: str | None = None) -> Column[str | None]:
-    """Full-text search document, read and written as text (``'cat':1 'sat':2``).
-    Usually generated: ``tsvector().generated_always_as(sql("to_tsvector('english', body)"))``."""
-    return Column("tsvector", (str,), name)
-
-
-def tsquery(name: str | None = None) -> Column[str | None]:
-    """Full-text search query, read and written as text (``'cat' & 'sat'``)."""
-    return Column("tsquery", (str,), name)
 
 
 @runtime_checkable
@@ -139,8 +218,9 @@ _VECTOR_VALUES: tuple[type[object], ...] = (list, tuple, SupportsToList)
 
 
 def vector(dimensions: int, name: str | None = None) -> Column[list[float] | None]:
-    """A pgvector ``vector(n)`` (float4 values; needs the ``vector`` extension, which
-    migrations create). Write a list, a tuple or a numpy array of floats; reads give lists."""
+    """A pgvector ``vector(n)`` (float4 values; needs the ``vector`` extension: create it
+    in a custom migration). Write a list, a tuple or a numpy array of floats; reads give
+    lists."""
     return Column(
         f"vector({dimensions})", _VECTOR_VALUES, name, encoder=_vector_text, decoder=_FLOAT4
     )
@@ -248,28 +328,37 @@ def inner_product(left: VectorOperand, right: VectorOperand) -> Expr[float]:
 
 def array[T](item: Column[T], name: str | None = None) -> Column[list[T] | None]:
     # Only called with list/tuple values (column accepts) or arrays decoded by asyncpg.
-    def encode(values: object) -> object:
-        return [item.encode(v) for v in cast(Iterable[object], values)]
-
-    def decode(values: object) -> object:
-        return [item.decode(v) for v in cast(Iterable[object], values)]
-
-    column: Column[list[T] | None] = Column(
-        f"{item.sql_type}[]",
-        (list, tuple),
-        name,
-        encoder=encode if item.encoder else None,
-        decoder=decode if item.decoder else None,
-    )
-    column.enum = item.enum
-    column.enum_schema = item.enum_schema
-    column.item = item
+    column = cast(Column[list[T] | None], item.array_column())
+    column.name = name
     return column
 
 
-def _enum_value(value: object) -> object:
-    # Only called with members of the column's enum. Enum.value is typed Any in typeshed.
-    return cast(enum.Enum, value).value  # pyright: ignore[reportAny]
+def _enum_encoder(enum_cls: type[enum.Enum]) -> Callable[[object], object]:
+    """Encode a member as its label, ``str(member.value)`` (the label the snapshot creates).
+    An IntEnum's value is an int, which a text enum parameter refused (B49). Anything else
+    (a plain ``"admin"``) is a ``QueryError``, not a raw ``AttributeError`` from deep in the
+    compiler (B15)."""
+
+    def encode(value: object) -> object:
+        if not isinstance(value, enum_cls):
+            raise QueryError(
+                f"{enum_cls.__name__} column expects a {enum_cls.__name__} member, got "
+                f"{type(value).__name__}"
+            )
+        return str(cast(object, value.value))
+
+    return encode
+
+
+def _enum_decoder(enum_cls: type[enum.Enum]) -> Callable[[object], object]:
+    """A label back to its member, also for an IntEnum, whose labels are ``"1"``, ``"2"``."""
+    by_label: dict[str, enum.Enum] = {str(cast(object, m.value)): m for m in enum_cls}
+
+    def decode(value: object) -> object:
+        member = by_label.get(value) if isinstance(value, str) else None
+        return member if member is not None else enum_cls(value)
+
+    return decode
 
 
 def pg_enum[E: enum.Enum](
@@ -285,9 +374,89 @@ def pg_enum[E: enum.Enum](
         type_name or snake_case(enum_cls.__name__),
         (enum_cls,),
         name,
-        encoder=_enum_value,
-        decoder=enum_cls,
+        encoder=_enum_encoder(enum_cls),
+        decoder=_enum_decoder(enum_cls),
     )
     column.enum = enum_cls
     column.enum_schema = schema
+    return column
+
+
+class CustomColumn[T](Column[T]):
+    """See ``custom``. A relational query nests its values as their JSON form."""
+
+
+_NON_FINITE = frozenset({"NaN", "Infinity", "-Infinity"})
+
+
+def _json_parser(py_type: type[object] | None) -> Callable[[object], object]:
+    """Nested as JSON text (``to_json(col)::text``): numbers are ints or Decimals, so every
+    digit is kept (R8-1, Q9-2), or ``py_type`` when that is float or Decimal, as a plain
+    select gives (H10-1); for those, NaN and Infinity (JSON strings) too."""
+    number = cast(Callable[[str], object], py_type) if py_type in (float, Decimal) else None
+
+    def parse(value: object) -> object:
+        text = cast(str, value)
+        parsed = cast(
+            object,
+            _jsonlib.loads(text, parse_float=number or Decimal, parse_int=number or int),
+        )
+        if number is not None and isinstance(parsed, str) and parsed in _NON_FINITE:
+            return number(parsed)
+        return parsed
+
+    return parse
+
+
+@overload
+def custom(sql_type: str, name: str | None = None) -> CustomColumn[object]: ...
+# The value type: decode's return type, else encode's parameter type, else py_type (Q8-6).
+# With decode, py_type does not take part: pyright would widen a disagreeing py_type and
+# decode to a union (str | int); py_type must name decode's return type.
+@overload
+def custom[T, D](
+    sql_type: str,
+    name: str | None = None,
+    *,
+    py_type: type[object] | None = None,
+    decode: Callable[[D], T],
+    encode: Callable[[T], D] | None = None,
+) -> CustomColumn[T | None]: ...
+@overload
+def custom[T](
+    sql_type: str,
+    name: str | None = None,
+    *,
+    py_type: type[T] | None = None,
+    encode: Callable[[T], object],
+) -> CustomColumn[T | None]: ...
+@overload
+def custom[T](
+    sql_type: str, name: str | None = None, *, py_type: type[T]
+) -> CustomColumn[T | None]: ...
+def custom(
+    sql_type: str,
+    name: str | None = None,
+    *,
+    py_type: type[object] | None = None,
+    decode: Callable[[Never], object] | None = None,
+    encode: Callable[[Never], object] | None = None,
+) -> ColumnBase:
+    """A column of a type mizzle has no column type for:
+    ``sql_type`` is its DDL type, verbatim (``"citext"``, ``"int4range"``, ``"my_domain"``,
+    ``"app.my_type"``). Values are the driver's (asyncpg's) for that type, both ways: a
+    ``str`` for citext or tsvector, a ``Range`` for int4range, a ``Record`` for a composite.
+    ``decode`` turns a value read into ``py_type``, ``encode`` one written into what the
+    driver takes. A relational query nests it as its JSON form (``decode`` then gets that:
+    a ``bool``, an ``int``, a ``Decimal`` for other numbers, a ``str``, a ``dict`` for a
+    composite...).
+    """
+    column = CustomColumn[object](
+        sql_type,
+        (py_type or object,),
+        name,
+        encoder=cast(Callable[[object], object] | None, encode),
+        decoder=cast(Callable[[object], object] | None, decode),
+    )
+    column.json_decoder = _json_parser(py_type)
     return column

@@ -1,50 +1,80 @@
-"""Grants, function overloads and options, trigger kinds, table <-> view swaps, SQL-standard
-function bodies, operator classes, generated column rebuilds, enums in other schemas, table
-moves and identity options: applied, introspected without drift, and pulled back."""
+"""Table <-> view swaps, operator classes, generated column rebuilds, enums in other schemas,
+table moves and identity options: applied, introspected without drift, and pulled back."""
 
+import datetime as dt
 import enum
 import importlib.util
+import re
 import sys
 import uuid
-from collections.abc import AsyncGenerator, Sequence
+from collections.abc import AsyncGenerator, Callable, Sequence
+from decimal import Decimal
 from pathlib import Path
-from typing import final, override
+from typing import cast, final, override
 
 import pytest
+from asyncpg import BitString, Point
 
 from mizzle import (
     Constraint,
+    DatabaseError,
+    Expr,
     QueryBuilder,
     Table,
     View,
-    function,
-    grant,
+    check,
+    contains,
+    eq,
     index,
-    role,
+    primary_key,
     sql,
-    trigger,
+    unique,
+    unique_index,
 )
-from mizzle.core.schema.column import Computed
-from mizzle.core.schema.objects import Extension, Function, SchemaObject, Trigger
+from mizzle.core.schema.column import ColumnBase, Computed
 from mizzle.core.snapshot import Snapshot, empty_snapshot
 from mizzle.core.steps import Statement, Step
-from mizzle.dialects.postgres import PostgresDialect
+from mizzle.dialects.postgres import PostgresDialect, ddl
 from mizzle.dialects.postgres.driver import PostgresDriver
 from mizzle.kit.codegen import render_schema_module
 from mizzle.kit.diff import StrictRenames, diff
 from mizzle.kit.migrate import apply_statements
 from mizzle.kit.snapshot import build_snapshot
-from mizzle.pg import bigint, date, integer, pg_enum, smallint, text, timestamp
+from mizzle.pg import (
+    array,
+    bigint,
+    bit,
+    boolean,
+    bytea,
+    char,
+    cidr,
+    custom,
+    date,
+    integer,
+    interval,
+    json,
+    jsonb,
+    line,
+    macaddr,
+    macaddr8,
+    pg_enum,
+    point,
+    smallint,
+    text,
+    timestamp,
+    varbit,
+    varchar,
+)
 from tests.integration.test_generated_columns import server_version
 
 dialect = PostgresDialect()
 SCHEMAS = ["mg", "mg2"]
 READER, OTHER = "mizzle_mg_reader", "mizzle_mg_other"
-reader = role(READER, existing=True)
 
 RESET = f"""
 DROP SCHEMA IF EXISTS mg CASCADE;
 DROP SCHEMA IF EXISTS mg2 CASCADE;
+DROP SCHEMA IF EXISTS mg3 CASCADE;
 DROP ROLE IF EXISTS {READER};
 DROP ROLE IF EXISTS {OTHER};
 """
@@ -62,8 +92,8 @@ async def driver(pg_url: str) -> AsyncGenerator[PostgresDriver]:
     await drv.close()
 
 
-def snap(tables: Sequence[type[Table]], objects: Sequence[SchemaObject] = ()) -> Snapshot:
-    return build_snapshot(tables, dialect, objects=objects)
+def snap(tables: Sequence[type[Table]]) -> Snapshot:
+    return build_snapshot(tables, dialect)
 
 
 async def execute(driver: PostgresDriver, statement: str) -> list[dict[str, object]]:
@@ -91,10 +121,8 @@ async def assert_no_drift(driver: PostgresDriver, desired: Snapshot) -> None:
     async with driver.acquire() as conn:
         current = await dialect.introspect(conn, SCHEMAS)
         expected = await dialect.normalize_snapshot(conn, desired)
-    remaining = diff(current, expected, compare_expressions=False)
+    remaining = diff(current, expected, compare_expressions=False, normalized=True)
     assert remaining == [], [s.describe() for s in remaining]
-    for k, fn in expected.get("functions", {}).items():  # the parts push does not compare
-        assert current.get("functions", {})[k] == fn
     for k, table in expected["tables"].items():
         assert current["tables"][k]["indexes"] == table["indexes"]
 
@@ -102,7 +130,6 @@ async def assert_no_drift(driver: PostgresDriver, desired: Snapshot) -> None:
 async def assert_pull_round_trip(driver: PostgresDriver, tmp_path: Path) -> str:
     """The pulled module builds the snapshot of the database it was pulled from."""
     current = await live(driver)
-    current["extensions"] = {}
     source = render_schema_module(current)
     name = f"pulled_mg_{uuid.uuid4().hex[:8]}"
     path = tmp_path / f"{name}.py"
@@ -118,225 +145,15 @@ async def assert_pull_round_trip(driver: PostgresDriver, tmp_path: Path) -> str:
         for m in members
         if isinstance(m, type) and issubclass(m, Table) and "__table__" in vars(m)
     ]
-    objects = [m for m in members if isinstance(m, Extension | Function | Trigger)]
-    pulled = build_snapshot(tables, dialect, objects=objects)
+    pulled = build_snapshot(tables, dialect)
     remaining = diff(current, pulled)
     assert remaining == [], (source, [s.describe() for s in remaining])
     return source
 
 
-# -- grants ------------------------------------------------------------------------------
-
-
-@final
-class Docs(Table, name="docs", schema="mg"):
-    id = integer().primary_key()
-    title = text()
-
-    @classmethod
-    @override
-    def config(cls) -> list[Constraint]:
-        return [grant(["select", "insert"], to=[reader]), grant("all", to=["public"])]
-
-
-@final
-class Docs2(Table, name="docs", schema="mg"):
-    id = integer().primary_key()
-    title = text()
-
-    @classmethod
-    @override
-    def config(cls) -> list[Constraint]:
-        return [grant("select", to=[reader])]
-
-
-def titles(where: str, grants: bool = True) -> type[View]:
-    @final
-    class Titles(View, name="titles", schema="mg"):
-        title = text()
-
-        @classmethod
-        @override
-        def query(cls, db: QueryBuilder):
-            return sql(f"SELECT title FROM mg.docs WHERE {where}")
-
-        @classmethod
-        @override
-        def config(cls) -> list[Constraint]:
-            return [grant("select", to=[reader])] if grants else []
-
-    return Titles
-
-
-async def test_grants_are_declared_and_kept_across_view_recreation(
-    driver: PostgresDriver, tmp_path: Path
-) -> None:
-    v1 = snap([Docs, titles("id > 0")])
-    await migrate(driver, empty_snapshot("postgresql"), v1)
-    docs = (await live(driver))["tables"]["mg.docs"].get("grants", {})
-    assert docs[READER] == ["insert", "select"]
-    assert "maintain" in docs["public"] or len(docs["public"]) == 7  # ALL, PostgreSQL 17+
-    # Made outside the schema: kept when the view is created again.
-    await execute(driver, f"GRANT UPDATE ON mg.titles TO {OTHER}")
-    await execute(driver, "COMMENT ON VIEW mg.titles IS 'kept'")
-
-    v2 = snap([Docs2, titles("id > 1")])
-    steps = [s.describe() for s in await migrate(driver, v1, v2)]
-    assert "keep privileges of titles" in steps and "restore privileges of titles" in steps
-    assert "revoke insert on docs from mizzle_mg_reader" in steps
-    current = await live(driver)
-    assert current["tables"]["mg.docs"].get("grants", {}) == {READER: ["select"]}
-    assert current.get("views", {})["mg.titles"].get("grants", {}) == {
-        OTHER: ["update"],
-        READER: ["select"],
-    }
-    [comment] = await execute(driver, "SELECT obj_description('mg.titles'::regclass) AS c")
-    assert comment["c"] == "kept"
-
-    # A declared grant that goes away is revoked, also after a re-create.
-    v3 = snap([Docs2, titles("id > 2", grants=False)])
-    await migrate(driver, v2, v3)
-    grants = (await live(driver)).get("views", {})["mg.titles"].get("grants", {})
-    assert grants == {OTHER: ["update"]}
-
-    # push compares with the live database: roles the schema does not name are left alone.
-    async with driver.acquire() as conn:
-        target = await dialect.normalize_snapshot(conn, snap([Docs2, titles("id > 2")]))
-        steps = diff(await dialect.introspect(conn, SCHEMAS), target, compare_expressions=False)
-    assert [s.describe() for s in steps] == ["grant select on titles to mizzle_mg_reader"]
-    source = await assert_pull_round_trip(driver, tmp_path)
-    assert f"grant(['update'], to=['{OTHER}'])" in source
-
-
-# -- functions -----------------------------------------------------------------------------
-
-add1 = function(
-    "add", schema="mg", returns="integer", language="sql", args="a integer", body="RETURN a + 1"
-)
-add2 = function(
-    "add",
-    schema="mg",
-    returns="integer",
-    language="sql",
-    args="a integer, b integer, c integer DEFAULT 0",
-    body="BEGIN ATOMIC\n SELECT a + b + c;\nEND",
-    strict=True,
-    parallel="safe",
-    cost=5,
-    volatility="immutable",
-)
-tidy = function(
-    "tidy",
-    schema="mg",
-    returns="text",
-    args="t text",
-    body="BEGIN RETURN trim(t); END",
-    settings={"search_path": "mg, pg_temp", "work_mem": "'64MB'"},
-    leakproof=True,
-    security_definer=True,
-)
-tidy2 = function("tidy", schema="mg", returns="text", args="t text", body="BEGIN RETURN t; END")
-
-
 @final
 class Holder(Table, name="holder", schema="mg"):  # a table, so the schema is in a snapshot
     id = integer()
-
-
-async def test_function_overloads_options_and_sql_bodies(
-    driver: PostgresDriver, tmp_path: Path
-) -> None:
-    v1 = snap([Holder], [add1, add2, tidy])
-    assert set(v1.get("functions", {})) == {
-        "mg.add(a integer)",
-        "mg.add(a integer, b integer, c integer DEFAULT 0)",
-        "mg.tidy(t text)",
-    }
-    await migrate(driver, empty_snapshot("postgresql"), v1)
-    [row] = await execute(driver, "SELECT mg.add(1) AS one, mg.add(1, 5) AS two")
-    assert (row["one"], row["two"]) == (2, 6)
-    functions = (await live(driver)).get("functions", {})
-    assert functions["mg.add(a integer)"]["body"] == "RETURN (a + 1)"  # as the server prints it
-    tidy_live = functions["mg.tidy(t text)"]
-    assert tidy_live.get("settings") == {"search_path": "mg, pg_temp", "work_mem": "'64MB'"}
-    assert tidy_live.get("leakproof") is True
-    await assert_pull_round_trip(driver, tmp_path)
-
-    # One overload goes, the other stays; options are replaced in place.
-    v2 = snap([Holder], [add2, tidy2])
-    steps = [s.describe() for s in await migrate(driver, v1, v2)]
-    assert steps == ["drop function add", "create function tidy"]
-    tidy_live = (await live(driver)).get("functions", {})["mg.tidy(t text)"]
-    assert "settings" not in tidy_live and "leakproof" not in tidy_live
-
-
-# -- triggers ------------------------------------------------------------------------------
-
-
-@final
-class Items(Table, name="items", schema="mg"):
-    id = integer().primary_key()
-    name = text()
-    price = integer()
-    seen = integer()
-
-
-@final
-class ItemNames(View, name="item_names", schema="mg"):
-    id = integer()
-    name = text()
-
-    @classmethod
-    @override
-    def query(cls, db: QueryBuilder):
-        return db.select(Items.id, Items.name).from_(Items)
-
-
-bump = function("bump", schema="mg", returns="trigger", body="BEGIN RETURN NEW; END")
-log = function("log", schema="mg", returns="trigger", body="BEGIN RETURN NULL; END")
-insert_into_items = function(
-    "insert_item",
-    schema="mg",
-    returns="trigger",
-    body="BEGIN INSERT INTO mg.items (id, name) VALUES (NEW.id, NEW.name); RETURN NEW; END",
-)
-
-
-async def test_trigger_kinds(driver: PostgresDriver, tmp_path: Path) -> None:
-    def objects(*update_of: str) -> list[SchemaObject]:
-        columns = [Items.__table__.columns[c] for c in update_of]
-        return [
-            trigger("on_price", on=Items, execute=bump, events=["update"], update_of=columns),
-            trigger(
-                "audit",
-                on=Items,
-                execute=log,
-                timing="after",
-                events=["insert"],
-                for_each="statement",
-                new_table="added",
-            ),
-            trigger(
-                "insert_name",
-                on=ItemNames,
-                execute=insert_into_items,
-                timing="instead of",
-                events=["insert"],
-            ),
-        ]
-
-    v1 = snap([Items, ItemNames], objects("price", "name"))
-    trg = v1["tables"]["mg.items"].get("triggers", {})["on_price"]
-    assert trg.get("columns") == ["name", "price"]
-    await migrate(driver, empty_snapshot("postgresql"), v1)
-    await execute(driver, "INSERT INTO mg.item_names (id, name) VALUES (1, 'a')")
-    [row] = await execute(driver, "SELECT name FROM mg.items WHERE id = 1")
-    assert row["name"] == "a"
-    await assert_pull_round_trip(driver, tmp_path)
-
-    v2 = snap([Items, ItemNames], objects("seen"))
-    steps = [s.describe() for s in await migrate(driver, v1, v2)]
-    assert steps == ["replace trigger on_price on items"]
 
 
 # -- table <-> view ------------------------------------------------------------------------
@@ -472,9 +289,9 @@ async def test_rebuilt_column_referenced_by_a_foreign_key(driver: PostgresDriver
     await execute(driver, "INSERT INTO mg.calc (a) VALUES (1), (2), (3)")
     await execute(driver, "INSERT INTO mg.uses VALUES (6)")  # checked again after the change
     [change] = dialect.render(diff(stored, snap(keyed("3"))))
-    assert ">= 170000" in change.sql
+    assert ">=) 170000" in change.sql
     async with driver.acquire() as conn:
-        await apply_statements(conn, [Statement(change.sql.replace(">= 170000", ">= 9900000"))])
+        await apply_statements(conn, [Statement(change.sql.replace(">=) 170000", ">=) 9900000"))])
     await assert_no_drift(driver, snap(keyed("3")))
     rows = await execute(driver, "SELECT b FROM mg.calc ORDER BY a")
     assert [r["b"] for r in rows] == [3, 6, 9]
@@ -558,3 +375,766 @@ class Audit(Table, name="audit", schema="mg"):
 async def test_sql_keyword_defaults_converge(driver: PostgresDriver) -> None:
     """PostgreSQL prints them in upper case: push must find nothing left to do."""
     await migrate(driver, empty_snapshot("postgresql"), snap([Audit]))
+
+
+# -- NULLS NOT DISTINCT (PostgreSQL 15+) ----------------------------------------------------
+
+
+def nulls(kind: str) -> type[Table]:
+    @final
+    class Nulls(Table, name="nulls", schema="mg"):
+        a = integer().unique(nulls_not_distinct=True) if kind == "column" else integer()
+        b = text()
+
+        @classmethod
+        @override
+        def config(cls) -> list[Constraint]:
+            if kind == "unique":
+                return [unique(cls.b, nulls_not_distinct=True)]
+            if kind == "index":
+                return [unique_index("nulls_b", nulls_not_distinct=True).on(cls.b)]
+            return []
+
+    return Nulls
+
+
+async def test_nulls_not_distinct_round_trip(driver: PostgresDriver, tmp_path: Path) -> None:
+    # S6: NULLS NOT DISTINCT is PostgreSQL 15+. On 14 the guard names the version instead
+    # of a raw syntax error.
+    if await server_version(driver) < 150000:
+        query = snap([nulls("column")])
+        with pytest.raises(DatabaseError, match=r"NULLS NOT DISTINCT needs PostgreSQL 15"):
+            await migrate(driver, empty_snapshot("postgresql"), query)
+        return
+    column_unique = snap([nulls("column")])
+    await migrate(driver, empty_snapshot("postgresql"), column_unique)
+    assert (await live(driver))["tables"]["mg.nulls"]["uniques"]["nulls_a_key"].get(
+        "nulls_not_distinct"
+    )
+    await assert_pull_round_trip(driver, tmp_path)
+
+    distinct = snap([nulls("distinct")])
+    steps = await migrate(driver, column_unique, distinct)
+    assert any(s.describe().startswith("drop unique") for s in steps)
+    await assert_pull_round_trip(driver, tmp_path)
+
+    constraint = snap([nulls("unique")])
+    await migrate(driver, distinct, constraint)
+    live_unique = (await live(driver))["tables"]["mg.nulls"]["uniques"]
+    assert any(u.get("nulls_not_distinct") for u in live_unique.values())
+    await assert_pull_round_trip(driver, tmp_path)
+
+    named_index = snap([nulls("index")])
+    await migrate(driver, constraint, named_index)
+    index_snap = (await live(driver))["tables"]["mg.nulls"]["indexes"]["nulls_b"]
+    assert index_snap.get("nulls_not_distinct") is True
+    await assert_pull_round_trip(driver, tmp_path)
+
+
+# -- deferrable / NOT VALID constraints ----------------------------------------------------
+
+
+@final
+class DefColumn(Table, name="def_column", schema="mg"):
+    id = integer().primary_key(deferrable=True, initially_deferred=True)
+    code = text().unique(deferrable=True)
+
+
+@final
+class DefColumnPlain(Table, name="def_column", schema="mg"):
+    id = integer().primary_key()
+    code = text().unique()
+
+
+@final
+class DefTable(Table, name="def_table", schema="mg"):
+    code = text()
+    ref = text()
+
+    @classmethod
+    @override
+    def config(cls) -> list[Constraint]:
+        return [
+            primary_key(
+                cls.code, name="def_table_code_pk", deferrable=True, initially_deferred=True
+            ),
+            unique(cls.ref, name="def_table_ref_uniq", deferrable=True),
+        ]
+
+
+@final
+class DefParent(Table, name="def_parent", schema="mg"):
+    code = text().primary_key()
+
+
+@final
+class DefFk(Table, name="def_fk", schema="mg"):
+    ref = text().references(
+        lambda: DefParent.code, deferrable=True, initially_deferred=True, not_valid=True
+    )
+
+
+@final
+class DefCheck(Table, name="def_check", schema="mg"):
+    amount = integer()
+
+    @classmethod
+    @override
+    def config(cls) -> list[Constraint]:
+        return [check("def_check_amount", sql("amount is null or amount > 0"), not_valid=True)]
+
+
+async def test_deferrable_and_not_valid_round_trip(driver: PostgresDriver, tmp_path: Path) -> None:
+    tables = [DefColumn, DefTable, DefParent, DefFk, DefCheck]
+    await migrate(driver, empty_snapshot("postgresql"), snap(tables))
+    live_tables = (await live(driver))["tables"]
+    pk = live_tables["mg.def_column"]["primary_key"]
+    assert pk is not None
+    assert pk.get("deferrable") and pk.get("initially_deferred")
+    assert live_tables["mg.def_column"]["uniques"]["def_column_code_key"].get("deferrable")
+    table_pk = live_tables["mg.def_table"]["primary_key"]
+    assert table_pk is not None
+    assert table_pk.get("initially_deferred")
+    assert live_tables["mg.def_table"]["uniques"]["def_table_ref_uniq"].get("deferrable")
+    fk = live_tables["mg.def_fk"]["foreign_keys"]["def_fk_ref_fkey"]
+    assert fk.get("deferrable") and fk.get("initially_deferred") and fk.get("not_valid")
+    assert live_tables["mg.def_check"]["checks"]["def_check_amount"].get("not_valid")
+    await assert_pull_round_trip(driver, tmp_path)
+
+    # Turning the column-level options off rewrites the constraints, and the result is clean.
+    plain = snap([DefColumnPlain, DefTable, DefParent, DefFk, DefCheck])
+    steps = await migrate(driver, snap(tables), plain)
+    described = [s.describe() for s in steps]
+    assert any(d.startswith("drop primary key") for d in described), described
+    remaining = (await live(driver))["tables"]["mg.def_column"]
+    remaining_pk = remaining["primary_key"]
+    assert remaining_pk is not None
+    assert not remaining_pk.get("deferrable")
+    assert not remaining["uniques"]["def_column_code_key"].get("deferrable")
+    await assert_pull_round_trip(driver, tmp_path)
+
+
+# -- fixed-length strings (character / bpchar) ---------------------------------------------
+
+
+@final
+class Chars(Table, name="chars", schema="mg"):
+    fixed = char(4)
+    single = char()
+
+
+async def test_char_types_round_trip(driver: PostgresDriver, tmp_path: Path) -> None:
+    await migrate(driver, empty_snapshot("postgresql"), snap([Chars]))
+    columns = (await live(driver))["tables"]["mg.chars"]["columns"]
+    assert columns["fixed"]["type"] == "character(4)"
+    assert columns["single"]["type"] == "character(1)"
+    await execute(driver, "INSERT INTO mg.chars (fixed, single) VALUES ('abcd', 'x')")
+    [row] = await execute(driver, "SELECT fixed, single FROM mg.chars")
+    assert (row["fixed"], row["single"]) == ("abcd", "x")
+    await assert_pull_round_trip(driver, tmp_path)
+
+
+# -- hand-written CHECK expressions (T10) -------------------------------------------------
+
+
+@final
+class Bookings(Table, name="bookings", schema="mg"):
+    status = text().not_null()
+
+    @classmethod
+    @override
+    def config(cls) -> list[Constraint]:
+        # Written the way a person writes it: no outer parens, no ::text casts.
+        return [check("bookings_status_valid", sql("status <> ''"), not_valid=True)]
+
+
+async def test_hand_written_constraint_text_does_not_drift(
+    driver: PostgresDriver, tmp_path: Path
+) -> None:
+    # T10: PostgreSQL prints ``(status <> ''::text)``; a hand-written ``status <> ''`` must
+    # compare equal instead of being dropped and re-added on every generate.
+    await migrate(driver, empty_snapshot("postgresql"), snap([Bookings]))
+    live_left = await live(driver)
+    async with driver.acquire() as conn:
+        desired = await dialect.normalize_snapshot(conn, snap([Bookings]))
+    live_table, wanted = live_left["tables"]["mg.bookings"], desired["tables"]["mg.bookings"]
+    assert live_table["checks"]["bookings_status_valid"]["expression"].endswith("::text)")
+    assert (
+        wanted["checks"]["bookings_status_valid"]["expression"]
+        == live_table["checks"]["bookings_status_valid"]["expression"]
+    )
+    assert diff(live_left, desired, compare_expressions=True) == []
+    await assert_pull_round_trip(driver, tmp_path)
+
+
+# -- column collation ----------------------------------------------------------------------
+
+
+@final
+class CollatedText(Table, name="collated_text", schema="mg"):
+    label = text().collate("C")
+
+
+@final
+class PlainText(Table, name="collated_text", schema="mg"):
+    label = text()
+
+
+async def test_column_collation_round_trip(driver: PostgresDriver, tmp_path: Path) -> None:
+    collated = snap([CollatedText])
+    await migrate(driver, empty_snapshot("postgresql"), collated)
+    columns = (await live(driver))["tables"]["mg.collated_text"]["columns"]
+    assert columns["label"].get("collation") == "C"
+    await assert_pull_round_trip(driver, tmp_path)
+
+    plain = snap([PlainText])
+    steps = await migrate(driver, collated, plain)
+    assert any(s.describe().startswith("change collation") for s in steps)
+    columns = (await live(driver))["tables"]["mg.collated_text"]["columns"]
+    assert "collation" not in columns["label"]
+    await assert_pull_round_trip(driver, tmp_path)
+
+
+# -- comments ------------------------------------------------------------------------------
+
+
+@final
+class Documented(Table, name="documented", schema="mg", comment="a table"):
+    id = integer().comment("the id")
+    note = text().comment("a note")
+
+
+@final
+class DocumentedLater(Table, name="documented", schema="mg", comment="a renamed table"):
+    id = integer()  # its comment is removed
+    note = text().comment("a note")
+
+
+async def test_table_and_column_comments(driver: PostgresDriver, tmp_path: Path) -> None:
+    v1 = snap([Documented])
+    await migrate(driver, empty_snapshot("postgresql"), v1)
+    table = (await live(driver))["tables"]["mg.documented"]
+    assert table.get("comment") == "a table"
+    assert table["columns"]["id"].get("comment") == "the id"
+    assert table["columns"]["note"].get("comment") == "a note"
+    await assert_pull_round_trip(driver, tmp_path)
+
+    v2 = snap([DocumentedLater])
+    steps = await migrate(driver, v1, v2)
+    assert any(s.describe().endswith("on table documented") for s in steps)
+    assert any(s.describe().endswith("on documented.id") for s in steps)
+    table = (await live(driver))["tables"]["mg.documented"]
+    assert table.get("comment") == "a renamed table"
+    assert "comment" not in table["columns"]["id"]
+    await assert_pull_round_trip(driver, tmp_path)
+
+
+# -- unlogged tables and storage parameters -------------------------------------------------
+
+
+@final
+class Cache(Table, name="cache", schema="mg", unlogged=True, storage={"fillfactor": 70}):
+    id = integer().not_null()
+    payload = text()
+
+
+@final
+class CacheLogged(
+    Table, name="cache", schema="mg", storage={"fillfactor": 90, "autovacuum_enabled": "false"}
+):
+    id = integer().not_null()
+    payload = text()
+
+
+async def test_unlogged_and_storage_parameters(driver: PostgresDriver, tmp_path: Path) -> None:
+    v1 = snap([Cache])
+    await migrate(driver, empty_snapshot("postgresql"), v1)
+    table = (await live(driver))["tables"]["mg.cache"]
+    assert table.get("unlogged") is True
+    assert table.get("options") == {"fillfactor": "70"}
+    await assert_pull_round_trip(driver, tmp_path)
+
+    v2 = snap([CacheLogged])
+    steps = await migrate(driver, v1, v2)
+    described = [s.describe() for s in steps]
+    assert any(d.startswith("set cache logged") for d in described), described
+    assert any("storage of cache" in d for d in described), described
+    table = (await live(driver))["tables"]["mg.cache"]
+    assert "unlogged" not in table
+    assert table.get("options") == {"fillfactor": "90", "autovacuum_enabled": "false"}
+    await assert_pull_round_trip(driver, tmp_path)
+
+
+# -- exclusion constraints -----------------------------------------------------------------
+
+
+# -- more column types: network, bit, geometric ---------------------------------------------
+
+
+@final
+class Assorted(Table, name="assorted", schema="mg"):
+    id = integer().primary_key()
+    net = cidr()
+    mac = macaddr()
+    mac8 = macaddr8()
+    flags = bit(4)
+    variable = varbit(8)
+    pt = point()
+    ln = line()
+
+
+async def test_more_column_types_round_trip(driver: PostgresDriver, tmp_path: Path) -> None:
+    await migrate(driver, empty_snapshot("postgresql"), snap([Assorted]))
+    columns = (await live(driver))["tables"]["mg.assorted"]["columns"]
+    expected = {
+        "net": "cidr",
+        "mac": "macaddr",
+        "mac8": "macaddr8",
+        "flags": "bit(4)",
+        "variable": "bit varying(8)",
+        "pt": "point",
+        "ln": "line",
+    }
+    assert {name: columns[name]["type"] for name in expected} == expected
+
+    await execute(
+        driver,
+        "INSERT INTO mg.assorted (id, net, mac, mac8, flags, variable, pt, ln) VALUES "
+        "(1, '10.0.0.0/8', '08:00:2b:01:02:03', '08:00:2b:01:02:03:04:05', B'1010', B'1010', "
+        "'(1,2)', '{1,2,3}')",
+    )
+    [row] = await execute(driver, "SELECT net, mac, mac8, flags, variable FROM mg.assorted")
+    assert str(row["net"]) == "10.0.0.0/8"
+    assert row["mac"] == "08:00:2b:01:02:03"
+    assert row["mac8"] == "08:00:2b:01:02:03:04:05"
+    assert "1010" in str(row["flags"])
+    assert "1010" in str(row["variable"])
+    await assert_pull_round_trip(driver, tmp_path)
+
+
+# -- domains -------------------------------------------------------------------------------
+
+
+# -- partitions --------------------------------------------------------------------------
+
+
+# -- composite types ---------------------------------------------------------------------
+
+
+# -- S8: a domain outside schema_filter, used by a pulled table -----------------------------
+
+
+async def test_an_identity_added_to_a_column_with_rows_starts_after_them(
+    driver: PostgresDriver,
+) -> None:
+    # C29: the new sequence started at 1, so the next insert hit a duplicate key.
+    @final
+    class Plain(Table, name="ids", schema="mg"):
+        id = integer().primary_key()
+        note = text()
+
+    @final
+    class Identity(Table, name="ids", schema="mg"):
+        id = integer().primary_key().generated_by_default_as_identity()
+        note = text()
+
+    v1 = snap([Plain])
+    await migrate(driver, empty_snapshot("postgresql"), v1)
+    await execute(driver, "INSERT INTO mg.ids (id, note) VALUES (1, 'a'), (2, 'b')")
+    await migrate(driver, v1, snap([Identity]))
+    [row] = await execute(driver, "INSERT INTO mg.ids (note) VALUES ('c') RETURNING id")
+    assert row["id"] == 3
+
+
+async def test_pull_writes_valid_code_for_awkward_objects(
+    driver: PostgresDriver, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    # C26: a table or enum named with a leading digit gave `class 2e`, NO INHERIT broke the
+    # next migrate, MATCH FULL was dropped silently, and a column on a shared sequence
+    # became serial().
+    async with driver.acquire() as conn:
+        await conn.execute(
+            "CREATE SCHEMA mg; CREATE TYPE mg.\"2e\" AS ENUM ('a'); "
+            'CREATE TABLE mg."1stuff" (id int PRIMARY KEY, e mg."2e"); '
+            "CREATE TABLE mg.chk (a int, CONSTRAINT pos CHECK (a > 0) NO INHERIT); "
+            "CREATE TABLE mg.ref (id int PRIMARY KEY); "
+            "CREATE TABLE mg.fk (a int, CONSTRAINT f FOREIGN KEY (a) REFERENCES mg.ref "
+            "MATCH FULL); CREATE SEQUENCE mg.shared START 100; "
+            "CREATE TABLE mg.seq (n int DEFAULT nextval('mg.shared'))",
+            [],
+        )
+    with caplog.at_level("WARNING", logger="mizzle"):
+        source = await assert_pull_round_trip(driver, tmp_path)
+    assert "class T1stuff(" in source and "class T2e(" in source
+    assert "NO INHERIT" not in source
+    assert "serial()" not in source
+    messages = [r.getMessage() for r in caplog.records]
+    assert any("NO INHERIT" in m for m in messages)
+    assert any("MATCH FULL" in m for m in messages)
+
+
+async def test_pull_keeps_index_order_and_collation_and_key_columns(
+    driver: PostgresDriver, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    # C25: INCLUDE columns were read as keys (a weaker unique rule), and DESC, NULLS LAST
+    # and COLLATE were dropped, with no drift reported.
+    async with driver.acquire() as conn:
+        await conn.execute(
+            "CREATE SCHEMA mg; CREATE TABLE mg.ix (code text, n int); "
+            "CREATE UNIQUE INDEX ix_u ON mg.ix (code) INCLUDE (n); "
+            "CREATE INDEX ix_d ON mg.ix (code DESC NULLS LAST, n NULLS FIRST); "
+            'CREATE INDEX ix_c ON mg.ix (code COLLATE "C" text_pattern_ops)',
+            [],
+        )
+    with caplog.at_level("WARNING", logger="mizzle"):
+        indexes = (await live(driver))["tables"]["mg.ix"]["indexes"]
+        await assert_pull_round_trip(driver, tmp_path)
+    assert indexes["ix_u"]["columns"] == ["code"]
+    assert indexes["ix_d"].get("expression") == "code DESC NULLS LAST, n NULLS FIRST"
+    assert indexes["ix_c"].get("expression") == 'code COLLATE "C" text_pattern_ops'
+    assert any("INCLUDE" in r.getMessage() for r in caplog.records)
+
+
+async def test_odd_literal_defaults_apply_and_show_no_drift(driver: PostgresDriver) -> None:
+    # C44: DEFAULT inf read as a column name. C45: interval and bytea defaults were refused.
+    import datetime
+
+    from mizzle.pg import bytea, double_precision, numeric
+
+    @final
+    class Odd(Table, name="odd", schema="mg"):
+        id = integer().primary_key()
+        hi = double_precision().default(float("inf"))
+        lo = double_precision().default(float("-inf"))
+        nan = double_precision().default(float("nan"))
+        big = numeric().default(Decimal("Infinity"))
+        day = interval().default(datetime.timedelta(days=1))
+        back = interval().default(datetime.timedelta(days=-1, hours=1, microseconds=500))
+        zero = interval().default(datetime.timedelta())
+        raw = bytea().default(b"\x00\xff")
+
+    desired = snap([Odd])
+    await migrate(driver, empty_snapshot("postgresql"), desired)
+    [row] = await execute(driver, "INSERT INTO mg.odd (id) VALUES (1) RETURNING *")
+    assert row["hi"] == float("inf") and row["lo"] == float("-inf") and row["nan"] != row["nan"]
+    assert row["big"] == Decimal("Infinity")
+    assert row["day"] == datetime.timedelta(days=1)
+    assert row["back"] == datetime.timedelta(days=-1, hours=1, microseconds=500)
+    assert row["zero"] == datetime.timedelta() and row["raw"] == b"\x00\xff"
+    async with driver.acquire() as conn:
+        current = await dialect.introspect(conn, SCHEMAS)
+        expected = await dialect.normalize_snapshot(conn, desired)
+    assert diff(current, expected, normalized=True) == []
+
+
+async def test_json_scalar_and_postgres_type_defaults_apply(driver: PostgresDriver) -> None:
+    # Q10: DEFAULT 5 on jsonb. Q12: inet, cidr, bit and geometry defaults refused.
+    import ipaddress
+
+    from asyncpg import BitString, Line, Point
+
+    from mizzle.pg import inet, jsonb
+
+    @final
+    class Typed(Table, name="typed", schema="mg"):
+        id = integer().primary_key()
+        n = jsonb[int]().default(5)
+        s = jsonb[str]().default("x")
+        ip = inet().default(ipaddress.ip_address("10.0.0.1"))
+        net = cidr().default(ipaddress.ip_network("10.0.0.0/8"))
+        bits = bit(4).default(BitString.from_int(5, length=4))
+        vbits = varbit().default(BitString.from_int(3, length=3))
+        at = point().default(Point(1, 2.5))
+        edge = line().default(Line(1, -1, 0))
+
+    desired = snap([Typed])
+    await migrate(driver, empty_snapshot("postgresql"), desired)
+    [row] = await execute(driver, "INSERT INTO mg.typed (id) VALUES (1) RETURNING *")
+    assert row["n"] == 5 and row["s"] == "x" and row["edge"] == Line(1, -1, 0)
+    assert str(row["ip"]) == "10.0.0.1" and str(row["net"]) == "10.0.0.0/8"
+    assert row["bits"] == BitString.from_int(5, length=4) and row["at"] == Point(1, 2.5)
+
+
+# -- functions called by CHECKs and DEFAULTs, defaults of new types, raw defaults ------------
+
+
+async def test_column_type_change_recreates_the_checks_and_indexes_using_it(
+    driver: PostgresDriver,
+) -> None:
+    # K4-21: PostgreSQL rewrites `c_c >= 0` as `(c_c)::numeric >= (0)::numeric` when c_c
+    # becomes bigint, so the next diff dropped and added the check again, forever.
+    from mizzle.pg import numeric
+
+    @final
+    class Beta(Table, name="beta", schema="mg"):
+        id = integer().primary_key()
+        c_c = numeric()
+
+        @classmethod
+        @override
+        def config(cls) -> list[Constraint]:
+            return [
+                check("beta_c_c", sql("c_c >= 0")),
+                index("beta_part").on(cls.id).where(sql("c_c > 1")),
+                index("beta_expr").on(sql("(c_c + 2)")),
+            ]
+
+    @final
+    class Beta2(Table, name="beta", schema="mg"):
+        id = integer().primary_key()
+        c_c = bigint()
+
+        @classmethod
+        @override
+        def config(cls) -> list[Constraint]:
+            return [
+                check("beta_c_c", sql("c_c >= 0")),
+                index("beta_part").on(cls.id).where(sql("c_c > 1")),
+                index("beta_expr").on(sql("(c_c + 2)")),
+            ]
+
+    v1 = snap([Beta])
+    await migrate(driver, empty_snapshot("postgresql"), v1)
+    await migrate(driver, v1, snap([Beta2]))
+
+
+async def test_a_wider_column_keeps_its_checks_and_indexes(driver: PostgresDriver) -> None:
+    # K4-21 dropped and added again every check and index on a retyped column, also for
+    # varchar(40) -> varchar(64): the expression reads the same, and the added check scans
+    # the whole table.
+    from mizzle.pg import numeric, varchar
+
+    def gamma(size: int) -> type[Table]:
+        @final
+        class Gamma(Table, name="gamma", schema="mg"):
+            id = integer().primary_key()
+            slug = varchar(size)
+            price = numeric(size // 2, 2)
+
+            @classmethod
+            @override
+            def config(cls) -> list[Constraint]:
+                return [
+                    check("gamma_slug", sql("slug ~ '^[a-z]+$'")),
+                    check("gamma_price", sql("price >= 0")),
+                    index("gamma_part").on(cls.id).where(sql("price > 1")),
+                ]
+
+        return Gamma
+
+    v1, v2 = snap([gamma(40)]), snap([gamma(64)])
+    steps = diff(v1, v2)
+    assert [type(s).__name__ for s in steps] == ["AlterColumnType", "AlterColumnType"], steps
+    await migrate(driver, empty_snapshot("postgresql"), v1)
+    await migrate(driver, v1, v2)
+
+
+class K4Mood(enum.Enum):
+    HAPPY = "happy"
+
+
+@final
+class Waits(Table, name="waits", schema="mg"):
+    id = integer().primary_key()
+    wait = interval().default(sql("'1 day 5 seconds'::interval"))
+    mood = pg_enum(K4Mood, type_name="mg_k4_mood", schema="mg")  # not created yet
+
+
+async def test_column_of_a_new_type_leaves_other_defaults_normalized(
+    driver: PostgresDriver,
+) -> None:
+    # K4: the temporary table failed on the new type, so `wait` kept its text (drift).
+    async with driver.acquire() as conn:
+        printed = await dialect.normalize_snapshot(conn, snap([Waits]))
+    assert printed["tables"]["mg.waits"]["columns"]["wait"]["default"] == "'1 day 00:00:05'"
+
+
+@final
+class Stamps(Table, name="stamps", schema="mg"):
+    id = integer().primary_key()
+    at = timestamp().default(sql("now() AT TIME ZONE 'utc'"))
+
+
+@final
+class Stamps2(Table, name="stamps", schema="mg"):
+    id = integer().primary_key()
+    at = timestamp().default(sql("now() AT TIME ZONE 'utc'"))
+    on = timestamp().default(sql("now() AT TIME ZONE 'utc'"))
+
+
+async def test_raw_operator_default_is_parenthesized(driver: PostgresDriver) -> None:
+    # K11: DEFAULT now() AT TIME ZONE 'utc' is a syntax error without parentheses.
+    v1 = snap([Stamps])
+    await migrate(driver, empty_snapshot("postgresql"), v1)  # CREATE TABLE
+    await migrate(driver, v1, snap([Stamps2]))  # ADD COLUMN
+
+
+# -- defaults and DDL literals of every type, as PostgreSQL prints them back ------------------
+
+
+class Q4Color(enum.StrEnum):
+    RED = "red"
+    BLUE = "blue"
+
+
+_UTC5 = dt.timezone(dt.timedelta(hours=5))
+_T0 = dt.datetime(2020, 1, 1, tzinfo=dt.UTC)
+_D1, _D5 = dt.date(2020, 1, 1), dt.date(2020, 1, 5)
+
+type _Check = Callable[[Expr[object]], Expr[bool]] | None
+# (column with its default, a CHECK comparing it with a literal); point has no `=`.
+_TYPED_DEFAULTS: dict[str, tuple[Callable[[], ColumnBase], _Check]] = {
+    "int[]": (lambda: array(integer()).default([1, 2]), lambda v: contains(v, [1])),
+    "varchar[]": (
+        lambda: array(varchar(20)).default(["a b", 'q"\\', "NULL", "", "{x}"]),
+        lambda v: contains(v, ["a b", ""]),
+    ),
+    "enum[]": (
+        lambda: array(pg_enum(Q4Color, type_name="q4_color", schema="mg")).default([Q4Color.RED]),
+        lambda v: contains(v, [Q4Color.RED]),
+    ),
+    "date[]": (lambda: array(date()).default([_D1]), lambda v: contains(v, [_D1])),
+    "jsonb": (
+        lambda: jsonb[object]().default({"k": "\u00fcn\u00ef", "b": 1, "aa": [1e20, 1.5]}),
+        lambda v: contains(v, {"b": 1}),
+    ),
+    "jsonb list": (
+        lambda: jsonb[object]().default([1, 2, {"b": 1, "a": 2}]),
+        lambda v: contains(v, [1, 2]),
+    ),
+    "jsonb[]": (
+        lambda: array(jsonb[object]()).default([{"b": 1, "a": "\u00fc"}, [1, "x"]]),
+        lambda v: contains(v, [[1, "x"]]),
+    ),
+    "bytea[]": (lambda: array(bytea()).default([b"\x00a"]), lambda v: contains(v, [b"\x00a"])),
+    "timestamptz": (
+        lambda: timestamp(tz=True).default(dt.datetime(2020, 1, 1, tzinfo=_UTC5)),
+        lambda v: eq(v, dt.datetime(2019, 12, 31, 19, tzinfo=dt.UTC)),
+    ),
+    "point[]": (lambda: array(point()).default([Point(1, 2.5)]), None),
+    "varbit": (
+        lambda: varbit().default(BitString.from_int(341, length=10)),
+        lambda v: eq(v, BitString.from_int(341, length=10)),
+    ),
+    "varbit[]": (
+        lambda: array(varbit()).default([BitString.from_int(1, length=2)]),
+        lambda v: contains(v, [BitString.from_int(1, length=2)]),
+    ),
+    "timestamptz[]": (
+        lambda: array(timestamp(tz=True)).default([_T0, dt.datetime(2020, 1, 1, tzinfo=_UTC5)]),
+        lambda v: contains(v, [_T0]),
+    ),
+    "timestamp[]": (
+        lambda: array(timestamp()).default([dt.datetime(2020, 1, 1, 0, 0, 0, 500000)]),
+        lambda v: contains(v, [dt.datetime(2020, 1, 1, 0, 0, 0, 500000)]),
+    ),
+    "custom": (lambda: custom("int4range").default("[2,6)"), lambda v: eq(v, "[2,6)")),
+    "interval[]": (
+        lambda: array(interval()).default([dt.timedelta(hours=1), dt.timedelta(days=-1, hours=1)]),
+        lambda v: contains(v, [dt.timedelta(hours=1)]),
+    ),
+    # Q5-1: jsonb[]/json[] elements were JSON-encoded twice.
+    "jsonb[] eq": (
+        lambda: array(jsonb[object]()).default([{"k": 1}, "s"]),
+        lambda v: eq(v, [{"k": 1}, "s"]),
+    ),
+    "json[]": (lambda: array(json[object]()).default([{"k": 1}, [1, 2]]), None),
+    "json float": (lambda: json[object]().default({"f": 1e20, "g": 2.5}), None),  # Q5-10c
+    # Q5-5: the max and min are sent as infinity and -infinity.
+    "date max": (lambda: date().default(dt.date.max), lambda v: eq(v, dt.date.max)),
+    "timestamp min": (
+        lambda: timestamp().default(dt.datetime.min),
+        lambda v: eq(v, dt.datetime.min),
+    ),
+    "timestamptz max": (
+        lambda: timestamp(tz=True).default(dt.datetime.max.replace(tzinfo=dt.UTC)),
+        lambda v: eq(v, dt.datetime.max.replace(tzinfo=dt.UTC)),
+    ),
+    # Q5-8: PostgreSQL has one array type, boolean[], for boolean[][].
+    "boolean[][]": (lambda: array(array(boolean())).default([[True, False], [None, True]]), None),
+}
+
+
+@pytest.mark.parametrize("kind", list(_TYPED_DEFAULTS))
+async def test_typed_defaults_and_check_literals_do_not_drift(
+    driver: PostgresDriver, kind: str
+) -> None:
+    # Q4-1 varchar[]/enum[]/date[] literals were text[]; Q4-2 CAST(ARRAY[1, 2] AS jsonb);
+    # Q4-7 jsonb defaults drifted; Q4-11 array elements were Python repr;
+    make, condition = _TYPED_DEFAULTS[kind]
+    column = make()
+
+    @final
+    class Typed(Table, name="q4_typed", schema="mg"):
+        id = integer().primary_key()
+        v = column
+
+        @classmethod
+        @override
+        def config(cls) -> list[Constraint]:
+            return (
+                []
+                if condition is None
+                else [check("q4_typed_ck", condition(cast(Expr[object], cast(object, cls.v))))]
+            )
+
+    desired = snap([Typed])
+    await migrate(driver, empty_snapshot("postgresql"), desired)
+    current = await live(driver)
+    # Compared as written too: the default is what PostgreSQL prints.
+    assert diff(current, desired, compare_expressions=False) == []
+    # And so is each literal in the CHECK (Q4-19).
+    for name, ck in desired["tables"]["mg.q4_typed"]["checks"].items():
+        written = current["tables"]["mg.q4_typed"]["checks"][name]["expression"]
+        for literal in re.findall(r"'(?:[^']|'')*'", ck["expression"]):
+            assert literal in written
+    # In any session TimeZone: the server prints a timestamptz constant in it (Q4-15).
+    async with driver.acquire() as conn:
+        await conn.execute("SET TimeZone = 'Asia/Dhaka'", [])
+        try:
+            current = await dialect.introspect(conn, SCHEMAS)
+            normalized = await dialect.normalize_snapshot(conn, desired)
+        finally:
+            await conn.execute("RESET TimeZone", [])
+    assert diff(current, desired, compare_expressions=False) == []
+    assert diff(current, normalized, compare_expressions=False, normalized=True) == []
+    await execute(driver, "INSERT INTO mg.q4_typed (id) VALUES (1)")
+    if kind != "custom":  # The default is what an insert of its value stores.
+        value = column.encode(column.default_value)
+        async with driver.acquire() as conn:
+            await conn.execute("INSERT INTO mg.q4_typed (id, v) VALUES (2, $1)", [value])
+        rows = await execute(driver, "SELECT v::text FROM mg.q4_typed ORDER BY id")
+        assert rows[0] == rows[1]
+
+
+async def test_type_named_like_a_keyword_the_server_lacks(
+    driver: PostgresDriver, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # K4-22: mizzle quotes PostgreSQL 18's keywords; on 14-17 json_table is none, so
+    # format_type() printed it bare and the column type drifted. Faked here with a word
+    # mizzle takes for a keyword and this server does not.
+    keywords = ddl._KEYWORDS | {"k4_word"}
+    monkeypatch.setattr(ddl, "_KEYWORDS", keywords)
+
+    @final
+    class Worded(Table, name="k4_worded", schema="mg"):
+        id = integer().primary_key()
+        v = pg_enum(Q4Color, type_name="k4_word", schema="mg")
+        w = array(pg_enum(Q4Color, type_name="k4_word", schema="mg"))
+
+    desired = snap([Worded])
+    assert desired["tables"]["mg.k4_worded"]["columns"]["w"]["type"] == 'mg."k4_word"[]'
+    await migrate(driver, empty_snapshot("postgresql"), desired)
+    assert diff(await live(driver), desired, compare_expressions=False) == []
+
+
+def test_requote_type() -> None:
+    old = ddl._KEYWORDS - {"json", "json_table"}
+    assert ddl.requote_type("json_table", old) == '"json_table"'
+    assert ddl.requote_type("json_table.json_table[]", old) == '"json_table"."json_table"[]'
+    assert ddl.requote_type("json[]", old) == "json[]"  # the built-in type
+    assert ddl.requote_type("mg.json", old) == 'mg."json"'
+    assert ddl.requote_type('mg."json_table"', old) == 'mg."json_table"'
+    assert ddl.requote_type("timestamp(3) without time zone", old) == (
+        "timestamp(3) without time zone"
+    )

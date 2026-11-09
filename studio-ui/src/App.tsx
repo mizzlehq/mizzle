@@ -2,9 +2,11 @@ import { DatabaseIcon } from "lucide-react"
 import { useCallback, useEffect, useState } from "react"
 
 import { DataGrid } from "@/components/data-grid"
+import { DdlDialog } from "@/components/ddl-dialog"
+import { RelationshipDiagram } from "@/components/relationship-diagram"
 import { SqlConsole } from "@/components/sql-console"
 import { StructureView } from "@/components/structure-view"
-import { TableSidebar } from "@/components/table-sidebar"
+import { TableSidebar, type View } from "@/components/table-sidebar"
 import { Toaster } from "@/components/ui/sonner"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { ApiError, api, type Meta, type TableInfo, tableKey } from "@/lib/api"
@@ -13,8 +15,9 @@ export function App() {
   const [meta, setMeta] = useState<Meta | null>(null)
   const [tables, setTables] = useState<TableInfo[]>([])
   const [selected, setSelected] = useState<string | null>(null)
-  const [sqlOpen, setSqlOpen] = useState(false)
+  const [view, setView] = useState<View>("table")
   const [error, setError] = useState<string | null>(null)
+  const [createOpen, setCreateOpen] = useState(false)
 
   const load = useCallback(async () => {
     try {
@@ -58,22 +61,31 @@ export function App() {
       <TableSidebar
         tables={tables}
         selected={selected}
-        sqlOpen={sqlOpen}
+        view={view}
         readOnly={readOnly}
         onSelect={(key) => {
           setSelected(key)
-          setSqlOpen(false)
+          setView("table")
         }}
-        onOpenSql={() => setSqlOpen(true)}
+        onOpenSql={() => setView("sql")}
+        onOpenDiagram={() => setView("diagram")}
         onRefresh={() => void load()}
+        onCreateTable={() => setCreateOpen(true)}
       />
       <main className="flex min-w-0 flex-1 flex-col">
-        {sqlOpen ? (
+        {view === "sql" ? (
           <>
             <header className="border-b px-4 py-3">
               <h1 className="font-heading font-semibold">SQL console</h1>
             </header>
-            <SqlConsole readOnly={readOnly} />
+            <SqlConsole readOnly={readOnly} onRan={() => void load()} />
+          </>
+        ) : view === "diagram" ? (
+          <>
+            <header className="border-b px-4 py-3">
+              <h1 className="font-heading font-semibold">Schema diagram</h1>
+            </header>
+            <RelationshipDiagram />
           </>
         ) : table ? (
           <Tabs
@@ -95,7 +107,7 @@ export function App() {
               <DataGrid table={table} readOnly={readOnly} />
             </TabsContent>
             <TabsContent value="structure" className="min-h-0 flex-1 overflow-auto">
-              <StructureView table={table} />
+              <StructureView table={table} readOnly={readOnly} onChanged={() => void load()} />
             </TabsContent>
           </Tabs>
         ) : (
@@ -104,6 +116,16 @@ export function App() {
           </div>
         )}
       </main>
+      {createOpen && (
+        <DdlDialog
+          kind="create_table"
+          schema="public"
+          table=""
+          open
+          onOpenChange={(open) => setCreateOpen(open)}
+          onApplied={() => void load()}
+        />
+      )}
       <Toaster position="bottom-right" />
     </div>
   )

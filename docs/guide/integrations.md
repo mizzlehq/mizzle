@@ -7,7 +7,7 @@ Supabase-style policies:
 ```python
 from typing import final, override
 
-from mizzle import Constraint, Table, eq, grant, rls, sql
+from mizzle import Constraint, Table, eq, rls, sql
 from mizzle.pg import integer, text, timestamp, uuid
 from mizzle.supabase import ANON, AUTHENTICATED, auth_uid, crud_policy
 
@@ -25,8 +25,6 @@ class Notes(Table, name="notes"):
     def config(cls) -> list[Constraint]:
         return [
             rls(),
-            grant(["select", "insert", "update", "delete"], to=[AUTHENTICATED]),
-            grant("select", to=[ANON]),
             *crud_policy(
                 "notes_owner",
                 to=[AUTHENTICATED],
@@ -43,7 +41,7 @@ class Notes(Table, name="notes"):
 pip install "mizzle[pydantic]"
 ```
 
-`mizzle.pydantic` builds Pydantic models from a table, like drizzle-zod:
+`mizzle.pydantic` builds Pydantic models from a table:
 
 ```python
 class NoteIn(insert_model(Notes, include=["body", "public"])):
@@ -88,8 +86,8 @@ except pydantic.ValidationError:
 ```
 
 `values(model)` and `set(model)` use only the fields the client sent
-(`model_dump(exclude_unset=True)`), so the others keep their database defaults or current
-values. (`as_user` is defined [below](#supabase).)
+(`model_fields_set`), so the others keep their database defaults or current values. Each
+value is the dumped one: serializers run, and a nested model keeps its defaults. (`as_user` is defined [below](#supabase).)
 
 !!! warning "Use include= for client input"
     A model accepts every field it contains. Without `include=`, a client could send a
@@ -110,13 +108,12 @@ models in a FastAPI app.
 `mizzle.supabase` has what Supabase projects need for row-level security:
 
 - `ANON`, `AUTHENTICATED`, `SERVICE_ROLE`, `POSTGRES`, `SUPABASE_AUTH_ADMIN`: Supabase's
-  roles, as `role(..., existing=True)`. Migrations use them in policies and grants but
-  never create or change them.
+  roles, as `role(..., existing=True)`. Migrations use them in policies but never create
+  or change them.
 - `auth_uid()`, `auth_jwt()`, `auth_role()`: `(select auth.uid())` and friends, for
   policy conditions. The subquery makes PostgreSQL evaluate them once per statement
   instead of once per row, as Supabase recommends.
-- `crud_policy(name, to=[...], read=..., modify=...)`: the usual policies, like Drizzle's
-  `crudPolicy`. `read` controls SELECT; `modify` controls INSERT, UPDATE and DELETE.
+- `crud_policy(name, to=[...], read=..., modify=...)`: the usual policies. `read` controls SELECT; `modify` controls INSERT, UPDATE and DELETE.
   `True` allows every row, `False` none, a condition the matching rows, and `None` adds no
   policy. They are named `{name}_select`, `{name}_insert`, `{name}_update` and
   `{name}_delete`.
@@ -129,9 +126,10 @@ CREATE POLICY "notes_owner_insert" ON "notes" AS PERMISSIVE FOR INSERT TO "authe
 CREATE POLICY "notes_owner_update" ON "notes" AS PERMISSIVE FOR UPDATE TO "authenticated" USING ("owner_id" = (select auth.uid())) WITH CHECK ("owner_id" = (select auth.uid()));
 CREATE POLICY "notes_owner_delete" ON "notes" AS PERMISSIVE FOR DELETE TO "authenticated" USING ("owner_id" = (select auth.uid()));
 CREATE POLICY "notes_public_select" ON "notes" AS PERMISSIVE FOR SELECT TO "anon" USING ("public" = 'yes');
-GRANT SELECT ON "notes" TO "anon";
-GRANT DELETE, INSERT, SELECT, UPDATE ON "notes" TO "authenticated";
 ```
+
+Grants are not managed by mizzle (Supabase grants its roles on new tables by default); add
+any others in a custom migration (`GRANT SELECT ON notes TO anon;`).
 
 Your server connects as a role that bypasses RLS (`postgres`, or the table owner). To run
 queries as a signed-in user, do what Supabase's API does: set the JWT claims and the role
@@ -186,14 +184,18 @@ uses the same `mizzle.toml` and database URL as the other commands.
 
 - It listens on `127.0.0.1` only, and every API call needs the one-time token in the
   printed link. Other websites cannot call it.
-- `--read-only` blocks every write; SQL runs in a read-only transaction.
+- `--read-only` blocks every write; SQL runs in a read-only transaction. It needs a
+  non-privileged database role and refuses to start as a superuser (see
+  [the CLI reference](../cli.md#studio)).
 - The UI (about 250 KB) downloads on first run into your virtual environment, checked by
   SHA-256. On offline machines pass `--ui-path` with a local build.
 
 ## typegen
 
-`mizzle typegen` writes a `TypedDict` for inserts and one for updates of each table, next
-to your schema module (`db/schema_types.py`):
+`mizzle typegen` writes three `TypedDict`s per table, next to your schema module
+(`db/schema_types.py`): `<Table>Row` for a full selected row (including generated
+columns), `<Table>Insert` for the values of a new row, and `<Table>Update` for a partial
+update.
 
 ```python
 class NotesInsert(TypedDict):
@@ -210,6 +212,17 @@ inserting:
 rows: list[NotesInsert] = [{"body": "one"}, {"body": "two"}]
 async with as_user(db, ANN) as tx:
     await tx.insert(Notes).values(rows)  # a misspelled key is a type error
+```
+
+`<Table>Row` names the shape a projection returns; `as_rows()` checks the field names and
+re-types the result:
+
+```python
+rows = (
+    await db.select({"id": Notes.id, "body": Notes.body})
+    .from_(Notes)
+    .as_rows(NotesRow)  # list[NotesRow]
+)
 ```
 
 Once the file exists, `mizzle generate` rewrites it each time it writes a migration.

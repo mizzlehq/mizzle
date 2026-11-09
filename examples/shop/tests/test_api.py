@@ -4,7 +4,6 @@ import asyncio
 import datetime
 import json
 import math
-import os
 import struct
 import uuid
 from decimal import Decimal
@@ -19,8 +18,6 @@ from mizzle import Database, eq, sql
 from mizzle.dialects.postgres import PostgresDialect
 from mizzle.studio.server import create_app as studio_app
 from tests.conftest import APP_NAME, Sync
-
-BOUNCER = bool(os.environ.get("SHOP_BOUNCER_URL"))
 
 
 def tag() -> str:
@@ -245,7 +242,7 @@ async def test_catalog(client: httpx.AsyncClient) -> None:
         "price"
     ] == "2.00"
 
-    # COPY stock for the bulk products; a duplicate key stores nothing at all.
+    # Load stock for the bulk products; a duplicate key stores nothing at all.
     stock = {str(pid): {"main": 10, "backup": i % 3} for i, pid in enumerate(second["ids"])}
     loaded = await ok(
         await client.post(f"/stores/{sid}/inventory/load", json=stock, headers=H(sam))
@@ -256,7 +253,7 @@ async def test_catalog(client: httpx.AsyncClient) -> None:
         await client.post(f"/stores/{sid}/inventory/load", json=dup_stock, headers=H(sam))
     ).status_code == 409
     inv = await ok(await client.get("/admin/inventory", params={"store_id": sid}))
-    assert len(inv) == 5 + 250  # the failed COPY left nothing behind
+    assert len(inv) == 5 + 250  # the failed load left nothing behind
     assert {
         (i["warehouse"], i["quantity"]) for i in inv if i["product_id"] == second["ids"][4]
     } == {("main", 10), ("backup", 1)}
@@ -535,7 +532,7 @@ async def test_reviews_rls(client: httpx.AsyncClient) -> None:
     assert (await client.get("/products/999999999")).status_code == 404
 
 
-# -- notifications: triggers, LISTEN and row-level security ---------------------------
+# -- notifications: triggers and row-level security ---------------------------
 
 
 async def test_price_changes_notify(client: httpx.AsyncClient, db: Database) -> None:
@@ -545,10 +542,6 @@ async def test_price_changes_notify(client: httpx.AsyncClient, db: Database) -> 
     p = await make_product(client, sam, sid, price="10.00")
     q = await make_product(client, sam, sid, price="20.00")
 
-    listening = None
-    if not BOUNCER:
-        listening = asyncio.create_task(client.get("/events/prices", params={"n": 2}))
-        await asyncio.sleep(0.5)  # the listener is up
     await asyncio.sleep(0.01)
     changed = await ok(
         await client.patch(f"/products/{p['id']}", json={"price": "11.00"}, headers=H(sam))
@@ -564,17 +557,6 @@ async def test_price_changes_notify(client: httpx.AsyncClient, db: Database) -> 
     assert (
         await client.patch(f"/products/{q['id']}", json={"price": "1"}, headers=H(eve))
     ).status_code == 404
-
-    if listening is not None:
-        events = await ok(await listening)
-        assert events == [
-            {"product_id": p["id"], "old": 10.0, "new": 11.0},
-            {"product_id": q["id"], "old": 20.0, "new": 19.5},
-        ]
-    else:  # PgBouncer in transaction mode drops notifications: listen() refuses
-        assert (
-            await client.get("/events/prices", params={"n": 1, "timeout": 5})
-        ).status_code == 500
 
     mine = await ok(await client.get("/me/notifications", headers=H(sam)))
     assert [(n["kind"], n["payload"]["product_id"]) for n in mine] == [
@@ -642,9 +624,8 @@ async def test_similar_products(client: httpx.AsyncClient, db: Database) -> None
     assert row.embedding == [f32(0.9), f32(0.1), 0.0]
     assert row.half == pytest.approx([0.9, 0.5, 0.25], abs=1e-3)
     assert row.keywords == {1: 0.5, 7: 2.0}
-    # copy_into falls back to INSERT for vector columns.
     extra = await make_product(client, sam, sid)
-    loaded = await db.copy_into(
+    loaded = await db.insert_many(
         ProductEmbeddings, [{"product_id": extra["id"], "embedding": [1.0, 1.0, 0.0]}]
     )
     assert loaded == 1

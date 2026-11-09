@@ -102,8 +102,61 @@ UPDATE users SET full_name = initcap(full_name);
 UPDATE posts SET body = trim(body);
 ```
 
+Each migration runs in one transaction, so do not write `BEGIN`, `COMMIT` or `ROLLBACK`:
+`migrate` refuses a migration that does. A statement that cannot run in a transaction
+(`CREATE INDEX CONCURRENTLY`) goes in its own chunk, marked `-- mizzle:no-transaction`:
+
+```sql
+-- mizzle:breakpoint
+-- mizzle:no-transaction
+CREATE INDEX CONCURRENTLY posts_body_idx ON posts (body);
+```
+
+Such a chunk cannot be rolled back if a later statement fails, so keep it last.
+
 `check` does not warn about edits to custom migrations. `mizzle drop` deletes the latest
-migration if it has not been applied yet.
+migration if it has not been applied yet. A custom migration keeps the schema snapshot as it
+was: schema changes still go into the next generated migration, so a custom migration can
+run before the tables that need what it creates.
+
+Some changes mizzle refuses to write: removing, renaming or reordering an enum's values.
+Change the schema, then write the SQL in a custom migration that records the new schema:
+
+```bash
+mizzle generate --custom --record-schema --name rename_status
+```
+
+```sql
+-- Custom migration. Separate statements with: -- mizzle:breakpoint
+ALTER TYPE status RENAME VALUE 'done' TO 'finished';
+```
+
+After `migrate`, the next `generate` finds no changes.
+
+## Not managed by mizzle
+
+Functions, triggers, domains, composite types, extensions, exclusion constraints,
+partitions and grants are left alone by `generate`, `push` and `pull`: they are never
+created, changed, dropped or reported as drift (`pull` names them in a warning, and reads a
+partitioned table as a plain one). Write them in a custom migration:
+
+```bash
+mizzle generate --custom --name extensions
+```
+
+```sql
+-- Custom migration. Separate statements with: -- mizzle:breakpoint
+CREATE EXTENSION IF NOT EXISTS pg_trgm;
+-- mizzle:breakpoint
+CREATE OR REPLACE FUNCTION touch_updated_at() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN NEW.updated_at = now(); RETURN NEW; END
+$$;
+```
+
+Generate it before the migration whose tables need it (an index using `gin_trgm_ops`), and
+put triggers and grants in one after the tables they are on. A column of another type (a
+domain, a composite, `citext`) is `custom("type")`; see
+[Schema](schema.md#columns-of-other-types).
 
 ## Many servers at once
 
@@ -125,9 +178,10 @@ After that it fails with `MigrationLockTimeout`.
 
 ## Database objects
 
-Migrations manage more than tables. Declare objects in your schema module; mizzle collects
-module-level `extension`, `function`, `trigger` and `role` values, like `Table` classes.
-Table-level objects (indexes, row-level security, policies, grants) go in `config()`.
+Migrations manage more than tables: enums, views, row-level security, policies and roles.
+mizzle collects module-level `role` values, like `Table` classes. Table-level objects
+(indexes, row-level security, policies) go in `config()`. Functions, triggers, extensions
+and grants are not managed: see [Not managed by mizzle](#not-managed-by-mizzle).
 
 ```python
 from typing import final, override
@@ -139,9 +193,6 @@ from mizzle import (
     View,
     count,
     eq,
-    extension,
-    function,
-    grant,
     index,
     many,
     one,
@@ -149,12 +200,9 @@ from mizzle import (
     rls,
     role,
     sql,
-    trigger,
     unique_index,
 )
 from mizzle.pg import bigint, integer, serial, text, timestamp, varchar
-
-trgm = extension("pg_trgm")
 
 app_user = role("docs_app_user")  # created and kept in sync by migrations
 reporting = role("docs_reporting", existing=True)  # made by someone else: only referenced
@@ -171,8 +219,8 @@ class Users(Table, name="users"):
     @override
     def config(cls) -> list[Constraint]:
         return [
+            # gin_trgm_ops needs pg_trgm: a custom migration creates it before this one.
             index("users_name_trgm_idx").using("gin", "gin_trgm_ops").on(cls.full_name),
-            grant(["select", "update"], to=[app_user]),
         ]
 
 
@@ -190,7 +238,6 @@ class Posts(Table, name="posts"):
     def config(cls) -> list[Constraint]:
         return [
             rls(),
-            grant(["select", "insert", "update", "delete"], to=[app_user]),
             policy(
                 "posts_own",
                 to=[app_user],
@@ -213,11 +260,6 @@ class PostCounts(View, name="post_counts"):
             .group_by(Posts.author_id)
         )
 
-    @classmethod
-    @override
-    def config(cls) -> list[Constraint]:
-        return [grant("select", to=[reporting])]
-
 
 @final
 class DailyPosts(View, name="daily_posts", materialized=True):
@@ -236,39 +278,19 @@ class DailyPosts(View, name="daily_posts", materialized=True):
     def config(cls) -> list[Constraint]:
         return [unique_index("daily_posts_day_key").on(cls.day)]
 
-
-touch = function(
-    "touch_updated_at",
-    returns="trigger",
-    body="BEGIN NEW.updated_at = now(); RETURN NEW; END",
-)
-posts_touch = trigger("posts_touch", on=Posts, execute=touch, events=["update"])
 ```
 
 `mizzle generate` writes, besides the tables:
 
 ```sql
 -- create role docs_app_user
--- create extension pg_trgm
 -- create index users_name_trgm_idx
--- create function touch_updated_at
 -- create view post_counts
 -- create materialized view daily_posts
 -- create index daily_posts_day_key
 -- enable row level security on posts
 -- create policy posts_own on posts
--- create trigger posts_touch on posts
--- grant select, update on users to docs_app_user
--- grant delete, insert, select, update on posts to docs_app_user
--- grant select on post_counts to docs_reporting
 ```
-
-### Extensions
-
-`extension("pg_trgm")` is `CREATE EXTENSION IF NOT EXISTS`. Migrations create extensions
-before anything else. `schema=` and `version=` pin where and which version. Columns that
-need an extension (pgvector's `vector`) add it on their own; see
-[Extensions](extensions.md).
 
 ### Views
 
@@ -311,48 +333,8 @@ missing and keeps those options in sync. Passwords are not managed: set them out
 schema. `existing=True` only references a role something else manages. Roles belong to
 the whole server, so mizzle never drops a role it does not manage.
 
-A role used in a `policy` or `grant` is created by the migration, so you do not need to
+A role used in a `policy` is created by the migration, so you do not need to
 assign it to a module-level name, but you can.
-
-### Grants
-
-`grant(privileges, to=[...])` in a table's or view's `config()`. Privileges are
-`"select"`, `"insert"`, `"update"`, `"delete"`, `"truncate"`, `"references"`, `"trigger"`,
-`"maintain"` or `"all"`. Migrations grant what is declared and revoke what was declared
-before and no longer is. Privileges the schema never declared are left alone, and `push`
-never revokes from roles the schema does not name.
-
-A denied query raises `DatabaseError` with `sqlstate` `"42501"`:
-
-```python
-try:
-    async with db.transaction() as tx:
-        await tx.execute(sql("SET LOCAL ROLE docs_app_user"))
-        await tx.select().from_(PostCounts)  # docs_app_user has no grant on the view
-except DatabaseError as exc:
-    assert exc.sqlstate == "42501"  # insufficient_privilege
-```
-
-### Functions
-
-`function(name, returns=, body=)` is `CREATE OR REPLACE FUNCTION`. The body is kept as
-written. Options: `args="a integer, b text"`, `language=` (default `"plpgsql"`),
-`schema=`, `volatility="stable"`, `security_definer=True`, `strict=`, `leakproof=`,
-`parallel="safe"`, `cost=` and `settings={"search_path": "public, pg_temp"}`. Use
-PostgreSQL's type names (`integer`, not `int`) so the database prints them back the same.
-Functions with the same name and other `args` are separate overloads. A
-`language="sql"` body that starts with `RETURN` or `BEGIN ATOMIC` is a SQL-standard body.
-
-### Triggers
-
-`trigger(name, on=Table, execute=fn)` runs `fn` `before` (default) or `after` the
-`events` (default insert and update), `for_each="row"` (default) or `"statement"`. More
-options:
-
-- `when=sql("OLD.price IS DISTINCT FROM NEW.price")`: a `WHEN` condition.
-- `update_of=[Items.price]`: `UPDATE OF price`.
-- `new_table="added"`, `old_table=`: transition tables, for `after` triggers.
-- `on=SomeView, timing="instead of"`: a trigger on a view.
 
 ## mizzle pull
 
@@ -374,18 +356,8 @@ From the database above it writes:
 
 from typing import final, override
 
-from mizzle import Constraint, QueryBuilder, Table, View, extension, function, grant, index, many, one, policy, rls, sql, trigger, unique_index
+from mizzle import Constraint, QueryBuilder, Table, View, index, many, one, policy, rls, sql, unique_index
 from mizzle.pg import bigint, integer, serial, text, timestamp, varchar
-
-
-ext_pg_trgm = extension('pg_trgm')
-
-
-fn_touch_updated_at = function(
-    'touch_updated_at',
-    returns='trigger',
-    body='BEGIN NEW.updated_at = now(); RETURN NEW; END',
-)
 
 
 @final
@@ -404,7 +376,6 @@ class Posts(Table, name='posts'):
         return [
             rls(),
             policy('posts_own', to=['docs_app_user'], using=sql("(author_id = (current_setting('app.user_id'::text))::integer)")),
-            grant(['delete', 'insert', 'select', 'update'], to=['docs_app_user']),
         ]
 
 
@@ -421,7 +392,6 @@ class Users(Table, name='users'):
     def config(cls) -> list[Constraint]:
         return [
             index('users_name_trgm_idx').using('gin', 'gin_trgm_ops').on(cls.full_name),
-            grant(['select', 'update'], to=['docs_app_user']),
         ]
 
 
@@ -452,28 +422,14 @@ class PostCounts(View, name='post_counts'):
     @override
     def query(cls, db: QueryBuilder):
         return sql('SELECT author_id,\n    count(*) AS posts\n   FROM posts\n  GROUP BY author_id')
-
-    @classmethod
-    @override
-    def config(cls) -> list[Constraint]:
-        return [
-            grant(['select'], to=['docs_reporting']),
-        ]
-
-
-trg_posts_posts_touch = trigger(
-    'posts_touch',
-    on=Posts,
-    execute=fn_touch_updated_at,
-    timing='before',
-    events=['update'],
-)
 ```
 
 Run `mizzle generate` right after: it prints `No schema changes.`
 
 It reads tables, columns, enums (also in other schemas), indexes, views and materialized
-views, row-level security, policies, grants, functions, triggers and extensions. Each
+views, row-level security and policies, and warns about what it leaves out (see
+[Not managed by mizzle](#not-managed-by-mizzle)). A column of a type mizzle has no column
+type for (a domain, a range, `citext`...) is written as `custom("type")`. Each
 foreign key becomes a `one()` relation and its reverse a `many()` (or `one()` when the key
 is unique). Roles come out as names; wrap them in `role(...)` if migrations should manage
 them. View queries and policy conditions come back as `sql(...)`, the way PostgreSQL

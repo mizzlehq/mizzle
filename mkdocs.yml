@@ -72,17 +72,19 @@ plugins:
 nav:
   - Home: index.md
   - Getting started: getting-started.md
+  - All features: features.md
   - Guide:
       - Schema: guide/schema.md
       - Queries: guide/queries.md
       - Relational queries: guide/relational.md
       - Transactions and errors: guide/transactions.md
       - Migrations and database objects: guide/migrations.md
-      - Bulk, streaming and LISTEN: guide/bulk.md
+      - Bulk and streaming: guide/bulk.md
       - pgvector: guide/extensions.md
       - Pydantic, Supabase, Studio: guide/integrations.md
   - CLI: cli.md
   - Production: production.md
+  - Known gaps: gaps.md
   - API reference:
       - mizzle: reference/mizzle.md
       - mizzle.pg: reference/pg.md

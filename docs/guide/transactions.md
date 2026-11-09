@@ -3,6 +3,12 @@
 The examples use these two tables:
 
 ```python
+from typing import final, override
+
+from mizzle import Constraint, Table, check, many, one, sql
+from mizzle.pg import integer, serial, text
+
+
 @final
 class Accounts(Table, name="txdoc_accounts"):
     id = serial().primary_key()
@@ -40,7 +46,7 @@ async with db.transaction() as tx:
 transaction, on other connections.
 
 Statements on one `tx` never overlap, so `asyncio.gather` on it is safe; they run one
-after another:
+after another. `insert_many()` in a `gather` is fine too.
 
 ```python
 async with db.transaction() as tx:
@@ -65,6 +71,57 @@ async with db.transaction() as tx:
     except CheckViolation:
         pass  # only the savepoint rolled back; the entry is still there
 ```
+
+A savepoint belongs to the task that opened it. While it is open, only that task (and code it awaits directly) may use the transaction: a
+statement from another task would be undone with the savepoint, so it raises `QueryError`
+at once, and the savepoint goes on. Tasks started inside a savepoint (`asyncio.gather`,
+`create_task`, a `TaskGroup`) count as other tasks, so `gather` of statements inside a
+savepoint, or of several savepoint blocks on one transaction, is refused rather than
+interleaved. Give each task its own `db.transaction()`, or await them one after another.
+
+Leave transaction control to the blocks: do not send `COMMIT`, `ROLLBACK`, `SAVEPOINT`,
+`RELEASE` or `ROLLBACK TO` (or `COMMIT AND CHAIN` / `ROLLBACK AND CHAIN`) as raw SQL
+through `sql()` or `execute()` inside a transaction. A plain `COMMIT` or `ROLLBACK` is
+detected (leaving the block raises `DatabaseError`); the `AND CHAIN` forms and raw
+savepoint commands are not, and the block can then report success for work that was not
+committed as one transaction.
+
+### Side effects after commit
+
+`transaction(after_commit=..., after_rollback=...)` runs a callback outside the transaction,
+so a write that did not commit does not send an email or enqueue a job:
+
+```python
+async with db.transaction(after_commit=notify_warehouse) as tx:
+    await tx.insert(Orders).values(...)
+```
+
+Two rules keep hook errors from confusing the outcome:
+
+- In a **savepoint**, `after_commit` is queued, not run: releasing a savepoint is not a
+  commit, and the outer transaction can still roll back. Queued hooks run after the
+  outermost `COMMIT`, and are dropped if either level rolls back. In the same way, a
+  savepoint's `after_rollback` fires if an enclosing savepoint or the outer transaction
+  rolls back even though the savepoint itself was released. Rollback drops only the hooks
+  of the savepoint that failed, not those of siblings that already released.
+- An `after_commit` hook that raises raises `AfterCommitError`. The data **is** committed:
+  the message says so, so a retry does not insert it twice. Every queued hook still runs;
+  one failure does not skip the rest. The first failure is the error's `__cause__`; later
+  ones are only logged. An `after_rollback` hook that raises does not hide the error that
+  caused the rollback: the original error is raised. When it had no visible context, its
+  `__context__` is an `AfterRollbackError` whose `__cause__` is the hook's failure (with its
+  traceback); otherwise a note on the original names the failure.
+- A cancel or timeout that arrives after `COMMIT`, while the connection goes back to the
+  pool, still propagates, but the `after_commit` hooks run, the `after_rollback` hooks do
+  not, and a note on the error says the transaction was committed. Do not retry it.
+- A savepoint cancelled while its `RELEASE` or `ROLLBACK TO` was running may or may not
+  have ended, so the transaction refuses further statements and `COMMIT` with
+  `QueryError`, and rolls back. A cancel that arrives while the savepoint waits to end is
+  held until it has ended, then raised.
+- A statement that fails aborts the whole transaction in PostgreSQL, even if you catch the
+  error. Leaving the block then raises `DatabaseError` ("aborted the transaction"), the
+  `after_rollback` hooks run, and nothing is committed. To go on after an expected failure,
+  run the statement in a savepoint (`tx.transaction()`).
 
 ## Isolation levels and read-only
 
@@ -201,10 +258,9 @@ Messages never include your values: the server's detail line
 | `SerializationFailure` | A serialization conflict (`40001`) or a deadlock (`40P01`). Safe to retry: use `db.retry`. |
 | `QueryTimeout` | The statement ran longer than its timeout and was cancelled. |
 | `ConnectionError` | No connection could be made or taken from the pool, or the connection was lost. A plain read is retried once on a new connection first; writes and raw SQL are never retried. |
-| `QueryError` | A query cannot be built: `update`/`delete` without `.where()` (use `.all_rows()` to mean every row), `retry()` or `listen()` inside a transaction, isolation on a nested transaction, `batch_size < 1`... |
+| `QueryError` | A query cannot be built: `update`/`delete` without `.where()` (use `.all_rows()` to mean every row), `retry()` inside a transaction, isolation on a nested transaction, `batch_size < 1`... |
 | `RelationNotLoaded` | You read a relation the query did not load: add it to `with_`. |
 | `SchemaError` | A table definition is invalid, for example a table class with no columns. Raised when the class is defined. |
-| `ListenerOverflow` | A `listen()` consumer fell `max_queue` notifications behind. See [Bulk and streaming](bulk.md#listen-and-notify). |
 | `MigrationError` | The migration kit cannot go on: applied migrations missing on disk, a migration out of order, `push` without `--force` off a terminal... |
 | `MigrationLockTimeout` | `migrate` waited longer than `--lock-timeout` for another run's lock. |
 | `MigrationTampered` | A `migration.sql` changed after it was applied. |

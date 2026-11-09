@@ -1,4 +1,4 @@
-from collections.abc import AsyncGenerator, AsyncIterator
+from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from typing import cast
 
@@ -7,15 +7,13 @@ import pytest
 from mizzle import (
     ConnectionError,
     Database,
-    Notification,
     QueryError,
-    Reconnected,
     SerializationFailure,
     eq,
     exists,
     placeholder,
 )
-from mizzle.dialects.base import Connection, Driver
+from mizzle.dialects.base import Connection, Driver, PoolStats
 from tests.models import Posts, Users
 
 
@@ -34,6 +32,11 @@ class FakeConnection:
         if self.seen is not None:
             self.seen.append((sql, params))
         return []
+
+    async def execute(
+        self, sql: str, params: object, timeout: float | None = None, *, session_safe: bool = False
+    ) -> int:
+        return 0
 
 
 class FakeDriver:
@@ -54,13 +57,13 @@ class FakeDriver:
         # Only fetch() and fetch_dicts() are used here.
         yield cast(Connection, cast(object, FakeConnection(self.name, self.seen)))
 
+    def stats(self) -> PoolStats:
+        return PoolStats(size=1, idle=1, in_use=0, max_size=1, min_size=1, wait_ms=0.0)
+
     async def close(self) -> None:
         pass
 
     async def expire_connections(self) -> None:
-        pass
-
-    async def notify_unpooled(self, channel: str, payload: str = "") -> None:
         pass
 
 
@@ -132,52 +135,12 @@ async def test_retry() -> None:
         await db.retry(flaky, attempts=0)
 
 
-class FlakyListenDriver:
-    """acquire() fails ``down`` times after the first listener is lost."""
+async def test_ping_and_pool_stats() -> None:
+    log: list[str] = []
+    db = database(log)
+    assert await db.ping() is True
+    stats = db.pool_stats()
+    assert stats == PoolStats(size=1, idle=1, in_use=0, max_size=1, min_size=1, wait_ms=0.0)
 
-    def __init__(self, down: int) -> None:
-        self.down = down
-        self.opened = 0
-        self.expired = 0
-
-    @asynccontextmanager
-    async def acquire(self) -> AsyncGenerator[Connection]:
-        if self.opened and self.down:
-            self.down -= 1
-            raise ConnectionError("down")
-        yield cast(Connection, cast(object, self))
-
-    async def notify_unpooled(self, channel: str, payload: str = "") -> None:
-        pass
-
-    @asynccontextmanager
-    async def listen(self, *_: object) -> AsyncGenerator[AsyncIterator[Notification]]:
-        self.opened += 1
-        number = self.opened
-
-        async def events() -> AsyncGenerator[Notification]:
-            yield Notification("c", str(number), 1)
-            raise ConnectionError("lost")
-
-        yield events()
-
-    async def close(self) -> None:
-        pass
-
-    async def expire_connections(self) -> None:
-        self.expired += 1
-
-
-async def test_listen_reconnect_retries_until_the_database_is_back() -> None:
-    driver = FlakyListenDriver(down=3)
-    db = Database(driver=cast(Driver, driver))
-    async with db.listen("c", reconnect=True) as events:
-        got = [await anext(events) for _ in range(5)]
-    assert got == [
-        Notification("c", "1", 1),
-        Reconnected(),
-        Notification("c", "2", 1),
-        Reconnected(),
-        Notification("c", "3", 1),
-    ]
-    assert driver.down == 0 and driver.expired == 2
+    down = Database(driver=cast(Driver, FakeDriver("x", log, down=True)))
+    assert await down.ping() is False

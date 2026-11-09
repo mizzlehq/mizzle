@@ -1,9 +1,5 @@
 -- create role shop_support
 -- create schema shop_audit
--- create schema auth
--- create extension vector
--- create extension pg_trgm
--- create extension pgcrypto
 -- create enum user_role
 -- create enum order_status
 -- create enum audit_action
@@ -16,7 +12,6 @@
 -- create table reviews
 -- create table notifications
 -- create table audit_log
--- create table product_embeddings
 -- create index users_email_lower_key
 -- create index products_search_idx
 -- create index products_tags_idx
@@ -27,8 +22,6 @@
 -- create index order_items_product_idx
 -- create index notifications_unread_idx
 -- create index audit_log_row_idx
--- create index product_embeddings_hnsw
--- create index product_embeddings_half_hnsw
 -- add foreign key stores_owner_id_fkey
 -- add foreign key products_store_id_fkey
 -- add foreign key inventory_product_id_fkey
@@ -39,44 +32,20 @@
 -- add foreign key reviews_product_id_fkey
 -- add foreign key reviews_user_id_fkey
 -- add foreign key notifications_user_id_fkey
--- add foreign key product_embeddings_product_id_fkey
--- create function uid
--- create function log_change
--- create function price_changed
 -- create view product_ratings
 -- create materialized view store_sales
 -- create index store_sales_store_key
--- create view top_products
--- enable row level security on orders
 -- enable row level security on reviews
 -- enable row level security on notifications
--- create policy orders_owner on orders
 -- create policy reviews_owner_select on reviews
 -- create policy reviews_owner_insert on reviews
 -- create policy reviews_owner_update on reviews
 -- create policy reviews_owner_delete on reviews
 -- create policy notifications_own on notifications
 -- create policy notifications_support on notifications
--- create trigger stores_audit on stores
--- create trigger products_price_changed on products
--- create trigger orders_audit on orders
--- grant select on orders to shop_authenticated
--- grant delete, insert, select, update on reviews to shop_authenticated
--- grant select, update on notifications to shop_authenticated
--- grant select on notifications to shop_support
--- grant select on audit_log to shop_support
--- grant select on product_ratings to shop_authenticated
-DO $mizzle$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'shop_support') THEN CREATE ROLE "shop_support"; END IF; ALTER ROLE "shop_support" NOLOGIN NOCREATEDB NOCREATEROLE INHERIT; END $mizzle$;
+DO $mizzle$ BEGIN IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname OPERATOR(pg_catalog.=) 'shop_support') THEN CREATE ROLE "shop_support"; END IF; ALTER ROLE "shop_support" NOLOGIN NOCREATEDB NOCREATEROLE INHERIT; END $mizzle$;
 -- mizzle:breakpoint
 CREATE SCHEMA IF NOT EXISTS "shop_audit";
--- mizzle:breakpoint
-CREATE SCHEMA IF NOT EXISTS "auth";
--- mizzle:breakpoint
-CREATE EXTENSION IF NOT EXISTS vector;
--- mizzle:breakpoint
-CREATE EXTENSION IF NOT EXISTS pg_trgm;
--- mizzle:breakpoint
-CREATE EXTENSION IF NOT EXISTS pgcrypto;
 -- mizzle:breakpoint
 CREATE TYPE "user_role" AS ENUM ('customer', 'seller', 'admin');
 -- mizzle:breakpoint
@@ -88,7 +57,6 @@ CREATE TABLE "users" (
     "id" uuid NOT NULL DEFAULT gen_random_uuid(),
     "email" character varying(255) NOT NULL,
     "name" text NOT NULL,
-    "phone" text,
     "role" user_role NOT NULL DEFAULT 'customer',
     "tags" text[] NOT NULL DEFAULT '{}',
     "prefs" jsonb NOT NULL DEFAULT '{}',
@@ -101,7 +69,7 @@ CREATE TABLE "users" (
 CREATE TABLE "stores" (
     "id" integer GENERATED ALWAYS AS IDENTITY (START WITH 100) NOT NULL,
     "owner_id" uuid NOT NULL,
-    "slug" character varying(64) NOT NULL,
+    "slug" character varying(40) NOT NULL,
     "name" text NOT NULL,
     "created_at" timestamp with time zone NOT NULL DEFAULT now(),
     CONSTRAINT "stores_pkey" PRIMARY KEY ("id"),
@@ -114,12 +82,12 @@ CREATE TABLE "products" (
     "store_id" integer NOT NULL,
     "sku" text NOT NULL,
     "name" text NOT NULL,
-    "details" text,
+    "description" text,
     "price" numeric(10,2) NOT NULL,
     "tags" text[] NOT NULL DEFAULT '{}',
     "attrs" jsonb NOT NULL DEFAULT '{}',
     "active" boolean NOT NULL DEFAULT true,
-    "search" tsvector GENERATED ALWAYS AS (setweight(to_tsvector('english', name), 'A') || setweight(to_tsvector('english', coalesce(details, '')), 'B')) STORED,
+    "search" tsvector GENERATED ALWAYS AS (setweight(to_tsvector('english', name), 'A') || setweight(to_tsvector('english', coalesce(description, '')), 'B')) STORED,
     "created_at" timestamp with time zone NOT NULL DEFAULT now(),
     "updated_at" timestamp with time zone NOT NULL DEFAULT now(),
     CONSTRAINT "products_pkey" PRIMARY KEY ("id"),
@@ -191,14 +159,6 @@ CREATE TABLE "shop_audit"."audit_log" (
     CONSTRAINT "audit_log_pkey" PRIMARY KEY ("id")
 );
 -- mizzle:breakpoint
-CREATE TABLE "product_embeddings" (
-    "product_id" bigint NOT NULL,
-    "embedding" vector(3) NOT NULL,
-    "half" halfvec(3),
-    "keywords" sparsevec(8),
-    CONSTRAINT "product_embeddings_pkey" PRIMARY KEY ("product_id")
-);
--- mizzle:breakpoint
 CREATE UNIQUE INDEX "users_email_lower_key" ON "users" (lower("email"));
 -- mizzle:breakpoint
 CREATE INDEX "products_search_idx" ON "products" USING gin ("search");
@@ -218,10 +178,6 @@ CREATE INDEX "order_items_product_idx" ON "order_items" ("product_id");
 CREATE INDEX "notifications_unread_idx" ON "notifications" ("user_id") WHERE read_at IS NULL;
 -- mizzle:breakpoint
 CREATE INDEX "audit_log_row_idx" ON "shop_audit"."audit_log" ("table_name", "row_id");
--- mizzle:breakpoint
-CREATE INDEX "product_embeddings_hnsw" ON "product_embeddings" USING hnsw ("embedding" vector_cosine_ops) WITH (m = '16', ef_construction = '64');
--- mizzle:breakpoint
-CREATE INDEX "product_embeddings_half_hnsw" ON "product_embeddings" USING hnsw ("half" halfvec_l2_ops);
 -- mizzle:breakpoint
 ALTER TABLE "stores" ADD CONSTRAINT "stores_owner_id_fkey" FOREIGN KEY ("owner_id") REFERENCES "users" ("id") ON DELETE RESTRICT;
 -- mizzle:breakpoint
@@ -243,35 +199,6 @@ ALTER TABLE "reviews" ADD CONSTRAINT "reviews_user_id_fkey" FOREIGN KEY ("user_i
 -- mizzle:breakpoint
 ALTER TABLE "notifications" ADD CONSTRAINT "notifications_user_id_fkey" FOREIGN KEY ("user_id") REFERENCES "users" ("id") ON DELETE CASCADE;
 -- mizzle:breakpoint
-ALTER TABLE "product_embeddings" ADD CONSTRAINT "product_embeddings_product_id_fkey" FOREIGN KEY ("product_id") REFERENCES "products" ("id") ON DELETE CASCADE;
--- mizzle:breakpoint
-CREATE OR REPLACE FUNCTION "auth"."uid"() RETURNS uuid LANGUAGE sql STABLE AS $mizzle$SELECT nullif(current_setting('request.jwt.claims', true)::jsonb ->> 'sub', '')::uuid$mizzle$;
--- mizzle:breakpoint
-CREATE OR REPLACE FUNCTION "shop_audit"."log_change"() RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $mizzle$
-BEGIN
-  INSERT INTO shop_audit.audit_log (table_name, action, row_id, data)
-  VALUES (
-    TG_TABLE_NAME,
-    lower(TG_OP)::shop_audit.audit_action,
-    CASE WHEN TG_OP = 'DELETE' THEN OLD.id::text ELSE NEW.id::text END,
-    CASE WHEN TG_OP = 'DELETE' THEN to_jsonb(OLD) ELSE to_jsonb(NEW) END
-  );
-  RETURN NULL;
-END
-$mizzle$;
--- mizzle:breakpoint
-CREATE OR REPLACE FUNCTION "price_changed"() RETURNS trigger LANGUAGE plpgsql AS $mizzle$
-BEGIN
-  PERFORM pg_notify('shop_price', json_build_object(
-    'product_id', NEW.id, 'old', OLD.price, 'new', NEW.price)::text);
-  INSERT INTO notifications (user_id, kind, payload)
-  SELECT s.owner_id, 'price_changed',
-         jsonb_build_object('product_id', NEW.id, 'old', OLD.price, 'new', NEW.price)
-  FROM stores s WHERE s.id = NEW.store_id;
-  RETURN NULL;
-END
-$mizzle$;
--- mizzle:breakpoint
 CREATE VIEW "product_ratings" AS
 SELECT "reviews"."product_id" AS "product_id", count(*) AS "reviews", avg("reviews"."rating") AS "rating" FROM "reviews" GROUP BY "reviews"."product_id";
 -- mizzle:breakpoint
@@ -280,16 +207,9 @@ SELECT "orders"."store_id" AS "store_id", count(*) AS "orders", sum("orders"."to
 -- mizzle:breakpoint
 CREATE UNIQUE INDEX "store_sales_store_key" ON "store_sales" ("store_id");
 -- mizzle:breakpoint
-CREATE VIEW "top_products" AS
-SELECT "order_items"."product_id" AS "product_id", sum("order_items"."quantity") AS "sold" FROM "order_items" GROUP BY "order_items"."product_id";
--- mizzle:breakpoint
-ALTER TABLE "orders" ENABLE ROW LEVEL SECURITY, NO FORCE ROW LEVEL SECURITY;
--- mizzle:breakpoint
 ALTER TABLE "reviews" ENABLE ROW LEVEL SECURITY, NO FORCE ROW LEVEL SECURITY;
 -- mizzle:breakpoint
 ALTER TABLE "notifications" ENABLE ROW LEVEL SECURITY, FORCE ROW LEVEL SECURITY;
--- mizzle:breakpoint
-CREATE POLICY "orders_owner" ON "orders" AS PERMISSIVE FOR SELECT TO "shop_authenticated" USING ("user_id" = (select auth.uid()));
 -- mizzle:breakpoint
 CREATE POLICY "reviews_owner_select" ON "reviews" AS PERMISSIVE FOR SELECT TO "shop_authenticated" USING (true);
 -- mizzle:breakpoint
@@ -302,21 +222,3 @@ CREATE POLICY "reviews_owner_delete" ON "reviews" AS PERMISSIVE FOR DELETE TO "s
 CREATE POLICY "notifications_own" ON "notifications" AS PERMISSIVE FOR ALL TO "shop_authenticated" USING ("user_id" = (select auth.uid()));
 -- mizzle:breakpoint
 CREATE POLICY "notifications_support" ON "notifications" AS PERMISSIVE FOR SELECT TO "shop_support" USING (true);
--- mizzle:breakpoint
-CREATE TRIGGER "stores_audit" AFTER INSERT OR DELETE ON "stores" FOR EACH ROW EXECUTE FUNCTION "shop_audit"."log_change"();
--- mizzle:breakpoint
-CREATE TRIGGER "products_price_changed" AFTER UPDATE OF "price" ON "products" FOR EACH ROW WHEN (OLD.price IS DISTINCT FROM NEW.price) EXECUTE FUNCTION "price_changed"();
--- mizzle:breakpoint
-CREATE TRIGGER "orders_audit" AFTER INSERT OR DELETE OR UPDATE ON "orders" FOR EACH ROW EXECUTE FUNCTION "shop_audit"."log_change"();
--- mizzle:breakpoint
-GRANT SELECT ON "orders" TO "shop_authenticated";
--- mizzle:breakpoint
-GRANT DELETE, INSERT, SELECT, UPDATE ON "reviews" TO "shop_authenticated";
--- mizzle:breakpoint
-GRANT SELECT, UPDATE ON "notifications" TO "shop_authenticated";
--- mizzle:breakpoint
-GRANT SELECT ON "notifications" TO "shop_support";
--- mizzle:breakpoint
-GRANT SELECT ON "shop_audit"."audit_log" TO "shop_support";
--- mizzle:breakpoint
-GRANT SELECT ON "product_ratings" TO "shop_authenticated";

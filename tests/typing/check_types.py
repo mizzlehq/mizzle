@@ -7,12 +7,13 @@ unused ignores, so if an expected error disappears, CI fails.
 from __future__ import annotations
 
 import datetime
-from typing import Any, assert_type
+from typing import Any, TypedDict, assert_type
 
 from mizzle.core.query.builder import QueryBuilder
 from mizzle.core.schema.column import Column
-from mizzle.core.sql.nodes import Expr
-from mizzle.core.sql.operators import count, eq, lt, nullable
+from mizzle.core.sql.nodes import Aggregate, Expr, Json
+from mizzle.core.sql.operators import count, eq, json_agg, lt, nullable
+from mizzle.dialects.postgres.types import CustomColumn
 from tests.models import Posts, Role, Users
 
 
@@ -35,6 +36,35 @@ async def rows(qb: QueryBuilder, user: Users, post: Posts) -> None:
     assert_type(
         await qb.select(Users, Posts).from_(Users).right_join(Posts, eq(Posts.author_id, Users.id)),
         list[tuple[Users | None, Posts]],
+    )
+    # C34: the joined table may sit in any slot; that slot is the optional one.
+    on = eq(Users.id, Posts.author_id)
+    assert_type(
+        await qb.select(Users, Posts).from_(Posts).left_join(Users, on),
+        list[tuple[Users | None, Posts]],
+    )
+    assert_type(await qb.select(Users).from_(Posts).left_join(Users, on), list[tuple[Users | None]])
+    assert_type(
+        await qb.select(Users, Posts, Users.id).from_(Posts).left_join(Users, on),
+        list[tuple[Users | None, Posts, int]],
+    )
+    assert_type(await qb.select(Users).from_(Posts).full_join(Users, on), list[tuple[Users | None]])
+    assert_type(
+        await qb.select(Users.id, Users, Posts).from_(Users).right_join(Posts, on),
+        list[tuple[int | None, Users | None, Posts]],
+    )
+    # Q3: right/full join with the joined table first, and 4 slots.
+    assert_type(
+        await qb.select(Posts, Users).from_(Users).right_join(Posts, on),
+        list[tuple[Posts, Users | None]],
+    )
+    assert_type(
+        await qb.select(Posts, Users).from_(Users).full_join(Posts, on),
+        list[tuple[Posts | None, Users | None]],
+    )
+    assert_type(
+        await qb.select(Users, Users.id, Users.email, Posts).from_(Users).left_join(Posts, on),
+        list[tuple[Users, int, str, Posts | None]],
     )
     assert_type(
         await qb.select({"n": count()}).from_(Users).where(eq(Users.id, 1)),
@@ -72,6 +102,7 @@ async def expressions(qb: QueryBuilder) -> None:
 
     from mizzle import (
         abs_,
+        age,
         alias,
         case_,
         cast,
@@ -85,15 +116,27 @@ async def expressions(qb: QueryBuilder) -> None:
         greatest,
         lag,
         least,
+        left,
         length,
+        log,
         lower,
         matches,
+        md5,
+        mod,
         now,
         nullif,
+        percentile_cont,
+        power,
         rank,
+        regexp_match,
+        replace,
         round_,
         row_number,
+        starts_with,
+        strpos,
         sum_,
+        to_char,
+        to_date,
         to_tsquery,
         to_tsvector,
         ts_rank,
@@ -130,6 +173,32 @@ async def expressions(qb: QueryBuilder) -> None:
     assert_type(lower(Users.email), Expr[str])
     assert_type(lower(Users.bio), Expr[str | None])
     assert_type(length(Users.bio), Expr[int | None])
+    # T2: the newer string/date functions accept nullable columns and stay nullable.
+    assert_type(replace(Users.bio, "a", "b"), Expr[str | None])
+    assert_type(md5(Users.bio), Expr[str | None])
+    assert_type(starts_with(Users.bio, "a"), Expr[bool | None])
+    assert_type(strpos(Users.bio, "a"), Expr[int | None])
+    assert_type(left(Users.bio, 2), Expr[str | None])
+    # B13: a non-null input gives a non-null result; a text column is not a date.
+    assert_type(age(Users.created_at), Expr[datetime.timedelta])
+    assert_type(age(Users.created_at, Users.created_at), Expr[datetime.timedelta])
+    assert_type(age(Users.created_at, nullable(Users.created_at)), Expr[datetime.timedelta | None])
+    age(Users.email)  # type: ignore[arg-type]  # pyright: ignore[reportCallIssue, reportArgumentType]
+    assert_type(to_char(Users.created_at, "YYYY"), Expr[str])
+    assert_type(to_char(Users.id, "999"), Expr[str])
+    assert_type(regexp_match(Users.bio, "a(b)"), Expr[list[str] | None])
+    assert_type(to_date(Users.email, "YYYY-MM-DD"), Expr[datetime.date])
+    assert_type(to_date(Users.bio, "YYYY-MM-DD"), Expr[datetime.date | None])
+    assert_type(power(Users.id, 2), Expr[float])
+    assert_type(log(Users.id, 10), Expr[Decimal])
+    assert_type(mod(Users.id, 2), Expr[int])
+    assert_type(percentile_cont(0.5, Users.id), Aggregate[float | None])
+    # Nullable inputs stay nullable; non-null inputs do not gain None.
+    assert_type(power(nullable(Users.id), 2), Expr[float | None])
+    assert_type(mod(nullable(Users.id), 2), Expr[int | None])
+    assert_type(to_char(nullable(Users.created_at), "YYYY"), Expr[str | None])
+    assert_type(age(nullable(Users.created_at)), Expr[datetime.timedelta | None])
+    assert_type(percentile_cont(0.5, nullable(Users.id)), Aggregate[float | None])
     assert_type(concat(Users.email, "-", Users.id), Expr[str])
     assert_type(abs_(Users.id), Expr[int])
     round_(cast(Users.id, text()))  # type: ignore[type-var]  # pyright: ignore[reportArgumentType]
@@ -155,8 +224,11 @@ async def expressions(qb: QueryBuilder) -> None:
 
     manager = alias(Users, "manager")
     assert_type(manager.id, Column[int])
+    # Q3: manager has Users' type, so either Users slot may be the joined one.
     rows = await qb.select(Users, manager).from_(Users).left_join(manager, eq(manager.id, Users.id))
-    assert_type(rows, list[tuple[Users, Users | None]])
+    assert_type(rows, list[tuple[Users | None, Users | None]])
+    rows = await qb.select(manager, Users).from_(Users).right_join(manager, eq(manager.id, 1))
+    assert_type(rows, list[tuple[Users | None, Users | None]])
 
     union = qb.select(Users.id).from_(Users).union(qb.select(Posts.author_id).from_(Posts))
     assert_type(await union.order_by(Users.id).limit(5), list[tuple[int]])
@@ -205,3 +277,75 @@ def nullable_comparisons(user: Users) -> None:
     assert_type(eq(Users.email, Users.bio), Expr[bool])
     assert_type(lt(Users.bio, "m"), Expr[bool])
     eq(Users.bio, 1)  # type: ignore[misc]  # pyright: ignore[reportCallIssue, reportArgumentType]
+
+
+async def returning_and_scalar(qb: QueryBuilder) -> None:
+    # T1: a projection is typed from the expressions, not Unknown.
+    assert_type(await qb.insert(Users).values({}).returning(Users.id), list[tuple[int]])
+    assert_type(
+        await qb.insert(Users).values({}).returning(Users.id, Users.email), list[tuple[int, str]]
+    )
+    assert_type(
+        await qb.update(Users).set({"bio": "x"}).returning(Users.bio),
+        list[tuple[str | None]],
+    )
+    # T3: scalar() follows the selected column.
+    assert_type(await qb.select(Users.id).from_(Users).scalar(), int | None)
+    assert_type(await qb.select(Users.bio).from_(Users).scalar(), str | None)
+    assert_type(await qb.select({"n": count()}).from_(Users).scalar(), object)
+
+
+class UsersRow(TypedDict):
+    id: int
+    email: str
+
+
+async def typed_rows(qb: QueryBuilder) -> None:
+    # T8: the generated <Table>Row TypedDict names the shape a select returns.
+    rows = await qb.select({"id": Users.id, "email": Users.email}).from_(Users).as_rows(UsersRow)
+    assert_type(rows, list[UsersRow])
+
+
+def json_aggregates_are_json() -> None:
+    # C32: json_agg(created_at) said list[datetime] but returned ISO strings.
+    assert_type(json_agg(Users.created_at), Aggregate[list[Json] | None])
+
+
+def json_fields_are_json() -> None:
+    from mizzle import get_field, get_path
+
+    # Q15: a field of a dict[str, Any] column was typed as the whole dict.
+    assert_type(get_field(Posts.meta, "a"), Expr[Json])
+    assert_type(get_path(Posts.meta, ["a", "b"]), Expr[Json])
+
+
+def string_agg_takes_text() -> None:
+    from mizzle import string_agg
+
+    # C46: string_agg(integer, text) does not exist in PostgreSQL.
+    string_agg(Users.id, ",")  # type: ignore[arg-type]  # pyright: ignore[reportArgumentType]
+    string_agg(Users.bio, ",")
+
+
+def custom_columns_take_their_python_type() -> None:
+    from decimal import Decimal
+
+    from mizzle.pg import custom
+
+    def money(value: Decimal) -> int:
+        return int(value * 100)
+
+    def cents(value: int) -> Decimal:
+        return Decimal(value) / 100
+
+    assert_type(custom("citext"), CustomColumn[object])
+    assert_type(custom("citext", py_type=str), CustomColumn[str | None])
+    assert_type(custom("cash", decode=money, encode=cents), CustomColumn[int | None])
+    assert_type(custom("cash", py_type=int, decode=money).not_null(), Column[int])
+    # Q8-6: encode alone gives its parameter type; with decode, decode's return type
+    # decides (pyright widened a disagreeing py_type to str | int).
+    assert_type(custom("cash", encode=cents), CustomColumn[int | None])
+    assert_type(custom("cash", py_type=int, encode=cents), CustomColumn[int | None])
+    assert_type(custom("cash", decode=money), CustomColumn[int | None])
+    assert_type(custom("cash", py_type=Decimal, decode=money), CustomColumn[int | None])
+    custom("cash", py_type=str, encode=cents)  # type: ignore[arg-type]  # pyright: ignore[reportArgumentType]

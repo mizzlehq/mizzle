@@ -2,33 +2,58 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Literal, Protocol, Self, override
+from typing import Literal, Protocol, Self, cast, override
 
 from mizzle.core.compiler import CompiledQuery
 from mizzle.core.errors import QueryError
-from mizzle.core.query.base import Executable, evolve
-from mizzle.core.query.returning import Returning
-from mizzle.core.schema.column import ColumnBase
+from mizzle.core.query.base import evolve
+from mizzle.core.query.returning import ReturningMixin
+from mizzle.core.query.select import CompoundBase, Cte, SelectBase
+from mizzle.core.schema.column import MISSING, ColumnBase
 from mizzle.core.schema.table import Table
 from mizzle.core.sql.nodes import Expr
 
 
 class ModelLike(Protocol):
-    """A Pydantic model (or anything with the same ``model_dump``)."""
+    """A Pydantic model (or anything with the same ``model_dump`` and ``model_fields_set``)."""
 
-    def model_dump(self, *, exclude_unset: bool = ...) -> dict[str, object]: ...
+    @property
+    def model_fields_set(self) -> set[str]: ...
+
+    def model_dump(self) -> dict[str, object]: ...
 
 
 type RowLike = Mapping[str, object] | ModelLike
 
 
-def as_mapping(value: RowLike) -> Mapping[str, object]:
-    """A Pydantic model becomes the dict of fields the client actually set."""
+def as_mapping(value: RowLike, table: type[Table]) -> Mapping[str, object]:
+    """A Pydantic model becomes the dict of fields the client actually set, so omitted
+    columns keep their defaults. The values are the dumped ones (serializers run, nested
+    models complete with their defaults: R9-2, Q9-4), except where the column cannot take
+    the dumped value but takes the model's own: a dataclass for a custom() column with
+    ``py_type=`` stays one for ``encode=`` (Q8-3)."""
     if isinstance(value, Mapping):
         return value
-    return value.model_dump(exclude_unset=True)
+    columns = table.__table__.columns
+    out: dict[str, object] = {}
+    for key, dumped in value.model_dump().items():
+        if key in value.model_fields_set:
+            column = columns.get(key)
+            held = getattr(value, key, dumped)
+            keep = column is not None and not _fits(column, dumped) and _fits(column, held)
+            out[key] = held if keep else dumped
+    return out
+
+
+def _fits(column: ColumnBase, value: object) -> bool:
+    """Whether the column takes ``value`` as it is (arrays: each element)."""
+    if value is None or column.accepts is None:
+        return True
+    if column.item is not None and isinstance(value, list | tuple):
+        return all(_fits(column.item, v) for v in cast(Sequence[object], value))
+    return isinstance(value, column.accepts)
 
 
 def check_values(table: type[Table], values: Mapping[str, object]) -> None:
@@ -44,10 +69,15 @@ def check_values(table: type[Table], values: Mapping[str, object]) -> None:
 
 
 def prepare_row(
-    table: type[Table], row: Mapping[str, object], *, allow_identity: bool = False
+    table: type[Table],
+    row: Mapping[str, object],
+    *,
+    allow_identity: bool = False,
+    defaults: bool = True,
 ) -> dict[str, object]:
     """Validate one insert row and apply Python-side defaults. ``allow_identity`` lets it
-    set ``GENERATED ALWAYS`` identity columns (for ``overriding_system_value()``)."""
+    set ``GENERATED ALWAYS`` identity columns (for ``overriding_system_value()``).
+    ``defaults=False`` leaves ``default_fn`` columns out, for the caller to fill later."""
     columns = table.__table__.columns
     if not row.keys() <= columns.keys():
         check_values(table, row)  # raises with the unknown names
@@ -59,7 +89,7 @@ def prepare_row(
                 if column.computed is None:  # GENERATED ALWAYS identity (bulk paths)
                     raise QueryError(
                         f"{column.qualified_name} is GENERATED ALWAYS AS IDENTITY; the "
-                        "database assigns it. insert_many() and copy_into() cannot set it: "
+                        "database assigns it. insert_many() cannot set it: "
                         f"use db.insert({table.__name__}).values(...).overriding_system_value(), "
                         "or make the column generated_by_default_as_identity()"
                     )
@@ -67,6 +97,8 @@ def prepare_row(
             column.validate(value)
             out[attr] = value
         elif column.default_factory is not None:
+            if not defaults:
+                continue
             value = column.default_factory()
             column.validate(value)
             out[attr] = value
@@ -75,12 +107,46 @@ def prepare_row(
     return out
 
 
+def missing_defaults(table: type[Table], supplied: Collection[str]) -> list[str]:
+    """Columns whose Python-side ``default_fn`` cannot run once per row.
+
+    ``insert().values()`` calls the factory for each row; a statement that inserts rows the
+    builder has not seen (MERGE from a source, INSERT ... SELECT) can only call it once, so
+    every row would get the same value (B8). Callers refuse with a ``QueryError`` rather
+    than write wrong data: the caller must put the column in the source, or give it a
+    database-side default.
+    """
+    columns = table.__table__.columns
+    return [
+        column.qualified_name
+        for attr, column in columns.items()
+        if attr not in supplied
+        and column.default_factory is not None
+        and column.default_value is MISSING
+    ]
+
+
+def output_width(query: SelectBase | CompoundBase) -> int:
+    """How many columns a query's SELECT list produces (a whole-table slot expands)."""
+    while isinstance(query, CompoundBase):
+        query = query.left  # output columns are named by the first query
+    projection = query.projection
+    if projection is None:
+        source = query.source
+        return len(source.__table__.columns) if isinstance(source, type) else 0
+    if isinstance(projection, dict):
+        return len(projection)
+    return sum(len(slot.__table__.columns) if isinstance(slot, type) else 1 for slot in projection)
+
+
 @dataclass(frozen=True)
 class OnConflict:
     target: tuple[ColumnBase, ...]
     action: Literal["nothing", "update"]
     set_: dict[str, object] = field(default_factory=dict[str, object])
     where: Expr[bool] | None = None
+    # A named unique/exclusion constraint instead of a column list.
+    constraint: str | None = None
 
 
 def _targets(
@@ -97,19 +163,41 @@ def _targets(
     return columns
 
 
+def _conflict(
+    table: type[Table], target: ColumnBase | Sequence[ColumnBase] | None, constraint: str | None
+) -> tuple[tuple[ColumnBase, ...], str | None]:
+    """Resolve the conflict target, which is either columns or a named constraint."""
+    targets = _targets(table, target)
+    if constraint is not None:
+        if targets:
+            raise QueryError("on_conflict takes a target or a constraint, not both")
+        if not constraint:
+            raise QueryError("on_conflict constraint name cannot be empty")
+    return targets, constraint
+
+
 @dataclass(frozen=True, eq=False)
-class Insert[T: Table](Executable[int]):
+class Insert[T: Table](ReturningMixin[T]):
     """Awaiting returns the number of inserted rows; ``.returning()`` returns the rows."""
 
-    table: type[T]
     rows: tuple[dict[str, object], ...] = ()
     conflict: OnConflict | None = None
     overriding: Literal["SYSTEM", "USER"] | None = None
     # A GENERATED ALWAYS identity column the rows set: compiling fails without overriding.
     identity: ColumnBase | None = None
+    # INSERT ... SELECT (see from_select): a query as the source of rows, and its target columns.
+    source: SelectBase | CompoundBase | None = None
+    source_columns: tuple[ColumnBase, ...] = ()
+    # A WITH clause passed with db.with_(...): emitted before the INSERT.
+    ctes: tuple[Cte, ...] = ()
+    # Per row, the ``default_fn`` columns it leaves out. They are filled when the statement
+    # compiles, so a prepared or re-awaited insert gets a fresh value each run (B43).
+    defaulted: tuple[frozenset[str], ...] = ()
 
     def values(self, rows: RowLike | Sequence[RowLike] | None = None, /, **fields: object) -> Self:
         """``values(email="a")``, ``values({"email": "a"})`` or ``values([{...}, {...}])``."""
+        if self.source is not None:
+            raise QueryError("this insert already has from_select(); it cannot also take values()")
         if rows is not None and fields:
             raise QueryError("pass rows or keyword arguments to values(), not both")
         if rows is None:
@@ -117,12 +205,16 @@ class Insert[T: Table](Executable[int]):
                 raise QueryError("values() needs at least one row; use values({}) for all defaults")
             batch: list[Mapping[str, object]] = [fields]
         elif isinstance(rows, Sequence):
-            batch = [as_mapping(r) for r in rows]
+            batch = [as_mapping(r, self.table) for r in rows]
             if not batch:
                 raise QueryError("values() got an empty list")
         else:
-            batch = [as_mapping(rows)]
-        rows = tuple(prepare_row(self.table, row, allow_identity=True) for row in batch)
+            batch = [as_mapping(rows, self.table)]
+        rows = tuple(
+            prepare_row(self.table, row, allow_identity=True, defaults=False) for row in batch
+        )
+        factories = [a for a, c in self.table.__table__.columns.items() if c.default_factory]
+        defaulted = tuple(frozenset(a for a in factories if a not in row) for row in rows)
         identity = next(
             (
                 column
@@ -133,7 +225,26 @@ class Insert[T: Table](Executable[int]):
             ),
             None,
         )
-        return evolve(self, rows=rows, identity=identity)
+        return evolve(
+            self, rows=rows, identity=identity, defaulted=defaulted if any(defaulted) else ()
+        )
+
+    def with_defaults(self) -> Self:
+        """This insert with every left-out ``default_fn`` column called now."""
+        if not self.defaulted:
+            return self
+        columns = self.table.__table__.columns
+        rows: list[dict[str, object]] = []
+        for row, attrs in zip(self.rows, self.defaulted, strict=True):
+            filled = dict(row)
+            for attr in attrs:
+                factory = columns[attr].default_factory
+                assert factory is not None
+                value = factory()
+                columns[attr].validate(value)
+                filled[attr] = value
+            rows.append(filled)
+        return evolve(self, rows=tuple(rows), defaulted=())
 
     def overriding_system_value(self) -> Self:
         """``OVERRIDING SYSTEM VALUE``: store the given values of ``GENERATED ALWAYS``
@@ -145,29 +256,65 @@ class Insert[T: Table](Executable[int]):
         database assigns them."""
         return evolve(self, overriding="USER")
 
-    def on_conflict_do_nothing(
-        self, target: ColumnBase | Sequence[ColumnBase] | None = None
+    def from_select(
+        self,
+        columns: ColumnBase | Sequence[ColumnBase],
+        query: SelectBase | CompoundBase,
     ) -> Self:
-        return evolve(self, conflict=OnConflict(_targets(self.table, target), "nothing"))
+        """``INSERT ... SELECT``: insert the rows a query produces. ``columns`` are the target
+        columns, in the same order the query outputs them."""
+        if self.rows:
+            raise QueryError("this insert already has values(); it cannot also use from_select()")
+        target = (columns,) if isinstance(columns, ColumnBase) else tuple(columns)
+        if not target:
+            raise QueryError("from_select() needs at least one target column")
+        if missing := missing_defaults(self.table, [c.attr for c in target]):
+            # The factory would run once and every selected row would share the value.
+            raise QueryError(
+                f"insert().from_select() cannot apply the Python default of "
+                f"{', '.join(missing)}: it would run once for every row. Put the column in "
+                "the query, or give it a database-side default"
+            )
+        for column in target:
+            if column.table is not self.table:
+                raise QueryError(
+                    f"target column {column.qualified_name} is not a column of "
+                    f"{self.table.__name__}"
+                )
+        width = output_width(query)
+        if width != len(target):
+            raise QueryError(
+                f"from_select() got {len(target)} target column(s) but the query outputs {width}"
+            )
+        identity = next((c for c in target if c.identity is not None and c.identity.always), None)
+        return evolve(self, source=query, source_columns=target, identity=identity)
+
+    def on_conflict_do_nothing(
+        self,
+        target: ColumnBase | Sequence[ColumnBase] | None = None,
+        *,
+        constraint: str | None = None,
+    ) -> Self:
+        targets, constraint = _conflict(self.table, target, constraint)
+        return evolve(self, conflict=OnConflict(targets, "nothing", constraint=constraint))
 
     def on_conflict_do_update(
         self,
         *,
-        target: ColumnBase | Sequence[ColumnBase],
+        target: ColumnBase | Sequence[ColumnBase] | None = None,
+        constraint: str | None = None,
         set_: Mapping[str, object],
         where: Expr[bool] | None = None,
     ) -> Self:
-        """Upsert. Use ``excluded(Users.col)`` in ``set_`` to refer to the proposed row."""
-        targets = _targets(self.table, target)
-        if not targets:
-            raise QueryError("on_conflict_do_update() needs a target")
+        """Upsert. Use ``excluded(Users.col)`` in ``set_`` to refer to the proposed row.
+        Pass ``target`` (columns) or ``constraint`` (a named unique constraint)."""
+        targets, constraint = _conflict(self.table, target, constraint)
+        if not targets and constraint is None:
+            raise QueryError("on_conflict_do_update() needs a target or a constraint")
         if not set_:
             raise QueryError("on_conflict_do_update() needs a non-empty set_")
         check_values(self.table, set_)
-        return evolve(self, conflict=OnConflict(targets, "update", dict(set_), where))
-
-    def returning(self) -> Returning[T]:
-        return Returning(self.runner, self, self.table)
+        return evolve(self, conflict=OnConflict(targets, "update", dict(set_), where, constraint))
 
     @override
     async def run_compiled(self, compiled: CompiledQuery) -> int:

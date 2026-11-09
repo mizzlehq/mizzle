@@ -1,8 +1,12 @@
 import copy
+import hashlib
+import re
 from pathlib import Path
+from typing import override
 
 import pytest
 
+from mizzle import Constraint, Table, policy, rls, role, sql
 from mizzle.core.errors import MigrationError
 from mizzle.core.snapshot import Snapshot, empty_snapshot
 from mizzle.core.steps import (
@@ -14,11 +18,20 @@ from mizzle.core.steps import (
     Statement,
 )
 from mizzle.dialects.postgres import PostgresDialect
-from mizzle.dialects.postgres.ddl import normalize_default, normalize_type
+from mizzle.dialects.postgres.ddl import (
+    escape_backslashes,
+    normalize_default,
+    normalize_type,
+    same_type,
+)
+from mizzle.kit.codegen import render_schema_module
 from mizzle.kit.config import load_config
 from mizzle.kit.diff import StrictRenames, diff
-from mizzle.kit.journal import BREAKPOINT, MigrationsDir, format_sql, parse_sql
+from mizzle.kit.journal import BREAKPOINT, Migration, MigrationsDir, format_sql, parse_sql
+from mizzle.kit.migrate import pending_migrations
 from mizzle.kit.snapshot import build_snapshot
+from mizzle.kit.sqltext import transaction_control
+from mizzle.pg import serial
 from tests.models import Posts, Users
 
 dialect = PostgresDialect()
@@ -33,6 +46,9 @@ dialect = PostgresDialect()
         ("'x'::character varying", "'x'"),
         ("'{}'::jsonb", "'{}'"),
         ("('2'::numeric)", "2"),
+        ('\'happy\'::"App"."Mood"', "'happy'"),  # K4-4
+        ("'happy'::app.\"Mood\"", "'happy'"),
+        ("'happy'::\"App\".mood", "'happy'"),
         (None, None),
     ],
 )
@@ -43,11 +59,39 @@ def test_normalize_default(raw: str | None, expected: str | None) -> None:
 @pytest.mark.parametrize(
     ("raw", "expected"),
     [
+        (
+            r"""DEFAULT 'x\y' CHECK (("c\" <> '\'::text))""",
+            r"""DEFAULT E'x\\y' CHECK (("c\" <> E'\\'::text))""",
+        ),
+        (r"x = E'a\\b' AND y = 'q' AND z = U&'\0041'", None),  # escapes, or no backslash
+        (r"DO $x$ BEGIN PERFORM 'a\b'; END $x$", None),  # a body runs later
+        (r"-- 'a\b'", None),
+        (r"name'a\b' $1", r"name E'a\\b' $1"),
+        # K9-2: N E'..' is no string, nor is a continued part with an E: both kept.
+        (r"DEFAULT N'C:\dir'", None),
+        ("'a'\n'\\b' || 'c\\d'", "'a'\n'\\b' || E'c\\\\d'"),
+    ],
+)
+def test_ddl_strings_read_the_same_with_standard_conforming_strings_off(
+    raw: str, expected: str | None
+) -> None:
+    # K8-3: a pulled default or check printed as 'x\y' lost the backslash there, or failed.
+    assert escape_backslashes(raw) == (raw if expected is None else expected)
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
         ("varchar(255)", "character varying(255)"),
         ("numeric(10, 2)", "numeric(10,2)"),
         ("timestamptz", "timestamp with time zone"),
         ("text[]", "text[]"),
         ("varchar(5)[]", "character varying(5)[]"),
+        ("integer[][]", "integer[]"),  # Q5-8: one array type, whatever the dimensions
+        ("char(4)", "character(4)"),
+        ("char(1)", "character(1)"),
+        ("char", "character"),
+        ("bpchar(2)", "character(2)"),
     ],
 )
 def test_normalize_type(raw: str, expected: str) -> None:
@@ -179,6 +223,31 @@ def test_pulled_names_cannot_inject_code() -> None:
     compile(source, "pulled.py", "exec")
 
 
+def test_pulled_class_names_are_unique_identifiers() -> None:
+    # (K9) T, t, t_, table/Table, none and 2fa need distinct, valid, non-shadowing classes.
+    from mizzle.kit.codegen import render_schema_module
+
+    snapshot = empty_snapshot("postgresql")
+    names = ["T", "t", "t_", "table", "Table", "none", "2fa"]
+    for name in names:
+        snapshot["tables"][f"public.{name}"] = {
+            "schema": "public",
+            "name": name,
+            "columns": {"a": {"name": "a", "type": "integer", "not_null": False, "default": None}},
+            "primary_key": None,
+            "uniques": {},
+            "checks": {},
+            "foreign_keys": {},
+            "indexes": {},
+        }
+    source = render_schema_module(snapshot)
+    exec(compile(source, "pulled.py", "exec"), {})
+    classes = re.findall(r"^class (\w+)\(Table, name='([^']*)'", source, re.M)
+    assert sorted(n for _, n in classes) == sorted(names)
+    assert len({c for c, _ in classes}) == len(names)
+    assert "Table" not in {c for c, _ in classes}
+
+
 def test_init_creates_config_schema_and_folder(tmp_path: Path) -> None:
     from mizzle.kit.init import init_project
 
@@ -286,3 +355,123 @@ def test_schema_file(tmp_path: Path) -> None:
     (tmp_path / "app" / "db").mkdir(parents=True)
     (tmp_path / "app" / "db" / "schema.py").write_text("")
     assert config.schema_file().resolve() == (tmp_path / "app" / "db" / "schema.py").resolve()
+
+
+@pytest.mark.parametrize(
+    ("sql", "expected"),
+    [
+        # K2: CASE ... END inside a BEGIN ATOMIC body does not close the body.
+        (
+            "CREATE FUNCTION f(x int) RETURNS int LANGUAGE sql BEGIN ATOMIC\n"
+            "  SELECT CASE WHEN x > 0 THEN 1 ELSE 0 END;\nEND;\nSELECT 1;",
+            None,
+        ),
+        (
+            "CREATE FUNCTION f() RETURNS int BEGIN ATOMIC SELECT CASE 1 WHEN 1 THEN 2 END; END;"
+            "\nCOMMIT;",
+            "COMMIT",
+        ),
+        # K3: "begin atomic" in a string, comment or quoted name hides nothing.
+        ("SELECT 'begin atomic';\nCOMMIT;", "COMMIT"),
+        ("-- begin atomic\nCOMMIT;", "COMMIT"),
+        ("/* begin atomic */ SELECT 1;\nCOMMIT;", "COMMIT"),
+        ('SELECT 1 AS "begin atomic";\nCOMMIT;', "COMMIT"),
+        ("SELECT $$begin atomic$$;\nCOMMIT;", "COMMIT"),
+    ],
+)
+def test_transaction_control_reads_atomic_bodies(sql: str, expected: str | None) -> None:
+    assert transaction_control(sql) == expected
+
+
+def test_migration_hash_ignores_crlf(tmp_path: Path) -> None:
+    # K12: a CRLF checkout of an applied migration must not look edited.
+    (tmp_path / "migration.sql").write_bytes(b"SELECT 1;\nSELECT 2;\n")
+    migration = Migration(index=1, name="0001_x", path=tmp_path)
+    lf = migration.hash()
+    (tmp_path / "migration.sql").write_bytes(b"SELECT 1;\r\nSELECT 2;\r\n")
+    assert migration.hash() == lf
+
+
+def test_crlf_migration_sql_and_old_hash(tmp_path: Path) -> None:
+    # K4-7: sql() gives LF, so a function body does not keep \r.
+    raw = b"CREATE FUNCTION f() RETURNS int LANGUAGE sql AS $$\r\nSELECT 1\r\n$$;\r\n"
+    (tmp_path / "migration.sql").write_bytes(raw)
+    migration = Migration(index=1, name="0001_x", path=tmp_path)
+    assert "\r" not in migration.sql()
+    # K4-16: a hash an older mizzle stored (sha256 of the CRLF bytes) still matches.
+    old = hashlib.sha256(raw).hexdigest()
+    assert pending_migrations([migration], {"0001_x": old}) == []
+    with pytest.raises(MigrationError):
+        pending_migrations([migration], {"0001_x": "0" * 64})
+
+
+def test_commit_after_a_breakpoint_is_transaction_control(tmp_path: Path) -> None:
+    # K4-17: no ';' before the breakpoint, so the COMMIT did not start a statement.
+    sql = (
+        "INSERT INTO t VALUES (1)\n-- mizzle:breakpoint\nCOMMIT\n"
+        "-- mizzle:breakpoint\nINSERT INTO t VALUES (1)\n"
+    )
+    (tmp_path / "migration.sql").write_text(sql)
+    migration = Migration(index=1, name="0001_x", path=tmp_path)
+    with pytest.raises(MigrationError, match="contains COMMIT"):
+        pending_migrations([migration], {})
+
+
+def test_non_migration_folders_are_not_unlisted(tmp_path: Path) -> None:
+    # K4-11: .cache or __pycache__ in migrations/ blocked every command.
+    directory = MigrationsDir(tmp_path, "postgresql")
+    for name in (".cache", "__pycache__", "meta", "0001_merged"):
+        (tmp_path / name).mkdir()
+    assert directory.unlisted() == ["0001_merged"]
+
+
+def test_pulled_role_variables_never_shadow_imported_names() -> None:
+    # K7-8: `policy = role("policy")` shadowed the policy() the table's config() calls.
+    roles = [role("policy", login=True), role("role"), role("print")]
+
+    class Items(Table, name="items"):
+        id = serial().primary_key()
+
+        @classmethod
+        @override
+        def config(cls) -> list[Constraint]:
+            return [rls(), policy("p_admin", to=[roles[0]], using=sql("true"))]
+
+    source = render_schema_module(build_snapshot([Items], dialect, objects=roles))
+    for name in ("policy", "role", "print"):
+        assert f"\n{name} = " not in source
+    namespace: dict[str, object] = {}
+    exec(compile(source, "pulled", "exec"), namespace)
+    pulled = namespace["Items"]
+    assert isinstance(pulled, type) and issubclass(pulled, Table)
+    assert build_snapshot([pulled], dialect)["tables"]["public.items"].get("policies")
+
+
+@pytest.mark.parametrize(
+    ("a", "b", "same"),
+    [
+        ("posint", "public.posint", True),  # K8-2: an older snapshot's spelling
+        ("integer", "pg_catalog.int4", True),
+        ("int4", "public.int4", False),  # K7-7: public.int4 can be a domain
+        ("jsonpath", "public.jsonpath", False),  # K9-4: a built-in missing from the list
+        ("int4multirange", "public.int4multirange", False),
+        ("xid8", "public.xid8", False),
+    ],
+)
+def test_same_type(a: str, b: str, same: bool) -> None:
+    assert same_type(a, b) is same
+
+
+def test_rename_hints_and_flags_in_another_schema() -> None:
+    # H11-2: the hint said --rename posts=articles for app.posts, which matched nothing;
+    # app.posts=app.articles was taken for a move and refused.
+    renames = StrictRenames()
+    with pytest.raises(MigrationError, match=r"--rename app\.posts=articles "):
+        renames("table", "app", ["posts"], ["articles"])
+    with pytest.raises(MigrationError, match=r"--rename app\.posts\.name=title "):
+        renames("column", "app.posts", ["name"], ["title"])
+    with pytest.raises(MigrationError, match=r"--rename users\.name=title "):
+        renames("column", "public.users", ["name"], ["title"])
+    same = StrictRenames({"app.posts": "app.articles"})
+    assert same("table", "app", ["posts"], ["articles"]) == {"posts": "articles"}
+    assert same.unused() == []

@@ -135,6 +135,8 @@ rows = await db.select().from_(Users).where(
 Comparing with `None` raises, because `= NULL` is never true in SQL:
 
 ```python
+from mizzle import QueryError
+
 try:
     eq(Users.nickname, None)
 except QueryError as error:
@@ -359,6 +361,30 @@ top_posts = await (
 )
 ```
 
+### Recursive CTEs
+
+`db.recursive(name, seed)` builds the self-reference for you, so the name is written once.
+Everyone who reports to a manager, at any depth:
+
+```python
+from mizzle import eq
+
+reports = db.recursive(
+    "reports", db.select({"id": Users.id}).from_(Users).where(eq(Users.manager_id, boss_id))
+).step(
+    lambda reports: db.select({"id": Users.id})
+    .from_(Users)
+    .join(reports, eq(Users.manager_id, reports.c("id", int)))
+)
+rows = await db.with_(reports).select(reports.c("id", int)).from_(reports)
+```
+
+The step runs until it adds no new rows, so it must stop by itself: here, at people with
+no reports. A step that always finds rows (`n - 1` with no `where`) never ends.
+
+`query.cte(name, recursive=True)` still works when you already have the step query built
+against a CTE of the same name.
+
 ## Window functions
 
 ```python
@@ -445,7 +471,8 @@ many_rows = await db.insert(Users).values(
 ```
 
 `values()` takes keyword arguments, a dict, a list of dicts or a Pydantic model. Awaiting
-the insert returns the row count; `.returning()` returns the inserted rows. mizzle checks
+the insert returns the row count; `.returning()` returns the inserted rows (whole rows, or
+`.returning(Users.id, Users.email)` for `list[tuple[int, str]]`). mizzle checks
 the values before it sends anything: an unknown column, a wrong type or a missing required
 column raises `QueryError`.
 
@@ -508,8 +535,8 @@ upserted = await db.insert_many(
 )  # list[Users]
 ```
 
-`on_conflict` is an insert without values; every batch gets its conflict clause. For
-millions of rows, `db.copy_into()` is faster (see [Bulk and streaming](bulk.md)).
+`on_conflict` is an insert without values; every batch gets its conflict clause (see
+[Bulk and streaming](bulk.md)).
 
 ## Update and delete
 
@@ -625,5 +652,6 @@ found = await (
 - `websearch_to_tsquery` takes search-box syntax (`"a phrase" or -word`) and never fails
   on bad input.
 - `ts_rank_cd` also rewards matching words that are close together.
-- For speed, store the vector in a generated `tsvector()` column with a GIN index (see
-  [Schema](schema.md#identity-and-generated-columns)).
+- For speed, store the vector in a generated `custom("tsvector", py_type=str)` column (a
+  `str` to the type checker, as `matches` and `ts_rank` take) with a GIN index
+  (see [Schema](schema.md#identity-and-generated-columns)).

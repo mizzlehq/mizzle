@@ -1,8 +1,8 @@
 # Extensions
 
-Any PostgreSQL extension can be part of your schema: `extension("pg_trgm")` in your schema
-module makes migrations run `CREATE EXTENSION IF NOT EXISTS`. See
-[Migrations](migrations.md#extensions).
+mizzle does not manage extensions: create them in a custom migration
+(`CREATE EXTENSION IF NOT EXISTS ...`) that runs before the tables using them. See
+[Not managed by mizzle](migrations.md#not-managed-by-mizzle).
 
 This page covers [pgvector](https://github.com/pgvector/pgvector), which mizzle supports
 with column types and operators. Full-text search (`tsvector`, `to_tsvector`,
@@ -48,21 +48,39 @@ class Items(Table, name="vecdoc_items"):
 | `halfvec(n)` | `n` half-precision values | `list[float]` |
 | `sparsevec(n)` | mostly-zero vectors | `dict[int, float]`, indices from 0 to n - 1 |
 
-You do not need `extension("vector")`: a vector column makes the migration create it.
-`mizzle generate` writes:
+Create the `vector` extension in a custom migration before the first one that uses it
+(`mizzle generate --custom --name pgvector`, then `CREATE EXTENSION IF NOT EXISTS vector;`).
+`mizzle generate` then writes:
 
 ```sql
--- create extension vector
 -- create table vecdoc_items
 -- create index vecdoc_items_embedding_idx
 -- create index vecdoc_items_half_idx
 -- create index vecdoc_items_ivf_idx
-CREATE EXTENSION IF NOT EXISTS vector;
 ...
 CREATE INDEX "vecdoc_items_embedding_idx" ON "vecdoc_items" USING hnsw ("embedding" vector_cosine_ops) WITH (m = '16', ef_construction = '64');
 ```
 
 The server needs pgvector installed.
+
+### Types from other extensions
+
+A column of another extension's type is `custom("type")`, its values what asyncpg reads for
+the type (a `str` for these three; see [Columns of other types](schema.md#columns-of-other-types)):
+
+```python
+from mizzle.pg import custom
+
+
+@final
+class Document(Table):
+    labels = custom("hstore")
+    slug = custom("citext")
+    path = custom("ltree")
+```
+
+Create the extensions in a custom migration first, or the migration fails with
+`type "hstore" does not exist` (and so on). `pull` writes such columns as `custom(...)`.
 
 ## Writing and reading vectors
 
@@ -166,8 +184,6 @@ async with db.transaction() as tx:
 
 ## Notes
 
-- `copy_into` loads tables with vector columns through `insert_many`, since vectors have no
-  binary COPY format here. See [Bulk and streaming](bulk.md).
 - `mizzle.pydantic` models check a vector's length: `vector(3)` accepts exactly 3 floats.
   See [Integrations](integrations.md#pydantic-models).
 - [examples/shop](https://github.com/mizzlehq/mizzle/tree/main/examples/shop) keeps its

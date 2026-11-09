@@ -5,73 +5,207 @@ from __future__ import annotations
 import asyncio
 import itertools
 import logging
+import math
 import random
 import time
 from collections.abc import (
     AsyncGenerator,
-    AsyncIterator,
     Awaitable,
     Callable,
     Generator,
     Iterable,
     Iterator,
+    Mapping,
     Sequence,
 )
 from contextlib import (
     AbstractAsyncContextManager,
+    AbstractContextManager,
     AsyncExitStack,
     aclosing,
     asynccontextmanager,
     contextmanager,
+    nullcontext,
 )
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Literal, Self, final, overload
 
 from mizzle.core.compiler import CompiledQuery
+from mizzle.core.errors import (
+    AfterCommitError,
+    AfterRollbackError,
+    MizzleError,
+    QueryError,
+    QueryTimeout,
+    SerializationFailure,
+)
 from mizzle.core.errors import ConnectionError as DbConnectionError
-from mizzle.core.errors import MizzleError, QueryError, SerializationFailure
 from mizzle.core.naming import Casing
 from mizzle.core.query.base import Row, evolve
 from mizzle.core.query.builder import QueryBuilder
 from mizzle.core.query.insert import Insert, RowLike, as_mapping, prepare_row
 from mizzle.core.query.relational import RelationalStatement
 from mizzle.core.query.select import SelectBase
-from mizzle.core.schema.column import ColumnBase
 from mizzle.core.schema.table import Table, validate_tables
 from mizzle.core.schema.view import View
 from mizzle.core.sql.nodes import Identifier, Node, Raw
 from mizzle.dialects.base import (
     Connection,
-    CopyFormat,
-    CopyOutput,
     Dialect,
     Driver,
     IsolationLevel,
-    Notification,
-    Overflow,
-    Reconnected,
+    PoolStats,
     ResetMode,
 )
 from mizzle.dialects.postgres import PostgresDialect
+from mizzle.tracing import Tracer
 
 log = logging.getLogger("mizzle")
+# Seconds a replica that failed to give a connection is skipped.
+_REPLICA_PAUSE = 30.0
+
+_ENDED = (
+    "this transaction has ended; run the statement inside its "
+    "`async with db.transaction()` block, or on db"
+)
+_BROKEN = (
+    "a savepoint of this transaction was cancelled during its ROLLBACK TO / RELEASE, so "
+    "its state is unknown; the transaction must roll back"
+)
+_OUT_OF_ORDER = (
+    "a savepoint ended while one opened inside it was still open, so the state of the "
+    "transaction is unknown; it must roll back"
+)
+_OPEN_SAVEPOINT = (
+    "a savepoint opened by a task this block started is still open, so the block was "
+    "rolled back; await such tasks inside the block"
+)
+_OTHER_TASK = (
+    "another task has a savepoint open on this transaction; while it is open, only the "
+    "task that opened it may use the transaction. Await the savepoint first, or give "
+    "each task its own transaction"
+)
+_ISOLATION_LEVELS: tuple[IsolationLevel, ...] = (
+    "read committed",
+    "repeatable read",
+    "serializable",
+)
+
+
+type _Hook = Callable[[], Awaitable[None]]
+
+
+@final
+class _Frame:
+    """A transaction (the first frame) or a savepoint in it: the task that opened it (None:
+    any task may use it) and the hooks of savepoints released inside it, which run when
+    it commits or rolls back."""
+
+    __slots__ = ("commits", "owner", "rollbacks")
+
+    def __init__(self, owner: asyncio.Task[object] | None) -> None:
+        self.owner = owner
+        self.commits: list[_Hook] = []
+        self.rollbacks: list[_Hook] = []
+
+
+@final
+class _Tx:
+    """The state a transaction's sessions (its views) share."""
+
+    __slots__ = ("closed", "frames")
+
+    def __init__(self) -> None:
+        self.frames = [_Frame(None)]  # the transaction, then its open savepoints
+        self.closed: str | None = None  # why statements are refused
+
+
+def _timeout_ok(seconds: float | None) -> bool:
+    """A timeout is a finite number of seconds > 0, or None. 0, a negative, NaN or inf
+    failed every statement or meant no limit at all (R4-6)."""
+    return seconds is None or (math.isfinite(seconds) and seconds > 0)
+
+
+def _busy(driver: Driver) -> bool:
+    """Every pooled connection is handed out: the server is fine, just loaded (R4-7)."""
+    stats = driver.stats()
+    return stats.in_use >= stats.max_size
+
+
+def _commit_unknown(error: BaseException) -> bool:
+    """Whether ``error``, raised while COMMIT was in flight, leaves its outcome unknown."""
+    return isinstance(error, asyncio.CancelledError | DbConnectionError | QueryTimeout)
 
 
 @dataclass(frozen=True)
 class QueryEvent:
     """Passed to the ``logger`` hook after every statement. ``params`` is None unless
-    ``log_params=True``: parameter values may hold passwords or personal data."""
+    ``log_params=True``: parameter values may hold passwords or personal data. ``tags``
+    are the key/values set with ``Session.tag()``."""
 
     sql: str
     params: tuple[object, ...] | None
     duration_ms: float
     error: BaseException | None
+    tags: Mapping[str, object] = field(default_factory=lambda: {})
 
 
 type QueryLogger = Callable[[QueryEvent], None]
 type _CallKind = Literal["fetch", "execute", "dicts"]
 # The most bind parameters one statement can have (asyncpg / the wire protocol).
 MAX_PARAMS = 32767
+
+
+async def _run_commit_hooks(hooks: Sequence[Callable[[], Awaitable[None]]]) -> None:
+    """Run every after-commit hook; a failure is reported without suggesting the write failed.
+
+    One failing hook must not hide the others (B6): all of them run, and the first error is
+    the cause of the ``AfterCommitError``; later errors are only logged.
+    """
+    error: BaseException | None = None
+    for hook in hooks:
+        try:
+            await hook()
+        except Exception as exc:
+            log.error("mizzle: an after_commit hook failed", exc_info=exc)
+            if error is None:
+                error = exc
+    if error is not None:
+        raise AfterCommitError(
+            "an after_commit hook failed after the transaction committed; the data is saved. "
+            "Do not retry the transaction."
+        ) from error
+
+
+async def _run_rollback_hooks(
+    hooks: Sequence[Callable[[], Awaitable[None]]], original: BaseException
+) -> None:
+    """Run after-rollback hooks without replacing the error that caused the rollback.
+
+    The hook error is chained with its traceback (``AfterRollbackError.__cause__``) and
+    attached to the original as context. When the original already has a context, or hides
+    it (``raise X from Y`` sets ``__suppress_context__``, B40), a note is added instead.
+    """
+    error: BaseException | None = None
+    for hook in hooks:
+        try:
+            await hook()
+        except Exception as exc:
+            log.error("mizzle: an after_rollback hook failed", exc_info=exc)
+            if error is None:
+                error = exc
+    if error is None:
+        return
+    if error.__context__ is original:
+        # The hook ran while ``original`` was being handled; keeping that link would make the
+        # chain a cycle (original -> AfterRollbackError -> hook error -> original).
+        error.__context__ = None
+    hook_error = AfterRollbackError(f"an after_rollback hook failed: {error}")
+    hook_error.__cause__ = error  # keep the hook's traceback reachable
+    if original.__context__ is None and not original.__suppress_context__:
+        original.__context__ = hook_error
+    else:
+        original.add_note(f"an after_rollback hook also failed: {error!r}")
 
 
 class Session(QueryBuilder):
@@ -85,13 +219,25 @@ class Session(QueryBuilder):
     _driver: Driver | None
     _replicas: tuple[Driver, ...]
     _next_replica: itertools.count[int]
+    # A replica that failed to give a connection, and when it may be tried again (R7).
+    _replica_down: dict[Driver, float]
     _use_primary: bool
     _timeout: float | None
     _casing: Casing | None
     _logger: QueryLogger | None
     _log_params: bool
+    _slow_query_ms: float | None
+    _tracer: Tracer | None
+    _tags: Mapping[str, object]
     _conn: Connection | None
     _lock: asyncio.Lock
+    # Open savepoints and their hooks. A savepoint belongs to the task that opened it:
+    # while it is open, another task's statement would be undone with it, so
+    # it is refused (B39, C11).
+    _tx: _Tx
+    # False on insert_many's private view: its hidden savepoint holds the statement lock
+    # throughout, so a sibling task's statement waits instead of being refused (R5-2).
+    _owns_savepoints: bool = True
 
     def __init__(
         self,
@@ -101,6 +247,9 @@ class Session(QueryBuilder):
         casing: Casing | None = None,
         logger: QueryLogger | None = None,
         log_params: bool = False,
+        slow_query_ms: float | None = None,
+        tracer: Tracer | None = None,
+        tags: Mapping[str, object] | None = None,
         connection: Connection | None = None,
         replicas: Sequence[Driver] = (),
     ) -> None:
@@ -109,15 +258,20 @@ class Session(QueryBuilder):
         self._driver = driver
         self._replicas = tuple(replicas)
         self._next_replica = itertools.count()
+        self._replica_down = {}
         self._use_primary = False
         self._timeout = None
         self._casing = casing
         self._logger = logger
         self._log_params = log_params
+        self._slow_query_ms = slow_query_ms
+        self._tracer = tracer
+        self._tags = dict(tags) if tags else {}
         self._conn = connection
         # One connection runs one statement at a time; the lock lets asyncio.gather()
         # inside a transaction queue up instead of failing.
         self._lock = asyncio.Lock()
+        self._tx = _Tx()
 
     # -- Runner protocol --------------------------------------------------------------
 
@@ -125,8 +279,9 @@ class Session(QueryBuilder):
         return self._dialect.compiler(self._casing).compile(node)
 
     def fetch(self, query: CompiledQuery, *, read_only: bool = False) -> Awaitable[list[Row]]:
-        # FOR UPDATE anywhere in the query (CTE, subquery) needs the primary.
-        return self._call(query, "fetch", read_only and not query.locking)
+        # A write anywhere in the query (FOR UPDATE, or a data-modifying CTE) needs the
+        # primary and must never be retried.
+        return self._call(query, "fetch", read_only and query.pure_read)
 
     def run(self, query: CompiledQuery) -> Awaitable[int]:
         return self._call(query, "execute")
@@ -137,7 +292,11 @@ class Session(QueryBuilder):
         if batch_size < 1:
             raise QueryError("stream() needs batch_size >= 1")
         safe = query.session_safe
-        with self._logged(query):
+        # Traced per batch, not around the loop: a span made current here stayed current in
+        # the caller between batches and after a break, and its token was reset from
+        # another context when the generator was finalized (C16).
+        paused = [0.0]
+        with self._logged(query, trace=False, paused=paused):
             if self._conn is not None:
                 # Locked per batch, not for the whole loop: its body may run other
                 # statements in the same transaction.
@@ -146,26 +305,41 @@ class Session(QueryBuilder):
                 )
                 async with aclosing(cursor) as batches:
                     while True:
+                        self._check_savepoint_owner()  # at once, not once the lock is free
                         async with self._lock:
-                            batch = await anext(batches, None)
+                            self._check_savepoint_owner()
+                            with self._span(query):
+                                batch = await anext(batches, None)
                         if batch is None:
                             return
-                        yield batch
+                        handed = time.perf_counter()
+                        try:
+                            yield batch
+                        finally:
+                            paused[0] += time.perf_counter() - handed
             try:
                 # Cursors only live inside a transaction; it ends (and closes the cursor)
                 # when the loop ends, breaks or is cancelled.
                 async with (
-                    self._connection(read_only and not query.locking) as conn,
+                    self._connection(read_only and query.pure_read) as conn,
                     conn.transaction(),
                 ):
                     cursor = conn.cursor(
                         query.sql, query.params, batch_size, self._timeout, session_safe=safe
                     )
                     async with aclosing(cursor) as batches:
-                        async for batch in batches:
-                            yield batch
-            except DbConnectionError:
-                await self._after_lost_connection(query, False)  # never resumed mid-stream
+                        while True:
+                            with self._span(query):
+                                batch = await anext(batches, None)
+                            if batch is None:
+                                return
+                            handed = time.perf_counter()
+                            try:
+                                yield batch
+                            finally:
+                                paused[0] += time.perf_counter() - handed
+            except DbConnectionError as lost:
+                await self._after_lost_connection(query, False, lost)  # never resumed mid-stream
                 raise
 
     # -- public API -------------------------------------------------------------------
@@ -177,6 +351,23 @@ class Session(QueryBuilder):
             raise QueryError("execute() does not take placeholders")
         return await self._call(compiled, "dicts")
 
+    async def executemany(self, statement: Raw, params: Sequence[Sequence[object]]) -> int:
+        """Run one statement (with ``$1``, ``$2``, ... placeholders) for each parameter set,
+        pipelined in as few round trips as there can be. Returns how many sets ran. For
+        inserting many rows prefer ``insert_many()``."""
+        compiled = self.compile(statement)
+        if compiled.params or compiled.has_placeholders:
+            raise QueryError(
+                "executemany() takes plain SQL with $1, $2, ... placeholders and their values"
+            )
+        with self._logged(compiled):
+            try:
+                async with self._connection() as conn:
+                    return await conn.executemany(compiled.sql, params, self._timeout)
+            except DbConnectionError as lost:
+                await self._after_lost_connection(compiled, False, lost)
+                raise
+
     async def explain(self, statement: Node, *, analyze: bool = False) -> list[dict[str, object]]:
         """The query plan (``EXPLAIN``) as rows of dicts, one per plan line.
 
@@ -186,7 +377,8 @@ class Session(QueryBuilder):
         if compiled.has_placeholders:
             raise QueryError("explain() does not take placeholders; inline the values instead")
         is_read = isinstance(statement, SelectBase | RelationalStatement)
-        if analyze and not is_read:
+        if analyze and (not is_read or compiled.writes):
+            # Plain selects only: analyze runs the statement, and a data-modifying CTE writes.
             raise QueryError("explain(analyze=True) runs the statement; only selects are allowed")
         options = "ANALYZE, " if analyze else ""
         explained = CompiledQuery(
@@ -197,8 +389,9 @@ class Session(QueryBuilder):
             compiled.locking,
             compiled.dynamic,
             compiled.opaque,
+            compiled.writes,
         )
-        return await self._call(explained, "dicts", is_read and not compiled.locking)
+        return await self._call(explained, "dicts", is_read and compiled.pure_read)
 
     async def refresh(self, view: type[View], *, concurrently: bool = False) -> None:
         """``REFRESH MATERIALIZED VIEW``. ``concurrently=True`` keeps the view readable
@@ -211,76 +404,6 @@ class Session(QueryBuilder):
             name[:0] = [Identifier(info.schema), "."]
         how = "CONCURRENTLY " if concurrently else ""
         await self.execute(Raw((f"REFRESH MATERIALIZED VIEW {how}", *name)))
-
-    async def copy_into(
-        self,
-        table: type[Table],
-        rows: Iterable[RowLike],
-        *,
-        columns: Sequence[ColumnBase] | None = None,
-    ) -> int:
-        """Bulk load ``rows`` with COPY, much faster than INSERT for many rows; returns
-        the row count. Rows are checked like ``insert().values()``. Every row must set
-        the same columns: ``columns`` (default: those the first row sets). Columns left
-        out get their database default. All rows or none are stored. Tables with
-        vector or tsvector columns are loaded with ``insert_many()`` instead."""
-        it = iter(rows)
-        first = next(it, None)
-        if first is None:
-            return 0
-        if columns is not None:
-            attrs = _copy_attrs(table, columns)
-        else:
-            attrs = tuple(prepare_row(table, as_mapping(first)))
-        if not attrs:
-            raise QueryError("copy_into() needs at least one column")
-        info = table.__table__
-        if any(_text_only(info.columns[a]) for a in attrs):
-            # asyncpg's COPY sends binary values; these types only have a text encoding.
-            return await self.insert_many(table, itertools.chain((first,), it))
-        names = [info.columns[a].db_name(self._casing) for a in attrs]
-        compiled = CompiledQuery(f"COPY {info.name} ({', '.join(names)}) FROM STDIN", (), ())
-        records = _copy_records(table, itertools.chain((first,), it), attrs)
-        with self._logged(compiled):
-            try:
-                async with self._connection() as conn:
-                    return await conn.copy_records(
-                        info.name, info.schema, names, records, self._timeout
-                    )
-            except DbConnectionError:
-                await self._after_lost_connection(compiled, False)
-                raise
-
-    async def copy_from(
-        self,
-        query: Node,  # a select or relational query, or raw sql(...)
-        output: CopyOutput,
-        *,
-        format: CopyFormat = "csv",
-        header: bool = False,
-    ) -> int:
-        """Export the rows of ``query`` with ``COPY (query) TO STDOUT`` into ``output``: a
-        file path, a binary file, or ``async def write(chunk: bytes)``. Returns the row
-        count. Lock-free selects read from a replica, like plain reads."""
-        compiled = self.compile(query)
-        if compiled.has_placeholders:
-            raise QueryError("copy_from() does not take placeholders")
-        read_only = isinstance(query, SelectBase | RelationalStatement) and not compiled.locking
-        with self._logged(compiled):
-            try:
-                async with self._connection(read_only) as conn:
-                    return await conn.copy_out(
-                        compiled.sql,
-                        compiled.params,
-                        output,
-                        format,
-                        header,
-                        self._timeout,
-                        session_safe=compiled.session_safe,
-                    )
-            except DbConnectionError:
-                await self._after_lost_connection(compiled, False)
-                raise
 
     @overload
     async def insert_many[T: Table](
@@ -327,6 +450,26 @@ class Session(QueryBuilder):
             raise QueryError(f"on_conflict must be an insert into {table.__name__}")
         if template.rows:
             raise QueryError("on_conflict must not have values(); pass the rows to insert_many()")
+        if self._conn is None:
+            return await self._insert_rows(template, table, rows, batch_size, returning)
+        # In a transaction, its hidden savepoint holds the statement lock from SAVEPOINT to
+        # RELEASE: a sibling task's statement (asyncio.gather) waits for it (R5-2).
+        self._check_savepoint_owner()
+        async with self._lock:
+            self._check_savepoint_owner()
+            session = self._view()
+            session._lock = asyncio.Lock()
+            session._owns_savepoints = False
+            return await session._insert_rows(template, table, rows, batch_size, returning)
+
+    async def _insert_rows[T: Table](
+        self,
+        template: Insert[T],
+        table: type[T],
+        rows: Iterable[RowLike],
+        batch_size: int | None,
+        returning: bool,
+    ) -> int | list[T]:
         count = 0
         inserted: list[T] = []
         async with self.transaction() as tx:
@@ -344,83 +487,21 @@ class Session(QueryBuilder):
                     count += await insert
         return inserted if returning else count
 
-    @overload
-    def listen(
-        self,
-        *channels: str,
-        reconnect: Literal[False] = False,
-        max_queue: int | None = None,
-        overflow: Overflow = "raise",
-        pooler_session_mode: bool = False,
-    ) -> AbstractAsyncContextManager[AsyncIterator[Notification]]: ...
-    @overload
-    def listen(
-        self,
-        *channels: str,
-        reconnect: Literal[True],
-        max_queue: int | None = None,
-        overflow: Overflow = "raise",
-        pooler_session_mode: bool = False,
-    ) -> AbstractAsyncContextManager[AsyncIterator[Notification | Reconnected]]: ...
-    def listen(
-        self,
-        *channels: str,
-        reconnect: bool = False,
-        max_queue: int | None = None,
-        overflow: Overflow = "raise",
-        pooler_session_mode: bool = False,
-    ) -> AbstractAsyncContextManager[AsyncIterator[Notification | Reconnected]]:
-        """Receive ``NOTIFY`` messages sent to ``channels``, on a pooled connection held
-        until the block exits::
+    async def ping(self, timeout: float = 5.0) -> bool:
+        """``True`` when the database answers a trivial query, ``False`` when it cannot be
+        reached or does not answer within ``timeout`` seconds. For readiness probes; runs
+        ``SELECT 1`` on the primary. A hung server returns False instead of raising or
+        waiting forever (C17)."""
+        try:
+            async with asyncio.timeout(timeout):
+                await self._call(CompiledQuery("SELECT 1", (), ()), "execute")
+        except (DbConnectionError, QueryTimeout, TimeoutError):
+            return False
+        return True
 
-            async with db.listen("orders") as events:
-                async for event in events:
-                    print(event.channel, event.payload)
-
-        If the connection is lost, iterating raises ``ConnectionError`` (notifications
-        sent meanwhile are missed). With ``reconnect=True`` it LISTENs again on a new
-        connection instead (retrying until the database is back) and yields a
-        ``Reconnected`` event first, so the gap is never silent.
-
-        ``max_queue`` bounds the notifications waiting to be read (default: no bound).
-        When it is reached, ``overflow="raise"`` makes iteration raise ``ListenerOverflow``
-        after the queued ones; ``"drop_oldest"`` discards the oldest and logs a warning;
-        ``"block"`` stops reading the connection until the consumer catches up, so
-        PostgreSQL holds the rest and nothing is lost (the queue can briefly exceed
-        ``max_queue`` by the notifications already in one network read).
-
-        Through a connection pooler, listen() raises ``DatabaseError``: PgBouncer in
-        transaction or statement mode drops notifications. Connect it directly to
-        PostgreSQL, or pass ``pooler_session_mode=True`` when the pooler runs in session
-        mode (listen() then checks that a test notification arrives)."""
-        if self._conn is not None:
-            raise QueryError("listen() needs its own connection; call it outside a transaction")
-        if not channels:
-            raise QueryError("listen() needs at least one channel")
-        if max_queue is not None and max_queue < 1:
-            raise QueryError("listen() needs max_queue >= 1")
-        driver = self._require_driver()
-
-        async def open_listener(stack: AsyncExitStack) -> AsyncIterator[Notification]:
-            conn = await stack.enter_async_context(driver.acquire())
-            return await stack.enter_async_context(
-                # The pooler check's test notification must not wait for a pooled
-                # connection: with pool_size=1 the listener holds the only one.
-                conn.listen(
-                    channels, max_queue, overflow, driver.notify_unpooled, pooler_session_mode
-                )
-            )
-
-        if reconnect:
-            return _reconnecting(_Relistener(open_listener, driver))
-        return _listening(open_listener)
-
-    async def notify(self, channel: str, payload: str = "") -> None:
-        """Send a notification to ``channel`` (``pg_notify``; the payload is a bind
-        parameter). Inside a transaction it is sent on commit."""
-        await self._call(
-            CompiledQuery("SELECT pg_notify($1, $2)", (channel, payload), (None, None)), "execute"
-        )
+    def pool_stats(self) -> PoolStats:
+        """Connection-pool counters for the primary pool (see ``PoolStats``)."""
+        return self._require_driver().stats()
 
     @property
     def primary(self) -> Session:
@@ -433,8 +514,21 @@ class Session(QueryBuilder):
     def with_timeout(self, seconds: float | None) -> Session:
         """This session with a different statement timeout (None: the pool default).
         A statement that runs longer is cancelled and raises ``QueryTimeout``."""
+        if not _timeout_ok(seconds):
+            raise QueryError("with_timeout() needs seconds > 0 or None")  # R4-6
         view = self._view()
         view._timeout = seconds
+        return view
+
+    def tag(self, **tags: object) -> Session:
+        """This session with key/values attached to every statement it runs (a request id,
+        a route, a user): they arrive on the ``logger`` QueryEvent and on tracer spans. The
+        original session is unchanged, and tags merge with any already set::
+
+            db.tag(request_id=rid).insert(Users).values(...)
+        """
+        view = self._view()
+        view._tags = {**self._tags, **tags}
         return view
 
     async def retry[R](
@@ -465,27 +559,146 @@ class Session(QueryBuilder):
 
     @asynccontextmanager
     async def transaction(
-        self, isolation: IsolationLevel | None = None, *, readonly: bool = False
+        self,
+        isolation: IsolationLevel | None = None,
+        *,
+        readonly: bool = False,
+        after_commit: Callable[[], Awaitable[None]] | None = None,
+        after_rollback: Callable[[], Awaitable[None]] | None = None,
     ) -> AsyncGenerator[Session]:
-        """Commit on success, roll back on error. Nested calls create savepoints."""
+        """Commit on success, roll back on error. Nested calls create savepoints.
+
+        ``after_commit`` runs only once the data is committed, and ``after_rollback`` after
+        a rollback, both outside the transaction: use them for side effects (send an email,
+        enqueue a job) that must not happen when the transaction did not commit.
+
+        Hook errors do not change what happened to the data:
+
+        - an ``after_commit`` hook that raises is re-raised as
+          :class:`AfterCommitError` naming it, because the write *did* commit and a caller
+          must not treat the failure as "nothing was saved" and retry;
+        - an ``after_rollback`` hook that raises does not replace the original error: the
+          original is re-raised, and the hook's error is attached as its context (or, when
+          the original already has a context, as a note on it).
+        """
+        if isolation is not None and isolation not in _ISOLATION_LEVELS:
+            raise QueryError(  # not a bare KeyError from the driver (R4-5)
+                f"unknown isolation level {isolation!r}; use one of {', '.join(_ISOLATION_LEVELS)}"
+            )
         if self._conn is not None:
             if isolation is not None or readonly:
                 raise QueryError("isolation and readonly apply to the outermost transaction only")
-            async with self._conn.transaction():
-                yield self
+            frame = _Frame(asyncio.current_task() if self._owns_savepoints else None)
+            savepoint = self._conn.transaction()
+            with self._transaction_span(isolation):
+                # SAVEPOINT, RELEASE and ROLLBACK TO run under the statement lock, so they
+                # never overlap another task's statement (C11).
+                self._check_savepoint_owner()
+                async with self._lock:
+                    self._check_savepoint_owner()
+                    await savepoint.__aenter__()
+                    self._tx.frames.append(frame)
+                error: BaseException | None = None
+                try:
+                    yield self
+                except BaseException as exc:
+                    error = exc
+                try:
+                    cancel = await self._end_savepoint(savepoint, frame, error)
+                except BaseException as original:
+                    # Savepoints released inside this one are undone with it: their
+                    # after_rollback hooks run now (B37); no after_commit hook ever does.
+                    hooks = [*frame.rollbacks, *([after_rollback] if after_rollback else [])]
+                    await _run_rollback_hooks(hooks, original)
+                    raise
+            # Released, not committed: its hooks run when the enclosing one ends (R2, B6).
+            parent = self._tx.frames[-1]
+            parent.commits += [*frame.commits, *([after_commit] if after_commit else [])]
+            parent.rollbacks += [*frame.rollbacks, *([after_rollback] if after_rollback else [])]
+            if cancel is not None:
+                raise cancel
             return
         driver = self._require_driver()
-        async with driver.acquire() as conn, conn.transaction(isolation, readonly):
-            tx = Session(
-                dialect=self._dialect,
-                driver=driver,
-                casing=self._casing,
-                logger=self._logger,
-                log_params=self._log_params,
-                connection=conn,
-            )
-            tx._timeout = self._timeout
-            yield tx
+        deferred: list[_Hook] = []
+        rollbacks: list[_Hook] = []
+        started = committing = done = False
+        with self._transaction_span(isolation):
+            try:
+                async with driver.acquire() as conn:
+                    tx = Session(
+                        dialect=self._dialect,
+                        driver=driver,
+                        casing=self._casing,
+                        logger=self._logger,
+                        log_params=self._log_params,
+                        slow_query_ms=self._slow_query_ms,
+                        tracer=self._tracer,
+                        tags=self._tags,
+                        connection=conn,
+                    )
+                    tx._timeout = self._timeout
+                    deferred = tx._tx.frames[0].commits
+                    rollbacks = tx._tx.frames[0].rollbacks
+                    block = conn.transaction(isolation, readonly)
+                    await block.__aenter__()
+                    started = True
+                    try:
+                        yield tx
+                    except BaseException as exc:
+                        # COMMIT / ROLLBACK under the statement lock: a sibling task's
+                        # statement may still be running (C11).
+                        async with tx._lock:
+                            tx._tx.closed = _ENDED
+                            if not await block.__aexit__(type(exc), exc, exc.__traceback__):
+                                raise
+                    else:
+                        async with tx._lock:
+                            # A task's savepoint is still open (or one was interrupted):
+                            # committing would keep rows it may yet undo (R4-1, R4-2).
+                            refused = tx._tx.closed or (
+                                _OPEN_SAVEPOINT if len(tx._tx.frames) > 1 else None
+                            )
+                            # From here on the transaction refuses statements: one sent
+                            # after COMMIT would run in autocommit on this connection, or
+                            # on a pooled connection someone else now uses (R3).
+                            tx._tx.closed = _ENDED
+                            if refused is not None:
+                                error = QueryError(refused)
+                                await block.__aexit__(QueryError, error, None)
+                                raise error
+                            committing = True
+                            await block.__aexit__(None, None, None)
+                    done = True
+            except BaseException as original:
+                if committing and not done and _commit_unknown(original):
+                    # Cancelled or disconnected while COMMIT was in flight: the server may
+                    # have committed or not, so neither hook list runs (R5).
+                    original.add_note(
+                        "COMMIT was interrupted: the transaction may or may not have been "
+                        "committed, so no after_commit or after_rollback hook ran"
+                    )
+                    raise
+                if done:
+                    # COMMIT succeeded; the error (a cancel, a timeout) came while the
+                    # connection was being released. The data is saved, so the commit hooks
+                    # run and the rollback hooks do not (B36). The error still propagates.
+                    if after_commit is not None:
+                        deferred.append(after_commit)
+                    try:
+                        await _run_commit_hooks(deferred)
+                    except AfterCommitError as hook_error:
+                        original.add_note(f"an after_commit hook also failed: {hook_error}")
+                    original.add_note("the transaction was committed before this error")
+                    raise
+                hooks = [*rollbacks, *([after_rollback] if after_rollback is not None else [])]
+                deferred.clear()
+                rollbacks.clear()
+                if started:  # BEGIN never ran (no connection): nothing was rolled back (C15)
+                    await _run_rollback_hooks(hooks, original)
+                raise
+        if after_commit is not None:
+            deferred.append(after_commit)
+        await _run_commit_hooks(deferred)
 
     @property
     def dialect(self) -> Dialect:
@@ -510,12 +723,18 @@ class Session(QueryBuilder):
             casing=self._casing,
             logger=self._logger,
             log_params=self._log_params,
+            slow_query_ms=self._slow_query_ms,
+            tracer=self._tracer,
+            tags=self._tags,
             connection=self._conn,
             replicas=self._replicas,
         )
-        # Shared, so a view of a transaction still runs one statement at a time.
+        # Shared, so a view of a transaction still runs one statement at a time, and so
+        # hooks registered through a view land in the transaction's queues (B3).
         view._lock = self._lock
+        view._tx = self._tx
         view._next_replica = self._next_replica
+        view._replica_down = self._replica_down
         view._use_primary = self._use_primary
         view._timeout = self._timeout
         return view
@@ -531,26 +750,103 @@ class Session(QueryBuilder):
         primary = self._require_driver()
         if not read_only or self._use_primary or not self._replicas:
             return primary.acquire()  # the common case: no extra wrapper
-        replica = self._replicas[next(self._next_replica) % len(self._replicas)]
-        return self._replica_connection(replica, primary)
+        now = time.monotonic()
+        for _ in self._replicas:
+            replica = self._replicas[next(self._next_replica) % len(self._replicas)]
+            if self._replica_down.get(replica, 0.0) <= now:
+                return self._replica_connection(replica, primary)
+        return primary.acquire()  # every replica is down
 
     @asynccontextmanager
     async def _locked(self, conn: Connection) -> AsyncGenerator[Connection]:
+        self._check_savepoint_owner()  # at once, not once the lock is free
         async with self._lock:
+            self._check_savepoint_owner()
             yield conn
+
+    async def _end_savepoint(
+        self,
+        savepoint: AbstractAsyncContextManager[None],
+        frame: _Frame,
+        error: BaseException | None,
+    ) -> asyncio.CancelledError | None:
+        """ROLLBACK TO (after ``error``, which is raised again) or RELEASE ``savepoint``,
+        under the statement lock. This runs even when the task is cancelled while waiting
+        for the lock, never left to the garbage collector (R6-2); that cancel is returned,
+        to raise once done."""
+        tx = self._tx
+        cancel: asyncio.CancelledError | None = None
+        while True:
+            try:
+                await self._lock.acquire()
+                break
+            except asyncio.CancelledError as exc:
+                cancel = exc
+        try:
+            if tx.frames[-1] is not frame:  # e.g. an async generator left one open inside
+                tx.closed = _OUT_OF_ORDER
+                error = error or QueryError(_OUT_OF_ORDER)
+            try:
+                if error is None:
+                    await savepoint.__aexit__(None, None, None)
+                elif not await savepoint.__aexit__(type(error), error, error.__traceback__):
+                    raise error
+            except asyncio.CancelledError as exc:
+                if exc is not error:  # it may or may not have ended (R4-1)
+                    tx.closed = _BROKEN
+                raise
+            finally:
+                # Removed only now: a task queued for the lock must not run in the
+                # enclosing transaction while this savepoint is still open.
+                if frame in tx.frames:
+                    del tx.frames[tx.frames.index(frame) :]
+        except BaseException:
+            if cancel is not None:
+                raise cancel  # noqa: B904 - the cancel wins; the error is its context
+            raise
+        finally:
+            self._lock.release()
+        return cancel
+
+    def _check_savepoint_owner(self) -> None:
+        """Refuse a statement that would land in another task's savepoint: a rollback of
+        that savepoint would undo it silently (C11). Refuse any statement once the
+        transaction has ended (R3)."""
+        tx = self._tx
+        if tx.closed is not None:
+            raise QueryError(tx.closed)
+        owner = tx.frames[-1].owner
+        if owner is not None and owner is not asyncio.current_task():
+            raise QueryError(_OTHER_TASK)
 
     @asynccontextmanager
     async def _replica_connection(
         self, replica: Driver, primary: Driver
     ) -> AsyncGenerator[Connection]:
         async with AsyncExitStack() as stack:
-            try:
-                conn = await stack.enter_async_context(replica.acquire())
-            except DbConnectionError:
-                # No statement ran yet, so the primary can take the read.
-                log.warning("mizzle: read replica unavailable; reading from the primary")
+            # A replica whose pool is all busy is healthy: this read goes to the primary
+            # without waiting acquire_timeout, and the replica is not marked down (R4-7).
+            conn: Connection | None = None
+            if not _busy(replica):
+                try:
+                    conn = await stack.enter_async_context(replica.acquire())
+                except DbConnectionError:
+                    if not _busy(replica):  # it filled up while we waited (R4-7)
+                        # No statement ran yet, so the primary can take the read. Reads
+                        # skip the replica for a while: a hung one made every read wait (R7).
+                        self._replica_down[replica] = time.monotonic() + _REPLICA_PAUSE
+                        log.warning(
+                            "mizzle: read replica unavailable; reading from the primary for %.0f s",
+                            _REPLICA_PAUSE,
+                        )
+            on_replica = conn is not None
+            if conn is None:
                 conn = await stack.enter_async_context(primary.acquire())
-            yield conn
+            try:
+                yield conn
+            except DbConnectionError as lost:
+                lost.on_replica = on_replica
+                raise
 
     @overload
     async def _call(
@@ -565,63 +861,95 @@ class Session(QueryBuilder):
     async def _call(
         self, query: CompiledQuery, kind: _CallKind, read_only: bool = False
     ) -> list[Row] | int | list[dict[str, object]]:
-        if self._logger is None:
+        if self._logger is None and self._slow_query_ms is None and self._tracer is None:
             try:
                 async with self._connection(read_only) as conn:
                     return await self._send(conn, query, kind)
-            except DbConnectionError:
-                if not await self._after_lost_connection(query, read_only):
+            except DbConnectionError as lost:
+                if not await self._after_lost_connection(query, read_only, lost):
                     raise
             return await self._retry_read(query, kind, read_only)
         with self._logged(query):
             try:
                 async with self._connection(read_only) as conn:
                     return await self._send(conn, query, kind)
-            except DbConnectionError:
-                if not await self._after_lost_connection(query, read_only):
+            except DbConnectionError as lost:
+                if not await self._after_lost_connection(query, read_only, lost):
                     raise
             return await self._retry_read(query, kind, read_only)
 
+    def _span(self, query: CompiledQuery) -> AbstractContextManager[object]:
+        if self._tracer is None:
+            return nullcontext()
+        return self._tracer.statement(
+            query.sql, query.params if self._log_params else None, self._tags
+        )
+
     @contextmanager
-    def _logged(self, query: CompiledQuery) -> Generator[None]:
-        """Pass a QueryEvent to the logger hook when the block ends."""
-        if self._logger is None:
+    def _transaction_span(self, isolation: IsolationLevel | None) -> Generator[None]:
+        if self._tracer is None:
             yield
             return
-        start = time.perf_counter()
-        error: BaseException | None = None
-        try:
+        with self._tracer.transaction(isolation):
             yield
-        except GeneratorExit:  # a stream the caller stopped early: not an error
-            raise
-        except BaseException as exc:
-            error = exc
-            raise
-        finally:
-            event = QueryEvent(
-                query.sql,
-                query.params if self._log_params else None,
-                (time.perf_counter() - start) * 1000,
-                error,
-            )
-            try:
-                self._logger(event)
-            except Exception:
-                log.exception("mizzle query logger raised")
 
-    async def _after_lost_connection(self, query: CompiledQuery, read_only: bool) -> bool:
+    @contextmanager
+    def _logged(
+        self, query: CompiledQuery, *, trace: bool = True, paused: list[float] | None = None
+    ) -> Generator[None]:
+        """Time the block; trace it, log slow queries and pass a QueryEvent to the logger.
+        ``paused`` holds seconds the block spent outside the database (a stream's caller)
+        that do not count (R10)."""
+        if self._logger is None and self._slow_query_ms is None and self._tracer is None:
+            yield
+            return
+        with self._span(query) if trace else nullcontext():
+            start = time.perf_counter()
+            error: BaseException | None = None
+            try:
+                yield
+            except GeneratorExit:  # a stream the caller stopped early: not an error
+                raise
+            except BaseException as exc:
+                error = exc
+                raise
+            finally:
+                duration_ms = (time.perf_counter() - start - sum(paused or ())) * 1000
+                if self._slow_query_ms is not None and duration_ms >= self._slow_query_ms:
+                    log.warning("mizzle: slow query (%.1f ms): %s", duration_ms, query.sql)
+                if self._logger is not None:
+                    event = QueryEvent(
+                        query.sql,
+                        query.params if self._log_params else None,
+                        duration_ms,
+                        error,
+                        self._tags,
+                    )
+                    try:
+                        self._logger(event)
+                    except Exception:
+                        log.exception("mizzle query logger raised")
+
+    async def _after_lost_connection(
+        self, query: CompiledQuery, read_only: bool, error: DbConnectionError
+    ) -> bool:
         """Handle a lost connection; return whether the statement may run again.
 
         The usual cause is a server restart, failover or idle timeout, which kills every
         pooled connection, so all of them are replaced. A plain read outside a transaction
-        can safely run again; writes and raw SQL never do, as they may have taken effect.
+        can safely run again; writes, raw SQL and func() calls never do, as they may have
+        taken effect.
+        A connection that could not be opened (too many connections) leaves the pool alone:
+        replacing healthy connections then only made it worse (C12).
         """
-        if self._conn is not None:
-            return False  # inside a transaction: the caller must retry the transaction
+        if self._conn is not None or not error.lost:
+            return False  # in a transaction the caller must retry the whole transaction
         for driver in (self._driver, *self._replicas):
             if driver is not None:
                 await driver.expire_connections()
-        return read_only and not query.raw
+        # A func() call may write, so it runs again only when it ran on a replica, which
+        # cannot write (R6).
+        return read_only and not query.raw and (not query.opaque or error.on_replica)
 
     async def _retry_read(
         self, query: CompiledQuery, kind: _CallKind, read_only: bool
@@ -642,81 +970,6 @@ class Session(QueryBuilder):
         return conn.fetch_dicts(query.sql, query.params, self._timeout)
 
 
-type _OpenListener = Callable[[AsyncExitStack], Awaitable[AsyncIterator[Notification]]]
-
-
-@asynccontextmanager
-async def _listening(open_listener: _OpenListener) -> AsyncGenerator[AsyncIterator[Notification]]:
-    async with AsyncExitStack() as stack:
-        yield await open_listener(stack)
-
-
-@asynccontextmanager
-async def _reconnecting(
-    listener: _Relistener,
-) -> AsyncGenerator[AsyncIterator[Notification | Reconnected]]:
-    try:
-        await listener.connect()  # the first connection's errors are raised as they are
-        yield listener
-    finally:
-        await listener.close()
-
-
-@final
-class _Relistener:
-    """The iterator ``listen(reconnect=True)`` yields. A class, not an async generator: a
-    timeout or cancellation while waiting must not end the iteration (a reconnect it
-    interrupts starts again on the next call)."""
-
-    __slots__ = ("_driver", "_events", "_open", "_stack")
-    _open: _OpenListener
-    _driver: Driver
-    _stack: AsyncExitStack | None
-    _events: AsyncIterator[Notification] | None
-
-    def __init__(self, open_listener: _OpenListener, driver: Driver) -> None:
-        self._open = open_listener
-        self._driver = driver
-        self._stack = None
-        self._events = None
-
-    async def connect(self) -> None:
-        stack = AsyncExitStack()
-        try:
-            self._events = await self._open(stack)
-        except BaseException:
-            await stack.aclose()
-            raise
-        self._stack = stack
-
-    async def close(self) -> None:
-        stack, self._stack, self._events = self._stack, None, None
-        if stack is not None:
-            await stack.aclose()
-
-    def __aiter__(self) -> Self:
-        return self
-
-    async def __anext__(self) -> Notification | Reconnected:
-        if self._events is not None:
-            try:
-                return await anext(self._events)
-            except DbConnectionError:
-                log.warning("mizzle: the listen() connection was lost; reconnecting")
-                await self.close()
-                await self._driver.expire_connections()  # like any lost connection
-        delay = 0.1
-        while True:
-            try:
-                await self.connect()
-            except DbConnectionError:
-                log.warning("mizzle: listen() could not reconnect; retrying in %gs", delay)
-                await asyncio.sleep(delay)
-                delay = min(delay * 2, 5.0)
-            else:
-                return Reconnected()
-
-
 def _insert_batches(
     table: type[Table],
     rows: Iterable[RowLike],
@@ -730,7 +983,7 @@ def _insert_batches(
     params = 0
     limit = MAX_PARAMS - reserved
     for row in rows:
-        values = prepare_row(table, as_mapping(row), allow_identity=allow_identity)
+        values = prepare_row(table, as_mapping(row, table), allow_identity=allow_identity)
         size = sum(not isinstance(v, Node) for v in values.values())  # SQL is not bound
         if batch and (params + size > limit or len(batch) == batch_size):
             yield tuple(batch)
@@ -741,59 +994,15 @@ def _insert_batches(
         yield tuple(batch)
 
 
-# Extension and text-search types: asyncpg has no binary codec for them, so COPY cannot
-# send them; copy_into() falls back to insert_many() for tables that use them.
-_TEXT_ONLY_TYPES = ("vector", "halfvec", "sparsevec", "tsvector", "tsquery")
-
-
-def _text_only(column: ColumnBase) -> bool:
-    base = column.sql_type.removesuffix("[]").split("(", 1)[0].strip()
-    return base in _TEXT_ONLY_TYPES
-
-
-def _copy_attrs(table: type[Table], columns: Sequence[ColumnBase]) -> tuple[str, ...]:
-    for column in columns:
-        if column.table is not table:
-            raise QueryError(f"{column.qualified_name} is not a column of {table.__name__}")
-    wanted = {column.attr for column in columns}
-    for attr, column in table.__table__.columns.items():
-        if column.required_on_insert and attr not in wanted:
-            raise QueryError(f"{column.qualified_name} is required")
-    return tuple(attr for attr in table.__table__.columns if attr in wanted)
-
-
-def _copy_records(
-    table: type[Table], rows: Iterable[RowLike], attrs: tuple[str, ...]
-) -> Iterator[tuple[object, ...]]:
-    """Check and encode each row while COPY sends them (rows are never all in memory)."""
-    columns = table.__table__.columns
-    for number, row in enumerate(rows):
-        given = as_mapping(row)
-        values = prepare_row(table, given)  # unknown columns, types, NOT NULL, defaults
-        if missing := [a for a in attrs if a not in values]:
-            raise QueryError(
-                f"copy_into() row {number} has no value for {', '.join(missing)}; "
-                "every row must set the same columns"
-            )
-        if extra := [a for a in given if a not in attrs]:
-            raise QueryError(
-                f"copy_into() row {number} sets {', '.join(extra)}, which the first row "
-                "(or columns=) does not"
-            )
-        record: list[object] = []
-        for attr in attrs:
-            value = values[attr]
-            if isinstance(value, Node):
-                raise QueryError("copy_into() cannot send SQL expressions; use insert()")
-            record.append(columns[attr].encode(value))
-        yield tuple(record)
-
-
 def dialect_for_url(url: str) -> Dialect:
-    scheme = url.split("://", 1)[0]
-    if scheme in ("postgresql", "postgres"):
+    scheme, sep, _ = url.partition("://")
+    if sep and scheme.lower() in ("postgresql", "postgres"):  # case-insensitive (RFC 3986)
         return PostgresDialect()
-    raise MizzleError(f"unsupported database URL scheme {scheme!r}")
+    # Never echo the URL: anything after the scheme may hold a password (R7-1).
+    shown = f" {scheme!r}" if sep and scheme.isalnum() and len(scheme) <= 20 else ""
+    raise MizzleError(
+        f"unsupported database URL{shown}: use postgresql://user:password@host:port/database"
+    )
 
 
 class Database(Session):
@@ -813,6 +1022,8 @@ class Database(Session):
         casing: Casing | None = None,
         logger: QueryLogger | None = None,
         log_params: bool = False,
+        slow_query_ms: float | None = None,
+        tracer: Tracer | None = None,
         driver: Driver | None = None,
     ) -> None:
         validate_tables(schema, casing)
@@ -823,6 +1034,8 @@ class Database(Session):
             casing=casing,
             logger=logger,
             log_params=log_params,
+            slow_query_ms=slow_query_ms,
+            tracer=tracer,
         )
 
     @classmethod
@@ -841,6 +1054,14 @@ class Database(Session):
         casing: Casing | None = None,
         logger: QueryLogger | None = None,
         log_params: bool = False,
+        slow_query_ms: float | None = None,
+        tracer: Tracer | None = None,
+        on_connect: Callable[[Connection], Awaitable[None]] | None = None,
+        server_settings: Mapping[str, str] | None = None,
+        connect_retries: int = 0,
+        connect_backoff: float = 0.5,
+        connect_timeout: float = 10.0,
+        acquire_timeout: float | None = 30.0,
     ) -> Self:
         """Open a pool to ``url`` and one to each read replica URL (same pool settings).
 
@@ -848,34 +1069,86 @@ class Database(Session):
         cancels statements that run longer (seconds; None: no limit).
         ``statement_cache_size=0`` is needed behind PgBouncer in transaction mode.
 
+        ``slow_query_ms`` logs a warning for statements that take at least that long.
+        ``tracer`` (see ``mizzle.tracing``) opens a span around each statement and
+        transaction. ``on_connect`` runs on each new connection (e.g. ``SET search_path`` or
+        session settings), and again after a connection is reset (see ``reset_connections``),
+        because a reset undoes what the hook set; ``server_settings`` sets PostgreSQL GUCs for
+        every connection. ``connect_retries`` (with ``connect_backoff`` seconds, doubling each
+        time) retries a failed connection, to survive a database that is not up yet.
+        ``connect_timeout`` limits how long opening one connection may take, and
+        ``acquire_timeout`` how long a query waits for a free pooled connection (None: no
+        limit); both raise ``ConnectionError``.
+
         ``reset_connections="auto"`` (the default) resets a connection's session state when
         it goes back to the pool only after a statement that may have changed it: raw
-        ``sql(...)``, a function named with ``func()``, ``listen()``, direct connection use.
+        ``sql(...)``, a function named with ``func()``, direct connection use.
         Skipping the reset after mizzle-built statements saves a round trip per query (2x on
         a real network). Use ``"always"`` if triggers or database functions change session
         settings themselves (``SET`` or ``set_config(..., false)`` without LOCAL, session
-        advisory locks, temp tables), because mizzle cannot see inside them."""
+        advisory locks, ``LISTEN``), because mizzle cannot see inside them; the reset then
+        (and the ``on_connect`` hook with it) runs on every release. The reset is ``RESET ALL``,
+        advisory unlock, ``UNLISTEN *``, ``CLOSE ALL`` and ``DISCARD TEMP``; ``PREPARE``d
+        statements survive it."""
+        # Checked here: asyncpg raises a bare ValueError, or hangs (R11).
+        rules = {
+            "pool_size >= 1": pool_size >= 1,
+            "0 <= pool_min_size <= pool_size": 0 <= pool_min_size <= pool_size,
+            "max_idle >= 0": max_idle >= 0,
+            "query_timeout > 0 or None": _timeout_ok(query_timeout),
+            "statement_cache_size >= 0": statement_cache_size >= 0,
+            "connect_retries >= 0": connect_retries >= 0,
+            "connect_backoff >= 0": connect_backoff >= 0,
+            "connect_timeout > 0": _timeout_ok(connect_timeout),
+            "acquire_timeout > 0 or None": _timeout_ok(acquire_timeout),
+        }
+        for rule, ok in rules.items():
+            if not ok:
+                raise QueryError(f"Database.connect() needs {rule}")
         dialect = dialect_for_url(url)
         for replica in replicas:
             if dialect_for_url(replica).name != dialect.name:
                 raise MizzleError("replica URLs must use the same database as the primary")
         db = cls(
-            dialect=dialect, schema=schema, casing=casing, logger=logger, log_params=log_params
+            dialect=dialect,
+            schema=schema,
+            casing=casing,
+            logger=logger,
+            log_params=log_params,
+            slow_query_ms=slow_query_ms,
+            tracer=tracer,
         )
         drivers: list[Driver] = []
         try:
-            for target in (url, *replicas):
-                drivers.append(
-                    await dialect.connect(
-                        target,
-                        pool_size=pool_size,
-                        pool_min_size=pool_min_size,
-                        max_idle=max_idle,
-                        query_timeout=query_timeout,
-                        statement_cache_size=statement_cache_size,
-                        reset_connections=reset_connections,
-                    )
-                )
+            for attempt in itertools.count():
+                try:
+                    for target in (url, *replicas):
+                        drivers.append(
+                            await dialect.connect(
+                                target,
+                                pool_size=pool_size,
+                                pool_min_size=pool_min_size,
+                                max_idle=max_idle,
+                                query_timeout=query_timeout,
+                                statement_cache_size=statement_cache_size,
+                                reset_connections=reset_connections,
+                                on_connect=on_connect,
+                                server_settings=server_settings,
+                                connect_timeout=connect_timeout,
+                                acquire_timeout=acquire_timeout,
+                            )
+                        )
+                except DbConnectionError as exc:
+                    for driver in drivers:
+                        await driver.close()
+                    drivers.clear()
+                    if attempt >= connect_retries or not exc.retryable:
+                        raise
+                    delay = connect_backoff * 2.0**attempt
+                    log.warning("mizzle: could not connect; retrying in %.1fs", delay)
+                    await asyncio.sleep(delay)
+                else:
+                    break
         except BaseException:
             for driver in drivers:
                 await driver.close()

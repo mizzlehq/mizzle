@@ -1,20 +1,29 @@
-"""Snapshots, diffs and SQL for grants, overloads, trigger kinds, moves, rebuilt columns,
+"""Snapshots, diffs and SQL for moves, rebuilt columns,
 identity options and long generated names (no database)."""
 
 import copy
+from pathlib import Path
 from typing import final, override
 
 import pytest
 
-from mizzle import Constraint, QueryBuilder, SchemaError, Table, View, function, grant, index, sql
-from mizzle import trigger as make_trigger
+from mizzle import (
+    Constraint,
+    QueryError,
+    SchemaError,
+    Table,
+    index,
+    make_interval,
+    sql,
+)
 from mizzle.core.errors import MigrationError
 from mizzle.core.snapshot import Snapshot, empty_snapshot
 from mizzle.dialects.postgres import PostgresDialect
-from mizzle.dialects.postgres.ddl import _without_defaults
+from mizzle.kit.cli import main
 from mizzle.kit.diff import StrictRenames, diff, no_renames
 from mizzle.kit.snapshot import build_snapshot
-from mizzle.pg import integer, text
+from mizzle.pg import bit, integer, text
+from mizzle.studio.ddl import build_steps, statement_rows
 
 dialect = PostgresDialect()
 
@@ -44,136 +53,6 @@ def test_long_generated_names_never_collide_and_are_stable() -> None:
     assert all(n.endswith(("_key", "_pkey")) for n in names)
     again = build_snapshot([table(a), table(b)], dialect)
     assert diff(snap, again) == []  # stable
-
-
-def test_grants() -> None:
-    @final
-    class Docs(Table, name="docs"):
-        id = integer()
-
-        @classmethod
-        @override
-        def config(cls) -> list[Constraint]:
-            return [
-                grant(["select", "insert"], to=["reader", "public"]),
-                grant("all", to=["admin"]),
-            ]
-
-    snap = build_snapshot([Docs], dialect)
-    assert snap["tables"]["public.docs"].get("grants") == {
-        "reader": ["insert", "select"],
-        "public": ["insert", "select"],
-        "admin": ["all"],
-    }
-    assert sqls(empty_snapshot("postgresql"), snap)[1:] == [
-        'GRANT ALL ON "docs" TO "admin"',
-        'GRANT INSERT, SELECT ON "docs" TO PUBLIC',
-        'GRANT INSERT, SELECT ON "docs" TO "reader"',
-    ]
-    fewer = copy.deepcopy(snap)
-    fewer["tables"]["public.docs"]["grants"] = {"reader": ["select"]}
-    assert sqls(snap, fewer) == [
-        'REVOKE ALL ON "docs" FROM "admin"',
-        'REVOKE INSERT, SELECT ON "docs" FROM PUBLIC',
-        'REVOKE INSERT ON "docs" FROM "reader"',
-    ]
-    # Against a live database (push), roles the schema does not name are left alone.
-    assert diff(snap, fewer, compare_expressions=False) != []
-    assert all(s.role == "reader" for s in diff(snap, fewer, compare_expressions=False))  # pyright: ignore[reportAttributeAccessIssue]
-    with pytest.raises(SchemaError, match="unknown privileges"):
-        grant(["read"], to=["x"])  # pyright: ignore[reportArgumentType]
-
-
-def test_function_overloads_and_options() -> None:
-    one = function("f", returns="integer", language="sql", args="a integer", body="RETURN a")
-    two = function(
-        "f",
-        returns="integer",
-        language="sql",
-        args="a integer, b integer DEFAULT 1",
-        body="SELECT a + b",
-        strict=True,
-        leakproof=True,
-        parallel="safe",
-        cost=3,
-        settings={"search_path": "public, pg_temp"},
-    )
-
-    @final
-    class T(Table, name="t"):
-        id = integer()
-
-    snap = build_snapshot([T], dialect, objects=[one, two])
-    assert list(snap.get("functions", {})) == [
-        "public.f(a integer)",
-        "public.f(a integer, b integer DEFAULT 1)",
-    ]
-    statements = sqls(empty_snapshot("postgresql"), snap)
-    assert 'FUNCTION "f"(a integer) RETURNS integer LANGUAGE sql\nRETURN a' in statements[1]
-    assert (
-        "LANGUAGE sql STRICT LEAKPROOF PARALLEL SAFE COST 3 SET search_path = public, pg_temp "
-        "AS $mizzle$SELECT a + b$mizzle$"
-    ) in statements[2]
-    only_two = build_snapshot([T], dialect, objects=[two])
-    assert sqls(snap, only_two) == ['DROP FUNCTION "f"(a integer)']
-    assert _without_defaults("a integer, b text DEFAULT 'x, y', c int[] DEFAULT '{1,2}'") == (
-        "a integer, b text, c int[]"
-    )
-    # Snapshots written before overloads were keyed "schema.name": nothing changes.
-    old = copy.deepcopy(only_two)
-    old["functions"] = {"public.f": next(iter(only_two.get("functions", {}).values()))}
-    assert diff(old, only_two) == []
-
-
-@final
-class Items(Table, name="items"):
-    id = integer()
-    name = text()
-    price = integer()
-
-
-@final
-class Names(View, name="names"):
-    id = integer()
-
-    @classmethod
-    @override
-    def query(cls, db: QueryBuilder):
-        return db.select(Items.id).from_(Items)
-
-
-fn = function("t", returns="trigger", body="BEGIN RETURN NEW; END")
-
-
-def test_trigger_kinds() -> None:
-    triggers = [
-        make_trigger(
-            "upd", on=Items, execute=fn, events=["update"], update_of=[Items.price, Items.name]
-        ),
-        make_trigger(
-            "log",
-            on=Items,
-            execute=fn,
-            timing="after",
-            events=["insert"],
-            for_each="statement",
-            new_table="added",
-        ),
-        make_trigger("ins", on=Names, execute=fn, timing="instead of", events=["insert"]),
-    ]
-    snap = build_snapshot([Items, Names], dialect, objects=triggers)
-    statements = sqls(empty_snapshot("postgresql"), snap)
-    assert 'BEFORE UPDATE OF "name", "price" ON "items" FOR EACH ROW' in "\n".join(statements)
-    assert 'AFTER INSERT ON "items" REFERENCING NEW TABLE AS "added" FOR EACH STATEMENT' in (
-        "\n".join(statements)
-    )
-    assert 'INSTEAD OF INSERT ON "names" FOR EACH ROW' in "\n".join(statements)
-    with pytest.raises(SchemaError, match="INSTEAD OF"):
-        build_snapshot(
-            [Items], dialect, objects=[make_trigger("x", on=Items, execute=fn, timing="instead of")]
-        )
-    with pytest.raises(SchemaError, match="update_of"):
-        make_trigger("x", on=Items, execute=fn, events=["insert"], update_of=[Items.price])
 
 
 def test_table_moves_use_the_rename_resolver() -> None:
@@ -286,47 +165,6 @@ def test_identity_options() -> None:
     assert default_id.get("identity") == {"always": True, "start": 1, "increment": 1}
 
 
-def test_renamed_column_used_by_a_trigger_changes_type() -> None:
-    """Found by fuzzing: the old snapshot names the column as before the rename, and the
-    trigger (UPDATE OF it) must still be dropped before its type changes."""
-
-    def items(name: str, sql_type: str) -> type[Table]:
-        column = integer() if sql_type == "integer" else text()
-        return type("I", (Table,), {name: column, "__module__": __name__}, name="items")
-
-    old_t, new_t = items("price", "integer"), items("cost", "text")
-    old = build_snapshot(
-        [old_t],
-        dialect,
-        objects=[
-            make_trigger(
-                "t",
-                on=old_t,
-                execute=fn,
-                events=["update"],
-                update_of=[old_t.__table__.columns["price"]],
-            )
-        ],
-    )
-    new = build_snapshot(
-        [new_t],
-        dialect,
-        objects=[
-            make_trigger(
-                "t",
-                on=new_t,
-                execute=fn,
-                events=["update"],
-                update_of=[new_t.__table__.columns["cost"]],
-            )
-        ],
-    )
-    steps = [s.describe() for s in diff(old, new, StrictRenames({"items.price": "cost"}))]
-    assert steps.index("drop trigger t on items") < steps.index(
-        "change type of items.cost from integer to text"
-    )
-
-
 def test_table_dropped_before_one_reusing_its_index_names() -> None:
     """Found by fuzzing: a rename without the resolver (--no-renames) creates the new table
     with the old one's index name, so the old table must be gone first."""
@@ -360,6 +198,11 @@ def test_table_dropped_before_one_reusing_its_index_names() -> None:
         ("real", "double precision", True),
         ("text[]", "text[]", True),
         ("character varying(10)[]", "text[]", True),
+        ("character(4)", "character(8)", True),
+        ("character(4)", "text", True),
+        ("character", "character(8)", True),
+        ("character(8)", "character(4)", False),
+        ("character(4)", "character varying(8)", False),
         ("character varying(64)", "character varying(40)", False),
         ("text", "character varying(40)", False),
         ("numeric(10,2)", "numeric(12,3)", False),
@@ -412,3 +255,270 @@ def test_keyword_default_in_an_older_snapshot_is_not_a_change() -> None:
     assert diff(new, old) == []
     old_columns["actor"]["default"] = "session_user"  # a real change still is one
     assert [s.describe() for s in diff(old, new)] == ["change default of audit_log.actor"]
+
+
+# -- domains -------------------------------------------------------------------------------
+
+
+# -- partitions ----------------------------------------------------------------------------
+
+
+# -- composite types -----------------------------------------------------------------------
+
+
+# -- studio DDL (allow-listed) -------------------------------------------------------------
+
+
+def test_studio_ddl_renders_only_allow_listed_operations() -> None:
+    steps = build_steps(
+        dialect,
+        {
+            "operation": "create_table",
+            "schema": "public",
+            "name": "notes",
+            "columns": [
+                {"name": "id", "type": "integer", "primary_key": True},
+                {"name": "title", "type": "character varying(80)", "not_null": True},
+                {"name": "created_at", "type": "timestamp with time zone", "default": "now()"},
+            ],
+        },
+    )
+    assert statement_rows(dialect, steps) == [
+        {
+            "sql": (
+                'CREATE TABLE "public"."notes" (\n'
+                '    "id" integer,\n'
+                '    "title" character varying(80) NOT NULL,\n'
+                '    "created_at" timestamp with time zone DEFAULT now(),\n'
+                '    CONSTRAINT "notes_pkey" PRIMARY KEY ("id")\n'
+                ")"
+            ),
+            "description": "create table notes",
+            "data_loss": False,
+        }
+    ]
+
+    for bad in (  # only these five operations, and only safe shapes
+        {"operation": "drop_database", "name": "x"},
+        {"operation": "create_table", "name": "x", "columns": []},
+        {
+            "operation": "create_table",
+            "name": "x",
+            "columns": [{"name": "c", "type": "text; drop"}],
+        },
+        {
+            "operation": "create_table",
+            "name": "x",
+            "columns": [{"name": "c", "type": "text", "default": "0; drop table users"}],
+        },
+        {"operation": "create_table", "name": "x", "columns": [{"name": "c; --", "type": "text"}]},
+        {
+            "operation": "create_table",
+            "name": "x",
+            "columns": [{"name": "c", "type": "int references users(id)"}],
+        },
+    ):
+        with pytest.raises(SchemaError):
+            build_steps(dialect, bad)
+
+
+def test_studio_ddl_changes_an_existing_table() -> None:
+    @final
+    class Notes(Table, name="notes"):
+        id = integer().primary_key()
+        title = text()
+
+    current = build_snapshot([Notes], dialect)["tables"]["public.notes"]
+    assert current is not None
+
+    add = build_steps(
+        dialect,
+        {
+            "operation": "add_column",
+            "schema": "public",
+            "table": "notes",
+            "name": "body",
+            "column": {"name": "body", "type": "text", "not_null": True},
+        },
+        current,
+    )
+    assert (
+        statement_rows(dialect, add)[0]["sql"]
+        == 'ALTER TABLE "public"."notes" ADD COLUMN "body" text NOT NULL'
+    )
+
+    altered = build_steps(
+        dialect,
+        {
+            "operation": "alter_column",
+            "schema": "public",
+            "table": "notes",
+            "name": "title",
+            "type": "character varying(50)",
+            "default": "'x'::text",
+        },
+        current,
+    )
+    assert [s.describe() for s in altered] == [
+        "change type of notes.title from text to character varying(50)",
+        "change default of notes.title",
+    ]
+    assert statement_rows(dialect, altered)[1]["sql"] == (
+        'ALTER TABLE "public"."notes" ALTER COLUMN "title" SET DEFAULT \'x\'::text'
+    )
+
+    drop = build_steps(
+        dialect,
+        {"operation": "drop_column", "schema": "public", "table": "notes", "name": "title"},
+        current,
+    )
+    assert [s.describe() for s in drop] == ["drop column notes.title"]
+
+    with pytest.raises(SchemaError, match="nothing to change"):
+        build_steps(
+            dialect,
+            {
+                "operation": "alter_column",
+                "schema": "public",
+                "table": "notes",
+                "name": "title",
+                "type": current["columns"]["title"]["type"],
+            },
+            current,
+        )
+    with pytest.raises(SchemaError, match="does not exist"):
+        build_steps(
+            dialect,
+            {"operation": "drop_column", "schema": "public", "table": "notes", "name": "nope"},
+            current,
+        )
+
+
+# -- ISSUES.md fixes: injection, drift and ordering ---------------------------------------
+
+
+def test_storage_options_cannot_break_out_of_the_with_clause() -> None:
+    @final
+    class Widget(Table, name="widget", storage={"fillfactor": "70); DROP TABLE victim; --"}):
+        id = integer().primary_key()
+
+    sql = sqls(empty_snapshot("postgresql"), build_snapshot([Widget], dialect))[0]
+    assert "WITH (fillfactor='70); DROP TABLE victim; --')" in sql
+
+    @final
+    class Bad(Table, name="bad", storage={"fillfactor; DROP TABLE victim; --": 70}):
+        id = integer().primary_key()
+
+    with pytest.raises(SchemaError, match="storage parameter"):
+        sqls(empty_snapshot("postgresql"), build_snapshot([Bad], dialect))
+
+
+def test_make_interval_rejects_values_that_are_not_numbers() -> None:
+    assert make_interval(days=7) is not None
+    with pytest.raises(QueryError, match="must be an int"):
+        make_interval(days="7")  # pyright: ignore[reportArgumentType]
+    with pytest.raises(QueryError, match="must be a number"):
+        make_interval(secs="0.5")  # pyright: ignore[reportArgumentType]
+
+
+def test_initially_deferred_implies_deferrable() -> None:
+    @final
+    class Order(Table, name="order"):
+        id = integer().primary_key(initially_deferred=True)
+        code = text().unique(initially_deferred=True)
+
+    table = build_snapshot([Order], dialect)["tables"]["public.order"]
+    pk = table["primary_key"]
+    assert pk is not None and pk.get("deferrable")
+    assert table["uniques"]["order_code_key"].get("deferrable")
+
+
+def test_changing_a_collated_column_keeps_the_collation() -> None:
+    @final
+    class Item(Table, name="item"):
+        code = text().collate("C")
+
+    before = build_snapshot([Item], dialect)
+    after = copy.deepcopy(before)
+    after["tables"]["public.item"]["columns"]["code"]["type"] = "character varying(20)"
+    statements = dialect.render(diff(before, after))
+    assert statements[0].sql == (
+        'ALTER TABLE "item" ALTER COLUMN "code" SET DATA TYPE character varying(20) '
+        'COLLATE "C" USING "code"::character varying(20)'
+    )
+
+
+def test_storage_option_keys_and_bools_are_normalized() -> None:
+    @final
+    class Cache(Table, name="cache", storage={"FillFactor": 70, "autovacuum_enabled": False}):
+        id = integer().primary_key()
+
+    options = build_snapshot([Cache], dialect)["tables"]["public.cache"].get("options")
+    assert options == {"fillfactor": "70", "autovacuum_enabled": "false"}
+
+
+def test_bit_without_a_length_is_bit_one() -> None:
+    assert bit().sql_type == "bit(1)"
+    assert bit(4).sql_type == "bit(4)"
+
+
+def test_typegen_help_mentions_row_types(capsys: pytest.CaptureFixture[str]) -> None:
+    # D2: typegen also writes the <Table>Row TypedDicts.
+    with pytest.raises(SystemExit):
+        main(["--help"])
+    assert "write row/insert/update TypedDicts" in capsys.readouterr().out
+
+
+def test_a_squash_is_adopted_only_for_a_whole_history() -> None:
+    # B57: only the last replaced name was checked, so a database with a gap was adopted.
+    from mizzle.kit.migrate import history_complete
+
+    names = ["0001_a", "0002_b", "0003_c"]
+    assert history_complete(names, dict.fromkeys(names, ""))
+    assert not history_complete(names, dict.fromkeys(["0001_a", "0003_c"], ""))
+    # An earlier squash stands for the names before it: either history counts.
+    twice = ["0001_a", "0002_b", "0001_squash", "0003_d"]
+    assert history_complete(twice, dict.fromkeys(["0001_squash", "0003_d"], ""))
+    assert history_complete(twice, dict.fromkeys(["0001_a", "0002_b", "0003_d"], ""))
+    assert not history_complete(twice, dict.fromkeys(["0001_a", "0003_d"], ""))
+
+
+def test_a_journal_entry_cannot_name_a_folder_outside_migrations(tmp_path: Path) -> None:
+    # squash and drop delete root / name: "../victim" would reach outside migrations/.
+    import json
+
+    from mizzle.core.errors import MigrationError
+    from mizzle.kit.journal import MigrationsDir
+
+    (tmp_path / "victim").mkdir()
+    meta = tmp_path / "migrations" / "meta"
+    meta.mkdir(parents=True)
+    entry = {"index": 1, "name": "../victim", "hash": "x", "created_at": "2026-01-01"}
+    journal = {"version": 1, "dialect": "postgresql", "entries": [entry]}
+    (meta / "journal.json").write_text(json.dumps(journal))
+    with pytest.raises(MigrationError, match="malformed journal entry"):
+        MigrationsDir(tmp_path / "migrations", "postgresql").clear()
+    assert (tmp_path / "victim").is_dir()
+
+
+def test_schema_objects_in_a_list_or_tuple_are_collected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # D4: `roles = [role("a"), ...]` must not be ignored.
+    import sys
+
+    from mizzle import role
+    from mizzle.kit.config import Config
+
+    module = "d4_schema_objects"
+    (tmp_path / f"{module}.py").write_text(
+        "from mizzle import role\n"
+        'roles = [role("d4_a"), role("d4_b")]\n'
+        'more = (role("d4_c"),)\n'
+        'single = role("d4_a")\n'
+        'unrelated = [1, "x"]\n'
+    )
+    monkeypatch.syspath_prepend(tmp_path)
+    monkeypatch.delitem(sys.modules, module, raising=False)
+    config = Config(root=tmp_path, schema=[module], out=tmp_path / "migrations")
+    assert config.load_objects() == [role("d4_a"), role("d4_b"), role("d4_c")]

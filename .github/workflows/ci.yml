@@ -14,8 +14,8 @@ jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v6
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e  # v6
       - run: uv sync --python 3.12
       - run: uv run ruff check
       - run: uv run ruff format --check
@@ -24,6 +24,12 @@ jobs:
       - run: uv run basedpyright --pythonversion 3.14
       - run: uv run mypy --python-version 3.14
       - run: uv run --group docs zensical build --strict --clean && uv run python scripts/llms_full.py  # Read the Docs
+      # Fail when pyproject and uv.lock disagree, and when a dependency has a known advisory.
+      - run: uv lock --check
+      - name: Audit dependencies
+        run: |
+          uv export --no-emit-project --format requirements-txt --no-hashes --output-file requirements-audit.txt
+          uvx pip-audit --requirement requirements-audit.txt
 
   ui:
     runs-on: ubuntu-latest
@@ -31,11 +37,11 @@ jobs:
       run:
         working-directory: studio-ui
     steps:
-      - uses: actions/checkout@v4
-      - uses: pnpm/action-setup@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1  # v4
         with:
           package_json_file: studio-ui/package.json
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4
         with:
           node-version: 24
           cache: pnpm
@@ -43,6 +49,9 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - run: pnpm run ci  # Biome; bare `pnpm ci` is pnpm's own clean-install command
       - run: pnpm build
+      # pip-audit covers Python only; the UI's own dependencies need their own audit.
+      - name: Audit UI dependencies
+        run: pnpm audit --prod --audit-level high
 
   studio-assets:
     # The Studio UI zip is unpacked by mizzle on every OS: prove it on each one.
@@ -52,8 +61,8 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v6
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e  # v6
       - run: uv sync --python 3.12
       - run: uv run pytest tests/unit/test_studio_assets.py -v
 
@@ -82,13 +91,13 @@ jobs:
     env:
       MIZZLE_TEST_URL: postgresql://mizzle:mizzle@localhost:5432/mizzle
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v6
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e  # v6
       - run: uv sync --python ${{ matrix.python }}
       - run: uv run pytest --cov --cov-report=term-missing --cov-report=xml
       - name: Upload coverage (one matrix cell)
         if: matrix.python == '3.14' && matrix.postgres == '18'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
         with:
           name: coverage-xml
           path: coverage.xml
@@ -112,8 +121,8 @@ jobs:
       # pgvector (test_vector.py)
       MIZZLE_VECTOR_URL: postgresql://mizzle:mizzle@localhost:54335/mizzle
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v6
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e  # v6
       - run: uv sync --python 3.14
       - run: docker compose -f tests/infra/compose.yml up -d --wait
       - run: uv run pytest tests/integration/test_infra.py tests/integration/test_infra_io.py tests/integration/test_production_env.py tests/integration/test_vector.py -v
@@ -132,13 +141,35 @@ jobs:
       - if: failure()
         run: docker compose -f tests/infra/compose.yml logs
 
+  benchmark:
+    # A relative gate (mizzle vs asyncpg, same machine) so there is no absolute baseline to
+    # rot. See benchmarks/regression.py and benchmarks/bench.py for the full comparison table.
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_USER: mizzle
+          POSTGRES_PASSWORD: mizzle
+          POSTGRES_DB: mizzle
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd pg_isready --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      MIZZLE_TEST_URL: postgresql://mizzle:mizzle@localhost:5432/mizzle
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e  # v6
+      - run: uv sync --python 3.12
+      - run: uv run python benchmarks/regression.py
+
   package:
     # The release workflow only builds at tag time. Build and install the wheel here so a
     # broken build system, a missing file or a bad entry point fails on the PR, not on tag.
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v6
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e  # v6
       - run: uv build --out-dir dist
       - name: Install the wheel into a clean environment and import it
         run: |
@@ -147,7 +178,7 @@ jobs:
           ./smoke/bin/python -c "import mizzle; print('mizzle', mizzle.__version__)"
           ./smoke/bin/mizzle --help >/dev/null
       - name: Attach the built distributions
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
         with:
           name: dist
           path: dist/
