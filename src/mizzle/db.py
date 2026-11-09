@@ -417,7 +417,10 @@ class Session(QueryBuilder):
         """``NOTIFY channel``: a ``str`` payload is sent as it is, anything else as JSON. In
         a transaction it is delivered when the transaction commits, and not at all if it
         rolls back."""
+        _check_channel(channel)
         if isinstance(payload, str):
+            if len(payload.encode()) >= _MAX_PAYLOAD:
+                raise QueryError(f"a NOTIFY payload must be under {_MAX_PAYLOAD} bytes")
             await self.execute(sql_raw("SELECT pg_catalog.pg_notify({}, {})", channel, payload))
         else:  # the jsonb codec writes it (exact Decimals); jsonb prints it compactly
             await self.execute(
@@ -1133,6 +1136,17 @@ def _copy_records(
         yield tuple(record)
 
 
+# PostgreSQL's limits: a channel is an identifier (63 bytes, longer ones were cut short by
+# LISTEN but refused by pg_notify), and a payload is under 8000 bytes.
+_MAX_CHANNEL = 63
+_MAX_PAYLOAD = 8000
+
+
+def _check_channel(channel: str) -> None:
+    if not channel or len(channel.encode()) > _MAX_CHANNEL:
+        raise QueryError(f"a channel name must be 1 to {_MAX_CHANNEL} bytes, got {channel!r}")
+
+
 def _payload(text: str) -> str:
     return text
 
@@ -1343,6 +1357,8 @@ class Database(Session):
         the pooler."""
         if not channels:
             raise QueryError("listen() needs at least one channel")
+        for channel in channels:
+            _check_channel(channel)
         if max_queue < 1 or not _timeout_ok(keepalive):
             raise QueryError("listen() needs max_queue >= 1 and keepalive > 0")
         return self._require_driver().listen(

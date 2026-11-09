@@ -180,3 +180,16 @@ async def test_listen_misuse(db: Database) -> None:
         db.listen("x", max_queue=0)
     with pytest.raises(QueryError, match="keepalive"):
         db.listen("x", keepalive=0)
+
+
+async def test_channel_names_and_payload_sizes_are_checked(db: Database) -> None:
+    # H13-1..3: a 70-byte channel was cut to 63 by LISTEN but refused by pg_notify with a
+    # hidden message; an 8000-byte payload too; an empty name raised a raw driver error.
+    for bad in ("", "c" * 64, "é" * 32):
+        with pytest.raises(QueryError, match="1 to 63 bytes"):
+            db.listen(bad)
+        with pytest.raises(QueryError, match="1 to 63 bytes"):
+            await db.notify(bad)
+    with pytest.raises(QueryError, match="under 8000 bytes"):
+        await db.notify("big", "x" * 8000)
+    await db.notify("c" * 63, "x" * 7999)  # the limits themselves are fine

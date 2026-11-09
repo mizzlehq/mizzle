@@ -860,6 +860,12 @@ class _Listener[T]:
             conn.add_termination_listener(self._on_lost)
             if await _behind_pooler(conn):
                 await self._check_delivery(conn)
+        except MizzleError:
+            conn.terminate()
+            raise
+        except Exception as exc:
+            conn.terminate()
+            raise _translate(exc, "LISTEN") from None
         except BaseException:
             conn.terminate()
             raise
