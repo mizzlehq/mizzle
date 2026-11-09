@@ -46,8 +46,10 @@ db = await Database.connect(url, reset_connections="always")
 ## Schemas other roles can write to
 
 mizzle's own SQL (studio, migrations, introspection) calls PostgreSQL's built-in functions
-as `pg_catalog.<name>`, so a function another role creates in `public` cannot stand in for
-them. Your queries, and the asyncpg driver's own type lookups, use the search path as
+and operators as `pg_catalog.<name>`, so a function or operator another role creates in
+`public` cannot stand in for them. Studio compares a column (row keys, grid filters) with
+the operator of its type's default btree operator class, named with its schema, so an
+operator planted for a `varchar`, enum or domain column is not used either. Your queries, and the asyncpg driver's own type lookups, use the search path as
 written. Do not let untrusted roles create objects in a schema on the app's or the
 migrator's search path: this is the default from PostgreSQL 15; on older servers run
 `REVOKE CREATE ON SCHEMA public FROM PUBLIC`.

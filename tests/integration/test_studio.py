@@ -2013,3 +2013,90 @@ def test_a_type_name_with_brackets_is_cast_to_itself(client: TestClient) -> None
     added = client.post(rows, json={"values": values}, headers=AUTH)
     assert added.status_code == 201, added.text
     assert _query(client, "select e::text, es::text from st_qt") == [["x", "{x}"]]
+
+
+EVE = "mizzle_studio_eve"
+
+
+def test_key_and_filter_operators_cannot_be_planted(client: TestClient) -> None:
+    # S9-1: keys and filters used a bare = (and < ...). varchar has no = of its own (text's
+    # serves it) and an enum uses anyenum's, so a non-superuser's exact-type public = won,
+    # and its function ran as the Studio user on every update, delete and filter.
+    _sql(
+        client,
+        f"DO $$ BEGIN CREATE ROLE {EVE}; EXCEPTION WHEN duplicate_object THEN NULL; END $$; "
+        f"drop owned by {EVE}; grant usage, create on schema public to {EVE}; "
+        "drop table if exists st_opv, st_ope; drop type if exists st_mood; "
+        "create type st_mood as enum ('sad', 'ok', 'happy'); "
+        "create table st_opv (k varchar(10) primary key, n int); "
+        "create table st_ope (k st_mood primary key, n int); "
+        "insert into st_opv values ('a', 1), ('b', 2), ('c', 3); "
+        "insert into st_ope values ('sad', 1), ('ok', 2), ('happy', 3)",
+    )
+    plant = [f"set role {EVE}"]
+    for t in ("varchar", "public.st_mood"):
+        name = t.removeprefix("public.")
+        plant.append(
+            f"create function public.st_evil_{name}({t}, {t}) returns bool language plpgsql "
+            "as $$ begin raise exception 'planted operator ran'; end $$"
+        )
+        plant += [
+            f"create operator public.{op} (leftarg = {t}, rightarg = {t}, "
+            f"function = public.st_evil_{name})"
+            for op in ("=", "<>", "<", ">=")
+        ]
+    _sql(client, "; ".join([*plant, "reset role"]))
+    try:
+        for table, keys in (("st_opv", ("a", "b", "c")), ("st_ope", ("sad", "ok", "happy"))):
+            rows = f"/api/tables/public/{table}/rows"
+            for op, want in (("eq", [1]), ("ne", [2, 3]), ("lt", []), ("gte", [1, 2, 3])):
+                filters = json.dumps([{"column": "k", "op": op, "value": keys[0]}])
+                got = _rows(client, table, filters=filters, order="n")
+                assert [r["n"] for r in got] == want, (table, op)
+            body = {"key": {"k": keys[1]}, "values": {"n": 20}}
+            changed = client.patch(rows, json=body, headers=AUTH)
+            assert changed.status_code == 200, changed.text
+            assert changed.json()["row"]["n"] == 20
+            gone = client.request("DELETE", rows, json={"keys": [{"k": keys[2]}]}, headers=AUTH)
+            assert gone.json() == {"deleted": 1}, gone.text
+    finally:
+        _sql(client, f"drop owned by {EVE}; drop table st_opv, st_ope; drop type st_mood")
+
+
+def test_key_lookups_keep_the_index_and_the_type_semantics(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # S9-1: the key's operator is its type's btree opclass one, so the primary key index
+    # serves an update by key, citext stays case-blind and numeric 1.0 matches 1.00.
+    _sql(
+        client,
+        "create extension if not exists citext; drop table if exists st_big, st_ci, st_onum; "
+        "create table st_big (k varchar(20) primary key, n int); "
+        "insert into st_big select 'k' || g, g from generate_series(1, 20000) g; "
+        "analyze st_big; create table st_ci (k citext primary key, n int); "
+        "insert into st_ci values ('Abc', 1); "
+        "create table st_onum (k numeric primary key, n int); insert into st_onum values (1.00, 1)",
+    )
+    matches: list[str] = []
+    key_match = server._key_match
+
+    def spy(*args: Any) -> str:
+        matches.append(key_match(*args))
+        return matches[-1]
+
+    monkeypatch.setattr(server, "_key_match", spy)
+    try:
+        for table, key, row in (
+            ("st_big", "k77", {"k": "k77", "n": 0}),
+            ("st_ci", "ABC", {"k": "Abc", "n": 0}),
+            ("st_onum", "1.0", {"k": "1.00", "n": 0}),
+        ):
+            body = {"key": {"k": key}, "values": {"n": 0}}
+            changed = client.patch(f"/api/tables/public/{table}/rows", json=body, headers=AUTH)
+            assert changed.status_code == 200, changed.text
+            assert changed.json()["row"] == row
+        where = matches[0].replace("$1", "'k77'")
+        plan = _query(client, f"explain select from st_big t where {where}")
+        assert "Index" in plan[0][0] and "Seq Scan" not in str(plan), plan
+    finally:
+        _sql(client, "drop table st_big, st_ci, st_onum")

@@ -74,7 +74,11 @@ STATIC_DIR = Path(__file__).parent / "static"
 MAX_SQL_ROWS = 1000
 MAX_PAGE = 500
 MAX_HISTORY = 100
-_COMPARE = {"eq": "=", "ne": "<>", "lt": "<", "lte": "<=", "gt": ">", "gte": ">="}
+# A filter's btree strategy (1-5, as an index into the column's operators); ne is NOT eq.
+_COMPARE = {"lt": 0, "lte": 1, "eq": 2, "ne": 2, "gte": 3, "gt": 4}
+# A column's btree operators, OPERATOR(schema.op) for strategies 1-5, and the type both sides
+# are cast to (None when they are all pg_catalog's), from ``_BASE_TYPES`` (S9-1).
+type Ops = tuple[list[str], str | None]
 
 # Failed-login throttle (SS4, B7, B34): a client address with this many wrong credentials
 # within the window gets 429 for every API request, a correct one included, until the oldest
@@ -121,7 +125,8 @@ _READ_ONLY_DENIED_CALLS = re.compile(
 # pg_catalog.
 # Unqualified, a planted public.to_jsonb(public.t) (an exact type match) or a public ``=``
 # won over the built-in wherever the role's path searched public first, and ran as the
-# Studio user. A column's own type and its operators are the user's, and stay as they are.
+# Studio user. A column's own type stays as it is; its comparisons use its btree opclass's
+# operators, schema-qualified (S9-1, ``_compare``).
 _EQ = "OPERATOR(pg_catalog.=)"
 # A role that is, or can become, one of these can act on the server from inside a READ ONLY
 # transaction, so read-only Studio refuses to run as it (B18).
@@ -219,6 +224,8 @@ class Studio:
     # (schema, table) -> its columns of a type no built-in one (an extension's hstore, ...):
     # the grid reads and writes them as their text (S7-4)
     texts: dict[tuple[str, str], list[str]] = field(default_factory=dict)
+    # (schema, table) -> column -> its comparison operators (none: no btree opclass)
+    ops: dict[tuple[str, str], dict[str, Ops]] = field(default_factory=dict)
     history: list[dict[str, object]] = field(default_factory=list)
     saved: dict[str, str] = field(default_factory=dict)
     state_path: Path | None = None
@@ -238,7 +245,7 @@ class Studio:
                 (t["schema"], t["name"]): t for s in snapshots for t in s["tables"].values()
             }
             self.enums = {k: e for s in snapshots for k, e in s["enums"].items()}
-            self.bases, self.composites, self.texts = {}, {}, {}
+            self.bases, self.composites, self.texts, self.ops = {}, {}, {}, {}
             for row in rows:
                 k, column = (str(row["schema"]), str(row["table"])), str(row["name"])
                 self.bases.setdefault(k, {})[column] = str(row["base"])
@@ -246,6 +253,12 @@ class Studio:
                     self.composites.setdefault(k, []).append(column)
                 if row["extension"]:
                     self.texts.setdefault(k, []).append(column)
+                if row["ops"] is not None:
+                    opcast = row["opcast"]
+                    self.ops.setdefault(k, {})[column] = (
+                        [str(o) for o in cast(list[object], row["ops"])],
+                        None if opcast is None else str(opcast),
+                    )
         return self.tables
 
     async def table(
@@ -282,6 +295,9 @@ class Studio:
 
     def text_columns(self, table: TableSnap) -> list[str]:
         return self.texts.get((table["schema"], table["name"]), [])
+
+    def operators(self, table: TableSnap) -> dict[str, Ops]:
+        return self.ops.get((table["schema"], table["name"]), {})
 
     # -- query history and saved queries ----------------------------------------------
 
@@ -441,8 +457,47 @@ SELECT n.nspname AS schema, c.relname AS table, r.name,
          OPERATOR(pg_catalog.||) pg_catalog.repeat('[]', r.dims) AS base,
        t.typtype {_EQ} 'c' AS composite,
        -- a base type no built-in one (16384: FirstNormalObjectId), an extension's
-       t.typtype {_EQ} 'b' AND t.oid OPERATOR(pg_catalog.>=) 16384 AS extension
+       t.typtype {_EQ} 'b' AND t.oid OPERATOR(pg_catalog.>=) 16384 AS extension,
+       -- an operator outside pg_catalog: both sides are cast to its exact input type
+       ops.ops, CASE WHEN NOT ops.builtin THEN oc.intype END AS opcast
 FROM r JOIN pg_catalog.pg_type t ON t.oid {_EQ} r.oid
+-- S9-1: the column type's default btree opclass, picked as PostgreSQL picks it (an exact
+-- input type, else a polymorphic or binary-coercible one), and its < <= = >= > operators.
+-- Only a superuser creates an opclass, so another role cannot plant one.
+LEFT JOIN LATERAL (
+  SELECT c.opcfamily, c.opcintype,
+         pg_catalog.quote_ident(cn.nspname) OPERATOR(pg_catalog.||) '.'
+           OPERATOR(pg_catalog.||) pg_catalog.quote_ident(ct.typname) AS intype
+  FROM pg_catalog.pg_opclass c
+  JOIN pg_catalog.pg_am am ON am.oid {_EQ} c.opcmethod
+  JOIN pg_catalog.pg_type ct ON ct.oid {_EQ} c.opcintype
+  JOIN pg_catalog.pg_namespace cn ON cn.oid {_EQ} ct.typnamespace
+  WHERE am.amname {_EQ} 'btree' AND c.opcdefault AND CASE
+    WHEN r.dims OPERATOR(pg_catalog.>) 0
+      THEN c.opcintype {_EQ} 'pg_catalog.anyarray'::pg_catalog.regtype
+    ELSE c.opcintype {_EQ} r.oid
+      OR c.opcintype {_EQ} CASE t.typtype
+        WHEN 'e' THEN 'pg_catalog.anyenum'::pg_catalog.regtype
+        WHEN 'r' THEN 'pg_catalog.anyrange'::pg_catalog.regtype
+        WHEN 'm' THEN 'pg_catalog.anymultirange'::pg_catalog.regtype
+        WHEN 'c' THEN 'pg_catalog.record'::pg_catalog.regtype END
+      OR EXISTS (SELECT FROM pg_catalog.pg_cast x WHERE x.castsource {_EQ} r.oid
+        AND x.casttarget {_EQ} c.opcintype AND x.castmethod {_EQ} 'b'
+        AND x.castcontext {_EQ} 'i') END
+  ORDER BY c.opcintype {_EQ} r.oid DESC LIMIT 1
+) oc ON true
+LEFT JOIN LATERAL (
+  SELECT pg_catalog.array_agg('OPERATOR(' OPERATOR(pg_catalog.||)
+           pg_catalog.quote_ident(n.nspname) OPERATOR(pg_catalog.||) '.'
+           OPERATOR(pg_catalog.||) o.oprname OPERATOR(pg_catalog.||) ')'
+           ORDER BY a.amopstrategy) AS ops,
+         pg_catalog.bool_and(n.nspname {_EQ} 'pg_catalog') AS builtin
+  FROM pg_catalog.pg_amop a
+  JOIN pg_catalog.pg_operator o ON o.oid {_EQ} a.amopopr
+  JOIN pg_catalog.pg_namespace n ON n.oid {_EQ} o.oprnamespace
+  WHERE a.amopfamily {_EQ} oc.opcfamily AND a.amoplefttype {_EQ} oc.opcintype
+    AND a.amoprighttype {_EQ} oc.opcintype AND a.amoppurpose {_EQ} 's'
+) ops ON true
 JOIN pg_catalog.pg_class c ON c.oid {_EQ} r.rel
 JOIN pg_catalog.pg_namespace n ON n.oid {_EQ} c.relnamespace
 WHERE t.typtype OPERATOR(pg_catalog.<>) 'd' AND t.typcategory OPERATOR(pg_catalog.<>) 'A'
@@ -467,8 +522,29 @@ def _param(params: list[object], column: ColumnSnap, value: object, base: str) -
     return f"CAST(${len(params)}::pg_catalog.text AS {_cast_type(column, base)})"
 
 
+def _compare(op: str, ref: str, value: str, ops: Ops | None) -> str:
+    """S9-1: ``ref <op> value`` with the column type's own btree operator, schema-qualified.
+    A bare ``=`` resolved through search_path: varchar has no ``=`` of its own (it uses text's)
+    and an enum uses anyenum's, so a planted exact-type public ``=`` won and ran as the Studio
+    user. The opclass operator is also the one a key's index uses."""
+    if ops is None:  # no btree opclass (json, point): equal text forms, and no order
+        if op not in ("eq", "ne"):
+            raise StudioError(f"cannot compare {ref} with {op}: its type has no order")
+        expr = f"{ref}::pg_catalog.text {_EQ} ({value})::pg_catalog.text"
+    else:
+        names, opcast = ops
+        if opcast is not None:  # exact operand types: nothing planted in its schema matches
+            ref, value = f"{ref}::{opcast}", f"({value})::{opcast}"
+        expr = f"{ref} {names[_COMPARE[op]]} {value}"
+    return f"NOT ({expr})" if op == "ne" else expr
+
+
 def _where(
-    table: TableSnap, base: Mapping[str, str], filters: list[object], params: list[object]
+    table: TableSnap,
+    base: Mapping[str, str],
+    filters: list[object],
+    params: list[object],
+    ops: Mapping[str, Ops],
 ) -> str:
     parts: list[str] = []
     for item in filters:
@@ -478,11 +554,12 @@ def _where(
         op = f.get("op")
         if isinstance(op, str) and op in _COMPARE:
             value = _param(params, column, f.get("value"), base[column["name"]])
-            parts.append(f"{ref} {_COMPARE[op]} {value}")
+            parts.append(_compare(op, ref, value, ops.get(column["name"])))
         elif op in ("like", "ilike"):
             params.append(_as_text(f.get("value")) or "")
             like = "~~" if op == "like" else "~~*"
-            parts.append(f"{ref}::pg_catalog.text OPERATOR(pg_catalog.{like}) ${len(params)}")
+            pattern = f"${len(params)}::pg_catalog.text"
+            parts.append(f"{ref}::pg_catalog.text OPERATOR(pg_catalog.{like}) {pattern}")
         elif op == "is_null":
             parts.append(f"{ref} IS NULL")
         elif op == "is_not_null":
@@ -493,7 +570,11 @@ def _where(
 
 
 def _key_match(
-    table: TableSnap, base: Mapping[str, str], key_values: object, params: list[object]
+    table: TableSnap,
+    base: Mapping[str, str],
+    key_values: object,
+    params: list[object],
+    ops: Mapping[str, Ops],
 ) -> str:
     pk = table["primary_key"]
     if pk is None:
@@ -502,7 +583,9 @@ def _key_match(
     if set(values) != set(pk["columns"]):
         raise StudioError(f"key must give exactly the primary key columns {pk['columns']}")
     return " AND ".join(
-        f"t.{quote(c)} = {_param(params, _column(table, c), values[c], base[c])}"
+        _compare(
+            "eq", f"t.{quote(c)}", _param(params, _column(table, c), values[c], base[c]), ops.get(c)
+        )
         for c in pk["columns"]
     )
 
@@ -758,7 +841,7 @@ async def list_rows(studio: Studio, request: Request) -> Response:
     if limit < 0 or offset < 0:
         raise StudioError("limit and offset must be >= 0")
     params: list[object] = []
-    where = _where(table, base, filters, params)
+    where = _where(table, base, filters, params, studio.operators(table))
     order_sql = _order_sql(table, base, q)
     source = f"{_relation(table)} AS t"
     # S7-1: READ ONLY, also in a read-write Studio. Reading a table runs code of the
@@ -805,7 +888,7 @@ async def export_rows(studio: Studio, request: Request) -> Response:
     except ValueError as exc:
         raise StudioError(f"bad query parameters: {exc}") from exc
     params: list[object] = []
-    where = _where(table, base, filters, params)
+    where = _where(table, base, filters, params, studio.operators(table))
     order_sql = _order_sql(table, base, q)
     source = f"{_relation(table)} AS t"
     row = (
@@ -913,7 +996,7 @@ async def update_row(studio: Studio, request: Request) -> Response:
         raise StudioError("values must not be empty")
     _reject_composites(studio, table, values)
     params: list[object] = []
-    match = _key_match(table, base, body.get("key"), params)
+    match = _key_match(table, base, body.get("key"), params, studio.operators(table))
     key_params = list(params)  # the key's placeholders come first, so ``match`` reuses them
     sets = ", ".join(
         f"{quote(c['name'])} = {_param(params, c, values[c['name']], base[c['name']])}"
@@ -961,7 +1044,7 @@ async def delete_rows(studio: Studio, request: Request) -> Response:
     async with studio.pool().acquire() as conn, conn.transaction():
         for k in keys:
             params: list[object] = []
-            match = _key_match(table, base, k, params)
+            match = _key_match(table, base, k, params, studio.operators(table))
             sql = f"DELETE FROM {_relation(table)} AS t WHERE {match}"
             count = await conn.execute(sql, params)
             _one_row(count)
