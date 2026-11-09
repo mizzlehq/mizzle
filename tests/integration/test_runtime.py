@@ -674,6 +674,24 @@ async def test_reset_drops_temp_tables(pg_url: str) -> None:
                 await db.execute(sql("SELECT x FROM c14"))
 
 
+async def test_reset_puts_the_role_back(pg_url: str) -> None:
+    # S7-5: RESET ALL leaves SET ROLE alone, so the next user of the connection ran as it.
+    for mode in ("always", "auto"):
+        async with await Database.connect(
+            pg_url, schema=[Users, Posts], pool_size=1, reset_connections=mode
+        ) as db:
+            await db.execute(
+                sql(
+                    "DO $$ BEGIN CREATE ROLE mizzle_s75 NOLOGIN; "
+                    "EXCEPTION WHEN duplicate_object THEN NULL; END $$"
+                )
+            )
+            [login] = await db.execute(sql("SELECT current_user AS u"))
+            await db.execute(sql("SET ROLE mizzle_s75"))
+            [after] = await db.execute(sql("SELECT current_user AS u"))
+            assert after["u"] == login["u"], mode
+
+
 async def test_ping_returns_false_when_the_server_hangs(
     pg_url: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:

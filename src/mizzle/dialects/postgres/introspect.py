@@ -36,6 +36,7 @@ from mizzle.dialects.postgres.ddl import (
     SERIAL_TYPES,
     create_index,
     default_sql,
+    literal,
     normalize_default,
     qualified,
     quote,
@@ -750,7 +751,7 @@ async def _normalize_column_expressions(snapshot: Snapshot, read_back: _ReadBack
                 [f"CREATE TEMP TABLE {quote(_NORM)} ({columns})"],
                 "SELECT pg_get_expr(d.adbin, d.adrelid) AS e FROM pg_attrdef d "
                 "JOIN pg_attribute a ON a.attrelid = d.adrelid AND a.attnum = d.adnum "
-                f"WHERE d.adrelid = {rel} AND a.attname = {_text(name)}",
+                f"WHERE d.adrelid = {rel} AND a.attname = {literal(name)}",
             )
             if row is None or row["e"] is None:
                 continue  # cannot be created here (a type or sequence made later): as is
@@ -758,11 +759,6 @@ async def _normalize_column_expressions(snapshot: Snapshot, read_back: _ReadBack
                 generated["expression"] = str(row["e"])
             else:
                 column["default"] = normalize_default(str(row["e"]))  # as introspect does
-
-
-def _text(value: str) -> str:
-    """``value`` as an SQL string literal."""
-    return "'" + value.replace("'", "''") + "'"
 
 
 async def normalize_snapshot(conn: Connection, snapshot: Snapshot) -> Snapshot:
@@ -877,8 +873,8 @@ async def _normalize(snapshot: Snapshot, read_back: _ReadBack, version: int) -> 
             if row is None:  # it names its own table (refs.t): on the table itself (K7-3)
                 row = await read_back(
                     [f"CREATE POLICY {quote(_NORM)} ON {real}{body}"],
-                    f"{query}WHERE polrelid = to_regclass({_text(real)}) "
-                    f"AND polname = {_text(_NORM)}",
+                    f"{query}WHERE polrelid = to_regclass({literal(real)}) "
+                    f"AND polname = {literal(_NORM)}",
                 )
             if row is not None:
                 policy["using"], policy["with_check"] = (
