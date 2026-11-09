@@ -350,20 +350,12 @@ def test_values_next_to_cte_and_subquery_columns_are_encoded(qb: QueryBuilder) -
     )
 
 
-def test_values_compared_with_custom_columns_take_their_type(qb: QueryBuilder) -> None:
-    # Q8-5: a tuple next to a composite was an anonymous record PostgreSQL cannot take.
+def test_values_compared_with_custom_columns_are_not_cast(qb: QueryBuilder) -> None:
+    # R9-1: a cast to the custom type cut or rounded the value (varchar(5), numeric(10,2)).
     sql_text, params = qb.select(Priced.id).from_(Priced).where(eq(Priced.pair, (1, 2))).to_sql()
-    assert sql_text.endswith('WHERE "priced"."pair" = $1::price_pair') and params == ((1, 2),)
-    where = eq(Priced.pair, placeholder("p"))
-    assert qb.select(Priced.id).from_(Priced).where(where).to_sql()[0].endswith("$1::price_pair")
-    assert (
-        qb.select(Priced.id)
-        .from_(Priced)
-        .where(eq(Priced.price, 150))
-        .to_sql()[0]
-        .endswith("$1::money_amount")
-    )
-    # Writes are unchanged.
+    assert sql_text.endswith('WHERE "priced"."pair" = $1') and params == ((1, 2),)
+    where = eq(Priced.price, placeholder("p"))
+    assert qb.select(Priced.id).from_(Priced).where(where).to_sql()[0].endswith("= $1")
     assert qb.insert(Priced).values(pair=(1, 2)).to_sql()[0].endswith("VALUES ($1)")
 
 

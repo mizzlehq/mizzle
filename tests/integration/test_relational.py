@@ -12,6 +12,7 @@ from asyncpg import Box, Range, Record
 
 from mizzle import (
     Database,
+    DatabaseError,
     QueryError,
     RelationNotLoaded,
     Table,
@@ -21,6 +22,7 @@ from mizzle import (
     gt,
     in_,
     like,
+    placeholder,
     sql,
 )
 from mizzle.core.query.select import Select
@@ -349,8 +351,9 @@ async def test_custom_values_are_the_drivers(cus_db: Database) -> None:
     assert mood == [{"m": "happy"}]
     labelled = await cus_db.select().from_(CusRow).where(eq(CusRow.label, Label("HI")))
     assert [r.label for r in labelled] == [Label("Hi")]
-    # A tuple compared with a composite is typed as it (Q8-5).
-    paired = await cus_db.select().from_(CusRow).where(eq(CusRow.pair, (Decimal("1.5"), _DAY)))
+    # A tuple next to a composite needs the type written out: values are never cast (R9-1).
+    pair = sql("{}::rel_c_pair", (Decimal("1.5"), _DAY))
+    paired = await cus_db.select().from_(CusRow).where(eq(CusRow.pair, pair))
     assert [r.id for r in paired] == [rows[0].id]
     # A subquery or CTE column encodes values as the column it selects (Q8-1).
     s = cus_db.select(CusRow.id, CusRow.label).from_(CusRow).subquery("s")
@@ -369,6 +372,39 @@ async def test_custom_values_are_the_drivers(cus_db: Database) -> None:
     ups = ups.on_conflict_do_update(target=CusRow.id, set_={"rect": excluded(CusRow.rect)})
     [upserted] = await ups.returning({"r": CusRow.rect, "c": CusRow.ci})
     assert upserted == {"r": Box((3, 3), (1, 1)), "c": "Z"}
+
+
+class CusSized(Table, name="rel_cus_sized"):
+    id = serial().primary_key()
+    code = custom("varchar(5)")
+    amt = custom("rel_c_money", py_type=Decimal)  # a domain over numeric(10,2)
+
+
+async def test_custom_values_are_never_cast(driver: PostgresDriver, pg_url: str) -> None:
+    # R9-1: an explicit cast to the custom type cut or rounded the value, so a long text was
+    # stored cut, and a filter matched a row it should not.
+    async with driver.acquire() as conn:
+        await conn.execute(
+            "DROP TABLE IF EXISTS rel_cus_sized; DROP DOMAIN IF EXISTS rel_c_money;"
+            " CREATE DOMAIN rel_c_money AS numeric(10,2);"
+            " CREATE TABLE rel_cus_sized (id serial PRIMARY KEY, code varchar(5), amt rel_c_money)",
+            [],
+        )
+    try:
+        async with await Database.connect(pg_url, schema=[CusSized]) as db:
+            await db.insert(CusSized).values(code="abcde", amt=Decimal("10.00"))
+            insert = db.insert(CusSized).values(code=placeholder("c")).prepare()
+            with pytest.raises(DatabaseError):
+                await insert.execute(c="vwxyz123")
+            where = db.select(CusSized.id).from_(CusSized)
+            assert await where.where(eq(CusSized.code, "abcdefgh")) == []
+            assert await where.where(eq(CusSized.amt, Decimal("10.001"))) == []
+            assert len(await where.where(gt(CusSized.amt, Decimal("9.999")))) == 1
+            [(product,)] = await db.select(CusSized.amt * Decimal("1.005")).from_(CusSized)
+            assert product == Decimal("10.05000")
+    finally:
+        async with driver.acquire() as conn:
+            await conn.execute("DROP TABLE rel_cus_sized; DROP DOMAIN rel_c_money", [])
 
 
 async def test_custom_nested_rows_are_text(cus_db: Database) -> None:

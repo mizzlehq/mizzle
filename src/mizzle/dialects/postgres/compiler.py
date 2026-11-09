@@ -14,7 +14,7 @@ from asyncpg import BitString, Line, Point
 from mizzle.core.compiler import CompiledQuery, Compiler, interval_text
 from mizzle.core.errors import QueryError
 from mizzle.core.sql.alias import real_table
-from mizzle.core.sql.nodes import ExprBase, Node, Param, Placeholder
+from mizzle.core.sql.nodes import ExprBase, Node
 from mizzle.dialects.postgres.types import CustomColumn, JsonText
 
 if TYPE_CHECKING:
@@ -179,21 +179,6 @@ class PostgresCompiler(Compiler):
     @override
     def param_marker(self, index: int, /) -> str:
         return f"${index}"
-
-    # A value compared with a custom() column is typed as it: a tuple next to a composite
-    # was an anonymous record, which PostgreSQL cannot take as input (Q8-5).
-    @override
-    def visit_Param(self, node: Param) -> str:
-        return self._as_custom(super().visit_Param(node), node.column)
-
-    @override
-    def visit_Placeholder(self, node: Placeholder) -> str:
-        return self._as_custom(super().visit_Placeholder(node), node.column)
-
-    def _as_custom(self, marker: str, column: ColumnBase | None) -> str:
-        if isinstance(column, CustomColumn) and not self.inline_literals:
-            return f"{marker}::{column.sql_type}"
-        return marker
 
     @override
     def literal(self, value: object) -> str:

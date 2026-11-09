@@ -345,8 +345,10 @@ class Stays(Table, name="stays"):
 ```
 
 `Stays.nights` is a `Column[Nights | None]`; filters encode their values too
-(`eq(Stays.nights, Nights(1, 4))`), and send them as the column's type (`$1::int4range`),
-so a tuple compares with a composite.
+(`eq(Stays.nights, Nights(1, 4))`). Values are sent as they are, with no cast: PostgreSQL
+types them from the column, and checks length and precision as for any value. A tuple
+compared with a composite needs the type written out:
+`eq(Row.pair, sql("{}::price_pair", (Decimal("1.5"), day)))`.
 
 A relational query (`with_=`) nests related rows as JSON, so a custom column there holds
 its text form, a `str` as PostgreSQL prints the value: `"[1,5)"` for a range,

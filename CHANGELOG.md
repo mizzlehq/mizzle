@@ -17,8 +17,9 @@
   it compares, sorts and deduplicates as the type. `decode=` / `encode=` convert values
   read and written, and `py_type=` is the Python type (`object` by default; type checkers
   take it from `decode`'s return or `encode`'s parameter when given). `select_model` needs
-  `py_type=` (or `refine=`) for such a column. Values compared with it are sent as its type
-  (`$1::type`), so a tuple matches a composite. Nested rows (`with_=`) give the value's
+  `py_type=` (or `refine=`) for such a column. Values compared with it are sent with no
+  cast (a cast cut `varchar(5)` text and rounded `numeric(10,2)`); compare a tuple with a
+  composite as `sql("{}::type", value)`. Nested rows (`with_=`) give the value's
   text form (a `str`, exact for a numeric domain), through `decode` if given. `pull` writes
   every column of a type mizzle has no column type for as `custom(...)`.
 - `values(model)` / `set(model)` take each field as the model holds it, so a dataclass or
