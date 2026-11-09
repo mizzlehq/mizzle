@@ -289,9 +289,9 @@ async def test_rebuilt_column_referenced_by_a_foreign_key(driver: PostgresDriver
     await execute(driver, "INSERT INTO mg.calc (a) VALUES (1), (2), (3)")
     await execute(driver, "INSERT INTO mg.uses VALUES (6)")  # checked again after the change
     [change] = dialect.render(diff(stored, snap(keyed("3"))))
-    assert ">= 170000" in change.sql
+    assert ">=) 170000" in change.sql
     async with driver.acquire() as conn:
-        await apply_statements(conn, [Statement(change.sql.replace(">= 170000", ">= 9900000"))])
+        await apply_statements(conn, [Statement(change.sql.replace(">=) 170000", ">=) 9900000"))])
     await assert_no_drift(driver, snap(keyed("3")))
     rows = await execute(driver, "SELECT b FROM mg.calc ORDER BY a")
     assert [r["b"] for r in rows] == [3, 6, 9]

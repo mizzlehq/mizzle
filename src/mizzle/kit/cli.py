@@ -871,7 +871,9 @@ def cmd_info(config: Config, args: Args) -> int:
 
     async def inspect(driver: Driver, dialect: Dialect) -> tuple[str, dict[str, str], list[Step]]:
         async with driver.acquire() as conn:
-            [row] = await conn.fetch_dicts("SELECT current_setting('server_version') AS v", [])
+            [row] = await conn.fetch_dicts(
+                "SELECT pg_catalog.current_setting('server_version') AS v", []
+            )
             latest = _latest(directory, dialect)
             try:
                 applied = await dialect.applied_migrations(conn, config.migrations_schema)

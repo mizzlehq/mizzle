@@ -43,7 +43,7 @@
 -- create policy reviews_owner_delete on reviews
 -- create policy notifications_own on notifications
 -- create policy notifications_support on notifications
-DO $mizzle$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'shop_support') THEN CREATE ROLE "shop_support"; END IF; ALTER ROLE "shop_support" NOLOGIN NOCREATEDB NOCREATEROLE INHERIT; END $mizzle$;
+DO $mizzle$ BEGIN IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname OPERATOR(pg_catalog.=) 'shop_support') THEN CREATE ROLE "shop_support"; END IF; ALTER ROLE "shop_support" NOLOGIN NOCREATEDB NOCREATEROLE INHERIT; END $mizzle$;
 -- mizzle:breakpoint
 CREATE SCHEMA IF NOT EXISTS "shop_audit";
 -- mizzle:breakpoint

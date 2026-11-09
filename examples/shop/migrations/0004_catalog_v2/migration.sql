@@ -11,37 +11,37 @@ ALTER TABLE "users" ADD COLUMN "phone" text;
 -- mizzle:breakpoint
 ALTER TABLE "stores" ALTER COLUMN "slug" SET DATA TYPE character varying(64) USING "slug"::character varying(64);
 -- mizzle:breakpoint
-DO $mizzle$ DECLARE defs text[]; refs text[]; def text; r record; note text; BEGIN
-IF current_setting('server_version_num')::int >= 170000 THEN
+DO $mizzle$ DECLARE defs pg_catalog.text[]; refs pg_catalog.text[]; def pg_catalog.text; r record; note pg_catalog.text; BEGIN
+IF pg_catalog.current_setting('server_version_num')::int OPERATOR(pg_catalog.>=) 170000 THEN
   EXECUTE 'ALTER TABLE "products" ALTER COLUMN "search" SET EXPRESSION AS (setweight(to_tsvector(''english'', name), ''A'') || setweight(to_tsvector(''english'', coalesce(details, '''')), ''B''))';
 ELSE
-IF EXISTS (SELECT 1 FROM pg_attribute a WHERE a.attrelid = '"products"'::regclass AND a.attname = 'search' AND a.attacl IS NOT NULL)
-OR EXISTS (SELECT 1 FROM pg_depend d JOIN pg_attribute a ON a.attrelid = d.refobjid AND a.attnum = d.refobjsubid WHERE d.refclassid = 'pg_class'::regclass AND d.refobjid = '"products"'::regclass AND a.attname = 'search' AND d.deptype IN ('a', 'n') AND d.classid <> 'pg_attrdef'::regclass AND NOT EXISTS (SELECT 1 FROM pg_class s WHERE d.classid = 'pg_class'::regclass AND s.oid = d.objid AND s.relkind = 'S') AND NOT EXISTS (SELECT 1 FROM pg_constraint n WHERE d.classid = 'pg_constraint'::regclass AND n.oid = d.objid AND n.contype = 'n') AND d.classid <> 'pg_constraint'::regclass AND NOT EXISTS (SELECT 1 FROM pg_class i WHERE d.classid = 'pg_class'::regclass AND i.oid = d.objid AND i.relkind IN ('i', 'I'))) THEN
+IF EXISTS (SELECT 1 FROM pg_catalog.pg_attribute a WHERE a.attrelid OPERATOR(pg_catalog.=) '"products"'::pg_catalog.regclass AND a.attname OPERATOR(pg_catalog.=) 'search' AND a.attacl IS NOT NULL)
+OR EXISTS (SELECT 1 FROM pg_catalog.pg_depend d JOIN pg_catalog.pg_attribute a ON a.attrelid OPERATOR(pg_catalog.=) d.refobjid AND a.attnum OPERATOR(pg_catalog.=) d.refobjsubid WHERE d.refclassid OPERATOR(pg_catalog.=) 'pg_catalog.pg_class'::pg_catalog.regclass AND d.refobjid OPERATOR(pg_catalog.=) '"products"'::pg_catalog.regclass AND a.attname OPERATOR(pg_catalog.=) 'search' AND d.deptype OPERATOR(pg_catalog.=) ANY ('{a,n}'::pg_catalog."char"[]) AND d.classid OPERATOR(pg_catalog.<>) 'pg_catalog.pg_attrdef'::pg_catalog.regclass AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_class s WHERE d.classid OPERATOR(pg_catalog.=) 'pg_catalog.pg_class'::pg_catalog.regclass AND s.oid OPERATOR(pg_catalog.=) d.objid AND s.relkind OPERATOR(pg_catalog.=) 'S') AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_constraint n WHERE d.classid OPERATOR(pg_catalog.=) 'pg_catalog.pg_constraint'::pg_catalog.regclass AND n.oid OPERATOR(pg_catalog.=) d.objid AND n.contype OPERATOR(pg_catalog.=) 'n') AND d.classid OPERATOR(pg_catalog.<>) 'pg_catalog.pg_constraint'::pg_catalog.regclass AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_class i WHERE d.classid OPERATOR(pg_catalog.=) 'pg_catalog.pg_class'::pg_catalog.regclass AND i.oid OPERATOR(pg_catalog.=) d.objid AND i.relkind OPERATOR(pg_catalog.=) ANY ('{i,I}'::pg_catalog."char"[]))) THEN
   RAISE EXCEPTION 'column % is dropped and added again, which would drop the grants, constraints, views or triggers on it that mizzle does not manage; this needs a custom migration', 'products.search';
 END IF;
-  SELECT array_agg(d) INTO defs FROM (
-    SELECT format('ALTER TABLE %s ADD CONSTRAINT %I %s', '"products"', conname, pg_get_constraintdef(c.oid)) AS d
-    FROM pg_constraint c JOIN pg_attribute a ON a.attrelid = c.conrelid
-    WHERE c.conrelid = '"products"'::regclass AND a.attname = 'search' AND a.attnum = ANY(c.conkey)
+  SELECT pg_catalog.array_agg(d) INTO defs FROM (
+    SELECT pg_catalog.format('ALTER TABLE %s ADD CONSTRAINT %I %s', '"products"', conname, pg_catalog.pg_get_constraintdef(c.oid)) AS d
+    FROM pg_catalog.pg_constraint c JOIN pg_catalog.pg_attribute a ON a.attrelid OPERATOR(pg_catalog.=) c.conrelid
+    WHERE c.conrelid OPERATOR(pg_catalog.=) '"products"'::pg_catalog.regclass AND a.attname OPERATOR(pg_catalog.=) 'search' AND a.attnum OPERATOR(pg_catalog.=) ANY(c.conkey)
     UNION ALL
-    SELECT DISTINCT pg_get_indexdef(i.indexrelid) FROM pg_index i
-    JOIN pg_depend dep ON dep.classid = 'pg_class'::regclass AND dep.objid = i.indexrelid AND dep.refobjid = i.indrelid
-    JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = dep.refobjsubid
-    WHERE i.indrelid = '"products"'::regclass AND a.attname = 'search'
-      AND NOT EXISTS (SELECT 1 FROM pg_constraint c WHERE c.conindid = i.indexrelid)
+    SELECT DISTINCT pg_catalog.pg_get_indexdef(i.indexrelid) FROM pg_catalog.pg_index i
+    JOIN pg_catalog.pg_depend dep ON dep.classid OPERATOR(pg_catalog.=) 'pg_catalog.pg_class'::pg_catalog.regclass AND dep.objid OPERATOR(pg_catalog.=) i.indexrelid AND dep.refobjid OPERATOR(pg_catalog.=) i.indrelid
+    JOIN pg_catalog.pg_attribute a ON a.attrelid OPERATOR(pg_catalog.=) i.indrelid AND a.attnum OPERATOR(pg_catalog.=) dep.refobjsubid
+    WHERE i.indrelid OPERATOR(pg_catalog.=) '"products"'::pg_catalog.regclass AND a.attname OPERATOR(pg_catalog.=) 'search'
+      AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_constraint c WHERE c.conindid OPERATOR(pg_catalog.=) i.indexrelid)
   ) s;
-  FOR r IN SELECT c.conrelid::regclass AS t, c.conname, pg_get_constraintdef(c.oid) AS d
-    FROM pg_constraint c JOIN pg_attribute a ON a.attrelid = c.confrelid
-    WHERE c.contype = 'f' AND c.confrelid = '"products"'::regclass AND a.attname = 'search'
-      AND a.attnum = ANY(c.confkey)
-      AND NOT (c.conrelid = c.confrelid AND a.attnum = ANY(c.conkey)) LOOP
-    refs := refs || format('ALTER TABLE %s ADD CONSTRAINT %I %s', r.t, r.conname, r.d);
-    EXECUTE format('ALTER TABLE %s DROP CONSTRAINT %I', r.t, r.conname);
+  FOR r IN SELECT c.conrelid::pg_catalog.regclass AS t, c.conname, pg_catalog.pg_get_constraintdef(c.oid) AS d
+    FROM pg_catalog.pg_constraint c JOIN pg_catalog.pg_attribute a ON a.attrelid OPERATOR(pg_catalog.=) c.confrelid
+    WHERE c.contype OPERATOR(pg_catalog.=) 'f' AND c.confrelid OPERATOR(pg_catalog.=) '"products"'::pg_catalog.regclass AND a.attname OPERATOR(pg_catalog.=) 'search'
+      AND a.attnum OPERATOR(pg_catalog.=) ANY(c.confkey)
+      AND NOT (c.conrelid OPERATOR(pg_catalog.=) c.confrelid AND a.attnum OPERATOR(pg_catalog.=) ANY(c.conkey)) LOOP
+    refs := pg_catalog.array_append(refs, pg_catalog.format('ALTER TABLE %s ADD CONSTRAINT %I %s', r.t, r.conname, r.d));
+    EXECUTE pg_catalog.format('ALTER TABLE %s DROP CONSTRAINT %I', r.t, r.conname);
   END LOOP;
-  note := col_description('"products"'::regclass, (SELECT attnum FROM pg_attribute WHERE attrelid = '"products"'::regclass AND attname = 'search'));
+  note := pg_catalog.col_description('"products"'::pg_catalog.regclass, (SELECT attnum FROM pg_catalog.pg_attribute WHERE attrelid OPERATOR(pg_catalog.=) '"products"'::pg_catalog.regclass AND attname OPERATOR(pg_catalog.=) 'search'));
   EXECUTE 'ALTER TABLE "products" DROP COLUMN "search"';
   EXECUTE 'ALTER TABLE "products" ADD COLUMN "search" tsvector GENERATED ALWAYS AS (setweight(to_tsvector(''english'', name), ''A'') || setweight(to_tsvector(''english'', coalesce(details, '''')), ''B'')) STORED';
-  IF note IS NOT NULL THEN EXECUTE format('COMMENT ON COLUMN %s.%I IS %L', '"products"', 'search', note); END IF;
+  IF note IS NOT NULL THEN EXECUTE pg_catalog.format('COMMENT ON COLUMN %s.%I IS %L', '"products"', 'search', note); END IF;
   FOREACH def IN ARRAY coalesce(defs, '{}') LOOP EXECUTE def; END LOOP;
   FOREACH def IN ARRAY coalesce(refs, '{}') LOOP EXECUTE def; END LOOP;
 END IF; END $mizzle$;

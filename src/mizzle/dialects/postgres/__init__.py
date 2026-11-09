@@ -102,7 +102,9 @@ class PostgresDialect:
     async def acquire_migration_lock(self, conn: Connection, timeout: float) -> None:
         deadline = time.monotonic() + timeout
         while True:
-            [row] = await conn.fetch("SELECT pg_try_advisory_lock($1)", [MIGRATION_LOCK_KEY])
+            [row] = await conn.fetch(
+                "SELECT pg_catalog.pg_try_advisory_lock($1)", [MIGRATION_LOCK_KEY]
+            )
             if row[0]:
                 return
             if time.monotonic() >= deadline:
@@ -112,15 +114,16 @@ class PostgresDialect:
             await asyncio.sleep(0.2)
 
     async def release_migration_lock(self, conn: Connection) -> None:
-        await conn.fetch("SELECT pg_advisory_unlock($1)", [MIGRATION_LOCK_KEY])
+        await conn.fetch("SELECT pg_catalog.pg_advisory_unlock($1)", [MIGRATION_LOCK_KEY])
 
     async def ensure_migrations_table(self, conn: Connection, schema: str) -> None:
         table = ddl.qualified(schema, MIGRATIONS_TABLE)
         await conn.execute(f"CREATE SCHEMA IF NOT EXISTS {ddl.quote(schema)}", [])
         await conn.execute(
             f"CREATE TABLE IF NOT EXISTS {table} ("
-            "id serial PRIMARY KEY, name text NOT NULL UNIQUE, hash text NOT NULL, "
-            "applied_at timestamptz NOT NULL DEFAULT now())",
+            "id serial PRIMARY KEY, name pg_catalog.text NOT NULL UNIQUE, "
+            "hash pg_catalog.text NOT NULL, "
+            "applied_at pg_catalog.timestamptz NOT NULL DEFAULT pg_catalog.now())",
             [],
         )
 
@@ -139,4 +142,4 @@ class PostgresDialect:
 
     def forget_migration(self, schema: str, name: str) -> tuple[str, list[object]]:
         table = ddl.qualified(schema, MIGRATIONS_TABLE)
-        return f"DELETE FROM {table} WHERE name = $1", [name]
+        return f"DELETE FROM {table} WHERE name {ddl.EQ} $1", [name]

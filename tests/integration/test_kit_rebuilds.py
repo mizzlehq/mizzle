@@ -209,7 +209,7 @@ async def test_a_new_expression_before_pg17_keeps_the_comment_and_managed_views(
     await migrate(kit_url, empty_snapshot("postgresql"), v1)
     await execute(kit_url, "INSERT INTO calc (name) VALUES ('Ab')")
     old_branch = [
-        Statement(s.sql.replace(">= 170000", ">= 9900000")) for s in dialect.render(diff(v1, v2))
+        Statement(s.sql.replace(">=) 170000", ">=) 9900000")) for s in dialect.render(diff(v1, v2))
     ]
     await apply(kit_url, old_branch)
     assert await comment_of_b(kit_url) == "computed"

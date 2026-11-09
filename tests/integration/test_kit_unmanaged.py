@@ -1,16 +1,19 @@
 """Objects mizzle does not manage are neither read, dropped nor lost (K6)."""
 
+import copy
 import json
+import uuid
 from collections.abc import Sequence
 from pathlib import Path
 from typing import final, override
+from urllib.parse import quote
 
 import asyncpg
 import pytest
 
 from mizzle import QueryBuilder, Table, View, sql
 from mizzle.core.errors import DatabaseError, SchemaError
-from mizzle.core.snapshot import Snapshot, empty_snapshot
+from mizzle.core.snapshot import GeneratedSnap, Snapshot, empty_snapshot
 from mizzle.core.sql.nodes import Node
 from mizzle.core.steps import Statement
 from mizzle.dialects.postgres import PostgresDialect, ddl
@@ -230,7 +233,7 @@ async def test_changing_an_expression_before_pg17_refuses_to_drop_unmanaged_obje
     v1, v2 = calc("id * 2"), calc("id * 3")
     await migrate(kit_url, empty_snapshot("postgresql"), v1)
     [change] = dialect.render(diff(v1, v2))
-    old_branch = [Statement(change.sql.replace(">= 170000", ">= 9900000"))]
+    old_branch = [Statement(change.sql.replace(">=) 170000", ">=) 9900000"))]
     for unmanaged, undo in [
         ("GRANT SELECT (b) ON calc TO PUBLIC", "REVOKE SELECT (b) ON calc FROM PUBLIC"),
         (
@@ -502,3 +505,130 @@ async def test_schema_names_with_a_dot_are_refused(kit_url: str) -> None:
     with pytest.raises(SchemaError, match="not supported in schema names"):
         await live(kit_url, ["public", "public.x"])
     assert list((await live(kit_url))["tables"]) == ["public.x.y"]  # a dotted table is fine
+
+
+# K8-6: built-ins the kit's own SQL calls, planted in public with the exact signature. Each
+# bumps a sequence (it survives the rollback introspection ends in) and calls the real one.
+_PLANTED = (
+    ("format_type", "oid, integer", "text"),
+    ("pg_get_expr", "pg_node_tree, oid", "text"),
+    ("pg_get_constraintdef", "oid", "text"),
+    ("pg_get_indexdef", "oid, integer, boolean", "text"),
+    ("pg_get_viewdef", "oid", "text"),
+    ("pg_get_serial_sequence", "text, text", "text"),
+    ("obj_description", "oid, name", "text"),
+    ("col_description", "oid, integer", "text"),
+    ("quote_ident", "text", "text"),
+    ("pg_get_userbyid", "oid", "name"),
+    ("current_setting", "text", "text"),
+    ("set_config", "text, text, boolean", "text"),
+    ("to_regclass", "text", "regclass"),
+    ("pg_has_role", "oid, text", "boolean"),
+    ("pg_try_advisory_lock", "bigint", "boolean"),
+    ("pg_advisory_unlock", "bigint", "boolean"),
+    ("now", "", "timestamptz"),
+    # pg_catalog's is polymorphic (anyarray): an exact int2[] one wins wherever it is.
+    ("unnest", "smallint[]", "SETOF smallint"),
+    (
+        "aclexplode",
+        "aclitem[]",
+        "TABLE (grantor oid, grantee oid, privilege_type text, is_grantable boolean)",
+    ),
+)
+
+_PLANTED_V1 = """
+from mizzle import Table, View, sql
+from mizzle.pg import integer, text
+
+class Docs(Table, name="docs"):
+    id = integer().primary_key()
+    body = text().not_null()
+    shout = text().generated_always_as(sql("upper(body)"))
+
+class VDocs(View, name="v_docs"):
+    id = integer()
+    body = text()
+
+    @classmethod
+    def query(cls, db):
+        return sql("SELECT id, body FROM docs")
+"""
+
+
+def _plant(name: str, args: str, result: str) -> str:
+    params = ", ".join(f"${i + 1}" for i in range(args.count(",") + 1 if args else 0))
+    real = f"pg_catalog.{name}({params})"
+    give = f"QUERY SELECT * FROM {real}" if result.startswith(("SETOF", "TABLE")) else real
+    return (
+        f"CREATE FUNCTION public.{name}({args}) RETURNS {result} LANGUAGE plpgsql AS $f$ "
+        f"BEGIN PERFORM pg_catalog.nextval('public.k86_hits'); RETURN {give}; END $f$"
+    )
+
+
+async def test_functions_planted_in_public_never_run_as_the_migrator(
+    project: Path, kit_url: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # K8-6: the kit's own SQL called built-ins unqualified. A role that can create in public
+    # planted an exact-signature function there (or any, with public before pg_catalog on
+    # the path), and introspection, generated DO blocks and the migrations table ran it as
+    # the migrating role. User expressions (upper(body)) still resolve through the path.
+    planter = f"k86_{uuid.uuid4().hex[:8]}"
+
+    async def ran() -> bool:
+        return bool((await fetch_one(kit_url, "SELECT is_called FROM k86_hits"))[0])
+
+    await execute(
+        kit_url,
+        f"CREATE ROLE {planter}; GRANT CREATE ON SCHEMA public TO {planter}; "
+        f"CREATE SEQUENCE public.k86_hits; GRANT USAGE ON SEQUENCE public.k86_hits TO PUBLIC",
+    )
+    try:
+        await execute(kit_url, f"SET ROLE {planter}; " + "; ".join(_plant(*p) for p in _PLANTED))
+        url = f"{kit_url}?search_path={quote('public, pg_catalog')}"
+        monkeypatch.setenv("DATABASE_URL", url)
+        rewrite_schema(project, _PLANTED_V1, monkeypatch)
+        assert await cli("generate") == 0
+        assert await cli("migrate") == 0
+        await execute(url, "GRANT SELECT ON v_docs TO PUBLIC; COMMENT ON VIEW v_docs IS 'v'")
+        await execute(url, "INSERT INTO docs (id, body) VALUES (1, 'a')")
+        # A recreated view (save and restore grants), an identity added to a filled column
+        # (setval) and a changed generated expression (SET EXPRESSION).
+        v2 = (
+            _PLANTED_V1.replace(
+                "id = integer().primary_key()",
+                "id = integer().primary_key().generated_by_default_as_identity()",
+            )
+            .replace("upper(body)", "lower(body)")
+            .replace("FROM docs", "FROM docs WHERE id > 0")
+        )
+        rewrite_schema(project, v2, monkeypatch)
+        assert await cli("generate") == 0
+        assert await cli("migrate") == 0
+        assert await cli("doctor") == 0
+        driver = await PostgresDriver.connect(url, pool_size=1)
+        try:
+            async with driver.acquire() as conn:
+                assert "grants on v_docs" in await dialect.skipped_objects(conn, ["public"])
+                current = await dialect.introspect(conn, ["public"])
+                await dialect.normalize_snapshot(conn, current)
+        finally:
+            await driver.close()
+        assert not await ran(), "a planted function ran"
+        # The rebuild PostgreSQL before 17 runs instead of SET EXPRESSION.
+        changed = copy.deepcopy(current)
+        changed["tables"]["public.docs"]["columns"]["shout"]["generated"] = GeneratedSnap(
+            expression="upper(body)", stored=True
+        )
+        old_branch = [
+            Statement(s.sql.replace(">=) 170000", ">=) 9900000"))
+            for s in dialect.render(diff(current, changed))
+        ]
+        assert any("9900000" in s.sql for s in old_branch)
+        await apply(url, old_branch)
+        assert (await fetch_one(kit_url, "SELECT shout FROM docs"))[0] == "A"
+        assert not await ran(), "a planted function ran"
+        # The trap is live: the same path runs it for an unqualified call.
+        await fetch_one(url, "SELECT format_type(23, -1)")
+        assert await ran()
+    finally:
+        await execute(kit_url, f"DROP OWNED BY {planter} CASCADE; DROP ROLE {planter}")

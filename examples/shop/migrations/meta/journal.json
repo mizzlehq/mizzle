@@ -12,7 +12,7 @@
     {
       "index": 2,
       "name": "0002_shop_schema",
-      "hash": "60eb5ca253b1700636f3665814381549aedeb3719df29cb935e086a3b509cbe9",
+      "hash": "617f1dfcad2ce218bb6f9dd59466f7c9a63e3552065eaa0efba751a42ca01ef5",
       "created_at": "2026-11-07T16:51:39+00:00"
     },
     {
@@ -25,7 +25,7 @@
     {
       "index": 4,
       "name": "0004_catalog_v2",
-      "hash": "a0d2f3a93c1166022e0132a0399e4bf2943035237032ec5d772646b7397cb09a",
+      "hash": "432c0b515713fa8bd7703176163c1963413457c20d525871250fc83a61b7d579",
       "created_at": "2026-11-07T16:51:40+00:00"
     }
   ]

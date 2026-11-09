@@ -33,6 +33,10 @@ from mizzle.core.snapshot import (
 from mizzle.dialects.base import Connection
 from mizzle.dialects.postgres.ddl import (
     DEFAULT_SCHEMA,
+    EQ,
+    NE,
+    PG_CLASS,
+    REGCLASS,
     SERIAL_TYPES,
     create_index,
     default_sql,
@@ -49,17 +53,31 @@ MIGRATIONS_TABLE = "__mizzle_migrations"
 _ACTIONS = {"a": None, "r": "restrict", "c": "cascade", "n": "set null", "d": "set default"}
 _NEXTVAL = re.compile(r"nextval\('.*'::regclass\)")
 
+# Every built-in, catalog, catalog type and operator below is named in pg_catalog (K8-6).
+# Arrays come back as text[]: on a name[] or int2[] result asyncpg first runs its own type
+# lookup, which calls current_setting() and set_config() unqualified.
+_GT = "OPERATOR(pg_catalog.>)"
+
+
+def _chars(*kinds: str) -> str:
+    """``= ANY`` of "char" catalog codes (``IN`` would resolve ``=`` on the path)."""
+    return f"{EQ} ANY ('{{{','.join(kinds)}}}'::pg_catalog.\"char\"[])"
+
+
 # Objects that belong to an extension (pg_trgm's functions...) are not the schema's own.
-_NOT_EXTENSION = """NOT EXISTS (SELECT 1 FROM pg_depend d WHERE d.classid = {catalog}::regclass
-                  AND d.objid = {oid} AND d.deptype = 'e')"""
+_NOT_EXTENSION = (
+    "NOT EXISTS (SELECT 1 FROM pg_catalog.pg_depend d WHERE d.classid "
+    f"{EQ} 'pg_catalog.{{catalog}}'{REGCLASS}\n"
+    f"                  AND d.objid {EQ} {{oid}} AND d.deptype {EQ} 'e')"
+)
 
 
 # A partition, an inheritance child or an extension's table: not managed (K6-3, K6-6). A
 # foreign key that references one is not managed either (K7-2).
 def _unmanaged_relation(oid: str) -> str:
     return (
-        f"(EXISTS (SELECT 1 FROM pg_inherits i WHERE i.inhrelid = {oid})\n  OR "
-        + _NOT_EXTENSION.format(catalog="'pg_class'", oid=oid).removeprefix("NOT ")
+        f"(EXISTS (SELECT 1 FROM pg_catalog.pg_inherits i WHERE i.inhrelid {EQ} {oid})\n  OR "
+        + _NOT_EXTENSION.format(catalog="pg_class", oid=oid).removeprefix("NOT ")
         + ")"
     )
 
@@ -67,188 +85,202 @@ def _unmanaged_relation(oid: str) -> str:
 _TABLES = f"""
 SELECT c.oid, n.nspname AS schema, c.relname AS name,
        c.relrowsecurity AS rls, c.relforcerowsecurity AS rls_force,
-       obj_description(c.oid, 'pg_class') AS comment,
-       c.relpersistence::text AS persistence, coalesce(c.reloptions, '{{}}') AS options,
+       pg_catalog.obj_description(c.oid, 'pg_class') AS comment,
+       c.relpersistence::pg_catalog.text AS persistence,
+       coalesce(c.reloptions, '{{}}') AS options,
        coalesce(tc.reloptions, '{{}}') AS toast_options
-FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
-LEFT JOIN pg_class tc ON tc.oid = c.reltoastrelid
+FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid {EQ} c.relnamespace
+LEFT JOIN pg_catalog.pg_class tc ON tc.oid {EQ} c.reltoastrelid
 -- A partitioned table reads as a plain one; its partitions and inheritance children are
 -- not read (not managed, K6-6), nor are an extension's tables (K6-3).
-WHERE c.relkind IN ('r', 'p') AND n.nspname = ANY($1::text[]) AND c.relname <> $2
-  AND NOT {_unmanaged_relation("c.oid")}
+WHERE c.relkind {_chars("r", "p")} AND n.nspname {EQ} ANY($1::pg_catalog.text[])
+  AND c.relname {NE} $2 AND NOT {_unmanaged_relation("c.oid")}
 ORDER BY n.nspname, c.relname
 """
 
 log = logging.getLogger("mizzle")
 
-_COLUMNS = """
+_COLUMNS = f"""
 SELECT a.attrelid AS table_oid, a.attname AS name,
-       pg_get_serial_sequence(a.attrelid::regclass::text, a.attname) AS owned_sequence,
-       format_type(a.atttypid, a.atttypmod) AS type, a.attnotnull AS not_null,
-       pg_get_expr(d.adbin, d.adrelid) AS default,
-       a.attidentity::text AS identity, a.attgenerated::text AS generated,
+       pg_catalog.pg_get_serial_sequence(a.attrelid{REGCLASS}::pg_catalog.text, a.attname)
+         AS owned_sequence,
+       pg_catalog.format_type(a.atttypid, a.atttypmod) AS type, a.attnotnull AS not_null,
+       pg_catalog.pg_get_expr(d.adbin, d.adrelid) AS default,
+       a.attidentity::pg_catalog.text AS identity, a.attgenerated::pg_catalog.text AS generated,
        col.collname AS collation, coln.nspname AS collation_schema,
-       col_description(a.attrelid, a.attnum) AS comment,
+       pg_catalog.col_description(a.attrelid, a.attnum) AS comment,
        s.seqstart AS identity_start, s.seqincrement AS identity_increment,
        s.seqmin AS identity_min, s.seqmax AS identity_max, s.seqcache AS identity_cache,
        s.seqcycle AS identity_cycle
-FROM pg_attribute a
-LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum
-LEFT JOIN pg_collation col ON col.oid = a.attcollation
-LEFT JOIN pg_namespace coln ON coln.oid = col.collnamespace
+FROM pg_catalog.pg_attribute a
+LEFT JOIN pg_catalog.pg_attrdef d ON d.adrelid {EQ} a.attrelid AND d.adnum {EQ} a.attnum
+LEFT JOIN pg_catalog.pg_collation col ON col.oid {EQ} a.attcollation
+LEFT JOIN pg_catalog.pg_namespace coln ON coln.oid {EQ} col.collnamespace
 -- An identity column's sequence depends on it internally (deptype 'i').
-LEFT JOIN pg_depend dep ON a.attidentity <> '' AND dep.refclassid = 'pg_class'::regclass
-  AND dep.refobjid = a.attrelid AND dep.refobjsubid = a.attnum AND dep.deptype = 'i'
-  AND dep.classid = 'pg_class'::regclass
-LEFT JOIN pg_sequence s ON s.seqrelid = dep.objid
-WHERE a.attrelid = ANY($1::oid[]) AND a.attnum > 0 AND NOT a.attisdropped
+LEFT JOIN pg_catalog.pg_depend dep ON a.attidentity {NE} '' AND dep.refclassid {EQ} {PG_CLASS}
+  AND dep.refobjid {EQ} a.attrelid AND dep.refobjsubid {EQ} a.attnum AND dep.deptype {EQ} 'i'
+  AND dep.classid {EQ} {PG_CLASS}
+LEFT JOIN pg_catalog.pg_sequence s ON s.seqrelid {EQ} dep.objid
+WHERE a.attrelid {EQ} ANY($1::pg_catalog.oid[]) AND a.attnum {_GT} 0 AND NOT a.attisdropped
 ORDER BY a.attrelid, a.attnum
 """
 
 _CONSTRAINTS = f"""
-SELECT con.conrelid AS table_oid, con.conname AS name, con.contype::text AS kind,
-       ARRAY(SELECT a.attname FROM unnest(con.conkey) WITH ORDINALITY k(n, ord)
-             JOIN pg_attribute a ON a.attrelid = con.conrelid AND a.attnum = k.n
+SELECT con.conrelid AS table_oid, con.conname AS name, con.contype::pg_catalog.text AS kind,
+       ARRAY(SELECT a.attname::pg_catalog.text
+             FROM pg_catalog.unnest(con.conkey) WITH ORDINALITY k(n, ord)
+             JOIN pg_catalog.pg_attribute a ON a.attrelid {EQ} con.conrelid AND a.attnum {EQ} k.n
              ORDER BY k.ord) AS columns,
        fn.nspname AS ref_schema, fc.relname AS ref_table,
-       ARRAY(SELECT a.attname FROM unnest(con.confkey) WITH ORDINALITY k(n, ord)
-             JOIN pg_attribute a ON a.attrelid = con.confrelid AND a.attnum = k.n
+       ARRAY(SELECT a.attname::pg_catalog.text
+             FROM pg_catalog.unnest(con.confkey) WITH ORDINALITY k(n, ord)
+             JOIN pg_catalog.pg_attribute a ON a.attrelid {EQ} con.confrelid AND a.attnum {EQ} k.n
              ORDER BY k.ord) AS ref_columns,
-       con.confdeltype::text AS on_delete, con.confupdtype::text AS on_update,
-       pg_get_constraintdef(con.oid) AS definition,
+       con.confdeltype::pg_catalog.text AS on_delete,
+       con.confupdtype::pg_catalog.text AS on_update,
+       pg_catalog.pg_get_constraintdef(con.oid) AS definition,
        con.condeferrable AS deferrable, con.condeferred AS initially_deferred,
        con.convalidated AS validated,
-       EXISTS (SELECT 1 FROM pg_index i WHERE i.indexrelid = con.conindid
+       EXISTS (SELECT 1 FROM pg_catalog.pg_index i WHERE i.indexrelid {EQ} con.conindid
                AND i.indnullsnotdistinct) AS nulls_not_distinct
-FROM pg_constraint con
-LEFT JOIN pg_class fc ON fc.oid = con.confrelid
-LEFT JOIN pg_namespace fn ON fn.oid = fc.relnamespace
+FROM pg_catalog.pg_constraint con
+LEFT JOIN pg_catalog.pg_class fc ON fc.oid {EQ} con.confrelid
+LEFT JOIN pg_catalog.pg_namespace fn ON fn.oid {EQ} fc.relnamespace
 -- Exclusion constraints (contype 'x') are not managed: not read. Nor are the per-partition
 -- copies of an FK that references a partitioned table (K6-2), nor an FK to a table that
 -- is not managed (K7-2).
-WHERE con.conrelid = ANY($1::oid[]) AND con.contype IN ('p', 'u', 'f', 'c')
-  AND con.conparentid = 0
-  AND NOT (con.contype = 'f' AND {_unmanaged_relation("con.confrelid")})
+WHERE con.conrelid {EQ} ANY($1::pg_catalog.oid[]) AND con.contype {_chars("p", "u", "f", "c")}
+  AND con.conparentid {EQ} 0
+  AND NOT (con.contype {EQ} 'f' AND {_unmanaged_relation("con.confrelid")})
 ORDER BY con.conrelid, con.conname
 """
 
-_INDEXES = """
+_INDEXES = f"""
 SELECT i.indrelid AS table_oid, ic.relname AS name, i.indisunique AS unique,
        -- Key columns only: INCLUDE columns follow them in indkey (C25).
-       ARRAY(SELECT a.attname FROM unnest(i.indkey::int2[]) WITH ORDINALITY k(n, ord)
-             JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = k.n
-             WHERE k.ord <= i.indnkeyatts ORDER BY k.ord) AS columns,
-       i.indnatts > i.indnkeyatts AS has_include,
+       ARRAY(SELECT a.attname::pg_catalog.text
+             FROM pg_catalog.unnest(i.indkey::pg_catalog.int2[]) WITH ORDINALITY k(n, ord)
+             JOIN pg_catalog.pg_attribute a ON a.attrelid {EQ} i.indrelid AND a.attnum {EQ} k.n
+             WHERE k.ord OPERATOR(pg_catalog.<=) i.indnkeyatts ORDER BY k.ord) AS columns,
+       i.indnatts {_GT} i.indnkeyatts AS has_include,
        -- Per key: DESC (bit 1) and NULLS FIRST (bit 2), and a collation other than the
        -- column's own.
-       ARRAY(SELECT k.o FROM unnest(i.indoption::int2[]) WITH ORDINALITY k(o, ord)
+       ARRAY(SELECT k.o::pg_catalog.text
+             FROM pg_catalog.unnest(i.indoption::pg_catalog.int2[]) WITH ORDINALITY k(o, ord)
              ORDER BY k.ord) AS key_options,
-       ARRAY(SELECT CASE WHEN c.oid IS NULL OR c.collname = 'default'
-                          OR c.oid = a.attcollation THEN NULL ELSE c.collname::text END
-             FROM unnest(i.indcollation::oid[]) WITH ORDINALITY k(o, ord)
-             LEFT JOIN pg_collation c ON c.oid = k.o
-             LEFT JOIN pg_attribute a ON a.attrelid = i.indrelid
-                                     AND a.attnum = (i.indkey::int2[])[k.ord - 1]
+       ARRAY(SELECT CASE WHEN c.oid IS NULL OR c.collname {EQ} 'default'
+                          OR c.oid {EQ} a.attcollation THEN NULL
+                          ELSE c.collname::pg_catalog.text END
+             FROM pg_catalog.unnest(i.indcollation::pg_catalog.oid[]) WITH ORDINALITY k(o, ord)
+             LEFT JOIN pg_catalog.pg_collation c ON c.oid {EQ} k.o
+             LEFT JOIN pg_catalog.pg_attribute a ON a.attrelid {EQ} i.indrelid
+                  AND a.attnum {EQ} (i.indkey::pg_catalog.int2[])[k.ord OPERATOR(pg_catalog.-) 1]
              ORDER BY k.ord) AS collations,
-       pg_get_expr(i.indpred, i.indrelid) AS predicate,
+       pg_catalog.pg_get_expr(i.indpred, i.indrelid) AS predicate,
        i.indexprs IS NOT NULL AS has_expressions,
        -- Each key on its own, straight from the catalog (no parsing of definition text).
-       ARRAY(SELECT pg_get_indexdef(i.indexrelid, k, true)
-             FROM generate_series(1, i.indnkeyatts) AS k ORDER BY k) AS keys,
+       ARRAY(SELECT pg_catalog.pg_get_indexdef(i.indexrelid, k, true)
+             FROM pg_catalog.generate_series(1, i.indnkeyatts) AS k
+             ORDER BY k) AS keys,
        am.amname AS method,
-       ARRAY(SELECT CASE WHEN oc.opcdefault THEN NULL ELSE oc.opcname END
-             FROM unnest(i.indclass::oid[]) WITH ORDINALITY k(o, ord)
-             JOIN pg_opclass oc ON oc.oid = k.o ORDER BY k.ord) AS opclasses,
-       coalesce(ic.reloptions, '{}') AS options,
+       ARRAY(SELECT CASE WHEN oc.opcdefault THEN NULL ELSE oc.opcname::pg_catalog.text END
+             FROM pg_catalog.unnest(i.indclass::pg_catalog.oid[]) WITH ORDINALITY k(o, ord)
+             JOIN pg_catalog.pg_opclass oc ON oc.oid {EQ} k.o ORDER BY k.ord) AS opclasses,
+       coalesce(ic.reloptions, '{{}}') AS options,
        i.indnullsnotdistinct AS nulls_not_distinct
-FROM pg_index i
-JOIN pg_class ic ON ic.oid = i.indexrelid
-JOIN pg_am am ON am.oid = ic.relam
-WHERE i.indrelid = ANY($1::oid[])
+FROM pg_catalog.pg_index i
+JOIN pg_catalog.pg_class ic ON ic.oid {EQ} i.indexrelid
+JOIN pg_catalog.pg_am am ON am.oid {EQ} ic.relam
+WHERE i.indrelid {EQ} ANY($1::pg_catalog.oid[])
   -- The index of a key or of an exclusion constraint (not managed) is not an index of its own.
-  AND NOT EXISTS (SELECT 1 FROM pg_constraint con WHERE con.conindid = i.indexrelid
-                  AND con.contype IN ('p', 'u', 'x'))
+  AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_constraint con
+                  WHERE con.conindid {EQ} i.indexrelid AND con.contype {_chars("p", "u", "x")})
 ORDER BY i.indrelid, ic.relname
 """
 
 _ENUMS = f"""
 SELECT n.nspname AS schema, t.typname AS name,
-       array_agg(e.enumlabel ORDER BY e.enumsortorder) AS values
-FROM pg_type t
-JOIN pg_enum e ON e.enumtypid = t.oid
-JOIN pg_namespace n ON n.oid = t.typnamespace
-WHERE n.nspname = ANY($1::text[])
-  AND {_NOT_EXTENSION.format(catalog="'pg_type'", oid="t.oid")}
+       pg_catalog.array_agg(e.enumlabel::pg_catalog.text ORDER BY e.enumsortorder) AS values
+FROM pg_catalog.pg_type t
+JOIN pg_catalog.pg_enum e ON e.enumtypid {EQ} t.oid
+JOIN pg_catalog.pg_namespace n ON n.oid {EQ} t.typnamespace
+WHERE n.nspname {EQ} ANY($1::pg_catalog.text[])
+  AND {_NOT_EXTENSION.format(catalog="pg_type", oid="t.oid")}
 GROUP BY n.nspname, t.typname
 ORDER BY n.nspname, t.typname
 """
 
 _VIEWS = f"""
-SELECT c.oid, n.nspname AS schema, c.relname AS name, c.relkind = 'm' AS materialized,
-       pg_get_viewdef(c.oid) AS definition, coalesce(c.reloptions, '{{}}') AS options
-FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
-WHERE c.relkind IN ('v', 'm') AND n.nspname = ANY($1::text[])
-  AND {_NOT_EXTENSION.format(catalog="'pg_class'", oid="c.oid")}
+SELECT c.oid, n.nspname AS schema, c.relname AS name, c.relkind {EQ} 'm' AS materialized,
+       pg_catalog.pg_get_viewdef(c.oid) AS definition, coalesce(c.reloptions, '{{}}') AS options
+FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid {EQ} c.relnamespace
+WHERE c.relkind {_chars("v", "m")} AND n.nspname {EQ} ANY($1::pg_catalog.text[])
+  AND {_NOT_EXTENSION.format(catalog="pg_class", oid="c.oid")}
 ORDER BY n.nspname, c.relname
 """
 
 # What mizzle does not manage, for pull to say it leaves out (K8): generate, push and pull
 # neither read nor drop these.
+_IN_SCHEMAS = f"n.nspname {EQ} ANY($1::pg_catalog.text[])"
+_REL = f"{REGCLASS}::pg_catalog.text"
 _SKIPPED = f"""
-SELECT CASE p.prokind WHEN 'p' THEN 'procedure ' ELSE 'function ' END
-       || p.oid::regprocedure::text AS what
-FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
-WHERE p.prokind IN ('f', 'p') AND n.nspname = ANY($1::text[])
-  AND {_NOT_EXTENSION.format(catalog="'pg_proc'", oid="p.oid")}
+SELECT pg_catalog.concat(CASE WHEN p.prokind {EQ} 'p' THEN 'procedure ' ELSE 'function ' END,
+       p.oid::pg_catalog.regprocedure::pg_catalog.text) AS what
+FROM pg_catalog.pg_proc p JOIN pg_catalog.pg_namespace n ON n.oid {EQ} p.pronamespace
+WHERE p.prokind {_chars("f", "p")} AND {_IN_SCHEMAS}
+  AND {_NOT_EXTENSION.format(catalog="pg_proc", oid="p.oid")}
 UNION ALL
-SELECT 'trigger ' || quote_ident(t.tgname) || ' on ' || c.oid::regclass::text
-FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid
-JOIN pg_namespace n ON n.oid = c.relnamespace
-WHERE NOT t.tgisinternal AND n.nspname = ANY($1::text[])
+SELECT pg_catalog.concat('trigger ', pg_catalog.quote_ident(t.tgname), ' on ', c.oid{_REL})
+FROM pg_catalog.pg_trigger t JOIN pg_catalog.pg_class c ON c.oid {EQ} t.tgrelid
+JOIN pg_catalog.pg_namespace n ON n.oid {EQ} c.relnamespace
+WHERE NOT t.tgisinternal AND {_IN_SCHEMAS}
 UNION ALL
-SELECT CASE t.typtype WHEN 'd' THEN 'domain ' ELSE 'composite type ' END
-       || t.oid::regtype::text
-FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace
-LEFT JOIN pg_class c ON c.oid = t.typrelid
-WHERE (t.typtype = 'd' OR (t.typtype = 'c' AND c.relkind = 'c'))
-  AND n.nspname = ANY($1::text[])
-  AND {_NOT_EXTENSION.format(catalog="'pg_type'", oid="t.oid")}
+SELECT pg_catalog.concat(CASE WHEN t.typtype {EQ} 'd' THEN 'domain ' ELSE 'composite type ' END,
+       t.oid::pg_catalog.regtype::pg_catalog.text)
+FROM pg_catalog.pg_type t JOIN pg_catalog.pg_namespace n ON n.oid {EQ} t.typnamespace
+LEFT JOIN pg_catalog.pg_class c ON c.oid {EQ} t.typrelid
+WHERE (t.typtype {EQ} 'd' OR (t.typtype {EQ} 'c' AND c.relkind {EQ} 'c'))
+  AND {_IN_SCHEMAS}
+  AND {_NOT_EXTENSION.format(catalog="pg_type", oid="t.oid")}
 UNION ALL
-SELECT 'extension ' || quote_ident(e.extname)
-FROM pg_extension e WHERE e.extname <> 'plpgsql'
+SELECT pg_catalog.concat('extension ', pg_catalog.quote_ident(e.extname))
+FROM pg_catalog.pg_extension e WHERE e.extname {NE} 'plpgsql'
 UNION ALL
-SELECT 'exclusion constraint ' || quote_ident(con.conname) || ' on '
-       || con.conrelid::regclass::text
-FROM pg_constraint con JOIN pg_class c ON c.oid = con.conrelid
-JOIN pg_namespace n ON n.oid = c.relnamespace
-WHERE con.contype = 'x' AND n.nspname = ANY($1::text[])
+SELECT pg_catalog.concat('exclusion constraint ', pg_catalog.quote_ident(con.conname), ' on ',
+       con.conrelid{_REL})
+FROM pg_catalog.pg_constraint con JOIN pg_catalog.pg_class c ON c.oid {EQ} con.conrelid
+JOIN pg_catalog.pg_namespace n ON n.oid {EQ} c.relnamespace
+WHERE con.contype {EQ} 'x' AND {_IN_SCHEMAS}
 UNION ALL
-SELECT 'foreign key ' || quote_ident(con.conname) || ' on ' || con.conrelid::regclass::text
-       || ' (it references ' || con.confrelid::regclass::text || ')'
-FROM pg_constraint con JOIN pg_class c ON c.oid = con.conrelid
-JOIN pg_namespace n ON n.oid = c.relnamespace
-WHERE con.contype = 'f' AND con.conparentid = 0 AND n.nspname = ANY($1::text[])
+SELECT pg_catalog.concat('foreign key ', pg_catalog.quote_ident(con.conname), ' on ',
+       con.conrelid{_REL}, ' (it references ', con.confrelid{_REL}, ')')
+FROM pg_catalog.pg_constraint con JOIN pg_catalog.pg_class c ON c.oid {EQ} con.conrelid
+JOIN pg_catalog.pg_namespace n ON n.oid {EQ} c.relnamespace
+WHERE con.contype {EQ} 'f' AND con.conparentid {EQ} 0 AND {_IN_SCHEMAS}
   AND {_unmanaged_relation("con.confrelid")}
 UNION ALL
-SELECT 'sequence ' || c.oid::regclass::text
-FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
-WHERE c.relkind = 'S' AND n.nspname = ANY($1::text[])
-  AND {_NOT_EXTENSION.format(catalog="'pg_class'", oid="c.oid")}
-  AND NOT EXISTS (SELECT 1 FROM pg_depend d WHERE d.classid = 'pg_class'::regclass
-                  AND d.objid = c.oid AND d.refobjsubid > 0 AND d.deptype IN ('a', 'i'))
+SELECT pg_catalog.concat('sequence ', c.oid{_REL})
+FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid {EQ} c.relnamespace
+WHERE c.relkind {EQ} 'S' AND {_IN_SCHEMAS}
+  AND {_NOT_EXTENSION.format(catalog="pg_class", oid="c.oid")}
+  AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_depend d WHERE d.classid {EQ} {PG_CLASS}
+                  AND d.objid {EQ} c.oid AND d.refobjsubid {_GT} 0
+                  AND d.deptype {_chars("a", "i")})
 UNION ALL
-SELECT CASE WHEN c.relispartition THEN 'partition ' ELSE 'table inheritance ' END
-       || c.oid::regclass::text || ' of ' || i.inhparent::regclass::text
-FROM pg_inherits i JOIN pg_class c ON c.oid = i.inhrelid
-JOIN pg_namespace n ON n.oid = c.relnamespace
-WHERE n.nspname = ANY($1::text[]) AND c.relkind IN ('r', 'p', 'f')  -- not indexes (K4-10)
+SELECT pg_catalog.concat(CASE WHEN c.relispartition THEN 'partition '
+                              ELSE 'table inheritance ' END,
+       c.oid{_REL}, ' of ', i.inhparent{_REL})
+FROM pg_catalog.pg_inherits i JOIN pg_catalog.pg_class c ON c.oid {EQ} i.inhrelid
+JOIN pg_catalog.pg_namespace n ON n.oid {EQ} c.relnamespace
+WHERE {_IN_SCHEMAS} AND c.relkind {_chars("r", "p", "f")}  -- not indexes (K4-10)
 UNION ALL
-SELECT 'grants on ' || c.oid::regclass::text
-FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
-WHERE c.relkind IN ('r', 'p', 'v', 'm') AND n.nspname = ANY($1::text[]) AND NOT c.relispartition
-  AND c.relname <> $2 AND {_NOT_EXTENSION.format(catalog="'pg_class'", oid="c.oid")}
-  AND (EXISTS (SELECT 1 FROM aclexplode(c.relacl) g WHERE g.grantee <> c.relowner)
-       OR EXISTS (SELECT 1 FROM pg_attribute a WHERE a.attrelid = c.oid AND a.attacl IS NOT NULL))
+SELECT pg_catalog.concat('grants on ', c.oid{_REL})
+FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid {EQ} c.relnamespace
+WHERE c.relkind {_chars("r", "p", "v", "m")} AND {_IN_SCHEMAS} AND NOT c.relispartition
+  AND c.relname {NE} $2 AND {_NOT_EXTENSION.format(catalog="pg_class", oid="c.oid")}
+  AND (EXISTS (SELECT 1 FROM pg_catalog.aclexplode(c.relacl) g WHERE g.grantee {NE} c.relowner)
+       OR EXISTS (SELECT 1 FROM pg_catalog.pg_attribute a
+                  WHERE a.attrelid {EQ} c.oid AND a.attacl IS NOT NULL))
 ORDER BY 1
 """
 
@@ -261,23 +293,24 @@ async def skipped_objects(conn: Connection, schemas: Sequence[str]) -> list[str]
     return [str(row["what"]) for row in rows]
 
 
-_POLICIES = """
-SELECT p.polrelid AS table_oid, p.polname AS name, p.polcmd::text AS command,
+_POLICIES = f"""
+SELECT p.polrelid AS table_oid, p.polname AS name, p.polcmd::pg_catalog.text AS command,
        p.polpermissive AS permissive,
-       ARRAY(SELECT CASE WHEN r = 0 THEN 'public' ELSE pg_get_userbyid(r) END
-             FROM unnest(p.polroles) AS r ORDER BY 1) AS roles,
-       pg_get_expr(p.polqual, p.polrelid) AS using,
-       pg_get_expr(p.polwithcheck, p.polrelid) AS with_check
-FROM pg_policy p
-WHERE p.polrelid = ANY($1::oid[])
+       ARRAY(SELECT CASE WHEN r {EQ} 0 THEN 'public'
+                         ELSE pg_catalog.pg_get_userbyid(r)::pg_catalog.text END
+             FROM pg_catalog.unnest(p.polroles) AS r ORDER BY 1) AS roles,
+       pg_catalog.pg_get_expr(p.polqual, p.polrelid) AS using,
+       pg_catalog.pg_get_expr(p.polwithcheck, p.polrelid) AS with_check
+FROM pg_catalog.pg_policy p
+WHERE p.polrelid {EQ} ANY($1::pg_catalog.oid[])
 ORDER BY p.polrelid, p.polname
 """
 
 # Privileges granted on tables and views, except the owner's own.
-_ROLES = """
+_ROLES = f"""
 SELECT rolname AS name, rolcanlogin AS login, rolcreatedb AS create_db,
        rolcreaterole AS create_role, rolinherit AS inherit
-FROM pg_roles WHERE rolname = any($1::text[])
+FROM pg_catalog.pg_roles WHERE rolname {EQ} ANY($1::pg_catalog.text[])
 """
 _COMMANDS = {"*": "all", "r": "select", "a": "insert", "w": "update", "d": "delete"}
 
@@ -390,7 +423,7 @@ def _index(row: _Row) -> IndexSnap:
         where=_opt_str(row["predicate"]),
     )
     opclasses = cast(list[str | None], row["opclasses"])
-    orders = [_key_order(int(cast(int, o))) for o in cast("list[object]", row["key_options"])]
+    orders = [_key_order(int(o)) for o in _strs(row["key_options"])]
     collations = cast(list[str | None], row["collations"])
     if row["has_include"]:
         _not_modelled(f"index {index['name']}", "INCLUDE")
@@ -479,7 +512,7 @@ async def introspect(
         return cast(Snapshot, undo.args[0])
 
 
-_SERVER_KEYWORDS = "SELECT word FROM pg_get_keywords() WHERE catcode <> 'U'"
+_SERVER_KEYWORDS = f"SELECT word FROM pg_catalog.pg_get_keywords() WHERE catcode {NE} 'U'"
 
 
 def _requote_types(snapshot: Snapshot, server_keywords: frozenset[str]) -> None:
@@ -654,8 +687,10 @@ async def _introspect_objects(
 async def _normalize_indexes(snapshot: Snapshot, read_back: _ReadBack, version: int) -> None:
     """Operator classes (naming the default one is the same as naming none) and expression
     keys as the database prints them, from the index made on a temporary table."""
-    rel = f"to_regclass('pg_temp.{quote(_NORM)}')"
-    query = _indexes_query(version).replace("ANY($1::oid[])", f"ANY(ARRAY[{rel}::oid])")
+    rel = f"pg_catalog.to_regclass('pg_temp.{quote(_NORM)}')"
+    query = _indexes_query(version).replace(
+        "ANY($1::pg_catalog.oid[])", f"ANY(ARRAY[{rel}::pg_catalog.oid])"
+    )
     for table in snapshot["tables"].values():
         columns = ", ".join(
             f"{quote(c['name'])} {SERIAL_TYPES.get(c['type'], c['type'])}"
@@ -717,8 +752,8 @@ async def _normalize_types(snapshot: Snapshot, read_back: _ReadBack, rel: str) -
             if written not in printed:
                 row = await read_back(
                     [f"CREATE TEMP TABLE {quote(_NORM)} (c {written})"],
-                    "SELECT format_type(atttypid, atttypmod) AS t FROM pg_attribute "
-                    f"WHERE attrelid = {rel} AND attname = 'c'",
+                    "SELECT pg_catalog.format_type(atttypid, atttypmod) AS t "
+                    f"FROM pg_catalog.pg_attribute WHERE attrelid {EQ} {rel} AND attname {EQ} 'c'",
                 )
                 printed[written] = None if row is None else _opt_str(row["t"])
             column["type"] = printed[written] or written
@@ -751,9 +786,10 @@ async def _normalize_column_expressions(snapshot: Snapshot, read_back: _ReadBack
             )
             row = await read_back(
                 [f"CREATE TEMP TABLE {quote(_NORM)} ({columns})"],
-                "SELECT pg_get_expr(d.adbin, d.adrelid) AS e FROM pg_attrdef d "
-                "JOIN pg_attribute a ON a.attrelid = d.adrelid AND a.attnum = d.adnum "
-                f"WHERE d.adrelid = {rel} AND a.attname = {literal(name)}",
+                "SELECT pg_catalog.pg_get_expr(d.adbin, d.adrelid) AS e "
+                "FROM pg_catalog.pg_attrdef d JOIN pg_catalog.pg_attribute a "
+                f"ON a.attrelid {EQ} d.adrelid AND a.attnum {EQ} d.adnum "
+                f"WHERE d.adrelid {EQ} {rel} AND a.attname {EQ} {literal(name)}",
             )
             if row is None or row["e"] is None:
                 continue  # cannot be created here (a type or sequence made later): as is
@@ -821,10 +857,10 @@ async def _normalize_constraint_expressions(
     row = await read_back(
         statements,
         "SELECT "
-        "ARRAY(SELECT c.conname FROM pg_constraint c "
-        f"WHERE c.conrelid = {rel} AND c.contype = 'c' ORDER BY c.conname) AS check_names, "
-        "ARRAY(SELECT pg_get_constraintdef(c.oid) FROM pg_constraint c "
-        f"WHERE c.conrelid = {rel} AND c.contype = 'c' ORDER BY c.conname) AS check_defs",
+        "ARRAY(SELECT c.conname::pg_catalog.text FROM pg_catalog.pg_constraint c "
+        f"WHERE c.conrelid {EQ} {rel} AND c.contype {EQ} 'c' ORDER BY c.conname) AS check_names, "
+        "ARRAY(SELECT pg_catalog.pg_get_constraintdef(c.oid) FROM pg_catalog.pg_constraint c "
+        f"WHERE c.conrelid {EQ} {rel} AND c.contype {EQ} 'c' ORDER BY c.conname) AS check_defs",
     )
     if row is None:
         return
@@ -836,13 +872,13 @@ async def _normalize_constraint_expressions(
 async def _normalize(snapshot: Snapshot, read_back: _ReadBack, version: int) -> None:
     norm = f"pg_temp.{quote(_NORM)}"
     # Looked up when each query runs (a missing object reads as NULL, never as text).
-    rel = f"to_regclass('{norm}')"
+    rel = f"pg_catalog.to_regclass('{norm}')"
     for view in snapshot.get("views", {}).values():
         create = f"CREATE TEMP VIEW {quote(_NORM)} AS {view['definition']}"
         row = await read_back(
             [create],
-            f"SELECT pg_get_viewdef({rel}) AS d, ARRAY(SELECT attname "
-            f"FROM pg_attribute WHERE attrelid = {rel} AND attnum > 0 "
+            f"SELECT pg_catalog.pg_get_viewdef({rel}) AS d, ARRAY(SELECT attname::pg_catalog.text "
+            f"FROM pg_catalog.pg_attribute WHERE attrelid {EQ} {rel} AND attnum {_GT} 0 "
             "ORDER BY attnum) AS columns",
         )
         if row is None or row["d"] is None:
@@ -856,7 +892,7 @@ async def _normalize(snapshot: Snapshot, read_back: _ReadBack, version: int) -> 
 
     await _normalize_types(snapshot, read_back, rel)
     await _normalize_indexes(snapshot, read_back, version)
-    await _normalize_column_expressions(snapshot, read_back, f"to_regclass('{norm}')")
+    await _normalize_column_expressions(snapshot, read_back, rel)
 
     for table in snapshot["tables"].values():
         like = (
@@ -870,12 +906,11 @@ async def _normalize(snapshot: Snapshot, read_back: _ReadBack, version: int) -> 
             if policy["with_check"] is not None:
                 body += f" WITH CHECK ({policy['with_check']})"
             query = (
-                "SELECT pg_get_expr(polqual, polrelid) AS using, "
-                "pg_get_expr(polwithcheck, polrelid) AS with_check FROM pg_policy "
+                "SELECT pg_catalog.pg_get_expr(polqual, polrelid) AS using, "
+                "pg_catalog.pg_get_expr(polwithcheck, polrelid) AS with_check "
+                f"FROM pg_catalog.pg_policy WHERE polrelid {EQ} "
             )
-            row = await read_back(
-                [like, f"CREATE POLICY p ON {norm}{body}"], f"{query}WHERE polrelid = {rel}"
-            )
+            row = await read_back([like, f"CREATE POLICY p ON {norm}{body}"], f"{query}{rel}")
             if row is None:  # it names its own table (refs.t, K7-3): on a temporary copy
                 # under the same name (pg_temp is searched first), never on the table itself:
                 # CREATE POLICY there queued an ACCESS EXCLUSIVE lock behind readers (K8-1).
@@ -885,7 +920,7 @@ async def _normalize(snapshot: Snapshot, read_back: _ReadBack, version: int) -> 
                         f"CREATE TEMP TABLE {quote(table['name'])} (LIKE {real})",
                         f"CREATE POLICY p ON {shadow}{body}",
                     ],
-                    f"{query}WHERE polrelid = to_regclass({literal(shadow)})",
+                    f"{query}pg_catalog.to_regclass({literal(shadow)})",
                 )
             if row is not None:
                 policy["using"], policy["with_check"] = (

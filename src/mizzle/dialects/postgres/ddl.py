@@ -76,6 +76,15 @@ from mizzle.dialects.postgres.compiler import PostgresCompiler, temporal_text
 DEFAULT_SCHEMA = "public"
 MAX_IDENTIFIER = 63  # PostgreSQL silently truncates longer names
 
+# K8-6: the kit's own SQL (introspection, the DO blocks it writes) names every built-in,
+# catalog, catalog type and operator in pg_catalog. Unqualified, a planted function or
+# operator (an exact type match, or any match with public before pg_catalog on the path)
+# beat the built-in and ran as the migrating role. User expressions stay as written.
+EQ = "OPERATOR(pg_catalog.=)"
+NE = "OPERATOR(pg_catalog.<>)"
+REGCLASS = "::pg_catalog.regclass"
+PG_CLASS = "'pg_catalog.pg_class'::pg_catalog.regclass"
+
 SERIAL_TYPES = {"serial": "integer", "bigserial": "bigint", "smallserial": "smallint"}
 
 _TYPE_ALIASES = {
@@ -553,10 +562,11 @@ def _alter_identity(step: AlterColumnIdentity, sql_type: str) -> str:
         # next insert hit a duplicate key (C29). Move it past the largest value.
         table = qualified(step.schema, step.table)
         name = quote(step.column)
-        sequence = f"pg_get_serial_sequence({literal(table)}, {literal(step.column)})"
+        sequence = f"pg_catalog.pg_get_serial_sequence({literal(table)}, {literal(step.column)})"
+        start = new["start"]
         return (
-            f"{add};\nSELECT setval({sequence}, "
-            f"greatest(coalesce(max({name}) + 1, {new['start']}), {new['start']}), false) "
+            f"{add};\nSELECT pg_catalog.setval({sequence}, greatest(coalesce("
+            f"pg_catalog.max({name}) OPERATOR(pg_catalog.+) 1, {start}), {start}), false) "
             f"FROM {table}"
         )
     actions: list[str] = []
@@ -600,9 +610,12 @@ def _set_expression(step: AlterColumnGenerated, new: GeneratedSnap) -> str:
         f"SET EXPRESSION AS ({new['expression']})"
     )
     rel, att = literal(table), literal(step.column)
+    reg = f"{rel}{REGCLASS}"
     return (
-        "DO $mizzle$ DECLARE defs text[]; refs text[]; def text; r record; note text; BEGIN\n"
-        "IF current_setting('server_version_num')::int >= 170000 THEN\n"
+        "DO $mizzle$ DECLARE defs pg_catalog.text[]; refs pg_catalog.text[]; "
+        "def pg_catalog.text; r record; note pg_catalog.text; BEGIN\n"
+        "IF pg_catalog.current_setting('server_version_num')::int "
+        "OPERATOR(pg_catalog.>=) 170000 THEN\n"
         f"  EXECUTE {literal(set_expression)};\n"
         "ELSE\n"
         # Constraints and indexes on the column are made again below; nothing else (K6-10).
@@ -610,38 +623,45 @@ def _set_expression(step: AlterColumnGenerated, new: GeneratedSnap) -> str:
             table,
             step.table,
             step.column,
-            " AND d.classid <> 'pg_constraint'::regclass AND NOT EXISTS (SELECT 1 FROM pg_class "
-            "i WHERE d.classid = 'pg_class'::regclass AND i.oid = d.objid "
-            "AND i.relkind IN ('i', 'I'))",
+            f" AND d.classid {NE} 'pg_catalog.pg_constraint'::pg_catalog.regclass "
+            f"AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_class i WHERE d.classid {EQ} "
+            f"{PG_CLASS} AND i.oid {EQ} d.objid "
+            f"AND i.relkind {EQ} ANY ('{{i,I}}'::pg_catalog.\"char\"[]))",
         )
-        + "  SELECT array_agg(d) INTO defs FROM (\n"
-        "    SELECT format('ALTER TABLE %s ADD CONSTRAINT %I %s', "
-        f"{rel}, conname, pg_get_constraintdef(c.oid)) AS d\n"
-        "    FROM pg_constraint c JOIN pg_attribute a ON a.attrelid = c.conrelid\n"
-        f"    WHERE c.conrelid = {rel}::regclass AND a.attname = {att} "
-        "AND a.attnum = ANY(c.conkey)\n"
+        + "  SELECT pg_catalog.array_agg(d) INTO defs FROM (\n"
+        "    SELECT pg_catalog.format('ALTER TABLE %s ADD CONSTRAINT %I %s', "
+        f"{rel}, conname, pg_catalog.pg_get_constraintdef(c.oid)) AS d\n"
+        "    FROM pg_catalog.pg_constraint c JOIN pg_catalog.pg_attribute a "
+        f"ON a.attrelid {EQ} c.conrelid\n"
+        f"    WHERE c.conrelid {EQ} {reg} AND a.attname {EQ} {att} "
+        f"AND a.attnum {EQ} ANY(c.conkey)\n"
         "    UNION ALL\n"
-        "    SELECT DISTINCT pg_get_indexdef(i.indexrelid) FROM pg_index i\n"
-        "    JOIN pg_depend dep ON dep.classid = 'pg_class'::regclass "
-        "AND dep.objid = i.indexrelid AND dep.refobjid = i.indrelid\n"
-        "    JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = dep.refobjsubid\n"
-        f"    WHERE i.indrelid = {rel}::regclass AND a.attname = {att}\n"
-        "      AND NOT EXISTS (SELECT 1 FROM pg_constraint c WHERE c.conindid = i.indexrelid)\n"
+        "    SELECT DISTINCT pg_catalog.pg_get_indexdef(i.indexrelid) FROM pg_catalog.pg_index i\n"
+        f"    JOIN pg_catalog.pg_depend dep ON dep.classid {EQ} {PG_CLASS} "
+        f"AND dep.objid {EQ} i.indexrelid AND dep.refobjid {EQ} i.indrelid\n"
+        f"    JOIN pg_catalog.pg_attribute a ON a.attrelid {EQ} i.indrelid "
+        f"AND a.attnum {EQ} dep.refobjsubid\n"
+        f"    WHERE i.indrelid {EQ} {reg} AND a.attname {EQ} {att}\n"
+        "      AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_constraint c "
+        f"WHERE c.conindid {EQ} i.indexrelid)\n"
         "  ) s;\n"
-        "  FOR r IN SELECT c.conrelid::regclass AS t, c.conname, pg_get_constraintdef(c.oid) AS d\n"
-        "    FROM pg_constraint c JOIN pg_attribute a ON a.attrelid = c.confrelid\n"
-        f"    WHERE c.contype = 'f' AND c.confrelid = {rel}::regclass AND a.attname = {att}\n"
-        "      AND a.attnum = ANY(c.confkey)\n"
-        "      AND NOT (c.conrelid = c.confrelid AND a.attnum = ANY(c.conkey)) LOOP\n"
-        "    refs := refs || format('ALTER TABLE %s ADD CONSTRAINT %I %s', r.t, r.conname, r.d);\n"
-        "    EXECUTE format('ALTER TABLE %s DROP CONSTRAINT %I', r.t, r.conname);\n"
+        f"  FOR r IN SELECT c.conrelid{REGCLASS} AS t, c.conname, "
+        "pg_catalog.pg_get_constraintdef(c.oid) AS d\n"
+        "    FROM pg_catalog.pg_constraint c JOIN pg_catalog.pg_attribute a "
+        f"ON a.attrelid {EQ} c.confrelid\n"
+        f"    WHERE c.contype {EQ} 'f' AND c.confrelid {EQ} {reg} AND a.attname {EQ} {att}\n"
+        f"      AND a.attnum {EQ} ANY(c.confkey)\n"
+        f"      AND NOT (c.conrelid {EQ} c.confrelid AND a.attnum {EQ} ANY(c.conkey)) LOOP\n"
+        "    refs := pg_catalog.array_append(refs, "
+        "pg_catalog.format('ALTER TABLE %s ADD CONSTRAINT %I %s', r.t, r.conname, r.d));\n"
+        "    EXECUTE pg_catalog.format('ALTER TABLE %s DROP CONSTRAINT %I', r.t, r.conname);\n"
         "  END LOOP;\n"
-        f"  note := col_description({rel}::regclass, (SELECT attnum FROM pg_attribute "
-        f"WHERE attrelid = {rel}::regclass AND attname = {att}));\n"
+        f"  note := pg_catalog.col_description({reg}, (SELECT attnum FROM "
+        f"pg_catalog.pg_attribute WHERE attrelid {EQ} {reg} AND attname {EQ} {att}));\n"
         f"  EXECUTE {literal(f'ALTER TABLE {table} DROP COLUMN {quote(step.column)}')};\n"
         f"  EXECUTE {literal(add)};\n"
         # The comment goes with the column (K7-4).
-        "  IF note IS NOT NULL THEN EXECUTE format('COMMENT ON COLUMN %s.%I IS %L', "
+        "  IF note IS NOT NULL THEN EXECUTE pg_catalog.format('COMMENT ON COLUMN %s.%I IS %L', "
         f"{rel}, {att}, note); END IF;\n"
         "  FOREACH def IN ARRAY coalesce(defs, '{}') LOOP EXECUTE def; END LOOP;\n"
         "  FOREACH def IN ARRAY coalesce(refs, '{}') LOOP EXECUTE def; END LOOP;\n"
@@ -660,7 +680,9 @@ def _alter_type(step: AlterColumnType) -> str:
         f"ALTER TABLE {qualified(step.schema, step.table)} ALTER COLUMN {col} "
         f"SET DATA TYPE {step.new_type}{collate}"
     )
-    cast = f"{col}::text::{step.new_type}" if step.via_text else f"{col}::{step.new_type}"
+    cast = (
+        f"{col}::pg_catalog.text::{step.new_type}" if step.via_text else f"{col}::{step.new_type}"
+    )
     return text if step.generated else f"{text} USING {cast}"
 
 
@@ -770,8 +792,8 @@ def render_step(step: Step) -> Statement:
             # earlier run) may have made it already. ALTER then sets the options.
             name = quote(role["name"])
             return Statement(  # one statement, so migration files keep one per step
-                "DO $mizzle$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = "
-                f"{literal(role['name'])}) THEN CREATE ROLE {name}; END IF; "
+                "DO $mizzle$ BEGIN IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname "
+                f"{EQ} {literal(role['name'])}) THEN CREATE ROLE {name}; END IF; "
                 f"ALTER ROLE {name} {_role_options(role)}; END $mizzle$"
             )
         case AlterRole(role=role):
@@ -838,108 +860,122 @@ def _save_grants(name: str) -> str:
     statements that make them again. A grant is made again by the role that made it, so
     grant option chains hold (K7-1)."""
     rel = literal(name)
+    reg = f"{rel}{REGCLASS}"
     grantee = (
-        "CASE WHEN g.grantee = 0 THEN 'PUBLIC' ELSE quote_ident(pg_get_userbyid(g.grantee)) END"
+        f"CASE WHEN g.grantee {EQ} 0 THEN 'PUBLIC' "
+        "ELSE pg_catalog.quote_ident(pg_catalog.pg_get_userbyid(g.grantee)) END"
     )
     return (
         "DO $mizzle$ BEGIN\n"
         # PostgreSQL has no statement to disable a view's trigger or rule (only a catalog
         # edit does it): it would come back enabled, so stop before the view is dropped (K6-11).
-        f"IF EXISTS (SELECT 1 FROM pg_trigger WHERE tgrelid = {rel}::regclass "
-        "AND NOT tgisinternal AND tgenabled <> 'O') OR EXISTS (SELECT 1 FROM pg_rewrite "
-        f"WHERE ev_class = {rel}::regclass AND rulename <> '_RETURN' AND ev_enabled <> 'O') THEN\n"
+        f"IF EXISTS (SELECT 1 FROM pg_catalog.pg_trigger WHERE tgrelid {EQ} {reg} "
+        f"AND NOT tgisinternal AND tgenabled {NE} 'O') OR EXISTS (SELECT 1 FROM "
+        f"pg_catalog.pg_rewrite WHERE ev_class {EQ} {reg} AND rulename {NE} '_RETURN' "
+        f"AND ev_enabled {NE} 'O') THEN\n"
         f"  RAISE EXCEPTION 'view % has a disabled trigger or rule, which would come back "
         f"enabled when it is created again; this needs a custom migration', {rel};\n"
         "END IF;\n"
         # PostgreSQL has no GRANTED BY another role for object privileges: SET ROLE to it,
         # which PostgreSQL 16+ allows only with the membership's SET option (K8-4).
-        "IF EXISTS (SELECT 1 FROM pg_class c, LATERAL (SELECT c.relacl UNION ALL SELECT attacl "
-        "FROM pg_attribute WHERE attrelid = c.oid) x(acl), aclexplode(x.acl) g "
-        f"WHERE c.oid = {rel}::regclass AND g.grantor <> c.relowner "
-        "AND NOT pg_has_role(g.grantor, CASE WHEN current_setting('server_version_num')::int "
-        ">= 160000 THEN 'SET' ELSE 'MEMBER' END)) THEN\n"
+        "IF EXISTS (SELECT 1 FROM pg_catalog.pg_class c, LATERAL (SELECT c.relacl UNION ALL "
+        f"SELECT attacl FROM pg_catalog.pg_attribute WHERE attrelid {EQ} c.oid) x(acl), "
+        f"pg_catalog.aclexplode(x.acl) g WHERE c.oid {EQ} {reg} AND g.grantor {NE} c.relowner "
+        "AND NOT pg_catalog.pg_has_role(g.grantor, CASE WHEN "
+        "pg_catalog.current_setting('server_version_num')::int OPERATOR(pg_catalog.>=) 160000 "
+        "THEN 'SET' ELSE 'MEMBER' END)) THEN\n"
         f"  RAISE EXCEPTION 'view % has privileges granted by a role the current user cannot "
         f"SET ROLE to, so it cannot grant them again; this needs a custom migration', {rel};\n"
         "END IF;\n"
-        f"CREATE TEMP TABLE IF NOT EXISTS __mizzle_saved "
-        "(rel text PRIMARY KEY, acl aclitem[], owner oid, comment text);\n"
-        "CREATE TEMP TABLE IF NOT EXISTS __mizzle_saved_sql "
-        "(id serial, rel text, col name, stmt text, grantor oid);\n"
+        "CREATE TEMP TABLE IF NOT EXISTS __mizzle_saved (rel pg_catalog.text PRIMARY KEY, "
+        "acl pg_catalog.aclitem[], owner pg_catalog.oid, comment pg_catalog.text);\n"
+        "CREATE TEMP TABLE IF NOT EXISTS __mizzle_saved_sql (id serial, rel pg_catalog.text, "
+        "col pg_catalog.name, stmt pg_catalog.text, grantor pg_catalog.oid);\n"
         f"INSERT INTO {_SAVED} SELECT {rel}, c.relacl, c.relowner, "
-        "obj_description(c.oid, 'pg_class') FROM pg_class c "
-        f"WHERE c.oid = {rel}::regclass\n"
+        "pg_catalog.obj_description(c.oid, 'pg_class') FROM pg_catalog.pg_class c "
+        f"WHERE c.oid {EQ} {reg}\n"
         "ON CONFLICT (rel) DO UPDATE SET acl = EXCLUDED.acl, owner = EXCLUDED.owner, "
         "comment = EXCLUDED.comment;\n"
-        f"DELETE FROM {_SAVED_SQL} WHERE rel = {rel};\n"
+        f"DELETE FROM {_SAVED_SQL} WHERE rel {EQ} {rel};\n"
         f"INSERT INTO {_SAVED_SQL} (rel, col, stmt, grantor) SELECT {rel}, a.attname, "
-        "format('GRANT %s (%I) ON %s TO %s%s', "
+        "pg_catalog.format('GRANT %s (%I) ON %s TO %s%s', "
         f"g.privilege_type, a.attname, {rel}, {grantee}, "
         "CASE WHEN g.is_grantable THEN ' WITH GRANT OPTION' ELSE '' END), g.grantor "
-        "FROM pg_attribute a, aclexplode(a.attacl) WITH ORDINALITY g "
-        f"WHERE a.attrelid = {rel}::regclass AND a.attacl IS NOT NULL "
+        "FROM pg_catalog.pg_attribute a, pg_catalog.aclexplode(a.attacl) WITH ORDINALITY g "
+        f"WHERE a.attrelid {EQ} {reg} AND a.attacl IS NOT NULL "
         "ORDER BY a.attnum, g.ordinality;\n"
         f"INSERT INTO {_SAVED_SQL} (rel, col, stmt) SELECT {rel}, a.attname, "
-        f"format('COMMENT ON COLUMN %s.%I IS %L', {rel}, a.attname, d.description) "
-        "FROM pg_attribute a JOIN pg_description d ON d.objoid = a.attrelid "
-        "AND d.classoid = 'pg_class'::regclass AND d.objsubid = a.attnum "
-        f"WHERE a.attrelid = {rel}::regclass;\n"
+        f"pg_catalog.format('COMMENT ON COLUMN %s.%I IS %L', {rel}, a.attname, d.description) "
+        "FROM pg_catalog.pg_attribute a JOIN pg_catalog.pg_description d "
+        f"ON d.objoid {EQ} a.attrelid AND d.classoid {EQ} {PG_CLASS} "
+        f"AND d.objsubid {EQ} a.attnum WHERE a.attrelid {EQ} {reg};\n"
         f"INSERT INTO {_SAVED_SQL} (rel, col, stmt) SELECT {rel}, a.attname, "
-        f"format('ALTER VIEW %s ALTER COLUMN %I SET DEFAULT %s', {rel}, a.attname, "
-        "pg_get_expr(d.adbin, d.adrelid)) FROM pg_attrdef d JOIN pg_attribute a "
-        f"ON a.attrelid = d.adrelid AND a.attnum = d.adnum WHERE d.adrelid = {rel}::regclass;\n"
-        f"INSERT INTO {_SAVED_SQL} (rel, col, stmt) SELECT {rel}, NULL, pg_get_triggerdef(t.oid) "
-        f"FROM pg_trigger t WHERE t.tgrelid = {rel}::regclass AND NOT t.tgisinternal;\n"
+        f"pg_catalog.format('ALTER VIEW %s ALTER COLUMN %I SET DEFAULT %s', {rel}, a.attname, "
+        "pg_catalog.pg_get_expr(d.adbin, d.adrelid)) FROM pg_catalog.pg_attrdef d "
+        f"JOIN pg_catalog.pg_attribute a ON a.attrelid {EQ} d.adrelid AND a.attnum {EQ} d.adnum "
+        f"WHERE d.adrelid {EQ} {reg};\n"
         f"INSERT INTO {_SAVED_SQL} (rel, col, stmt) SELECT {rel}, NULL, "
-        "rtrim(pg_get_ruledef(r.oid), ';') "
-        f"FROM pg_rewrite r WHERE r.ev_class = {rel}::regclass AND r.rulename <> '_RETURN';\n"
+        "pg_catalog.pg_get_triggerdef(t.oid) FROM pg_catalog.pg_trigger t "
+        f"WHERE t.tgrelid {EQ} {reg} AND NOT t.tgisinternal;\n"
+        f"INSERT INTO {_SAVED_SQL} (rel, col, stmt) SELECT {rel}, NULL, "
+        "pg_catalog.rtrim(pg_catalog.pg_get_ruledef(r.oid), ';') FROM pg_catalog.pg_rewrite r "
+        f"WHERE r.ev_class {EQ} {reg} AND r.rulename {NE} '_RETURN';\n"
         "END $mizzle$"
     )
 
 
 def _restore_grants(name: str, kind: str) -> str:
     rel = literal(name)
+    reg = f"{rel}{REGCLASS}"
+    grantee = (
+        f"CASE WHEN a.grantee {EQ} 0 THEN 'PUBLIC' "
+        "ELSE pg_catalog.quote_ident(pg_catalog.pg_get_userbyid(a.grantee)) END"
+    )
+    as_grantor = (
+        f"  IF a.grantor {NE} s.owner THEN "
+        "PERFORM pg_catalog.set_config('role', pg_catalog.pg_get_userbyid(a.grantor), true); "
+        "END IF;\n"
+    )
     return (
-        "DO $mizzle$ DECLARE s record; a record; me text := current_setting('role'); BEGIN\n"
-        "IF to_regclass('pg_temp.__mizzle_saved') IS NULL THEN RETURN; END IF;\n"
-        f"SELECT * INTO s FROM {_SAVED} WHERE rel = {rel};\n"
+        "DO $mizzle$ DECLARE s record; a record; "
+        "me pg_catalog.text := pg_catalog.current_setting('role'); BEGIN\n"
+        "IF pg_catalog.to_regclass('pg_temp.__mizzle_saved') IS NULL THEN RETURN; END IF;\n"
+        f"SELECT * INTO s FROM {_SAVED} WHERE rel {EQ} {rel};\n"
         "IF NOT FOUND THEN RETURN; END IF;\n"
-        f"IF s.owner <> (SELECT relowner FROM pg_class WHERE oid = {rel}::regclass) THEN\n"
-        f"  EXECUTE format('ALTER {kind} %s OWNER TO %I', {rel}, pg_get_userbyid(s.owner));\n"
+        f"IF s.owner {NE} (SELECT relowner FROM pg_catalog.pg_class WHERE oid {EQ} {reg}) THEN\n"
+        f"  EXECUTE pg_catalog.format('ALTER {kind} %s OWNER TO %I', {rel}, "
+        "pg_catalog.pg_get_userbyid(s.owner));\n"
         "END IF;\n"
         # Exactly the saved ACL: the new view has the schema's default privileges (K5-1).
-        "FOR a IN SELECT DISTINCT grantee FROM pg_class, aclexplode("
-        f"coalesce(relacl, acldefault('r', relowner))) WHERE oid = {rel}::regclass LOOP\n"
-        "  EXECUTE format('REVOKE ALL ON %s FROM %s CASCADE', "
-        f"{rel}, CASE WHEN a.grantee = 0 THEN 'PUBLIC' "
-        "ELSE quote_ident(pg_get_userbyid(a.grantee)) END);\n"
+        "FOR a IN SELECT DISTINCT grantee FROM pg_catalog.pg_class, pg_catalog.aclexplode("
+        f"coalesce(relacl, pg_catalog.acldefault('r', relowner))) WHERE oid {EQ} {reg} LOOP\n"
+        f"  EXECUTE pg_catalog.format('REVOKE ALL ON %s FROM %s CASCADE', {rel}, {grantee});\n"
         "END LOOP;\n"
         # The owner's grants first, then those its grantees made, in the order they were.
-        "FOR a IN SELECT * FROM aclexplode(coalesce(s.acl, acldefault('r', s.owner))) "
-        "WITH ORDINALITY g ORDER BY g.grantor <> s.owner, g.ordinality LOOP\n"
-        "  IF a.grantor <> s.owner THEN "
-        "PERFORM set_config('role', pg_get_userbyid(a.grantor), true); END IF;\n"
-        "  EXECUTE format('GRANT %s ON %s TO %s%s', a.privilege_type, "
-        f"{rel}, CASE WHEN a.grantee = 0 THEN 'PUBLIC' "
-        "ELSE quote_ident(pg_get_userbyid(a.grantee)) END, "
+        "FOR a IN SELECT * FROM pg_catalog.aclexplode(coalesce(s.acl, "
+        "pg_catalog.acldefault('r', s.owner))) "
+        f"WITH ORDINALITY g ORDER BY g.grantor {NE} s.owner, g.ordinality LOOP\n"
+        + as_grantor
+        + "  EXECUTE pg_catalog.format('GRANT %s ON %s TO %s%s', a.privilege_type, "
+        f"{rel}, {grantee}, "
         "CASE WHEN a.is_grantable THEN ' WITH GRANT OPTION' ELSE '' END);\n"
-        "  PERFORM set_config('role', me, true);\n"
+        "  PERFORM pg_catalog.set_config('role', me, true);\n"
         "END LOOP;\n"
         "IF s.comment IS NOT NULL THEN\n"
-        f"  EXECUTE format('COMMENT ON {kind} %s IS %L', {rel}, s.comment);\n"
+        f"  EXECUTE pg_catalog.format('COMMENT ON {kind} %s IS %L', {rel}, s.comment);\n"
         "END IF;\n"
         # Column grants, comments and defaults on a column the view still has; triggers
         # and rules fail the migration if the new view cannot carry them, never vanish.
-        f"FOR a IN SELECT stmt, grantor FROM {_SAVED_SQL} WHERE rel = {rel} AND (col IS NULL OR "
-        f"EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = {rel}::regclass "
-        "AND attname = col AND NOT attisdropped)) "
-        "ORDER BY coalesce(grantor <> s.owner, false), id LOOP\n"
-        "  IF a.grantor <> s.owner THEN "
-        "PERFORM set_config('role', pg_get_userbyid(a.grantor), true); END IF;\n"
-        "  EXECUTE a.stmt;\n"
-        "  PERFORM set_config('role', me, true);\n"
+        f"FOR a IN SELECT stmt, grantor FROM {_SAVED_SQL} WHERE rel {EQ} {rel} AND (col IS NULL "
+        f"OR EXISTS (SELECT 1 FROM pg_catalog.pg_attribute WHERE attrelid {EQ} {reg} "
+        f"AND attname {EQ} col AND NOT attisdropped)) "
+        f"ORDER BY coalesce(grantor {NE} s.owner, false), id LOOP\n"
+        + as_grantor
+        + "  EXECUTE a.stmt;\n"
+        "  PERFORM pg_catalog.set_config('role', me, true);\n"
         "END LOOP;\n"
-        f"DELETE FROM {_SAVED_SQL} WHERE rel = {rel};\n"
-        f"DELETE FROM {_SAVED} WHERE rel = {rel};\n"
+        f"DELETE FROM {_SAVED_SQL} WHERE rel {EQ} {rel};\n"
+        f"DELETE FROM {_SAVED} WHERE rel {EQ} {rel};\n"
         "END $mizzle$"
     )
 
@@ -970,18 +1006,21 @@ def _unmanaged_check(table: str, name: str, column: str, restored: str = "") -> 
     `restored` is an extra SQL condition on the dependency `d` for what the caller
     makes again after the drop."""
     rel, col = literal(table), literal(column)
+    reg = f"{rel}{REGCLASS}"
     what = literal(f"{name}.{column}")
     return (
-        "IF EXISTS (SELECT 1 FROM pg_attribute a WHERE a.attrelid = "
-        f"{rel}::regclass AND a.attname = {col} AND a.attacl IS NOT NULL)\n"
-        "OR EXISTS (SELECT 1 FROM pg_depend d JOIN pg_attribute a ON a.attrelid = d.refobjid "
-        "AND a.attnum = d.refobjsubid WHERE d.refclassid = 'pg_class'::regclass "
-        f"AND d.refobjid = {rel}::regclass AND a.attname = {col} AND d.deptype IN ('a', 'n') "
-        "AND d.classid <> 'pg_attrdef'::regclass "
-        "AND NOT EXISTS (SELECT 1 FROM pg_class s WHERE d.classid = 'pg_class'::regclass "
-        "AND s.oid = d.objid AND s.relkind = 'S') "
-        "AND NOT EXISTS (SELECT 1 FROM pg_constraint n WHERE d.classid = "
-        f"'pg_constraint'::regclass AND n.oid = d.objid AND n.contype = 'n'){restored}) THEN\n"
+        f"IF EXISTS (SELECT 1 FROM pg_catalog.pg_attribute a WHERE a.attrelid {EQ} "
+        f"{reg} AND a.attname {EQ} {col} AND a.attacl IS NOT NULL)\n"
+        "OR EXISTS (SELECT 1 FROM pg_catalog.pg_depend d JOIN pg_catalog.pg_attribute a "
+        f"ON a.attrelid {EQ} d.refobjid AND a.attnum {EQ} d.refobjsubid "
+        f"WHERE d.refclassid {EQ} {PG_CLASS} AND d.refobjid {EQ} {reg} "
+        f"AND a.attname {EQ} {col} AND d.deptype {EQ} ANY ('{{a,n}}'::pg_catalog.\"char\"[]) "
+        f"AND d.classid {NE} 'pg_catalog.pg_attrdef'::pg_catalog.regclass "
+        "AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_class s "
+        f"WHERE d.classid {EQ} {PG_CLASS} AND s.oid {EQ} d.objid AND s.relkind {EQ} 'S') "
+        "AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_constraint n WHERE d.classid "
+        f"{EQ} 'pg_catalog.pg_constraint'::pg_catalog.regclass AND n.oid {EQ} d.objid "
+        f"AND n.contype {EQ} 'n'){restored}) THEN\n"
         f"  RAISE EXCEPTION 'column % is dropped and added again, which would drop the grants, "
         "constraints, views or triggers on it that mizzle does not manage; this needs a custom "
         f"migration', {what};\n"
