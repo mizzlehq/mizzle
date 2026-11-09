@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.3.0
 
 - **Breaking: mizzle manages tables and what hangs on them, nothing more.** Functions, triggers, domains,
   composite types, extensions, exclusion constraints, partitions and grants are gone from
