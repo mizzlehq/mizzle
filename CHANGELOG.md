@@ -30,6 +30,10 @@
 - A value compared with an expression that keeps a column's type (`nullable()`,
   `coalesce()`, `max_()`, `greatest()`...) is encoded as that column, as next to the column
   itself (an `Enum` was sent raw).
+- A type change of a column a generated column uses works: the generated column is dropped
+  and added again after it (PostgreSQL refused the change). `--rename` hints for a table in
+  another schema give the flag that works (`app.posts=articles`), and `app.posts=app.articles`
+  is a rename too.
 - Values compared with a CTE or subquery column are encoded as the column it selects again
   (enums, `custom()` with `encode=`).
 - Database URLs take the scheme in any case (`PostgreSQL://`).
