@@ -5,7 +5,7 @@ from __future__ import annotations
 import copy
 import logging
 import re
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from typing import Protocol, cast
 
 from mizzle.core.errors import DatabaseError, SchemaError
@@ -837,36 +837,104 @@ async def normalize_snapshot(conn: Connection, snapshot: Snapshot) -> Snapshot:
     return out
 
 
-async def _normalize_constraint_expressions(
-    table: TableSnap, like: str, norm: str, rel: str, read_back: _ReadBack
-) -> None:
+async def _on_table(
+    table: TableSnap,
+    statements: Callable[[str], list[str]],
+    query: Callable[[str], str],
+    texts: Sequence[str],
+    read_back: _ReadBack,
+) -> _Row | None:
+    """Create objects (a policy, checks) on a table like ``table`` and read them back.
+
+    First on a temporary copy, then on one under the table's own name (pg_temp is searched
+    first, so ``refs.t`` works, K7-3). An expression naming the table with its schema
+    (``app.items.owner``) or its row type (``mine(items)``) only works on the table itself
+    (K9-1): there, in the savepoint, and only when its ACCESS EXCLUSIVE lock is free right
+    now (waiting for it queued every reader behind it, K8-1). Otherwise the text is kept."""
+    real = qualified(table["schema"], table["name"])
+    for name in (_NORM, table["name"]):
+        target = f"pg_temp.{quote(name)}"
+        row = await read_back(
+            [f"CREATE TEMP TABLE {quote(name)} (LIKE {real})", *statements(target)],
+            query(f"pg_catalog.to_regclass({literal(target)})"),
+        )
+        if row is not None:
+            return row
+    if not any(_mentions(text, table["name"]) for text in texts):
+        return None  # it fails there too (a column made later...): no lock for nothing
+    return await read_back(
+        [f"LOCK TABLE {real} IN ACCESS EXCLUSIVE MODE NOWAIT", *statements(real)],
+        query(f"{literal(real)}{REGCLASS}"),
+    )
+
+
+async def _normalize_policies(table: TableSnap, read_back: _ReadBack) -> None:
+    for policy in table.get("policies", {}).values():
+        body = f" FOR {policy['command'].upper()}"
+        if policy["using"] is not None:
+            body += f" USING ({policy['using']})"
+        if policy["with_check"] is not None:
+            body += f" WITH CHECK ({policy['with_check']})"
+
+        def create(target: str, body: str = body) -> list[str]:
+            return [f"CREATE POLICY {quote(_NORM)} ON {target}{body}"]
+
+        def query(rel: str) -> str:
+            return (
+                "SELECT pg_catalog.pg_get_expr(polqual, polrelid) AS using, "
+                "pg_catalog.pg_get_expr(polwithcheck, polrelid) AS with_check "
+                f"FROM pg_catalog.pg_policy WHERE polrelid {EQ} {rel} "
+                f"AND polname {EQ} {literal(_NORM)}"
+            )
+
+        texts = [t for t in (policy["using"], policy["with_check"]) if t is not None]
+        row = await _on_table(table, create, query, texts, read_back)
+        if row is not None:
+            policy["using"], policy["with_check"] = (
+                _opt_str(row["using"]),
+                _opt_str(row["with_check"]),
+            )
+
+
+async def _normalize_constraint_expressions(table: TableSnap, read_back: _ReadBack) -> None:
     """CHECK expressions as PostgreSQL prints them.
 
     A CHECK written by hand (``status <> ''``) reads back as ``(status <> ''::text)``.
     Without this ``generate`` after ``pull`` (or a hand-written constraint) drops and
     re-adds it forever. All the table's checks are created in one savepoint, then read
-    back together.
+    back together, under names of their own (the real table has the real ones), NOT VALID
+    so no row is scanned (it prints the same).
     """
     checks = {n: c for n, c in table.get("checks", {}).items() if "expression" in c}
     if not checks:
         return
-    statements = [like]
-    for name, check in checks.items():
-        add = f"ALTER TABLE {norm} ADD CONSTRAINT {quote(name)} CHECK ({check['expression']})"
-        statements.append(add + (" NOT VALID" if check.get("not_valid") else ""))
-    row = await read_back(
-        statements,
-        "SELECT "
-        "ARRAY(SELECT c.conname::pg_catalog.text FROM pg_catalog.pg_constraint c "
-        f"WHERE c.conrelid {EQ} {rel} AND c.contype {EQ} 'c' ORDER BY c.conname) AS check_names, "
-        "ARRAY(SELECT pg_catalog.pg_get_constraintdef(c.oid) FROM pg_catalog.pg_constraint c "
-        f"WHERE c.conrelid {EQ} {rel} AND c.contype {EQ} 'c' ORDER BY c.conname) AS check_defs",
-    )
+    names = {f"{_NORM}{i}": name for i, name in enumerate(checks)}
+
+    def create(target: str) -> list[str]:
+        return [
+            f"ALTER TABLE {target} ADD CONSTRAINT {quote(norm)} "
+            f"CHECK ({checks[name]['expression']}) NOT VALID"
+            for norm, name in names.items()
+        ]
+
+    listed = f"ARRAY[{', '.join(map(literal, names))}]::pg_catalog.name[]"
+
+    def query(rel: str) -> str:
+        ours = f"c.conrelid {EQ} {rel} AND c.conname {EQ} ANY ({listed})"
+        return (
+            "SELECT "
+            "ARRAY(SELECT c.conname::pg_catalog.text FROM pg_catalog.pg_constraint c "
+            f"WHERE {ours} ORDER BY c.conname) AS check_names, "
+            "ARRAY(SELECT pg_catalog.pg_get_constraintdef(c.oid) FROM pg_catalog.pg_constraint c "
+            f"WHERE {ours} ORDER BY c.conname) AS check_defs"
+        )
+
+    texts = [c["expression"] for c in checks.values()]
+    row = await _on_table(table, create, query, texts, read_back)
     if row is None:
         return
-    for name, definition in zip(_strs(row["check_names"]), _strs(row["check_defs"]), strict=True):
-        if name in checks:
-            checks[name]["expression"] = _check_expression(definition)
+    for norm, definition in zip(_strs(row["check_names"]), _strs(row["check_defs"]), strict=True):
+        checks[names[norm]]["expression"] = _check_expression(definition)
 
 
 async def _normalize(snapshot: Snapshot, read_back: _ReadBack, version: int) -> None:
@@ -895,36 +963,5 @@ async def _normalize(snapshot: Snapshot, read_back: _ReadBack, version: int) -> 
     await _normalize_column_expressions(snapshot, read_back, rel)
 
     for table in snapshot["tables"].values():
-        like = (
-            f"CREATE TEMP TABLE {quote(_NORM)} (LIKE {qualified(table['schema'], table['name'])})"
-        )
-        real = qualified(table["schema"], table["name"])
-        for policy in table.get("policies", {}).values():
-            body = f" FOR {policy['command'].upper()}"
-            if policy["using"] is not None:
-                body += f" USING ({policy['using']})"
-            if policy["with_check"] is not None:
-                body += f" WITH CHECK ({policy['with_check']})"
-            query = (
-                "SELECT pg_catalog.pg_get_expr(polqual, polrelid) AS using, "
-                "pg_catalog.pg_get_expr(polwithcheck, polrelid) AS with_check "
-                f"FROM pg_catalog.pg_policy WHERE polrelid {EQ} "
-            )
-            row = await read_back([like, f"CREATE POLICY p ON {norm}{body}"], f"{query}{rel}")
-            if row is None:  # it names its own table (refs.t, K7-3): on a temporary copy
-                # under the same name (pg_temp is searched first), never on the table itself:
-                # CREATE POLICY there queued an ACCESS EXCLUSIVE lock behind readers (K8-1).
-                shadow = f"pg_temp.{quote(table['name'])}"
-                row = await read_back(
-                    [
-                        f"CREATE TEMP TABLE {quote(table['name'])} (LIKE {real})",
-                        f"CREATE POLICY p ON {shadow}{body}",
-                    ],
-                    f"{query}pg_catalog.to_regclass({literal(shadow)})",
-                )
-            if row is not None:
-                policy["using"], policy["with_check"] = (
-                    _opt_str(row["using"]),
-                    _opt_str(row["with_check"]),
-                )
-        await _normalize_constraint_expressions(table, like, norm, rel, read_back)
+        await _normalize_policies(table, read_back)
+        await _normalize_constraint_expressions(table, read_back)

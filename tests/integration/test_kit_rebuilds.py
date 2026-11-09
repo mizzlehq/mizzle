@@ -7,7 +7,7 @@ from typing import final, override
 import asyncpg
 import pytest
 
-from mizzle import Constraint, QueryBuilder, Table, View, policy, rls, sql
+from mizzle import Constraint, QueryBuilder, Table, View, check, policy, rls, sql
 from mizzle.core.errors import DatabaseError
 from mizzle.core.snapshot import Snapshot, empty_snapshot
 from mizzle.core.sql.nodes import Node
@@ -156,6 +156,66 @@ async def test_a_policy_naming_its_own_table_is_normalized(kit_url: str, reader:
         await driver.close()
     current = await live(kit_url)
     assert diff(current, normalized, compare_expressions=False, normalized=True) == []
+
+
+def owned(with_policies: bool) -> Snapshot:
+    @final
+    class Owned(Table, name="owned", schema="app"):
+        id = serial().primary_key()
+        owner = text()
+        x = integer()
+
+        @classmethod
+        @override
+        def config(cls) -> list[Constraint]:
+            if not with_policies:
+                return []
+            return [
+                rls(),
+                policy("own", using=sql("app.owned.owner = current_user")),
+                policy("row", using=sql("app.mine(owned)")),
+                check("pos", sql("owned.x > 0")),  # K9-5
+                check("qualified", sql("app.owned.x < 10")),
+            ]
+
+    return build_snapshot([Owned], dialect)
+
+
+@pytest.mark.parametrize("reader", [False, True])
+async def test_a_policy_or_check_naming_its_table_by_schema_or_row_type_is_normalized(
+    kit_url: str, reader: bool
+) -> None:
+    # K9-1: `app.owned.owner` and `mine(owned)` failed on both temporary tables, so the text
+    # stayed as written and push altered the policy every time. They are made on the real
+    # table only when its lock is free right now: with a reader in, never wait (K8-1).
+    # K9-5: a CHECK naming its own table was dropped and added again every push.
+    await execute(kit_url, "CREATE SCHEMA app")
+    v0, v1 = owned(False), owned(True)
+    await migrate(kit_url, empty_snapshot("postgresql"), v0)
+    await execute(
+        kit_url,
+        "CREATE FUNCTION app.mine(app.owned) RETURNS boolean LANGUAGE sql "
+        "AS 'SELECT $1.owner = current_user'",
+    )
+    await migrate(kit_url, v0, v1)
+    other = await asyncpg.connect(kit_url)
+    driver = await PostgresDriver.connect(kit_url, pool_size=1)
+    try:
+        if reader:
+            await other.execute("BEGIN; SELECT * FROM app.owned")
+        async with driver.acquire() as conn:
+            started = asyncio.get_running_loop().time()
+            normalized = await asyncio.wait_for(dialect.normalize_snapshot(conn, v1), 10)
+            elapsed = asyncio.get_running_loop().time() - started
+    finally:
+        await other.close()
+        await driver.close()
+    current = await live(kit_url, ["app"])
+    changes = diff(current, normalized, compare_expressions=False, normalized=True)
+    if reader:  # kept as written, at once (lock_timeout is 2s)
+        assert elapsed < 1.5 and changes
+    else:
+        assert changes == []
 
 
 def calc(expression: str, with_view: bool = False) -> Snapshot:
