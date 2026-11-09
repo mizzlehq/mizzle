@@ -62,6 +62,9 @@ def test_normalize_default(raw: str | None, expected: str | None) -> None:
         (r"DO $x$ BEGIN PERFORM 'a\b'; END $x$", None),  # a body runs later
         (r"-- 'a\b'", None),
         (r"name'a\b' $1", r"name E'a\\b' $1"),
+        # K9-2: N E'..' is no string, nor is a continued part with an E: both kept.
+        (r"DEFAULT N'C:\dir'", None),
+        ("'a'\n'\\b' || 'c\\d'", "'a'\n'\\b' || E'c\\\\d'"),
     ],
 )
 def test_ddl_strings_read_the_same_with_standard_conforming_strings_off(

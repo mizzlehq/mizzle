@@ -503,8 +503,13 @@ def literal(text: str) -> str:
 
 
 # What a statement's text holds, left to right: only a plain '...' string is rewritten.
+# N'..' and a string continued on the next line ('a'<newline>'b') are kept as written: an
+# E cannot go there (K9-2), so with standard_conforming_strings off their backslashes are
+# still lost.
 _LEXEME = re.compile(
     r"""(?P<keep>(?:[Ee]|[Uu]&)'(?:[^'\\]|\\.|'')*'"""  # E'..' / U&'..' (backslash escapes)
+    r"""|[Nn]'(?:[^']|'')*'"""  # a national string
+    r"""|'(?:[^']|'')*'(?:[ \t\f]*[\n\r]\s*'(?:[^']|'')*')+"""  # a continued string
     r"""|"(?:[^"]|"")*"|--[^\n]*|/\*.*?\*/"""  # a quoted name, a comment
     r"""|\$(?P<tag>[A-Za-z_][A-Za-z0-9_]*|)\$.*?\$(?P=tag)\$"""  # a dollar-quoted body
     r"""|[^\W\d][\w$]*)"""  # a word, so name'...' is not an E'' string
