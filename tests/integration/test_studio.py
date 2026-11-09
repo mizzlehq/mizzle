@@ -140,13 +140,15 @@ _LEFTOVERS = (
     ' st_neg, "st/a", st_sdom, st_bad, st_head, st_tie, st_skip, st_domt, st_ck, st_tx, st_log,'
     " st_stale, st_kid, st_parent, st_part, st_sort, st_uskip, st_items, st_iv, st_sread,"
     ' st_call, "st\nnl", "st_k.y", st_cins, st_rt, st_rls, st_victim, st_inj, st_sp,'
-    " st_qt cascade;"
-    ' drop sequence if exists st_seq; drop schema if exists "date", "public.st_k", st_app cascade;'
+    " st_qt, st_tamper, st_gen_t cascade;"
+    ' drop sequence if exists st_seq; drop schema if exists "date", "public.st_k", st_app,'
+    " st_ext cascade;"
+    " drop operator if exists public.~~ (text, text);"
     ' drop domain if exists st_amt2, st_amt, st_span, st_basedom, "St Base Dom", st_dpair,'
     " st_dj, interval_st_label;"
     ' drop type if exists st_pair, interval_st_unit, "st_q[]t";'
     " drop function if exists st_skip_fn(), st_logit(int), st_uskip_fn(), st_w(),"
-    " public.now();"
+    " public.now(), public.uuid_generate_v4(), public.st_never(text, text);"
     " drop procedure if exists st_call_p()"
 )
 
@@ -384,7 +386,7 @@ def test_ddl_preview_and_apply(client: TestClient) -> None:
     assert preview.json()["statements"] == [
         {
             "sql": (
-                'CREATE TABLE "st_notes" (\n'
+                'CREATE TABLE "public"."st_notes" (\n'
                 '    "id" integer,\n'
                 '    "title" text NOT NULL,\n'
                 '    CONSTRAINT "st_notes_pkey" PRIMARY KEY ("id")\n'
@@ -1626,6 +1628,12 @@ def test_public_tables_are_always_schema_qualified(client: TestClient) -> None:
         deleted = client.request("DELETE", rows, json={"keys": [{"id": 2}]}, headers=AUTH)
         assert deleted.json() == {"deleted": 1}
         assert _query(client, "select v from public.st_items") == [["x"]]
+        # S8-2: DDL names the table "public"."st_items" instead of changing the search_path.
+        add = {"operation": "add_column", "schema": "public", "table": "st_items", "name": "n"}
+        column = {"name": "n", "type": "integer"}
+        added = client.post("/api/ddl/apply", json={**add, "column": column}, headers=AUTH)
+        assert added.status_code == 200, added.text
+        assert _query(client, "select n from public.st_items") == [[None]]
         drop = {"operation": "drop_table", "schema": "public", "name": "st_items"}
         assert client.post("/api/ddl/apply", json=drop, headers=AUTH).status_code == 200
         assert _query(client, "select to_regclass('public.st_items') is null") == [[True]]
@@ -1762,9 +1770,11 @@ def test_ddl_keeps_the_rest_of_the_search_path(pg_url: str, client: TestClient) 
             assert _query(app, "show search_path") == [["st_app"]]
 
 
-def test_ddl_searches_pg_temp_last(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
-    # Unlisted, pg_temp is searched first: a temporary table or type left on the pooled
-    # connection (the console can make one) would stand in for a real one during DDL.
+def test_ddl_never_changes_the_search_path(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # S8-2: DDL ran with public first in the search_path, so the bare names in a default or
+    # type bound to whatever was planted in public, not to what the role's path finds.
     seen: list[str] = []
     from mizzle.kit.migrate import apply_statements as real
 
@@ -1774,16 +1784,86 @@ def test_ddl_searches_pg_temp_last(client: TestClient, monkeypatch: pytest.Monke
         await real(conn, statements)
 
     monkeypatch.setattr(server, "apply_statements", spy)
-    _sql(client, "drop table if exists st_tmp_last; create table st_tmp_last (id int primary key)")
-    op = {"operation": "add_column", "schema": "public", "table": "st_tmp_last", "name": "n"}
+    [[path]] = _query(client, "select current_setting('search_path')")
+    _sql(client, "create table st_gen_t (id int primary key)")
+    op = {"operation": "add_column", "schema": "public", "table": "st_gen_t", "name": "n"}
     applied = client.post(
         "/api/ddl/apply", json={**op, "column": {"name": "n", "type": "integer"}}, headers=AUTH
     )
     assert applied.status_code == 200, applied.text
-    [path] = seen
-    parts = [p.strip() for p in path.split(",")]
-    assert parts[0] == "public" and parts[-1] == "pg_temp", path
-    _sql(client, "drop table st_tmp_last")
+    assert seen == [path]
+
+
+def test_ddl_default_resolves_through_the_roles_path(pg_url: str, client: TestClient) -> None:
+    # S8-2: with public put first, a column default's bare uuid_generate_v4() bound to one
+    # planted in public instead of the extension's, which the role's path finds first.
+    _sql(
+        client,
+        "create schema st_ext; create function st_ext.uuid_generate_v4() returns uuid "
+        "language sql as $$ select '11111111-1111-1111-1111-111111111111'::uuid $$; "
+        "create function public.uuid_generate_v4() returns uuid "
+        "language sql as $$ select '00000000-0000-0000-0000-000000000000'::uuid $$; "
+        "create table st_gen_t (id int primary key)",
+    )
+    with make_client(_with_query(pg_url, "search_path=st_ext,public")) as app:
+        column = {"name": "u", "type": "uuid", "default": "uuid_generate_v4()"}
+        op = {"operation": "add_column", "schema": "public", "table": "st_gen_t", "name": "u"}
+        applied = app.post("/api/ddl/apply", json={**op, "column": column}, headers=AUTH)
+        assert applied.status_code == 200, applied.text
+    _sql(client, "insert into st_gen_t (id) values (1)")
+    assert _query(client, "select u::text from st_gen_t") == [
+        ["11111111-1111-1111-1111-111111111111"]
+    ]
+
+
+def test_ddl_preview_shows_the_schema_qualified_table(client: TestClient) -> None:
+    # S8-2: the review screen shows the statement that runs: the public table with its schema.
+    _sql(client, "create table st_gen_t (id int primary key)")
+    op = {"operation": "add_column", "schema": "public", "table": "st_gen_t", "name": "n"}
+    body = {**op, "column": {"name": "n", "type": "integer"}}
+    [row] = client.post("/api/ddl/preview", json=body, headers=AUTH).json()["statements"]
+    assert row["sql"] == 'ALTER TABLE "public"."st_gen_t" ADD COLUMN "n" integer'
+
+
+def test_studio_sql_uses_only_built_in_functions(client: TestClient) -> None:
+    # S8-1: to_jsonb(t.*) was unqualified, so a planted public.to_jsonb(public.st_tamper)
+    # (an exact type match, so it beats pg_catalog's) ran as the Studio user on every read
+    # and write of the table.
+    _sql(
+        client,
+        "create table st_tamper (id int primary key, v text); "
+        "insert into st_tamper values (1, 'real'); "
+        "create function public.to_jsonb(r public.st_tamper) returns jsonb language sql "
+        "as $$ select pg_catalog.jsonb_build_object('id', r.id, 'v', 'tampered') $$",
+    )
+    assert _rows(client, "st_tamper") == [{"id": 1, "v": "real"}]
+    rows = "/api/tables/public/st_tamper/rows"
+    added = client.post(rows, json={"values": {"id": 2, "v": "new"}}, headers=AUTH)
+    assert added.json()["row"] == {"id": 2, "v": "new"}
+    exported = client.get(
+        "/api/tables/public/st_tamper/export", params={"format": "json"}, headers=AUTH
+    )
+    assert exported.status_code == 200, exported.text
+    assert "tampered" not in exported.text
+
+
+def test_studio_sql_uses_only_built_in_operators(pg_url: str, client: TestClient) -> None:
+    # S8-1: with public before pg_catalog in the role's path, a planted public ~~ (text, text)
+    # stood in for LIKE in a grid filter.
+    _sql(
+        client,
+        "create table st_tamper (id int primary key, v text); "
+        "insert into st_tamper values (1, 'real'); "
+        "create function public.st_never(text, text) returns bool language sql "
+        "as 'select false'; create operator public.~~ "
+        "(leftarg = text, rightarg = text, function = public.st_never)",
+    )
+    try:
+        with make_client(_with_query(pg_url, "search_path=public,pg_catalog")) as app:
+            filters = json.dumps([{"column": "v", "op": "like", "value": "re%"}])
+            assert _rows(app, "st_tamper", filters=filters) == [{"id": 1, "v": "real"}]
+    finally:
+        _sql(client, "drop operator public.~~ (text, text); drop function public.st_never")
 
 
 def test_a_new_row_takes_a_composite_as_text(client: TestClient) -> None:

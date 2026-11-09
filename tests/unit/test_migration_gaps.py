@@ -286,7 +286,7 @@ def test_studio_ddl_renders_only_allow_listed_operations() -> None:
     assert statement_rows(dialect, steps) == [
         {
             "sql": (
-                'CREATE TABLE "notes" (\n'
+                'CREATE TABLE "public"."notes" (\n'
                 '    "id" integer,\n'
                 '    "title" character varying(80) NOT NULL,\n'
                 '    "created_at" timestamp with time zone DEFAULT now(),\n'
@@ -344,7 +344,7 @@ def test_studio_ddl_changes_an_existing_table() -> None:
     )
     assert (
         statement_rows(dialect, add)[0]["sql"]
-        == 'ALTER TABLE "notes" ADD COLUMN "body" text NOT NULL'
+        == 'ALTER TABLE "public"."notes" ADD COLUMN "body" text NOT NULL'
     )
 
     altered = build_steps(
@@ -364,7 +364,7 @@ def test_studio_ddl_changes_an_existing_table() -> None:
         "change default of notes.title",
     ]
     assert statement_rows(dialect, altered)[1]["sql"] == (
-        'ALTER TABLE "notes" ALTER COLUMN "title" SET DEFAULT \'x\'::text'
+        'ALTER TABLE "public"."notes" ALTER COLUMN "title" SET DEFAULT \'x\'::text'
     )
 
     drop = build_steps(

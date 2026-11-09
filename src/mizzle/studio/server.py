@@ -117,6 +117,12 @@ _READ_ONLY_DENIED_CALLS = re.compile(
     r"|\bU&\"",
     re.IGNORECASE,
 )
+# S8-1: every function, catalog, type and operator Studio's own SQL uses is named in
+# pg_catalog.
+# Unqualified, a planted public.to_jsonb(public.t) (an exact type match) or a public ``=``
+# won over the built-in wherever the role's path searched public first, and ran as the
+# Studio user. A column's own type and its operators are the user's, and stay as they are.
+_EQ = "OPERATOR(pg_catalog.=)"
 # A role that is, or can become, one of these can act on the server from inside a READ ONLY
 # transaction, so read-only Studio refuses to run as it (B18).
 _PRIVILEGED_ROLES = (
@@ -130,10 +136,12 @@ _PRIVILEGED_ROLES = (
 # starts as the plain role but can ``set_config('role', 'none', false)`` back to itself
 # (B69). Every role the login role can SET ROLE to is in its MEMBER chain.
 _PRIVILEGED_SQL = (
-    "SELECT rolname, rolsuper, rolreplication FROM pg_roles "
-    "WHERE (pg_has_role(session_user, oid, 'MEMBER') "
-    "OR pg_has_role(current_user, oid, 'MEMBER')) AND (rolsuper OR rolreplication "
-    f"OR rolname IN ({', '.join(repr(r) for r in _PRIVILEGED_ROLES)})) ORDER BY rolname"
+    "SELECT rolname, rolsuper, rolreplication FROM pg_catalog.pg_roles "
+    "WHERE (pg_catalog.pg_has_role(session_user, oid, 'MEMBER') "
+    "OR pg_catalog.pg_has_role(current_user, oid, 'MEMBER')) AND (rolsuper OR rolreplication "
+    f"OR rolname {_EQ} ANY (ARRAY[{', '.join(repr(r) for r in _PRIVILEGED_ROLES)}]"
+    "::pg_catalog.name[])) "
+    "ORDER BY rolname"
 )
 
 # Server-side functions PostgreSQL does not grant to PUBLIC. A direct GRANT EXECUTE on one
@@ -155,12 +163,12 @@ _SERVER_FUNCTIONS = (
     "lo_export",
 )
 _SERVER_FUNCTIONS_SQL = (
-    "SELECT DISTINCT p.proname::text FROM pg_proc p "
-    "JOIN pg_namespace n ON n.oid = p.pronamespace "
-    f"WHERE n.nspname = 'pg_catalog' AND p.proname IN "
-    f"({', '.join(repr(f) for f in _SERVER_FUNCTIONS)}) "
-    "AND (has_function_privilege(session_user, p.oid, 'EXECUTE') "
-    "OR has_function_privilege(current_user, p.oid, 'EXECUTE')) ORDER BY 1"
+    "SELECT DISTINCT p.proname::pg_catalog.text FROM pg_catalog.pg_proc p "
+    f"JOIN pg_catalog.pg_namespace n ON n.oid {_EQ} p.pronamespace "
+    f"WHERE n.nspname {_EQ} 'pg_catalog' AND p.proname {_EQ} ANY "
+    f"(ARRAY[{', '.join(repr(f) for f in _SERVER_FUNCTIONS)}]::pg_catalog.name[]) "
+    "AND (pg_catalog.has_function_privilege(session_user, p.oid, 'EXECUTE') "
+    "OR pg_catalog.has_function_privilege(current_user, p.oid, 'EXECUTE')) ORDER BY 1"
 )
 
 log = logging.getLogger("mizzle")
@@ -262,7 +270,7 @@ class Studio:
         back as strings (S5-4)."""
         table, base = await self.table(schema, name)
         async with self.pool().acquire() as conn, conn.transaction(readonly=True):
-            rows = await conn.fetch_dicts(_BASE_TYPES + " AND c.relname = $2", [[schema], name])
+            rows = await conn.fetch_dicts(f"{_BASE_TYPES} AND c.relname {_EQ} $2", [[schema], name])
         if {str(r["name"]): str(r["base"]) for r in rows} != self.bases.get((schema, name), {}):
             return await self.table(schema, name, fresh=True)
         return table, base
@@ -412,29 +420,32 @@ def _as_text(value: object) -> str | None:
 # domains and arrays of domains (``d[]`` -> ``jsonb[]``), by the server (S5-6). Every
 # type-dependent rule (exact text, CSV signs, key casts, sorting) reads it, so a domain acts
 # like its base type everywhere (S7, S4-1, S4-5, S4-6).
-_BASE_TYPES = """
+_BASE_TYPES = f"""
 WITH RECURSIVE r(rel, name, oid, typmod, dims) AS (
-  SELECT a.attrelid, a.attname::text, a.atttypid, a.atttypmod, 0
-  FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid
-  JOIN pg_namespace n ON n.oid = c.relnamespace
-  WHERE n.nspname = ANY($1::text[]) AND c.relkind IN ('r', 'p')
-    AND a.attnum > 0 AND NOT a.attisdropped
+  SELECT a.attrelid, a.attname::pg_catalog.text, a.atttypid, a.atttypmod, 0
+  FROM pg_catalog.pg_attribute a JOIN pg_catalog.pg_class c ON c.oid {_EQ} a.attrelid
+  JOIN pg_catalog.pg_namespace n ON n.oid {_EQ} c.relnamespace
+  WHERE n.nspname {_EQ} ANY($1::pg_catalog.text[])
+    AND c.relkind {_EQ} ANY('{{r,p}}'::pg_catalog."char"[])
+    AND a.attnum OPERATOR(pg_catalog.>) 0 AND NOT a.attisdropped
   UNION ALL
   SELECT r.rel, r.name,
-         CASE WHEN t.typtype = 'd' THEN t.typbasetype ELSE t.typelem END,
-         CASE WHEN t.typtype = 'd' THEN t.typtypmod ELSE r.typmod END,
-         r.dims + CASE WHEN t.typtype = 'd' THEN 0 ELSE 1 END
-  FROM r JOIN pg_type t ON t.oid = r.oid
-  WHERE t.typtype = 'd' OR t.typcategory = 'A'
+         CASE WHEN t.typtype {_EQ} 'd' THEN t.typbasetype ELSE t.typelem END,
+         CASE WHEN t.typtype {_EQ} 'd' THEN t.typtypmod ELSE r.typmod END,
+         r.dims OPERATOR(pg_catalog.+) CASE WHEN t.typtype {_EQ} 'd' THEN 0 ELSE 1 END
+  FROM r JOIN pg_catalog.pg_type t ON t.oid {_EQ} r.oid
+  WHERE t.typtype {_EQ} 'd' OR t.typcategory {_EQ} 'A'
 )
 SELECT n.nspname AS schema, c.relname AS table, r.name,
-       format_type(r.oid, r.typmod) || repeat('[]', r.dims) AS base,
-       t.typtype = 'c' AS composite,
+       pg_catalog.format_type(r.oid, r.typmod)
+         OPERATOR(pg_catalog.||) pg_catalog.repeat('[]', r.dims) AS base,
+       t.typtype {_EQ} 'c' AS composite,
        -- a base type no built-in one (16384: FirstNormalObjectId), an extension's
-       t.typtype = 'b' AND t.oid >= 16384 AS extension
-FROM r JOIN pg_type t ON t.oid = r.oid
-JOIN pg_class c ON c.oid = r.rel JOIN pg_namespace n ON n.oid = c.relnamespace
-WHERE t.typtype <> 'd' AND t.typcategory <> 'A'
+       t.typtype {_EQ} 'b' AND t.oid OPERATOR(pg_catalog.>=) 16384 AS extension
+FROM r JOIN pg_catalog.pg_type t ON t.oid {_EQ} r.oid
+JOIN pg_catalog.pg_class c ON c.oid {_EQ} r.rel
+JOIN pg_catalog.pg_namespace n ON n.oid {_EQ} c.relnamespace
+WHERE t.typtype OPERATOR(pg_catalog.<>) 'd' AND t.typcategory OPERATOR(pg_catalog.<>) 'A'
 """
 
 # A column type that is JSON itself (after domains), not something to_jsonb() turned into JSON.
@@ -448,11 +459,12 @@ def _param(params: list[object], column: ColumnSnap, value: object, base: str) -
         # JSON-to-type conversion reads it back.
         params.append(json.dumps(value))
         return (
-            "(SELECT x.v FROM jsonb_to_record(jsonb_build_object("
-            f"'v', ${len(params)}::text::jsonb)) AS x(v {_cast_type(column, base)}))"
+            "(SELECT x.v FROM pg_catalog.jsonb_to_record(pg_catalog.jsonb_build_object("
+            f"'v', ${len(params)}::pg_catalog.text::pg_catalog.jsonb)) "
+            f"AS x(v {_cast_type(column, base)}))"
         )
     params.append(_as_text(value))
-    return f"CAST(${len(params)}::text AS {_cast_type(column, base)})"
+    return f"CAST(${len(params)}::pg_catalog.text AS {_cast_type(column, base)})"
 
 
 def _where(
@@ -469,7 +481,8 @@ def _where(
             parts.append(f"{ref} {_COMPARE[op]} {value}")
         elif op in ("like", "ilike"):
             params.append(_as_text(f.get("value")) or "")
-            parts.append(f"{ref}::text {op.upper()} ${len(params)}")
+            like = "~~" if op == "like" else "~~*"
+            parts.append(f"{ref}::pg_catalog.text OPERATOR(pg_catalog.{like}) ${len(params)}")
         elif op == "is_null":
             parts.append(f"{ref} IS NULL")
         elif op == "is_not_null":
@@ -602,7 +615,7 @@ class _Named(Protocol):
 # A browser reads a JSON number as a double: past 2**53 an integer is no longer exact.
 _EXACT_INT = 2**53
 # Each row as the server's JSON text, decoded by ``_row_json``.
-_ROW = "to_jsonb(t.*)::text"
+_ROW = "pg_catalog.to_jsonb(t.*)::pg_catalog.text"
 # Columns sent as their exact text: a JSON value or a numeric decoded into the browser's
 # doubles lost digits (1.50 -> 1.5) and turned big numbers inside JSON into strings, which
 # an edit then wrote back (S1, S3).
@@ -620,22 +633,28 @@ def _row_sql(base: Mapping[str, str], texts: Collection[str] = ()) -> str:
     (hstore): to_jsonb's JSON for them is not their input syntax, so a save failed (S7-4)."""
     pairs: list[str] = []
     for name, t in base.items():
-        label, ref = literal(name), f"t.{quote(name)}::text"
+        label, ref = literal(name), f"t.{quote(name)}::pg_catalog.text"
         if _EXACT_TEXT.fullmatch(t) or name in texts:
             pairs.append(f"{label}, {ref}")
         elif t.endswith("[]") or _FLOAT.fullmatch(t):
-            changed = [f"{ref} LIKE '[%'"] if t.endswith("[]") else []
+            changed = [f"{ref} OPERATOR(pg_catalog.~~) '[%'"] if t.endswith("[]") else []
             if _FLOAT.fullmatch(t):
-                changed.append(f"{ref} ~ '(^|[{{,])-0($|[,}}])'")
+                changed.append(f"{ref} OPERATOR(pg_catalog.~) '(^|[{{,])-0($|[,}}])'")
             pairs.append(f"{label}, CASE WHEN {' OR '.join(changed)} THEN {ref} END")
     if not pairs:
         return _ROW
     # A NULL here is stripped, leaving to_jsonb's own value (NULL, or the plain array).
     parts = [
-        "jsonb_strip_nulls(jsonb_build_object(" + ", ".join(pairs[i : i + _PAIRS]) + "))"
+        "pg_catalog.jsonb_strip_nulls(pg_catalog.jsonb_build_object("
+        + ", ".join(pairs[i : i + _PAIRS])
+        + "))"
         for i in range(0, len(pairs), _PAIRS)
     ]
-    return "(" + " || ".join(["to_jsonb(t.*)", *parts]) + ")::text"
+    return (
+        "("
+        + " OPERATOR(pg_catalog.||) ".join(["pg_catalog.to_jsonb(t.*)", *parts])
+        + ")::pg_catalog.text"
+    )
 
 
 def _exact_int(text: str) -> int | str:
@@ -745,7 +764,7 @@ async def list_rows(studio: Studio, request: Request) -> Response:
     # S7-1: READ ONLY, also in a read-write Studio. Reading a table runs code of the
     # database's (an RLS policy, a type's output function): it must not be able to write.
     async with studio.pool().acquire() as conn, conn.transaction(readonly=True):
-        [total] = await conn.fetch(f"SELECT count(*) FROM {source}{where}", params)
+        [total] = await conn.fetch(f"SELECT pg_catalog.count(*) FROM {source}{where}", params)
         rows = await conn.fetch(
             f"SELECT {_row_sql(base, studio.text_columns(table))} FROM {source}{where}{order_sql}"
             f" LIMIT {limit} OFFSET {offset}",
@@ -1138,28 +1157,12 @@ async def ddl_apply(studio: Studio, request: Request) -> Response:
     data = await _body(request)
     _configured_schema(studio, data)
     steps = build_steps(studio.dialect, data, await _current_table(studio, data))
-    statements = studio.dialect.render(steps)
+    # S8-2: tables are named with their schema ("public"."t", never a "$user" schema's t),
+    # and the search_path is never changed: everything else in the DDL (a default's
+    # uuid_generate_v4(), a type) resolves through the role's own path, as psql would.
+    statements = studio.dialect.render(steps, qualify=True)
     async with studio.pool().acquire() as conn:
-        # S5-1: the rendered DDL leaves public names bare (as the migration kit does), so
-        # resolve them in public first, never in a "$user" schema. The rest of the role's
-        # path stays: an extension's function or an app schema's type is found by it (S6-2).
-        # pg_temp goes last: unlisted it is searched first, and a temporary table or type
-        # left on this pooled connection must not stand in for a real one. pg_catalog is
-        # left out, so it is searched first: a role path that listed it put it after public,
-        # and a planted public.now() or type shadowed the built-in (S7-3). Listed first, it
-        # would be where the bare CREATE TABLE goes. The role's schemas come resolved from
-        # the server, each quoted, with the system ones (pg_catalog, pg_temp_N) left out.
-        await conn.execute(
-            "SELECT set_config('search_path', concat_ws(', ', 'public', "
-            "(SELECT string_agg(quote_ident(s), ', ' ORDER BY i) "
-            "FROM unnest(current_schemas(false)) WITH ORDINALITY AS u(s, i) "
-            "WHERE s <> 'public' AND left(s, 3) <> 'pg_'), 'pg_temp'), false)",
-            [],
-        )
-        try:
-            await apply_statements(conn, statements)
-        finally:
-            await conn.execute("RESET search_path", [])
+        await apply_statements(conn, statements)
     await studio.load_snapshot(refresh=True)
     return JSONResponse(
         {"applied": len(statements), "statements": statement_rows(studio.dialect, steps)}

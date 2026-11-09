@@ -5,6 +5,7 @@ from __future__ import annotations
 import datetime
 import re
 from collections.abc import Mapping, Sequence
+from contextvars import ContextVar
 from typing import cast
 
 from mizzle.core.compiler import no_nul
@@ -130,8 +131,15 @@ def quote(ident: str) -> str:
     return '"' + no_nul(ident).replace('"', '""') + '"'
 
 
+# Studio renders with ``qualify=True``: a bare public name resolved through the role's
+# search_path, so a "$user" schema's same-named table was the one changed (S8-2).
+_QUALIFY = ContextVar("mizzle_qualify", default=False)
+
+
 def qualified(schema: str, name: str) -> str:
-    return quote(name) if schema == DEFAULT_SCHEMA else f"{quote(schema)}.{quote(name)}"
+    if schema == DEFAULT_SCHEMA and not _QUALIFY.get():
+        return quote(name)
+    return f"{quote(schema)}.{quote(name)}"
 
 
 def truncate_name(name: str) -> str:
@@ -920,10 +928,15 @@ def _unmanaged_check(table: str, name: str, column: str, restored: str = "") -> 
     )
 
 
-def render(steps: Sequence[Step]) -> list[Statement]:
-    out: list[Statement] = []
-    for step in steps:
-        if isinstance(step, DropColumn) and step.rebuilt:
-            out.append(Statement(_rebuild_guard(step)))
-        out.append(render_step(step))
-    return out
+def render(steps: Sequence[Step], *, qualify: bool = False) -> list[Statement]:
+    """``qualify`` names public tables and types as ``"public"."t"`` too."""
+    token = _QUALIFY.set(qualify)
+    try:
+        out: list[Statement] = []
+        for step in steps:
+            if isinstance(step, DropColumn) and step.rebuilt:
+                out.append(Statement(_rebuild_guard(step)))
+            out.append(render_step(step))
+        return out
+    finally:
+        _QUALIFY.reset(token)

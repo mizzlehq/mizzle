@@ -258,5 +258,5 @@ def statement_rows(dialect: Dialect, steps: list[Step]) -> list[dict[str, object
     """Preview rows for the review screen: the SQL, what it does, and whether it loses data."""
     return [
         {"sql": statement.sql, "description": step.describe(), "data_loss": step.data_loss}
-        for step, statement in zip(steps, dialect.render(steps), strict=True)
+        for step, statement in zip(steps, dialect.render(steps, qualify=True), strict=True)
     ]

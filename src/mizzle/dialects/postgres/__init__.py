@@ -93,8 +93,8 @@ class PostgresDialect:
     async def skipped_objects(self, conn: Connection, schemas: Sequence[str]) -> list[str]:
         return await skipped_objects(conn, schemas)
 
-    def render(self, steps: Sequence[Step]) -> list[Statement]:
-        return ddl.render(steps)
+    def render(self, steps: Sequence[Step], *, qualify: bool = False) -> list[Statement]:
+        return ddl.render(steps, qualify=qualify)
 
     async def acquire_migration_lock(self, conn: Connection, timeout: float) -> None:
         deadline = time.monotonic() + timeout
