@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.3.3
 
 - `tsvector()` and `tsquery()` columns in `mizzle.pg` for full-text search; `pull` writes them.
 
