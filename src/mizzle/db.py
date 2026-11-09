@@ -1337,7 +1337,7 @@ class Database(Session):
         url: str | None = None,
         max_queue: int = 10_000,
         keepalive: float = 30.0,
-    ) -> AbstractAsyncContextManager[AsyncIterator[Notification[object] | Reconnected]]:
+    ) -> AbstractAsyncContextManager[AsyncIterator[object]]:
         """Receive ``NOTIFY`` messages sent to ``channels``, until the block exits::
 
             async with db.listen("orders", decode=json.loads) as events:
