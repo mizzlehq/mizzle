@@ -225,11 +225,12 @@ studio = [
 [package.metadata]
 requires-dist = [
     { name = "asyncpg", specifier = ">=0.30" },
+    { name = "orjson", marker = "extra == 'speed'", specifier = ">=3.10" },
     { name = "pydantic", marker = "extra == 'pydantic'", specifier = ">=2.7" },
     { name = "starlette", marker = "extra == 'studio'", specifier = ">=0.40" },
     { name = "uvicorn", marker = "extra == 'studio'", specifier = ">=0.30" },
 ]
-provides-extras = ["pydantic", "studio"]
+provides-extras = ["pydantic", "speed", "studio"]
 
 [package.metadata.requires-dev]
 dev = [
@@ -238,7 +239,7 @@ dev = [
     { name = "fastapi", specifier = ">=0.115" },
     { name = "httpx", specifier = ">=0.28.1" },
     { name = "hypothesis", specifier = ">=6.170.14" },
-    { name = "mizzle", extras = ["studio", "pydantic"] },
+    { name = "mizzle", extras = ["studio", "pydantic", "speed"] },
     { name = "mypy", specifier = ">=1.15" },
     { name = "pydantic", specifier = ">=2.7" },
     { name = "pytest", specifier = ">=8.3" },
