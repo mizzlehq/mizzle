@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.3.2
 
 - `generate` renames, removes and reorders enum values: `--rename status.done=finished`
   for a rename; a removal or a new order creates the type again and converts its columns.
