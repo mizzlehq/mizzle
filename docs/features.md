@@ -251,6 +251,23 @@ await db.insert_many(Users, rows, batch_size=1000)
 async for user in db.select().from_(Users).stream(batch_size=1000): ...
 ```
 
+**COPY.** The fastest bulk load, and exports to CSV, text or binary.
+[More](guide/bulk.md#copy_into)
+
+```python
+await db.copy_into(Users, rows)
+await db.copy_to(db.select().from_(Users), "users.csv", header=True)
+```
+
+**LISTEN / NOTIFY.** Notifications with reconnects, JSON payloads and a queue limit.
+[More](guide/bulk.md#listen-and-notify)
+
+```python
+async with db.listen("orders", decode=json.loads) as events:
+    async for event in events: ...
+await db.notify("orders", {"id": 7})
+```
+
 ## Relational queries
 
 **find_many / find_first with nested relations.** Filters, order, limit and columns at

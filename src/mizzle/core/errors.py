@@ -85,6 +85,11 @@ class QueryTimeout(DatabaseError):
     """The statement ran longer than its timeout and was cancelled."""
 
 
+class ListenerOverflow(MizzleError):
+    """A ``listen()`` consumer fell ``max_queue`` notifications behind. The ones already
+    queued were delivered first; later ones were not kept."""
+
+
 class AfterCommitError(MizzleError):
     """An ``after_commit`` hook raised. The transaction **did** commit: the data is saved.
 

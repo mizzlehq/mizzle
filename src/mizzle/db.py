@@ -10,6 +10,7 @@ import random
 import time
 from collections.abc import (
     AsyncGenerator,
+    AsyncIterator,
     Awaitable,
     Callable,
     Generator,
@@ -46,18 +47,25 @@ from mizzle.core.query.builder import QueryBuilder
 from mizzle.core.query.insert import Insert, RowLike, as_mapping, prepare_row
 from mizzle.core.query.relational import RelationalStatement
 from mizzle.core.query.select import SelectBase
+from mizzle.core.schema.column import ColumnBase
 from mizzle.core.schema.table import Table, validate_tables
 from mizzle.core.schema.view import View
 from mizzle.core.sql.nodes import Identifier, Node, Raw
+from mizzle.core.sql.raw import sql as sql_raw
 from mizzle.dialects.base import (
     Connection,
+    CopyFormat,
+    CopyOutput,
     Dialect,
     Driver,
     IsolationLevel,
+    Notification,
     PoolStats,
+    Reconnected,
     ResetMode,
 )
 from mizzle.dialects.postgres import PostgresDialect
+from mizzle.dialects.postgres.types import CustomColumn
 from mizzle.tracing import Tracer
 
 log = logging.getLogger("mizzle")
@@ -404,6 +412,86 @@ class Session(QueryBuilder):
             name[:0] = [Identifier(info.schema), "."]
         how = "CONCURRENTLY " if concurrently else ""
         await self.execute(Raw((f"REFRESH MATERIALIZED VIEW {how}", *name)))
+
+    async def notify(self, channel: str, payload: object = "") -> None:
+        """``NOTIFY channel``: a ``str`` payload is sent as it is, anything else as JSON. In
+        a transaction it is delivered when the transaction commits, and not at all if it
+        rolls back."""
+        if isinstance(payload, str):
+            await self.execute(sql_raw("SELECT pg_catalog.pg_notify({}, {})", channel, payload))
+        else:  # the jsonb codec writes it (exact Decimals); jsonb prints it compactly
+            await self.execute(
+                sql_raw(
+                    "SELECT pg_catalog.pg_notify({}, {}::pg_catalog.jsonb::pg_catalog.text)",
+                    channel,
+                    payload,
+                )
+            )
+
+    async def copy_into(
+        self,
+        table: type[Table],
+        rows: Iterable[RowLike],
+        *,
+        columns: Sequence[ColumnBase] | None = None,
+    ) -> int:
+        """Bulk load ``rows`` with ``COPY``, much faster than INSERT for many rows; returns
+        the row count. Rows are dicts or models, checked like ``insert().values()``. Every
+        row sets the same columns: ``columns`` (default: those the first row sets); the
+        others get their database default. All rows or none are stored. A table with a
+        ``custom()`` or vector column is loaded with ``insert_many()`` instead (COPY sends
+        binary values, which those types may not have)."""
+        it = iter(rows)
+        first = next(it, None)
+        if first is None:
+            return 0
+        if columns is not None:
+            attrs = _copy_attrs(table, columns)
+        else:
+            attrs = tuple(prepare_row(table, as_mapping(first, table)))
+        if not attrs:
+            raise QueryError("copy_into() needs at least one column")
+        info = table.__table__
+        if any(_text_only(info.columns[a]) for a in info.columns):
+            return await self.insert_many(table, itertools.chain((first,), it))
+        names = [info.columns[a].db_name(self._casing) for a in attrs]
+        compiled = CompiledQuery(f"COPY {info.name} ({', '.join(names)}) FROM STDIN", (), ())
+        records = _copy_records(table, itertools.chain((first,), it), attrs)
+        with self._logged(compiled):
+            try:
+                async with self._connection() as conn:
+                    return await conn.copy_records(
+                        info.name, info.schema, names, records, self._timeout
+                    )
+            except DbConnectionError as lost:
+                await self._after_lost_connection(compiled, False, lost)
+                raise
+
+    async def copy_to(
+        self,
+        query: Node,
+        output: CopyOutput,
+        *,
+        format: CopyFormat = "csv",
+        header: bool = False,
+    ) -> int:
+        """Export the rows of ``query`` (a select, a relational query or ``sql(...)``) with
+        ``COPY (query) TO STDOUT`` into ``output``: a file path, a binary file, or
+        ``async def write(chunk: bytes)``. Returns the row count. Plain selects read from a
+        replica, like other reads."""
+        compiled = self.compile(query)
+        if compiled.has_placeholders:
+            raise QueryError("copy_to() does not take placeholders")
+        read_only = isinstance(query, SelectBase | RelationalStatement) and compiled.pure_read
+        with self._logged(compiled):
+            try:
+                async with self._connection(read_only) as conn:
+                    return await conn.copy_out(
+                        compiled.sql, compiled.params, output, format, header, self._timeout
+                    )
+            except DbConnectionError as lost:
+                await self._after_lost_connection(compiled, False, lost)
+                raise
 
     @overload
     async def insert_many[T: Table](
@@ -994,6 +1082,60 @@ def _insert_batches(
         yield tuple(batch)
 
 
+# pgvector types: asyncpg has no binary codec for them, and a custom() type may have none
+# either, so COPY (binary) cannot send them; copy_into() uses insert_many() instead.
+_TEXT_ONLY_TYPES = frozenset({"vector", "halfvec", "sparsevec"})
+
+
+def _text_only(column: ColumnBase) -> bool:
+    while column.item is not None:
+        column = column.item
+    base = column.sql_type.split("(", 1)[0].strip()
+    return isinstance(column, CustomColumn) or base in _TEXT_ONLY_TYPES
+
+
+def _copy_attrs(table: type[Table], columns: Sequence[ColumnBase]) -> tuple[str, ...]:
+    for column in columns:
+        if column.table is not table:
+            raise QueryError(f"{column.qualified_name} is not a column of {table.__name__}")
+    wanted = {column.attr for column in columns}
+    for attr, column in table.__table__.columns.items():
+        if column.required_on_insert and attr not in wanted:
+            raise QueryError(f"{column.qualified_name} is required")
+    return tuple(attr for attr in table.__table__.columns if attr in wanted)
+
+
+def _copy_records(
+    table: type[Table], rows: Iterable[RowLike], attrs: tuple[str, ...]
+) -> Iterator[tuple[object, ...]]:
+    """Check and encode each row while COPY sends them (rows are never all in memory)."""
+    columns = table.__table__.columns
+    for number, row in enumerate(rows):
+        given = as_mapping(row, table)
+        values = prepare_row(table, given)  # unknown columns, types, NOT NULL, defaults
+        if missing := [a for a in attrs if a not in values]:
+            raise QueryError(
+                f"copy_into() row {number} has no value for {', '.join(missing)}; "
+                "every row must set the same columns"
+            )
+        if extra := [a for a in given if a not in attrs]:
+            raise QueryError(
+                f"copy_into() row {number} sets {', '.join(extra)}, which the first row "
+                "(or columns=) does not"
+            )
+        record: list[object] = []
+        for attr in attrs:
+            value = values[attr]
+            if isinstance(value, Node):
+                raise QueryError("copy_into() cannot send SQL expressions; use insert()")
+            record.append(columns[attr].encode(value))
+        yield tuple(record)
+
+
+def _payload(text: str) -> str:
+    return text
+
+
 def dialect_for_url(url: str) -> Dialect:
     scheme, sep, _ = url.partition("://")
     if sep and scheme.lower() in ("postgresql", "postgres"):  # case-insensitive (RFC 3986)
@@ -1155,6 +1297,56 @@ class Database(Session):
             raise
         db._swap_drivers(drivers[0], drivers[1:])
         return db
+
+    @overload
+    def listen(
+        self,
+        *channels: str,
+        url: str | None = None,
+        max_queue: int = 10_000,
+        keepalive: float = 30.0,
+    ) -> AbstractAsyncContextManager[AsyncIterator[Notification[str] | Reconnected]]: ...
+    @overload
+    def listen[T](
+        self,
+        *channels: str,
+        decode: Callable[[str], T],
+        url: str | None = None,
+        max_queue: int = 10_000,
+        keepalive: float = 30.0,
+    ) -> AbstractAsyncContextManager[AsyncIterator[Notification[T] | Reconnected]]: ...
+    def listen(
+        self,
+        *channels: str,
+        decode: Callable[[str], object] = _payload,
+        url: str | None = None,
+        max_queue: int = 10_000,
+        keepalive: float = 30.0,
+    ) -> AbstractAsyncContextManager[AsyncIterator[Notification[object] | Reconnected]]:
+        """Receive ``NOTIFY`` messages sent to ``channels``, until the block exits::
+
+            async with db.listen("orders", decode=json.loads) as events:
+                async for event in events:
+                    if isinstance(event, Reconnected):
+                        reload()  # notifications sent while it was down were missed
+                    else:
+                        handle(event.data)
+
+        It uses a connection of its own, outside the pool. A lost connection is opened
+        again (retrying until the database is back), and ``Reconnected`` is yielded.
+        ``decode`` turns each payload into ``Notification.data`` (``json.loads``,
+        ``Order.model_validate_json``); without it ``data`` is the payload. More than
+        ``max_queue`` unread notifications raise ``ListenerOverflow``. ``keepalive``
+        seconds without a notification check the connection. ``url`` connects elsewhere:
+        a pooler in transaction mode (PgBouncer) drops notifications, so point it past
+        the pooler."""
+        if not channels:
+            raise QueryError("listen() needs at least one channel")
+        if max_queue < 1 or not _timeout_ok(keepalive):
+            raise QueryError("listen() needs max_queue >= 1 and keepalive > 0")
+        return self._require_driver().listen(
+            channels, decode, url=url, max_queue=max_queue, keepalive=keepalive
+        )
 
     async def close(self) -> None:
         for driver in self._swap_drivers(None):

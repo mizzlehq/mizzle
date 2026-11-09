@@ -141,21 +141,6 @@ Migrations only go forward. To undo one, generate a new migration that
 changes the schema back. On a development database, `mizzle reset` drops what mizzle
 manages and runs every migration again.
 
-## LISTEN / NOTIFY and COPY
-
-mizzle has no API for these. Use asyncpg on a connection of your own:
-
-```python
-import asyncpg
-
-conn = await asyncpg.connect(url)
-await conn.add_listener("orders", lambda _conn, _pid, _channel, payload: print(payload))
-await conn.copy_records_to_table("users", records=[("a@x.io",)], columns=["email"])
-```
-
-For bulk loads through mizzle, `insert_many()` batches rows in one transaction (see
-[Bulk and streaming](guide/bulk.md)).
-
 ## Values of custom() columns
 
 - **No operators for ranges, geometry and other extension types.** `contains`,

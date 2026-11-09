@@ -2,22 +2,28 @@
 
 from __future__ import annotations
 
+import asyncio
+import collections
 import itertools
 import json
 import logging
+import math
+import os
 import re
 import time
+import uuid
 from collections.abc import (
     AsyncGenerator,
     Awaitable,
     Callable,
+    Iterable,
     Iterator,
     Mapping,
     Sequence,
 )
 from contextlib import asynccontextmanager
 from decimal import Decimal
-from typing import cast, final
+from typing import BinaryIO, Self, cast, final
 from urllib.parse import parse_qsl, urlsplit
 
 import asyncpg
@@ -28,8 +34,10 @@ from mizzle.core.errors import (
     CheckViolation,
     DatabaseError,
     ForeignKeyViolation,
+    ListenerOverflow,
     MizzleError,
     NotNullViolation,
+    QueryError,
     QueryTimeout,
     SerializationFailure,
     UniqueViolation,
@@ -37,8 +45,12 @@ from mizzle.core.errors import (
 from mizzle.core.errors import ConnectionError as DbConnectionError
 from mizzle.core.query.base import Row
 from mizzle.dialects.base import (
+    CopyFormat,
+    CopyOutput,
     IsolationLevel,
+    Notification,
     PoolStats,
+    Reconnected,
     ResetMode,
 )
 from mizzle.dialects.postgres.types import JsonText
@@ -203,6 +215,50 @@ def _rowcount(status: str) -> int:
     return int(last) if last.isdigit() else 0
 
 
+def _float_text(value: float) -> str:
+    if math.isnan(value):
+        return "NaN"
+    if math.isinf(value):
+        return "Infinity" if value > 0 else "-Infinity"
+    return str(Decimal(value))  # the exact binary value: float4 then rounds it correctly
+
+
+def _float_literal(value: object, type_name: str) -> str | None:
+    """An exact literal for a float4/float8 (or array) parameter; None for other types
+    (and for ints too big for a float, which the server then rejects as usual)."""
+    try:
+        return _exact_float_literal(value, type_name)
+    except OverflowError:
+        return None
+
+
+def _exact_float_literal(value: object, type_name: str) -> str | None:
+    if type_name in ("float4", "float8") and isinstance(value, float | int):
+        return f"'{_float_text(float(value))}'"
+    if type_name in ("float4[]", "float8[]") and isinstance(value, list | tuple):
+        items = cast(Sequence[object], value)
+        if all(isinstance(v, float | int) for v in items):
+            body = ",".join(_float_text(float(cast(float, v))) for v in items)
+            return f"'{{{body}}}'"
+    return None
+
+
+_PARAM_OR_QUOTED = re.compile(
+    r"\$(\d+)\b"
+    r"|[eE]'(?:[^'\\]|\\.|'')*'"
+    r"|'(?:[^']|'')*'"
+    r'|"(?:[^"]|"")*"'
+    r"|--[^\n]*"
+    r"|/\*.*?\*/"
+    r"|\$([A-Za-z_][A-Za-z0-9_]*)?\$.*?\$\2\$",
+    re.DOTALL,
+)
+
+
+def _qualified(schema: str, name: str) -> str:
+    return ".".join('"' + part.replace('"', '""') + '"' for part in (schema, name))
+
+
 class PostgresConnection:
     _conn: asyncpg.Connection | PoolConnectionProxy
     dirty: bool  # ran a statement that may have changed session state
@@ -354,6 +410,111 @@ class PostgresConnection:
                 yield list(batch)
         except Exception as exc:
             raise self._translate(exc, sql) from None
+
+    async def _inline(self, sql: str, params: Sequence[object]) -> str:
+        """``sql`` with each ``$n`` replaced by its value as a quoted literal. Like asyncpg's
+        own inlining (the server quotes each value), except floats: the server prints those
+        per ``extra_float_digits`` (0 rounds to 15 digits), so they are written here exactly."""
+        statement = await self._conn.prepare(sql)
+        literals: list[str | None] = []
+        casts: list[str] = []
+        values: list[object] = []
+        for value, param in zip(params, statement.get_parameters(), strict=True):
+            exact = _float_literal(value, param.name)
+            if exact is not None or value is None:
+                literals.append(exact or "NULL")
+                continue
+            name = f"_{param.name[:-2]}" if param.name.endswith("[]") else param.name
+            values.append(value)
+            casts.append(
+                f"pg_catalog.quote_literal(${len(values)}::{_qualified(param.schema, name)}"
+                "::pg_catalog.text)"
+            )
+            literals.append(None)
+        row = await self._conn.fetchrow(f"SELECT {', '.join(casts)}", *values) if casts else None
+        quoted = iter(row or ())
+        texts = [text if text is not None else cast(str, next(quoted)) for text in literals]
+        # Quoted text, identifiers, comments and dollar-quoted bodies keep their "$n" as is.
+        return _PARAM_OR_QUOTED.sub(
+            lambda m: texts[int(m.group(1)) - 1] if m.group(1) else m.group(0), sql
+        )
+
+    async def copy_records(
+        self,
+        table: str,
+        schema: str | None,
+        columns: Sequence[str],
+        records: Iterable[Sequence[object]],
+        timeout: float | None = None,
+    ) -> int:
+        sql = f"COPY {table} FROM STDIN"
+        try:
+            status = await self._conn.copy_records_to_table(
+                table, records=records, columns=columns, schema_name=schema, timeout=timeout
+            )
+        except MizzleError:
+            raise  # a row the caller's checks rejected
+        except (ValueError, TypeError, OverflowError) as exc:
+            # asyncpg encodes COPY values in Python; its messages can quote the value.
+            raise DatabaseError(
+                f"{type(exc).__name__}: a COPY value has the wrong type or cannot be encoded "
+                "(value hidden)",
+                sql=sql,
+                original=exc,
+            ) from None
+        except Exception as exc:
+            raise self._translate(exc, sql) from None
+        return _rowcount(status)
+
+    async def copy_out(
+        self,
+        sql: str,
+        params: Sequence[object],
+        output: CopyOutput,
+        format: CopyFormat,
+        header: bool,
+        timeout: float | None = None,
+    ) -> int:
+        # Errors of the output (disk full, a callback that raises) are raised as they are:
+        # mapped like socket errors they would look like a lost connection.
+        output_errors: list[Exception] = []
+        file: BinaryIO | None = None
+        sink: BinaryIO | Callable[[bytes], Awaitable[None]]
+        if isinstance(output, str | os.PathLike):
+            file = await asyncio.to_thread(open, output, "wb")
+            sink = file
+        else:
+            sink = output
+
+        async def write(chunk: bytes) -> None:
+            try:
+                if callable(sink):
+                    await sink(chunk)
+                else:
+                    await asyncio.to_thread(sink.write, chunk)
+            except Exception as exc:
+                output_errors.append(exc)
+                raise
+
+        try:
+            # COPY takes no bind parameters, so their values are written into the SQL here
+            # (asyncpg's own version also replaced "$1" inside quoted text).
+            if params:
+                async with asyncio.timeout(timeout):
+                    query = await self._inline(sql, params)
+            else:
+                query = sql
+            status = await self._conn.copy_from_query(
+                query, output=write, format=format, header=header or None, timeout=timeout
+            )
+        except Exception as exc:
+            if output_errors:
+                raise output_errors[0] from None
+            raise self._translate(exc, sql) from None
+        finally:
+            if file is not None:
+                file.close()
+        return _rowcount(status)
 
 
 @final
@@ -644,15 +805,180 @@ def _is_closed(conn: asyncpg.Connection | PoolConnectionProxy) -> bool:
         return True
 
 
+# How long listen() waits for its test notification when connected through a pooler.
+_PROBE_TIMEOUT = 2.0
+
+
+async def _behind_pooler(conn: asyncpg.Connection) -> bool:
+    """PgBouncer and other poolers report their own process ID at startup."""
+    backend = cast(int, await conn.fetchval("SELECT pg_catalog.pg_backend_pid()"))
+    return backend != conn.get_server_pid()
+
+
+@final
+class _Listener[T]:
+    """The iterator ``db.listen()`` yields from. LISTENs on a connection of its own (never
+    a pooled one: a pool resets it, and a pooler in transaction mode loses notifications).
+
+    Notifications are queued by asyncpg's callback and decoded when read, so a ``decode``
+    that raises fails that ``async for`` step only. A lost connection is noticed by
+    asyncpg, or by a ``SELECT 1`` after ``keepalive`` quiet seconds (a dropped network sends
+    no close); the queued notifications are read first, then the listener connects again,
+    LISTENs again and yields ``Reconnected``."""
+
+    def __init__(
+        self,
+        open_connection: Callable[[], Awaitable[asyncpg.Connection]],
+        channels: Sequence[str],
+        decode: Callable[[str], T],
+        max_queue: int,
+        keepalive: float,
+    ) -> None:
+        self._open_connection = open_connection
+        self._channels = tuple(channels)
+        self._decode = decode
+        self._max_queue = max_queue
+        self._keepalive = keepalive
+        self._queue: collections.deque[tuple[str, str, int]] = collections.deque()
+        self._wake = asyncio.Event()
+        self._conn: asyncpg.Connection | None = None
+        self._lost = False
+        self._overflow = False
+
+    async def start(self) -> None:
+        self._conn = await self._listen()
+
+    async def _listen(self) -> asyncpg.Connection:
+        conn = await self._open_connection()
+        try:
+            for channel in self._channels:  # asyncpg quotes the channel name
+                await conn.add_listener(channel, self._on_notify)
+            conn.add_termination_listener(self._on_lost)
+            if await _behind_pooler(conn):
+                await self._check_delivery(conn)
+        except BaseException:
+            conn.terminate()
+            raise
+        return conn
+
+    async def _check_delivery(self, conn: asyncpg.Connection) -> None:
+        """Through a pooler, check that a notification sent from another connection
+        arrives. PgBouncer in transaction mode drops them: the server session that ran
+        LISTEN goes back to its pool, and notifications to an idle one are discarded."""
+        channel = f"mizzle_probe_{uuid.uuid4().hex}"
+        arrived = asyncio.Event()
+
+        def on_probe(*_: object) -> None:
+            arrived.set()
+
+        await conn.add_listener(channel, on_probe)
+        try:
+            sender = await self._open_connection()
+            try:
+                await sender.execute("SELECT pg_catalog.pg_notify($1, '')", channel)
+            finally:
+                await sender.close()
+            async with asyncio.timeout(_PROBE_TIMEOUT):
+                await arrived.wait()
+        except TimeoutError:
+            raise DatabaseError(
+                "listen() cannot receive notifications through this connection pooler: a "
+                f"test notification did not arrive within {_PROBE_TIMEOUT:g}s (PgBouncer in "
+                "transaction mode drops them). Pass listen(url=...) with a URL straight to "
+                "PostgreSQL, or to the pooler in session mode"
+            ) from None
+        finally:
+            await conn.remove_listener(channel, on_probe)
+
+    def _on_notify(self, conn: object, pid: int, channel: str, payload: object, /) -> None:
+        if conn is not self._conn:
+            return  # a connection given up on: its LISTENs are gone
+        if len(self._queue) >= self._max_queue:
+            self._overflow = True
+        else:
+            self._queue.append((channel, str(payload), pid))
+        self._wake.set()
+
+    def _on_lost(self, conn: object, /) -> None:
+        if conn is self._conn:
+            self._lost = True
+            self._wake.set()
+
+    def __aiter__(self) -> Self:
+        return self
+
+    async def __anext__(self) -> Notification[T] | Reconnected:
+        while True:
+            if self._queue:
+                channel, payload, pid = self._queue.popleft()
+                return Notification(channel, payload, self._decode(payload), pid)
+            if self._overflow:
+                raise ListenerOverflow(
+                    f"the listener fell {self._max_queue} notifications behind (max_queue); "
+                    "later ones were not kept"
+                )
+            if self._lost:
+                await self._reconnect()
+                return Reconnected()
+            self._wake.clear()
+            try:
+                await asyncio.wait_for(self._wake.wait(), self._keepalive)
+            except TimeoutError:
+                await self._probe()
+
+    async def _probe(self) -> None:
+        conn = self._conn
+        if conn is None:
+            return
+        try:
+            await conn.execute("SELECT 1", timeout=self._keepalive)
+        except Exception:
+            self._lost = True
+
+    async def _reconnect(self) -> None:
+        old, self._conn = self._conn, None
+        if old is not None:
+            old.terminate()
+        delay = 0.2
+        while True:
+            try:
+                self._conn = await self._listen()
+            except DbConnectionError as exc:
+                if not exc.retryable:
+                    raise  # a wrong password or a dropped database does not fix itself
+                log.warning("mizzle: listen() could not reconnect (%s); retrying", exc)
+            else:
+                self._lost = False
+                return
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, 10.0)
+
+    async def close(self) -> None:
+        conn, self._conn = self._conn, None
+        if conn is None:
+            return
+        try:
+            await asyncio.wait_for(conn.close(), 5.0)
+        except Exception:
+            conn.terminate()
+
+
 class PostgresDriver:
     _pool: asyncpg.Pool
     acquire_timeout: float | None
     last_acquire_ms: float
+    _connect_one: Callable[[str | None], Awaitable[asyncpg.Connection]] | None
 
-    def __init__(self, pool: asyncpg.Pool, acquire_timeout: float | None = 30.0) -> None:
+    def __init__(
+        self,
+        pool: asyncpg.Pool,
+        acquire_timeout: float | None = 30.0,
+        connect_one: Callable[[str | None], Awaitable[asyncpg.Connection]] | None = None,
+    ) -> None:
         self._pool = pool
         self.acquire_timeout = acquire_timeout
         self.last_acquire_ms = 0.0
+        self._connect_one = connect_one
 
     @classmethod
     async def connect(
@@ -723,7 +1049,35 @@ class PostgresDriver:
             error.retryable = _retryable(exc)
             raise error from exc
         else:
-            return cls(pool, acquire_timeout)
+
+            async def connect_one(target: str | None) -> asyncpg.Connection:
+                """One connection outside the pool, set up as the pool's are."""
+                link = target or url
+                try:
+                    conn = await asyncpg.connect(
+                        link,
+                        timeout=connect_timeout,
+                        statement_cache_size=statement_cache_size,
+                        server_settings=None if server_settings is None else dict(server_settings),
+                    )
+                except (asyncpg.ClientConfigurationError, ValueError) as exc:
+                    bad_url = _malformed(link, exc)
+                except (OSError, asyncpg.PostgresError, TimeoutError) as exc:
+                    error = DbConnectionError(f"could not connect: {type(exc).__name__}: {exc}")
+                    error.retryable = _retryable(exc)
+                    raise error from exc
+                else:
+                    try:
+                        await _init_connection(conn)
+                        if on_connect is not None:
+                            await on_connect(PostgresConnection(conn))
+                    except BaseException:
+                        conn.terminate()
+                        raise
+                    return conn
+                raise bad_url  # outside the except: the parser's error may quote the URL
+
+            return cls(pool, acquire_timeout, connect_one)
         raise malformed
 
     def acquire(self) -> _Acquire:
@@ -746,3 +1100,23 @@ class PostgresDriver:
 
     async def expire_connections(self) -> None:
         await self._pool.expire_connections()
+
+    @asynccontextmanager
+    async def listen[T](
+        self,
+        channels: Sequence[str],
+        decode: Callable[[str], T],
+        *,
+        url: str | None = None,
+        max_queue: int = 10_000,
+        keepalive: float = 30.0,
+    ) -> AsyncGenerator[_Listener[T]]:
+        connect_one = self._connect_one
+        if connect_one is None:
+            raise QueryError("listen() needs a driver made with PostgresDriver.connect()")
+        listener = _Listener(lambda: connect_one(url), channels, decode, max_queue, keepalive)
+        await listener.start()
+        try:
+            yield listener
+        finally:
+            await listener.close()

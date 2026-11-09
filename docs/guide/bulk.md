@@ -1,6 +1,7 @@
-# Bulk and streaming
+# Bulk, COPY and LISTEN
 
-Loading many rows and reading big results without holding them in memory. The examples use a `Users` table (`id`, `email` unique, `name`) and a
+Loading many rows, exporting them, reading big results without holding them in memory,
+and notifications with LISTEN / NOTIFY. The examples use a `Users` table (`id`, `email` unique, `name`) and a
 `Posts` table (`id`, `author_id`, `body`) with `Users.posts = many(...)`.
 
 ## insert_many
@@ -40,6 +41,42 @@ added = await db.insert_many(Users, rows, on_conflict=skip)  # 0: all exist alre
 Rows skipped by `DO NOTHING` are not counted or returned. With `DO UPDATE`, two rows with
 the same key in one batch fail: PostgreSQL cannot update a row twice in one statement.
 
+## copy_into
+
+`COPY` is the fastest way to load many rows, about 3 times faster than
+`insert_many`. Rows are dicts or models, checked like `insert().values()`, and enum, json
+and other values are converted per column:
+
+```python
+loaded = await db.copy_into(Posts, ({"author_id": 1, "body": f"post {i}"} for i in range(5000)))
+```
+
+Every row sets the same columns (those the first row sets, or `columns=[...]`); the others
+get their database default. All rows or none are stored, and rows are sent as they are read,
+so a generator never sits in memory. `copy_into` has no `on_conflict`: use `insert_many`
+for upserts. A table with a `custom()` or vector column is loaded with `insert_many`
+instead, because COPY sends binary values those types may not have.
+
+## copy_to
+
+Export a query with `COPY ... TO STDOUT`, as CSV (default), text or binary:
+
+```python
+query = db.select(Users.id, Users.email).from_(Users).order_by(Users.id)
+exported = await db.copy_to(query, "users.csv", header=True)  # a file path
+await db.copy_to(query, buffer, format="binary")  # a binary file
+
+
+async def write(chunk: bytes) -> None:  # or an async function
+    await response.send(chunk)
+
+
+await db.copy_to(sql("SELECT id, body FROM posts"), write, format="text")
+```
+
+It returns the row count. Plain selects read from a replica, like other reads. An error of
+the output (a full disk) is raised as it is.
+
 ## stream()
 
 Awaiting a query loads every row into memory at once. `stream()` reads from a server-side
@@ -68,4 +105,40 @@ async with aclosing(db.select().from_(Users).stream()) as users:
     async for user in users:
         if user.email.startswith("new"):
             break  # the cursor and its connection are released here
+```
+
+## LISTEN and NOTIFY
+
+```python
+async with db.listen("orders", decode=json.loads) as events:
+    async for event in events:
+        if isinstance(event, Reconnected):
+            await reload_orders()  # notifications sent while it was down were missed
+        else:
+            await handle(event.data)  # event.channel, event.payload, event.pid
+```
+
+```python
+await db.notify("orders", {"id": 7, "status": "paid"})  # a dict is sent as JSON
+async with db.transaction() as tx:
+    await tx.notify("orders", "last")  # sent when the transaction commits
+```
+
+- `listen()` uses a connection of its own, never one from the pool.
+- A lost connection is opened again on its own, then `Reconnected` is yielded: reload
+  whatever the missed notifications would have told you.
+- `decode=` turns each payload into `event.data` (`json.loads`,
+  `Order.model_validate_json`); without it `data` is the payload. A `decode` that raises
+  fails that step only; the next notification still arrives.
+- More than `max_queue` (10 000) unread notifications raise `ListenerOverflow`, after the
+  queued ones: none are dropped without an error.
+- After `keepalive` (30) seconds with no notification, it checks the connection, so a
+  dropped network is noticed too.
+
+PgBouncer in transaction mode drops notifications. Through a pooler, `listen()` checks
+that a test notification arrives, and raises if it does not. Point it straight at
+PostgreSQL with `url=`:
+
+```python
+async with db.listen("orders", url="postgresql://app@db-primary/app") as events: ...
 ```

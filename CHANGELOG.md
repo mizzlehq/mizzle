@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- `db.listen()` and `db.notify()` for LISTEN / NOTIFY. The listener uses its own
+  connection, reconnects by itself and tells you with a `Reconnected` event.
+- `db.copy_into()` and `db.copy_to()`: the fastest bulk load, and exports to CSV, text or
+  binary.
 - Install `mizzle[speed]` to read json and jsonb values with orjson, 1.5 to 3 times faster.
   Values stay exactly the same.
 

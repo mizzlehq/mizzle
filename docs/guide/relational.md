@@ -190,7 +190,7 @@ async with aclosing(db.query(Users).find_many(with_={"posts": True}).stream()) a
 ```
 
 `aclosing` (from `contextlib`) releases the connection right away if you break out of the
-loop early. See [Bulk and streaming](bulk.md).
+loop early. See [Bulk, COPY and LISTEN](bulk.md).
 
 ## Typing
 

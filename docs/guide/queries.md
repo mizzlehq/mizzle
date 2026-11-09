@@ -536,7 +536,7 @@ upserted = await db.insert_many(
 ```
 
 `on_conflict` is an insert without values; every batch gets its conflict clause (see
-[Bulk and streaming](bulk.md)).
+[Bulk, COPY and LISTEN](bulk.md)).
 
 ## Update and delete
 

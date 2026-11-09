@@ -40,7 +40,8 @@ db = await Database.connect(url, reset_connections="always")
 
 ## PgBouncer
 
-- **Transaction mode:** pass `statement_cache_size=0`.
+- **Transaction mode:** pass `statement_cache_size=0`. `listen()` cannot receive
+  notifications through it: pass `listen(url=...)` with a URL straight to PostgreSQL.
 - **Session mode:** works as is.
 
 ## Schemas other roles can write to

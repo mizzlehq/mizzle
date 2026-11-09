@@ -5,16 +5,19 @@ Adding a database means a new ``dialects/<name>/`` package that implements them.
 
 from __future__ import annotations
 
+import os
 from collections.abc import (
     AsyncGenerator,
+    AsyncIterator,
     Awaitable,
     Callable,
+    Iterable,
     Mapping,
     Sequence,
 )
 from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass
-from typing import Literal, Protocol
+from typing import BinaryIO, Literal, Protocol
 
 from mizzle.core.compiler import Compiler
 from mizzle.core.naming import Casing
@@ -30,6 +33,26 @@ type IsolationLevel = Literal["read committed", "repeatable read", "serializable
 # named with func(), direct connection use. "always": after every use (see Database.connect
 # for the one case "auto" cannot see).
 type ResetMode = Literal["always", "auto"]
+type CopyFormat = Literal["csv", "text", "binary"]
+# Where copy_to() writes: a file path, a binary file, or an async function given each chunk.
+type CopyOutput = str | os.PathLike[str] | BinaryIO | Callable[[bytes], Awaitable[None]]
+
+
+@dataclass(frozen=True)
+class Notification[T]:
+    """A ``NOTIFY`` received by ``db.listen()``. ``data`` is the payload run through
+    ``listen(decode=...)``, or the payload itself."""
+
+    channel: str
+    payload: str
+    data: T
+    pid: int  # server process ID of the session that sent it
+
+
+@dataclass(frozen=True)
+class Reconnected:
+    """Yielded by ``db.listen()`` after its connection was lost and LISTEN started again on
+    a new one. Notifications sent in between were missed: reload what they would tell."""
 
 
 @dataclass(frozen=True)
@@ -91,6 +114,29 @@ class Connection(Protocol):
         """Rows in batches from a server-side cursor; only inside a transaction."""
         ...
 
+    async def copy_records(
+        self,
+        table: str,
+        schema: str | None,
+        columns: Sequence[str],
+        records: Iterable[Sequence[object]],
+        timeout: float | None = None,
+    ) -> int:
+        """Bulk load with ``COPY ... FROM STDIN``; returns the number of rows."""
+        ...
+
+    async def copy_out(
+        self,
+        sql: str,
+        params: Sequence[object],
+        output: CopyOutput,
+        format: CopyFormat,
+        header: bool,
+        timeout: float | None = None,
+    ) -> int:
+        """``COPY (sql) TO STDOUT`` into ``output``; returns the number of rows."""
+        ...
+
 
 class Driver(Protocol):
     """A connection pool."""
@@ -103,6 +149,21 @@ class Driver(Protocol):
     async def close(self) -> None: ...
     async def expire_connections(self) -> None:
         """Replace every pooled connection (idle ones now, busy ones when released)."""
+        ...
+
+    def listen[T](
+        self,
+        channels: Sequence[str],
+        decode: Callable[[str], T],
+        *,
+        url: str | None = None,
+        max_queue: int = 10_000,
+        keepalive: float = 30.0,
+    ) -> AbstractAsyncContextManager[AsyncIterator[Notification[T] | Reconnected]]:
+        """LISTEN on a connection of its own until the context exits. A lost connection is
+        opened again (``Reconnected`` is yielded); more than ``max_queue`` unread
+        notifications raise ``ListenerOverflow``. ``url`` connects elsewhere than the pool
+        (past a pooler in transaction mode, which drops notifications)."""
         ...
 
 

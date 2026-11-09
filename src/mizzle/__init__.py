@@ -8,6 +8,7 @@ from mizzle.core.errors import (
     DatabaseError,
     DataLossBlocked,
     ForeignKeyViolation,
+    ListenerOverflow,
     MigrationError,
     MigrationLockTimeout,
     MigrationTampered,
@@ -189,6 +190,7 @@ from mizzle.core.sql.operators import (
 )
 from mizzle.core.sql.raw import sql
 from mizzle.db import Database, QueryEvent, Session
+from mizzle.dialects.base import Notification, Reconnected
 
 __version__ = "0.3.0"
 
@@ -206,15 +208,18 @@ __all__ = [
     "Expr",
     "ForeignKeyViolation",
     "Json",
+    "ListenerOverflow",
     "MigrationError",
     "MigrationLockTimeout",
     "MigrationTampered",
     "MizzleError",
     "NotNullViolation",
+    "Notification",
     "QueryBuilder",
     "QueryError",
     "QueryEvent",
     "QueryTimeout",
+    "Reconnected",
     "RelationNotLoaded",
     "SchemaError",
     "SerializationFailure",

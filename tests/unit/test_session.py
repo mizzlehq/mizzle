@@ -1,5 +1,5 @@
-from collections.abc import AsyncGenerator
-from contextlib import asynccontextmanager
+from collections.abc import AsyncGenerator, AsyncIterator, Callable, Sequence
+from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from typing import cast
 
 import pytest
@@ -13,7 +13,7 @@ from mizzle import (
     exists,
     placeholder,
 )
-from mizzle.dialects.base import Connection, Driver, PoolStats
+from mizzle.dialects.base import Connection, Driver, Notification, PoolStats, Reconnected
 from tests.models import Posts, Users
 
 
@@ -65,6 +65,17 @@ class FakeDriver:
 
     async def expire_connections(self) -> None:
         pass
+
+    def listen[T](
+        self,
+        channels: Sequence[str],
+        decode: Callable[[str], T],
+        *,
+        url: str | None = None,
+        max_queue: int = 10_000,
+        keepalive: float = 30.0,
+    ) -> AbstractAsyncContextManager[AsyncIterator[Notification[T] | Reconnected]]:
+        raise NotImplementedError  # not used here
 
 
 def database(log: list[str], *replicas: FakeDriver) -> Database:
