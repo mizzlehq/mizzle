@@ -72,6 +72,7 @@ plugins:
 nav:
   - Home: index.md
   - Getting started: getting-started.md
+  - All features: features.md
   - Guide:
       - Schema: guide/schema.md
       - Queries: guide/queries.md
@@ -83,6 +84,7 @@ nav:
       - Pydantic, Supabase, Studio: guide/integrations.md
   - CLI: cli.md
   - Production: production.md
+  - Known gaps: gaps.md
   - API reference:
       - mizzle: reference/mizzle.md
       - mizzle.pg: reference/pg.md
