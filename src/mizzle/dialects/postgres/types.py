@@ -460,3 +460,15 @@ def custom(
     )
     column.json_decoder = _json_parser(py_type)
     return column
+
+
+def tsvector(name: str | None = None) -> CustomColumn[str | None]:
+    """A full-text search document, as ``to_tsvector()`` makes it. Values read and write as
+    its text (``"'cat':2 'sat':3"``); search it with ``matches()``."""
+    return custom("tsvector", name, py_type=str)
+
+
+def tsquery(name: str | None = None) -> CustomColumn[str | None]:
+    """A full-text search query, as ``to_tsquery()`` makes it. Values read and write as its
+    text (``"'cat' & 'dog'"``)."""
+    return custom("tsquery", name, py_type=str)

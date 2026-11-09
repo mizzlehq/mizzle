@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- `tsvector()` and `tsquery()` columns in `mizzle.pg` for full-text search; `pull` writes them.
+
 ## 0.3.2
 
 - `generate` renames, removes and reorders enum values: `--rename status.done=finished`

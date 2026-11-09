@@ -5,7 +5,7 @@ reviews. It uses every 0.2 feature in one app, and its tests run it against a st
 replica, PgBouncer, a TLS-only server with odd settings and a pgvector server.
 
 - **Schema** (`shop/schema.py`): enums (one in the `shop_audit` schema), identity and
-  generated columns, `on_update_now()`, numeric, jsonb, arrays, uuid, `custom("tsvector")`,
+  generated columns, `on_update_now()`, numeric, jsonb, arrays, uuid, `tsvector()`,
   composite keys, checks, partial / expression / GIN / trigram indexes, a view and a
   materialized view, row-level security with Supabase-style `auth.uid()` and `crud_policy`,
   a managed role and an existing one.

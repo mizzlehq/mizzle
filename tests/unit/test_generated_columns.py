@@ -25,9 +25,12 @@ from mizzle.pg import (
     cosine_distance,
     integer,
     l2_distance,
+    serial,
     smallint,
     text,
     timestamp,
+    tsquery,
+    tsvector,
     vector,
 )
 from mizzle.pydantic import insert_model, select_model, update_model
@@ -333,3 +336,18 @@ def test_typegen_imports_nested_enums_and_types_inet_fully() -> None:
         " | ipaddress.IPv6Interface | ipaddress.IPv4Network | ipaddress.IPv6Network\n" in source
     )
     assert "    net: ipaddress.IPv4Network | ipaddress.IPv6Network\n" in source
+
+
+def test_tsvector_and_tsquery_columns_and_pull() -> None:
+    # tsvector() / tsquery(): custom() with py_type=str, written back the same way by pull.
+    @final
+    class Docs(Table, name="docs_ts"):
+        id = serial().primary_key()
+        doc = tsvector()
+        q = tsquery()
+
+    assert (Docs.doc.sql_type, Docs.doc.accepts) == ("tsvector", (str,))
+    assert Docs.q.sql_type == "tsquery"
+    source = render_schema_module(build_snapshot([Docs], dialect))
+    assert "doc = tsvector()" in source and "q = tsquery()" in source
+    assert "custom(" not in source

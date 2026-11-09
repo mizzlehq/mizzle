@@ -45,6 +45,8 @@ _SIMPLE_TYPES = {
     "double precision": "double_precision",
     "date": "date",
     "uuid": "uuid",
+    "tsvector": "tsvector",
+    "tsquery": "tsquery",
     "bytea": "bytea",
     "inet": "inet",
     "interval": "interval",

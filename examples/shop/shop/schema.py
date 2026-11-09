@@ -39,7 +39,6 @@ from mizzle.pg import (
     array,
     bigint,
     boolean,
-    custom,
     integer,
     jsonb,
     numeric,
@@ -48,6 +47,7 @@ from mizzle.pg import (
     smallint,
     text,
     timestamp,
+    tsvector,
     uuid,
     varchar,
 )
@@ -136,7 +136,7 @@ class Products(Table, name="products"):
     tags = array(text()).not_null().default(sql("'{}'::text[]"))
     attrs = jsonb[dict[str, Any]]().not_null().default(sql("'{}'::jsonb"))
     active = boolean().not_null().default(True)
-    search = custom("tsvector", py_type=str).generated_always_as(
+    search = tsvector().generated_always_as(
         sql(
             "setweight(to_tsvector('english', name), 'A') || "
             f"setweight(to_tsvector('english', coalesce({DETAILS}, '')), 'B')"

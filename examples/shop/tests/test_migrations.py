@@ -205,7 +205,7 @@ async def test_push_then_pull_without_drift(tmp_path: Path, admin_url: str) -> N
             "class AuditLog(Table",
             "schema='shop_audit'",
             "class StoreSales(View",
-            "custom('tsvector')",
+            "search = tsvector()",
         ):
             assert name in source, name
         imported = subprocess.run(

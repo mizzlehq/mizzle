@@ -90,8 +90,10 @@ class Everything(Table, name="everything"):
 - `timestamp(tz=True)` values always come back as aware datetimes in UTC.
 - `precision=` keeps 0 to 6 digits of fractional seconds (default 6).
 - The pgvector types need the `vector` extension. See [Extensions](extensions.md).
+- `tsvector()` and `tsquery()` hold full-text search values as their text (see
+  [Full-text search](queries.md#full-text-search)).
 - Other PostgreSQL types (ranges, geometry shapes other than `point` and `line`, `hstore`,
-  `citext`, `tsvector`, ...) are not built in; use `custom("type")`.
+  `citext`, ...) are not built in; use `custom("type")`.
 
 ## Nullability, defaults and on_update
 
@@ -290,7 +292,7 @@ from mizzle.pg import custom, serial
 class Places(Table, name="places"):
     id = serial().primary_key()
     name = custom("citext")  # needs the citext extension
-    search = custom("tsvector", py_type=str)  # str to type checkers, as matches() takes
+    labels = custom("hstore")  # needs the hstore extension
     nights = custom("int4range")
     price = custom("money_amount")  # a domain over numeric, made in a custom migration
     pair = custom("price_pair")  # a composite type
