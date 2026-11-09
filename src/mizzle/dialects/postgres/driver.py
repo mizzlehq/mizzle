@@ -18,7 +18,7 @@ from collections.abc import (
 from contextlib import asynccontextmanager
 from decimal import Decimal
 from typing import cast, final
-from urllib.parse import urlsplit
+from urllib.parse import parse_qsl, urlsplit
 
 import asyncpg
 from asyncpg import exceptions as pg
@@ -557,14 +557,56 @@ class _Acquire:
 def _malformed(url: str, exc: Exception) -> DbConnectionError:
     """A malformed database URL as a clean, permanent error (C18). The parser's message
     quotes pieces of the URL, so it is shown only for a URL with no user name or password
-    in it: masking pieces of a password in it missed some (R5-1, R6-4)."""
-    if "@" in url or "password" in url.lower():
+    in it: masking pieces of a password in it missed some (R5-1, R6-4). A bad query option
+    (``?sslmode=bogus``) is named, without its value or the parser's message (R9-4)."""
+    if option := _bad_option(url, str(exc)):
+        detail = f"invalid {option} option"
+    elif "@" in url or "password" in url.lower():
         detail = "percent-encode special characters in the user name and password"
     else:
         detail = str(exc)
     error = DbConnectionError(f"the database URL is malformed: {detail}")
     error.retryable = False
     return error
+
+
+# Options asyncpg reads from the URL that hold no secret. Only these are named: with an
+# unencoded '&' in a password, a piece of it can look like another option or its value.
+_URL_OPTIONS = frozenset(
+    [
+        "host",
+        "port",
+        "dbname",
+        "database",
+        "user",
+        "passfile",
+        "options",
+        "sslmode",
+        "sslcert",
+        "sslkey",
+        "sslrootcert",
+        "sslcrl",
+        "ssl_min_protocol_version",
+        "ssl_max_protocol_version",
+        "sslnegotiation",
+        "target_session_attrs",
+        "krbsrvname",
+        "gsslib",
+        "service",
+    ]
+)
+
+
+def _bad_option(url: str, message: str) -> str | None:
+    """The known URL query option ``message`` names (R9-4)."""
+    try:
+        keys = [key for key, _ in parse_qsl(urlsplit(url).query)]
+    except ValueError:
+        return None
+    for key in keys:
+        if key in _URL_OPTIONS and re.search(rf"\b{key}\b", message):
+            return key
+    return None
 
 
 def _is_closed(conn: asyncpg.Connection | PoolConnectionProxy) -> bool:

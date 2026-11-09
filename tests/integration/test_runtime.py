@@ -1216,6 +1216,7 @@ async def test_a_malformed_url_with_quotes_shows_no_piece_of_the_password(
         "host=localhost user=mizzle password=Zq9secretPW dbname=db",  # a libpq DSN
         "postgresql://mizzle:?Zq9secretPW@localhost:5432/db",  # asyncpg: bad query field
         "postgresql://localhost/db?user=mizzle&password=ab&Zq9secretPW",
+        "postgresql://u:pw@localhost/db?password=a&sslmode=Zq9secretPW",  # an '&' in it
     ],
 )
 async def test_no_url_error_shows_the_password(url: str) -> None:
@@ -1229,6 +1230,12 @@ async def test_no_url_error_shows_the_password(url: str) -> None:
         chain.append(error)
         error = error.__cause__ or error.__context__
     assert all("Zq9secretPW" not in str(e) for e in chain), chain
+
+
+async def test_a_bad_url_option_is_named() -> None:
+    # R9-4: a bad sslmode was reported as a user name or password to percent-encode.
+    with pytest.raises(MizzleError, match="invalid sslmode option"):
+        await Database.connect("postgresql://u:pw@localhost/db?sslmode=bogus")
 
 
 async def test_gather_on_a_transaction_with_insert_many(pg_url: str) -> None:
