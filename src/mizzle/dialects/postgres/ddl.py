@@ -184,16 +184,21 @@ _TYPE_NAME = re.compile(r"([A-Za-z_][A-Za-z0-9_$ .]*?)\s*(\(.*\))?")
 def normalize_type(sql_type: str) -> str:
     """``varchar(255)`` -> ``character varying(255)``, ``numeric(10, 2)`` -> ``numeric(10,2)``,
     ``integer[][]`` -> ``integer[]`` (PostgreSQL has one array type per element; Q5-8).
-    Unquoted names fold to lower case, and ``public.`` goes, as format_type() prints them
-    (K6-4): ``VARCHAR(10)``, ``int4[]``, ``public.posint``. A quoted name stays as written."""
+
+    Offline, so conservative: what the database would print is read from the database
+    (``normalize_snapshot``). Unquoted names fold to lower case, and only an unqualified
+    built-in name takes its canonical spelling; a qualified name keeps its schema
+    (``public.int4`` can be a domain named int4, K7-7), and a spelling not known here is
+    left as written."""
     sql_type, array = _array_base(sql_type.strip())
     match = _TYPE_NAME.fullmatch(sql_type.strip())
     if match is None:
         return sql_type + array
     base, args = " ".join(match.group(1).lower().split()), match.group(2) or ""
-    base = base.removeprefix("pg_catalog.").removeprefix(f"{DEFAULT_SCHEMA}.")
-    base = _TYPE_ALIASES.get(base, base)
     args = args.replace(" ", "")
+    if "." in base:
+        return base + args + array
+    base = _TYPE_ALIASES.get(base, base)
     if args and base.startswith(("timestamp with", "time with")):  # also "...without"
         base = base.replace(" with", f"{args} with")
         args = ""

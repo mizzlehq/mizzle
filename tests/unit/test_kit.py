@@ -2,9 +2,11 @@ import copy
 import hashlib
 import re
 from pathlib import Path
+from typing import override
 
 import pytest
 
+from mizzle import Constraint, Table, policy, rls, role, sql
 from mizzle.core.errors import MigrationError
 from mizzle.core.snapshot import Snapshot, empty_snapshot
 from mizzle.core.steps import (
@@ -17,12 +19,14 @@ from mizzle.core.steps import (
 )
 from mizzle.dialects.postgres import PostgresDialect
 from mizzle.dialects.postgres.ddl import normalize_default, normalize_type
+from mizzle.kit.codegen import render_schema_module
 from mizzle.kit.config import load_config
 from mizzle.kit.diff import StrictRenames, diff
 from mizzle.kit.journal import BREAKPOINT, Migration, MigrationsDir, format_sql, parse_sql
 from mizzle.kit.migrate import pending_migrations
 from mizzle.kit.snapshot import build_snapshot
 from mizzle.kit.sqltext import transaction_control
+from mizzle.pg import serial
 from tests.models import Posts, Users
 
 dialect = PostgresDialect()
@@ -391,3 +395,25 @@ def test_non_migration_folders_are_not_unlisted(tmp_path: Path) -> None:
     for name in (".cache", "__pycache__", "meta", "0001_merged"):
         (tmp_path / name).mkdir()
     assert directory.unlisted() == ["0001_merged"]
+
+
+def test_pulled_role_variables_never_shadow_imported_names() -> None:
+    # K7-8: `policy = role("policy")` shadowed the policy() the table's config() calls.
+    roles = [role("policy", login=True), role("role"), role("print")]
+
+    class Items(Table, name="items"):
+        id = serial().primary_key()
+
+        @classmethod
+        @override
+        def config(cls) -> list[Constraint]:
+            return [rls(), policy("p_admin", to=[roles[0]], using=sql("true"))]
+
+    source = render_schema_module(build_snapshot([Items], dialect, objects=roles))
+    for name in ("policy", "role", "print"):
+        assert f"\n{name} = " not in source
+    namespace: dict[str, object] = {}
+    exec(compile(source, "pulled", "exec"), namespace)
+    pulled = namespace["Items"]
+    assert isinstance(pulled, type) and issubclass(pulled, Table)
+    assert build_snapshot([pulled], dialect)["tables"]["public.items"].get("policies")

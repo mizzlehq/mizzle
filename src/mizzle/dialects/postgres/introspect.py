@@ -681,6 +681,27 @@ def _mentions(expression: str, column: str) -> bool:
     return re.search(rf"(?<![\w$\"]){plain}(?![\w$\"])", expression, re.IGNORECASE) is not None
 
 
+async def _normalize_types(snapshot: Snapshot, read_back: _ReadBack, rel: str) -> None:
+    """Column types as format_type() prints them, from a temporary table with a column of
+    each declared type: ``decimal(10,2)``, ``float(24)``, ``int[3]`` or ``public.int4`` (a
+    domain) all have spellings no rule here guessed right (K7-6, K7-7). A type the database
+    does not have yet (an enum this migration makes) keeps its offline spelling."""
+    printed: dict[str, str | None] = {}
+    for table in snapshot["tables"].values():
+        for column in table["columns"].values():
+            written = column["type"]
+            if written in SERIAL_TYPES:
+                continue
+            if written not in printed:
+                row = await read_back(
+                    [f"CREATE TEMP TABLE {quote(_NORM)} (c {written})"],
+                    "SELECT format_type(atttypid, atttypmod) AS t FROM pg_attribute "
+                    f"WHERE attrelid = {rel} AND attname = 'c'",
+                )
+                printed[written] = None if row is None else _opt_str(row["t"])
+            column["type"] = printed[written] or written
+
+
 async def _normalize_column_expressions(snapshot: Snapshot, read_back: _ReadBack, rel: str) -> None:
     """Defaults and generated expressions as the database prints them, from a temporary
     table holding that column. Compared as written, ``1e-7`` never matched ``0.0000001``
@@ -812,6 +833,7 @@ async def _normalize(snapshot: Snapshot, read_back: _ReadBack, version: int) -> 
                 f"return (it returns {_strs(row['columns'])})"
             )
 
+    await _normalize_types(snapshot, read_back, rel)
     await _normalize_indexes(snapshot, read_back, version)
     await _normalize_column_expressions(snapshot, read_back, f"to_regclass('{norm}')")
 

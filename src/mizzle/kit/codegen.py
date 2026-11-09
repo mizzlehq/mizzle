@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import builtins
 import datetime
 import decimal
 import ipaddress
@@ -11,6 +12,7 @@ import unicodedata
 import uuid
 from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 
+import mizzle
 from mizzle import pg
 from mizzle.core.schema.column import ColumnBase
 from mizzle.core.schema.table import Table
@@ -77,6 +79,12 @@ def _identifier(name: str) -> str:
         ident += "_"
     return ident
 
+
+# Every name the generated module may import, and the builtins: a module-level variable of
+# that name (a role named "policy") would shadow it for the code below (K7-8).
+_MODULE_NAMES = frozenset(
+    {*mizzle.__all__, *pg.__all__, "enum", "final", "override", "Any", *dir(builtins)}
+)
 
 # Capitalized names the generated module imports; a class must not shadow them (K9).
 _RESERVED_CLASSES = {"Table", "View", "QueryBuilder", "Column", "Constraint", "Any"}
@@ -197,7 +205,7 @@ class _SchemaWriter:
 
     def var(self, name: str) -> str:
         """A module-level variable for an object, unique in the module (K4-12)."""
-        var = _unique(_identifier(name), self.taken)
+        var = _unique(_identifier(name), self.taken | _MODULE_NAMES)
         self.taken.add(var)
         return var
 

@@ -259,12 +259,90 @@ def test_custom_type_spellings_normalize_as_the_server_prints_them() -> None:
         ("float8", "double precision"),
         ("int4[]", "integer[]"),
         ("VARCHAR(10)", "character varying(10)"),
-        ("public.posint", "posint"),
+        ("public.posint", "public.posint"),  # K7-7: offline, a schema is never dropped
+        ("public.int4", "public.int4"),  # a domain named int4, not integer
+        ("pg_catalog.char", "pg_catalog.char"),  # "char", not character
+        ("PUBLIC.User", "public.user"),
         ("s2.dom2", "s2.dom2"),
         ('"Weird Type"', '"Weird Type"'),
         ("numeric(10, 2)", "numeric(10,2)"),
     ]:
         assert ddl.normalize_type(written) == printed
+
+
+SPELLINGS = """
+from mizzle import Table
+from mizzle.pg import serial, custom
+
+class Items(Table, name="items"):
+    id = serial().primary_key()
+    c0 = custom("TIMESTAMP(3) WITH TIME ZONE")
+    c1 = custom("TIME(3) WITHOUT TIME ZONE")
+    c2 = custom("decimal(10,2)")
+    c3 = custom("dec(5)")
+    c4 = custom("float")
+    c5 = custom("float(24)")
+    c6 = custom('pg_catalog."char"')
+    c7 = custom("int[3]")
+    c8 = custom("integer array")
+    c9 = custom("national character(2)")
+    c10 = custom("INTERVAL DAY TO SECOND(3)")
+    c11 = custom("BIT VARYING(4)")
+"""
+
+QUALIFIED = """
+from mizzle import Table
+from mizzle.pg import serial, custom
+
+class Items(Table, name="items"):
+    id = serial().primary_key()
+    c0 = custom("public.int4")
+    c1 = custom("public.user")
+    c2 = custom("pg_catalog.char")
+"""
+
+
+async def no_drift(capsys: pytest.CaptureFixture[str]) -> None:
+    capsys.readouterr()
+    assert await cli("push", "--dry-run") == 0
+    assert "Database is up to date." in capsys.readouterr().out
+    assert await cli("doctor") == 0
+    assert "drift:       none" in capsys.readouterr().out
+
+
+async def test_declared_type_spellings_are_compared_as_the_server_prints_them(
+    project: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # K7-6: no spelling rule guessed decimal, float(24), int[3]... so they drifted forever.
+    rewrite_schema(project, SPELLINGS, monkeypatch)
+    assert await cli("generate") == 0
+    assert await cli("migrate") == 0
+    await no_drift(capsys)
+
+
+async def test_a_qualified_type_keeps_its_schema(
+    project: Path,
+    kit_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # K7-7: public.int4 (a domain) became integer, public.user a bare user (a syntax error)
+    # and pg_catalog.char (the one-byte "char") character.
+    await execute(kit_url, "CREATE DOMAIN public.int4 AS text")
+    await execute(kit_url, 'CREATE DOMAIN public."user" AS integer')
+    rewrite_schema(project, QUALIFIED, monkeypatch)
+    assert await cli("generate") == 0
+    assert await cli("migrate") == 0
+    conn = await asyncpg.connect(kit_url)
+    try:
+        rows = await conn.fetch(
+            "SELECT format_type(atttypid, atttypmod) AS t FROM pg_attribute "
+            "WHERE attrelid = 'items'::regclass AND attname LIKE 'c_' ORDER BY attname"
+        )
+    finally:
+        await conn.close()
+    assert [r["t"] for r in rows] == ["public.int4", '"user"', '"char"']
+    await no_drift(capsys)
 
 
 ARRAYS = """
