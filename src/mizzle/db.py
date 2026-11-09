@@ -995,10 +995,14 @@ def _insert_batches(
 
 
 def dialect_for_url(url: str) -> Dialect:
-    scheme = url.split("://", 1)[0]
-    if scheme in ("postgresql", "postgres"):
+    scheme, sep, _ = url.partition("://")
+    if sep and scheme in ("postgresql", "postgres"):
         return PostgresDialect()
-    raise MizzleError(f"unsupported database URL scheme {scheme!r}")
+    # Never echo the URL: anything after the scheme may hold a password (R7-1).
+    shown = f" {scheme!r}" if sep and scheme.isalnum() and len(scheme) <= 20 else ""
+    raise MizzleError(
+        f"unsupported database URL{shown}: use postgresql://user:password@host:port/database"
+    )
 
 
 class Database(Session):

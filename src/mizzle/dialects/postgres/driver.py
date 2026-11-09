@@ -608,6 +608,7 @@ class PostgresDriver:
             if on_connect is not None:
                 await on_connect(PostgresConnection(conn))
 
+        bad: DbConnectionError | None = None
         try:
             parts = urlsplit(url)
             _ = parts.port  # a bad port or IPv6 address raises here, before connecting
@@ -615,7 +616,9 @@ class PostgresDriver:
                 # asyncpg splits at the first '@' and quoted the rest in its error (R6-4).
                 raise ValueError("an unencoded '@' in the user name or password")
         except ValueError as exc:
-            raise _malformed(url, exc) from None
+            bad = _malformed(url, exc)
+        if bad is not None:  # raised here: the parser's error must not ride along (R7-2)
+            raise bad
         try:
             pool = await asyncpg.create_pool(
                 url,
@@ -632,8 +635,11 @@ class PostgresDriver:
                 reset=_reset_connection,
                 timeout=connect_timeout,  # asyncpg's default waits 60 s on a hung server (R7)
             )
-        except asyncpg.ClientConfigurationError as exc:  # a bad option, such as sslmode
-            raise _malformed(url, exc) from None
+        except (asyncpg.ClientConfigurationError, ValueError) as exc:
+            # A bad option (sslmode), or asyncpg's own URL parser ("bad query field") with
+            # pieces of the URL in its message (R7-2): raised below, outside this block, so
+            # the parser's error is not kept as __context__ either.
+            malformed = _malformed(url, exc)
         except (OSError, asyncpg.PostgresError, TimeoutError) as exc:
             # The URL is left out on purpose: it may contain a password.
             error = DbConnectionError(f"could not connect: {type(exc).__name__}: {exc}")
@@ -641,7 +647,9 @@ class PostgresDriver:
             # retry loop must not sleep and try again (R4).
             error.retryable = _retryable(exc)
             raise error from exc
-        return cls(pool, acquire_timeout)
+        else:
+            return cls(pool, acquire_timeout)
+        raise malformed
 
     def acquire(self) -> _Acquire:
         return _Acquire(self._pool, self)

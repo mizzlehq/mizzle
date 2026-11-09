@@ -1191,6 +1191,28 @@ async def test_a_malformed_url_with_quotes_shows_no_piece_of_the_password(
         assert piece not in str(bad.value)
 
 
+@pytest.mark.parametrize(
+    "url",
+    [
+        "postgresql:/mizzle:Zq9secretPW@localhost:5432/db",  # no "://"
+        "host=localhost user=mizzle password=Zq9secretPW dbname=db",  # a libpq DSN
+        "postgresql://mizzle:?Zq9secretPW@localhost:5432/db",  # asyncpg: bad query field
+        "postgresql://localhost/db?user=mizzle&password=ab&Zq9secretPW",
+    ],
+)
+async def test_no_url_error_shows_the_password(url: str) -> None:
+    # R7-1: an unsupported URL was echoed whole; R7-2: asyncpg's own parser raised a bare
+    # ValueError quoting the rest of the URL. Neither error, nor what it carries, may hold it.
+    with pytest.raises(MizzleError) as bad:
+        await Database.connect(url)
+    chain: list[BaseException] = []
+    error: BaseException | None = bad.value
+    while error is not None:
+        chain.append(error)
+        error = error.__cause__ or error.__context__
+    assert all("Zq9secretPW" not in str(e) for e in chain), chain
+
+
 async def test_gather_on_a_transaction_with_insert_many(pg_url: str) -> None:
     # R5-2: insert_many's hidden savepoint was "owned" by its task, so a sibling
     # statement in the gather was refused and the whole transaction was lost.
