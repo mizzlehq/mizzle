@@ -70,6 +70,23 @@ mizzle generate --rename app.users=archive.users  # move to another schema, data
 mizzle generate --no-renames                    # it really is drop + create
 ```
 
+## Enum values
+
+Change the Python enum and run `generate`:
+
+- **A new value** is added in place (`ALTER TYPE ... ADD VALUE`).
+- **A renamed value** keeps every row: `--rename status.done=finished` writes
+  `ALTER TYPE ... RENAME VALUE`. As for columns, mizzle asks on a terminal and stops in CI.
+- **A removed or reordered value**: PostgreSQL cannot drop or move one, so mizzle creates
+  the type again, converts its columns, and drops the old type. Views, policies, checks and
+  indexes that use those columns are created again around it. A removal needs
+  `--allow-data-loss`; a row that still holds the removed value stops the migration, and
+  nothing changes. Move those rows first (`UPDATE tasks SET status = 'draft' WHERE ...`).
+
+A column of a table mizzle does not manage, or a function, that uses the enum stops the
+migration too (the old type cannot be dropped). Convert it to `text` in a custom migration
+before, and back after.
+
 ## Data loss
 
 Steps that can lose data (dropping a table or column, narrowing a type) stop `generate`
@@ -119,16 +136,11 @@ migration if it has not been applied yet. A custom migration keeps the schema sn
 was: schema changes still go into the next generated migration, so a custom migration can
 run before the tables that need what it creates.
 
-Some changes mizzle refuses to write: removing, renaming or reordering an enum's values.
-Change the schema, then write the SQL in a custom migration that records the new schema:
+When your own SQL makes a schema change, change the schema too and record it in the custom
+migration, so `generate` does not write it again:
 
 ```bash
-mizzle generate --custom --record-schema --name rename_status
-```
-
-```sql
--- Custom migration. Separate statements with: -- mizzle:breakpoint
-ALTER TYPE status RENAME VALUE 'done' TO 'finished';
+mizzle generate --custom --record-schema --name split_names
 ```
 
 After `migrate`, the next `generate` finds no changes.

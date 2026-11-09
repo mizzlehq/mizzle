@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- `generate` renames, removes and reorders enum values: `--rename status.done=finished`
+  for a rename; a removal or a new order creates the type again and converts its columns.
+
 ## 0.3.1
 
 - `db.listen()` and `db.notify()` for LISTEN / NOTIFY. The listener uses its own

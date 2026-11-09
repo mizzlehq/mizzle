@@ -34,7 +34,8 @@ mizzle generate --custom --name backfill          # empty migration for your own
 mizzle generate --sql                             # print the SQL, write nothing
 mizzle generate --custom --name backfill --template header.sql
 mizzle generate --custom --name backfill --sql    # print the header only, write nothing
-mizzle generate --custom --record-schema --name rename_status  # its SQL makes the change
+mizzle generate --rename status.done=finished    # an enum value rename
+mizzle generate --custom --record-schema --name split_names  # its SQL makes the change
 ```
 
 `--template <file>` seeds the body of a `--custom` migration with that file's contents. With
@@ -46,10 +47,10 @@ A `--rename` that matches nothing is an error, so a typo cannot turn into a drop
 
 In a `--custom` migration, separate statements with `-- mizzle:breakpoint`.
 
-`--record-schema` is for a change mizzle will not write itself, such as removing or
-renaming an enum value: change the schema, run `generate --custom --record-schema`, and
-write the SQL. The migration records the schema as it is now, so the next `generate`
-finds nothing left to do. Without it, a custom migration keeps the snapshot as it was.
+`--record-schema` is for a change your own SQL makes: change the schema, run `generate
+--custom --record-schema`, and write the SQL. The migration records the schema as it is
+now, so the next `generate` finds nothing left to do. Without it, a custom migration keeps
+the snapshot as it was.
 
 ## migrate
 

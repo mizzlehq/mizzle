@@ -101,6 +101,41 @@ class AddEnumValue(Step):
 
 
 @dataclass(frozen=True)
+class RenameEnumValue(Step):
+    schema: str
+    name: str
+    old: str
+    new: str
+
+    @override
+    def describe(self) -> str:
+        return f"rename value {self.old!r} of enum {self.name} to {self.new!r}"
+
+
+@dataclass(frozen=True)
+class ReplaceEnum(Step):
+    """Values removed or reordered: the type is renamed to ``old_name`` and created again
+    with the new values. Columns of it are converted (a row holding a removed value fails
+    the migration), and the old type is dropped at the end."""
+
+    enum: EnumSnap
+    old_name: str
+    removed: tuple[str, ...] = ()
+
+    @property
+    @override
+    def data_loss(self) -> bool:
+        return bool(self.removed)
+
+    @override
+    def describe(self) -> str:
+        if self.removed:
+            gone = ", ".join(repr(v) for v in self.removed)
+            return f"remove values {gone} from enum {self.enum['name']}"
+        return f"reorder the values of enum {self.enum['name']}"
+
+
+@dataclass(frozen=True)
 class DropEnum(Step):
     schema: str
     name: str
@@ -215,16 +250,20 @@ class AlterColumnType(Step):
     collation: str | None = None  # keep the column's COLLATE across the type change
     # Cast through text: there is no direct cast from an enum to another type (C23).
     via_text: bool = False
+    # The column of an enum created again (ReplaceEnum): that step reports the change.
+    enum_replaced: bool = False
 
     @property
     @override
     def data_loss(self) -> bool:
         """Casts can fail, round or truncate; widening (varchar(40) -> text, integer ->
         bigint...) keeps every value."""
-        return not widens(self.old_type, self.new_type)
+        return not self.enum_replaced and not widens(self.old_type, self.new_type)
 
     @override
     def describe(self) -> str:
+        if self.enum_replaced:
+            return f"convert {self.table}.{self.column} to the new {self.new_type}"
         return f"change type of {self.table}.{self.column} from {self.old_type} to {self.new_type}"
 
 

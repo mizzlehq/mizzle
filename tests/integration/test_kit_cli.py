@@ -1755,16 +1755,14 @@ async def test_a_name_with_a_newline_stays_in_its_comment(
 async def test_a_custom_migration_can_record_the_schema_it_changes(
     project: Path, kit_url: str, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    # H12-1: an enum value removed or renamed "needs a custom migration", but after writing
-    # and applying it, generate refused the same way forever: the custom migration kept the
-    # old snapshot. --record-schema records the schema its SQL brings.
+    # H12-1: after a custom migration made a schema change itself, generate wrote it again
+    # (or refused it) forever: the custom migration kept the old snapshot. --record-schema
+    # records the schema its SQL brings.
     assert await cli("generate") == 0
     assert await cli("migrate") == 0
     conn = await asyncpg.connect(kit_url)
     await conn.execute("INSERT INTO users (email, role) VALUES ('a@b.c', 'user')")
     rewrite_schema(project, V1.replace('USER = "user"', 'USER = "member"'), monkeypatch)
-    assert await cli("generate") == 1
-    assert "--custom --record-schema" in capsys.readouterr().err
     assert await cli("generate", "--record-schema") == 1  # only with --custom
     assert await cli("generate", "--custom", "--record-schema", "--name", "member") == 0
     [sql_file] = project.glob("migrations/*_member/migration.sql")
@@ -1777,3 +1775,104 @@ async def test_a_custom_migration_can_record_the_schema_it_changes(
     assert await cli("generate", "--sql") == 0
     assert "No schema changes." in capsys.readouterr().out
     assert await cli("check") == 0
+
+
+ENUM_V1 = """
+import enum
+from typing import final, override
+from mizzle import Constraint, QueryBuilder, Table, View, check, eq, index, policy, rls, sql
+from mizzle.pg import array, pg_enum, serial, text
+
+class Status(enum.StrEnum):
+    DRAFT = "draft"
+    DONE = "done"
+    ARCHIVED = "archived"
+
+@final
+class Task(Table, name="task"):
+    id = serial().primary_key()
+    title = text()
+    status = pg_enum(Status).not_null().default(Status.DRAFT)
+    history = array(pg_enum(Status))
+
+    @classmethod
+    @override
+    def config(cls) -> list[Constraint]:
+        return [
+            check("titled", sql("status <> 'draft' OR title IS NOT NULL")),
+            index("task_drafts").on(cls.id).where(sql("status = 'draft'")),
+            rls(),
+            policy("drafts", using=sql("status = 'draft'")),
+        ]
+
+@final
+class Drafts(View, name="drafts"):
+    id = serial()
+
+    @classmethod
+    @override
+    def query(cls, db: QueryBuilder):
+        return db.select(Task.id).from_(Task).where(eq(Task.status, Status.DRAFT))
+"""
+
+
+async def test_enum_values_renamed_removed_and_reordered(
+    project: Path, kit_url: str, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # PostgreSQL cannot drop or move an enum value, and generate refused all three changes.
+    rewrite_schema(project, ENUM_V1, monkeypatch)
+    assert await cli("generate") == 0 and await cli("migrate") == 0
+    conn = await asyncpg.connect(kit_url)
+    await conn.execute(
+        "INSERT INTO task (title, status, history) VALUES ('a', 'done', '{draft,done}'),"
+        " ('b', 'archived', NULL)"
+    )
+
+    async def rows() -> list[tuple[object, ...]]:
+        return [
+            tuple(r)
+            for r in await conn.fetch("SELECT status::text, history::text[] FROM task ORDER BY id")
+        ]
+
+    async def no_drift() -> None:
+        capsys.readouterr()
+        assert await cli("generate", "--sql") == 0
+        assert "No schema changes." in capsys.readouterr().out
+
+    # A rename keeps the rows' values: RENAME VALUE, never a drop and add.
+    v2 = ENUM_V1.replace('DONE = "done"', 'DONE = "finished"')
+    rewrite_schema(project, v2, monkeypatch)
+    capsys.readouterr()
+    assert await cli("generate") == 1
+    assert "--rename status.done=finished" in capsys.readouterr().err
+    assert await cli("generate", "--rename", "status.done=finished") == 0
+    assert await cli("migrate") == 0
+    assert await rows() == [("finished", ["draft", "finished"]), ("archived", None)]
+    await no_drift()
+
+    # A removal re-creates the type; a row still holding the value stops the migration.
+    v3 = v2.replace('    ARCHIVED = "archived"\n', "")
+    rewrite_schema(project, v3, monkeypatch)
+    assert await cli("generate") == 1  # data loss: needs --allow-data-loss
+    assert await cli("generate", "--allow-data-loss") == 0
+    assert await cli("migrate") == 1
+    assert await rows() == [("finished", ["draft", "finished"]), ("archived", None)]
+    await conn.execute("UPDATE task SET status = 'draft', title = 'b' WHERE status = 'archived'")
+    assert await cli("migrate") == 0
+    assert await rows() == [("finished", ["draft", "finished"]), ("draft", None)]
+    assert await conn.fetchval("SELECT count(*) FROM drafts") == 1  # the view came back
+    assert await conn.fetchval("SELECT enum_range(NULL::status)::text") == "{draft,finished}"
+    assert not await conn.fetchval("SELECT count(*) FROM pg_type WHERE typname LIKE '%mizzle_old'")
+    await no_drift()
+
+    # A reorder loses nothing: no --allow-data-loss.
+    v4 = v3.replace(
+        '    DRAFT = "draft"\n    DONE = "finished"\n',
+        '    DONE = "finished"\n    DRAFT = "draft"\n',
+    )
+    rewrite_schema(project, v4, monkeypatch)
+    assert await cli("generate") == 0 and await cli("migrate") == 0
+    assert await conn.fetchval("SELECT enum_range(NULL::status)::text") == "{finished,draft}"
+    assert await rows() == [("finished", ["draft", "finished"]), ("draft", None)]
+    await no_drift()
+    await conn.close()

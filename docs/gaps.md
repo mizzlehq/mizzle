@@ -100,41 +100,6 @@ CREATE TABLE events (id bigint NOT NULL, at timestamptz NOT NULL,
 CREATE TABLE events_2026 PARTITION OF events FOR VALUES FROM ('2026-01-01') TO ('2027-01-01');
 ```
 
-## Removing, renaming or reordering enum values
-
-`generate` adds enum values, but it does not remove, rename or reorder them: a removed
-value may still be in rows. Change the enum in Python, then write the SQL in a custom
-migration that records the new schema:
-
-```bash
-mizzle generate --custom --record-schema --name rename_status
-```
-
-```sql
--- Custom migration. Separate statements with: -- mizzle:breakpoint
-ALTER TYPE status RENAME VALUE 'done' TO 'finished';
-```
-
-To remove a value, move its rows to another value first, then re-create the type:
-
-```sql
-UPDATE tasks SET status = 'draft' WHERE status = 'archived';
--- mizzle:breakpoint
-ALTER TABLE tasks ALTER COLUMN status DROP DEFAULT;
--- mizzle:breakpoint
-ALTER TYPE status RENAME TO status_old;
--- mizzle:breakpoint
-CREATE TYPE status AS ENUM ('draft', 'finished');
--- mizzle:breakpoint
-ALTER TABLE tasks ALTER COLUMN status TYPE status USING status::text::status;
--- mizzle:breakpoint
-ALTER TABLE tasks ALTER COLUMN status SET DEFAULT 'draft';
--- mizzle:breakpoint
-DROP TYPE status_old;
-```
-
-Leave out the two `DEFAULT` lines when the column has no default.
-
 ## No down migrations
 
 Migrations only go forward. To undo one, generate a new migration that

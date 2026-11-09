@@ -11,10 +11,14 @@ from mizzle.core.errors import MigrationError
 from mizzle.core.snapshot import Snapshot, empty_snapshot
 from mizzle.core.steps import (
     AddEnumValue,
+    AlterColumnType,
     CreateIndex,
     CreateTable,
+    DropEnum,
     DropTable,
     RenameConstraint,
+    RenameEnumValue,
+    ReplaceEnum,
     Statement,
 )
 from mizzle.dialects.postgres import PostgresDialect
@@ -117,9 +121,21 @@ def test_enum_value_added_and_removed() -> None:
     new["enums"]["public.role"]["values"] = ["owner", "admin", "user"]
     [step] = diff(old, new)
     assert step == AddEnumValue("public", "role", "owner", None, "admin")
+    # A removed value re-creates the type and converts its columns (it was refused).
     new["enums"]["public.role"]["values"] = ["admin"]
-    with pytest.raises(MigrationError, match="removing values"):
-        diff(old, new)
+    steps = diff(old, new)
+    replace = next(s for s in steps if isinstance(s, ReplaceEnum))
+    assert replace.removed == ("user",) and replace.data_loss
+    retype = next(s for s in steps if isinstance(s, AlterColumnType))
+    assert (retype.old_type, retype.new_type, retype.via_text) == ("role__mizzle_old", "role", True)
+    assert not retype.data_loss
+    assert steps[-1] == DropEnum("public", "role__mizzle_old")
+    # A rename resolved as one is RENAME VALUE only.
+    new["enums"]["public.role"]["values"] = ["admin", "member"]
+    renamed = diff(old, new, StrictRenames({"role.user": "member"}))
+    assert renamed == [RenameEnumValue("public", "role", "user", "member")]
+    with pytest.raises(MigrationError, match=r"--rename role\.user=member"):
+        diff(old, new, StrictRenames())
 
 
 def test_constraint_rename_is_detected() -> None:

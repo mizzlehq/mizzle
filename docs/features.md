@@ -340,6 +340,13 @@ mizzle generate --rename users.name=full_name
 mizzle generate --allow-data-loss
 ```
 
+**Enum values.** Added, renamed, removed or reordered, with the rows converted.
+[More](guide/migrations.md#enum-values)
+
+```bash
+mizzle generate --rename status.done=finished
+```
+
 **Custom migrations.** Your own SQL, in the same history. [More](guide/migrations.md#custom-migrations)
 
 ```bash

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import dataclasses
 import re
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
@@ -53,8 +54,10 @@ from mizzle.core.steps import (
     DropView,
     RenameColumn,
     RenameConstraint,
+    RenameEnumValue,
     RenameIndex,
     RenameTable,
+    ReplaceEnum,
     RestoreGrants,
     SaveGrants,
     SetColumnComment,
@@ -65,7 +68,7 @@ from mizzle.core.steps import (
     Step,
 )
 
-type RenameKind = Literal["table", "column"]
+type RenameKind = Literal["table", "column", "value"]
 
 
 class RenameResolver(Protocol):
@@ -223,23 +226,35 @@ def _without_name(item: Mapping[str, object]) -> dict[str, object]:
     return {k: v for k, v in item.items() if k != "name"}
 
 
-def _diff_enums(old: Snapshot, new: Snapshot, plan: _Plan) -> None:
+def _diff_enums(
+    old: Snapshot, new: Snapshot, plan: _Plan, resolve: RenameResolver
+) -> dict[str, str]:
+    """Enum steps. Returns the enums that are created again (values removed or reordered),
+    as {type name as columns spell it: the name the old type is renamed to}."""
+    replaced: dict[str, str] = {}
     for k, enum in new["enums"].items():
         before = old["enums"].get(k)
         if before is None:
             plan.enums.append(CreateEnum(enum))
             continue
+        schema, name = enum["schema"], enum["name"]
         old_values, new_values = before["values"], enum["values"]
-        if removed := [v for v in old_values if v not in new_values]:
-            raise MigrationError(
-                f"enum {enum['name']}: removing values {removed} needs a custom migration "
-                "(mizzle generate --custom --record-schema)"
-            )
-        if [v for v in new_values if v in old_values] != old_values:
-            raise MigrationError(
-                f"enum {enum['name']}: reordering values needs a custom migration "
-                "(mizzle generate --custom --record-schema)"
-            )
+        removed = [v for v in old_values if v not in new_values]
+        added = [v for v in new_values if v not in old_values]
+        if removed and added:  # a rename keeps the rows' values (RENAME VALUE)
+            renames = resolve("value", f"{schema}.{name}", removed, added)
+            plan.enums += [RenameEnumValue(schema, name, o, n) for o, n in renames.items()]
+            old_values = [renames.get(v, v) for v in old_values]
+            removed = [v for v in old_values if v not in new_values]
+        if removed or [v for v in new_values if v in old_values] != old_values:
+            # PostgreSQL cannot drop or move an enum value: the type is made again and its
+            # columns converted through text.
+            old_name = f"{name}__mizzle_old"[:MAX_ENUM_NAME]
+            plan.enums.append(ReplaceEnum(enum, old_name, tuple(removed)))
+            plan.drop_enums.append(DropEnum(schema, old_name))
+            spelled = name if schema == "public" else f"{schema}.{name}"
+            replaced[spelled] = old_name if schema == "public" else f"{schema}.{old_name}"
+            continue
         for i, value in enumerate(new_values):
             if value in old_values:
                 continue
@@ -250,12 +265,43 @@ def _diff_enums(old: Snapshot, new: Snapshot, plan: _Plan) -> None:
                 if after is None
                 else None
             )
-            plan.enums.append(
-                AddEnumValue(enum["schema"], enum["name"], value, after, before_value)
-            )
+            plan.enums.append(AddEnumValue(schema, name, value, after, before_value))
     for k, enum in old["enums"].items():
         if k not in new["enums"]:
             plan.drop_enums.append(DropEnum(enum["schema"], enum["name"]))
+    return replaced
+
+
+MAX_ENUM_NAME = 63
+
+
+def _retype_replaced(old: Snapshot, replaced: Mapping[str, str], plan: _Plan) -> Snapshot:
+    """``old`` with the columns of re-created enums typed as the renamed old type, so the
+    table diff converts them. Checks and indexes that use such a column are dropped here
+    and created again by the diff: their stored text names the old type."""
+    if not replaced:
+        return old
+    out = copy.deepcopy(old)
+    for table in out["tables"].values():
+        schema, name = table["schema"], table["name"]
+        moved: list[str] = []
+        for cname, column in table["columns"].items():
+            base = column["type"].removesuffix("[]")
+            if base in replaced:
+                column["type"] = replaced[base] + column["type"][len(base) :]
+                moved.append(cname)
+        if not moved:
+            continue
+        for cname, check in list(table["checks"].items()):
+            if _mentions(check["expression"], moved):
+                plan.drop_constraints.append(DropConstraint(schema, name, cname, "check"))
+                del table["checks"][cname]
+        for iname, index in list(table["indexes"].items()):
+            texts = (index.get("expression"), index["where"])
+            if any(_mentions(t, moved) for t in texts):
+                plan.drop_indexes.append(DropIndex(schema, iname))
+                del table["indexes"][iname]
+    return out
 
 
 def _rename_columns_in(table: TableSnap, mapping: Mapping[str, str]) -> None:
@@ -667,10 +713,15 @@ def diff(
     """
     plan = _Plan()
     plan.schemas = [CreateSchema(s) for s in new["schemas"] if s not in old["schemas"]]
-    _diff_enums(old, new, plan)
+    remade = _diff_enums(old, new, plan, resolve)
+    old = _retype_replaced(old, remade, plan)
     # Columns of these types change type through text (C23). A type in the default schema
     # may be spelled without it, so the bare name counts too.
-    enum_names = frozenset(old["enums"]) | frozenset(e["name"] for e in old["enums"].values())
+    enum_names = (
+        frozenset(old["enums"])
+        | frozenset(e["name"] for e in old["enums"].values())
+        | frozenset(remade.values())
+    )
     old_tables = _apply_renames(old, new, resolve, plan)
 
     for k, table in new["tables"].items():
@@ -712,6 +763,14 @@ def diff(
             plan.drop_policies += [
                 DropPolicy(table["schema"], table["name"], n) for n in table.get("policies", {})
             ]
+    if remade:
+        renamed = frozenset(remade.values())
+        plan.alter_columns = [
+            dataclasses.replace(step, enum_replaced=True)
+            if isinstance(step, AlterColumnType) and step.old_type.removesuffix("[]") in renamed
+            else step
+            for step in plan.alter_columns
+        ]
     _recreate_dependent_fks(old_tables, new, plan)
     _diff_roles(old, new, plan, drop_unlisted=compare_expressions)
     touched = _changed_tables(plan)

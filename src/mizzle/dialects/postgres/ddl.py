@@ -59,8 +59,10 @@ from mizzle.core.steps import (
     DropView,
     RenameColumn,
     RenameConstraint,
+    RenameEnumValue,
     RenameIndex,
     RenameTable,
+    ReplaceEnum,
     RestoreGrants,
     SaveGrants,
     SetColumnComment,
@@ -728,6 +730,16 @@ def render_step(step: Step) -> Statement:
                 text += f" BEFORE {literal(before)}"
             # A new enum value cannot be used in the transaction that adds it.
             return Statement(text, transactional=False)
+        case RenameEnumValue(schema=schema, name=name, old=old, new=new):
+            values = f"{literal(old)} TO {literal(new)}"
+            return Statement(f"ALTER TYPE {qualified(schema, name)} RENAME VALUE {values}")
+        case ReplaceEnum(enum=enum, old_name=old_name):
+            values = ", ".join(literal(v) for v in enum["values"])
+            name = qualified(enum["schema"], enum["name"])
+            return Statement(
+                f"ALTER TYPE {name} RENAME TO {quote(old_name)};\n"
+                f"CREATE TYPE {name} AS ENUM ({values})"
+            )
         case DropEnum(schema=schema, name=name):
             return Statement(f"DROP TYPE {qualified(schema, name)}")
         case CreateTable(table=table):
