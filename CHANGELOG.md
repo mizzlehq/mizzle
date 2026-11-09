@@ -20,7 +20,8 @@
   `py_type=` (or `refine=`) for such a column. Values compared with it are sent with no
   cast (a cast cut `varchar(5)` text and rounded `numeric(10,2)`); compare a tuple with a
   composite as `sql("{}::type", value)`. Nested rows (`with_=`) give the value's
-  text form (a `str`, exact for a numeric domain), through `decode` if given. `pull` writes
+  JSON form (`bool`, `int`, `Decimal` with all digits, `str`, `dict`), through `decode`
+  if given. `pull` writes
   every column of a type mizzle has no column type for as `custom(...)`.
 - `values(model)` / `set(model)` take each field as the model holds it, so a dataclass or
   model in a `custom()` column reaches `encode=` as one; json columns still get the dumped

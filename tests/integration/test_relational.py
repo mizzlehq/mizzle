@@ -251,6 +251,7 @@ class CusRow(Table, name="rel_cus_row"):
     rect = custom("box")
     rects = array(custom("box"))
     label = custom("citext", py_type=Label, decode=Label, encode=_label_text)
+    flag = custom("rel_c_yes", py_type=bool)  # a domain over boolean
     owner = one(
         lambda: CusOwner, fields=lambda: [CusRow.owner_id], references=lambda: [CusOwner.id]
     )
@@ -264,18 +265,20 @@ class CusCopy(Table, name="rel_cus_copy"):
 
 _CUS_DROP = (
     "DROP TABLE IF EXISTS rel_cus_row, rel_cus_owner, rel_cus_copy;"
-    " DROP TYPE IF EXISTS rel_c_pair, rel_c_mood; DROP DOMAIN IF EXISTS rel_c_num, rel_c_mail"
+    " DROP TYPE IF EXISTS rel_c_pair, rel_c_mood;"
+    " DROP DOMAIN IF EXISTS rel_c_num, rel_c_mail, rel_c_yes"
 )
 _CUS_DDL = """
 CREATE EXTENSION IF NOT EXISTS citext;
 CREATE DOMAIN rel_c_num AS numeric;
 CREATE DOMAIN rel_c_mail AS text CHECK (VALUE LIKE '%@%');
+CREATE DOMAIN rel_c_yes AS boolean;
 CREATE TYPE rel_c_mood AS ENUM ('sad', 'ok', 'happy');
 CREATE TYPE rel_c_pair AS (amount numeric, day date);
 CREATE TABLE rel_cus_owner (id serial PRIMARY KEY);
 CREATE TABLE rel_cus_row (id serial PRIMARY KEY, owner_id int REFERENCES rel_cus_owner,
   ci citext, num rel_c_num, mail rel_c_mail, mood rel_c_mood, doc tsvector, pair rel_c_pair,
-  span int4range, rect box, rects box[], label citext);
+  span int4range, rect box, rects box[], label citext, flag rel_c_yes);
 CREATE TABLE rel_cus_copy (id serial PRIMARY KEY, ci citext, span int4range);
 """
 _DAY = datetime.date(2020, 1, 2)
@@ -302,6 +305,7 @@ async def cus_db(driver: PostgresDriver, pg_url: str) -> AsyncGenerator[Database
                 "rect": _BOX,
                 "rects": [_BOX, None],
                 "label": Label("Hi"),
+                "flag": False,
             }
             more = [
                 {"owner_id": owner.id, "ci": "abc", "num": Decimal("1.00"), "span": Range(10, 12)},
@@ -407,9 +411,10 @@ async def test_custom_values_are_never_cast(driver: PostgresDriver, pg_url: str)
             await conn.execute("DROP TABLE rel_cus_sized; DROP DOMAIN rel_c_money", [])
 
 
-async def test_custom_nested_rows_are_text(cus_db: Database) -> None:
-    # A relational query nests a custom() value as its text form; decode still applies.
-    # As JSON a numeric domain was a float, which loses digits (R8-1).
+async def test_custom_nested_rows_are_json(cus_db: Database) -> None:
+    # A relational query nests a custom() value as its JSON form; decode still applies.
+    # Numbers keep every digit (R8-1: a float lost them); a boolean stays a bool (Q9-2:
+    # its text 'false' was truthy).
     [owner] = await cus_db.query(CusOwner).find_many(with_={"rows": {"order_by": CusRow.id}})
     row = owner.rows[0]
     assert (row.ci, row.mail, row.mood, row.doc, row.label) == (
@@ -419,8 +424,10 @@ async def test_custom_nested_rows_are_text(cus_db: Database) -> None:
         "'a' 'b'",
         Label("Hi"),
     )
-    assert [r.num for r in owner.rows] == ["1.0", "1.00", "2"]
-    assert row.pair == "(1.5,2020-01-02)"
+    nums = [r.num for r in owner.rows]
+    assert nums == [Decimal("1.0"), Decimal("1.00"), 2] and str(nums[1]) == "1.00"
+    assert row.flag is False and owner.rows[1].flag is None
+    assert row.pair == {"amount": Decimal("1.5"), "day": "2020-01-02"}
     assert (row.span, row.rect, row.rects) == ("[1,5)", "(2,2),(0,0)", ["(2,2),(0,0)", None])
 
 

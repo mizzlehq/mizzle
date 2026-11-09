@@ -351,10 +351,11 @@ compared with a composite needs the type written out:
 `eq(Row.pair, sql("{}::price_pair", (Decimal("1.5"), day)))`.
 
 A relational query (`with_=`) nests related rows as JSON, so a custom column there holds
-its text form, a `str` as PostgreSQL prints the value: `"[1,5)"` for a range,
-`"(1.5,2020-01-02)"` for a composite, `"12345678901234567890.123456789"` for a numeric
-domain (all digits kept). `decode` is applied to that `str` too, so a column with `decode`
-and nested reads needs a `decode` that takes both, or read the column with a plain select.
+its JSON form (`to_json`): a `bool` or `int` for a domain over one, a `Decimal` with all
+digits for other numbers, a `str` such as `"[1,5)"` for a range, a `dict` such as
+`{"amount": Decimal("1.5"), "day": "2020-01-02"}` for a composite. `decode` is applied to
+that value too, so a column with `decode` and nested reads needs a `decode` that takes
+both, or read the column with a plain select.
 
 The domain, composite type or extension itself is not managed by mizzle: create it in a
 custom migration (see [Not managed by mizzle](migrations.md#not-managed-by-mizzle)).

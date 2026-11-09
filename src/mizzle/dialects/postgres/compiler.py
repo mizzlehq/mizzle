@@ -306,8 +306,10 @@ class PostgresCompiler(Compiler):
 
     def json_value(self, ref: str, column: ColumnBase) -> str:
         if isinstance(column, CustomColumn):
-            # Its text form: a JSON number would lose digits of a numeric domain (R8-1).
-            return f"{ref}::text"
+            # Its JSON form as text, which the column parses with exact numbers: as JSON a
+            # numeric domain's value became a float (R8-1); as text a boolean was 'false'
+            # (Q9-2).
+            return f"to_json({ref})::text"
         if column.item is not None:
             item = self.json_value("x.v", column.item)
             if item == "x.v":

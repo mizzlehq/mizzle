@@ -10,6 +10,7 @@ import re
 import struct
 import uuid as _uuid
 from collections.abc import Callable, Iterable, Mapping, Sequence
+from decimal import Decimal
 from typing import Never, Protocol, cast, overload, override, runtime_checkable
 
 from asyncpg import BitString, Line, Point
@@ -382,11 +383,13 @@ def pg_enum[E: enum.Enum](
 
 
 class CustomColumn[T](Column[T]):
-    """See ``custom``. A relational query nests its values as their text form."""
+    """See ``custom``. A relational query nests its values as their JSON form."""
 
 
-def _as_is(value: object) -> object:
-    return value
+def _parse_json(value: object) -> object:
+    # Nested as JSON text (to_json(col)::text), parsed here so numbers keep every digit:
+    # a numeric domain's 1.10 is Decimal("1.10"), not a float (R8-1, Q9-2).
+    return cast(object, _jsonlib.loads(cast(str, value), parse_float=Decimal))
 
 
 @overload
@@ -428,8 +431,9 @@ def custom(
     ``"app.my_type"``). Values are the driver's (asyncpg's) for that type, both ways: a
     ``str`` for citext or tsvector, a ``Range`` for int4range, a ``Record`` for a composite.
     ``decode`` turns a value read into ``py_type``, ``encode`` one written into what the
-    driver takes. A relational query nests it as its text form (``decode`` then gets that
-    ``str``): JSON has no exact form for some values, such as a numeric domain's.
+    driver takes. A relational query nests it as its JSON form (``decode`` then gets that:
+    a ``bool``, an ``int``, a ``Decimal`` for other numbers, a ``str``, a ``dict`` for a
+    composite...).
     """
     column = CustomColumn[object](
         sql_type,
@@ -438,5 +442,5 @@ def custom(
         encoder=cast(Callable[[object], object] | None, encode),
         decoder=cast(Callable[[object], object] | None, decode),
     )
-    column.json_decoder = _as_is  # the text form as it is
+    column.json_decoder = _parse_json
     return column
