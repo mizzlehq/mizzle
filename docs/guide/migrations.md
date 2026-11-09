@@ -83,9 +83,9 @@ Change the Python enum and run `generate`:
   `--allow-data-loss`; a row that still holds the removed value stops the migration, and
   nothing changes. Move those rows first (`UPDATE tasks SET status = 'draft' WHERE ...`).
 
-A column of a table mizzle does not manage, or a function, that uses the enum stops the
-migration too (the old type cannot be dropped). Convert it to `text` in a custom migration
-before, and back after.
+Something mizzle does not manage that uses the enum (a table's column, a view, a domain, a
+function) stops the migration too: the old type cannot be dropped, and nothing changes.
+Convert it to `text` in a custom migration before, and back after.
 
 ## Data loss
 

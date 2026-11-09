@@ -1,8 +1,9 @@
 """Re-created views, rebuilt columns and unmanaged references keep what they had (K7)."""
 
 import asyncio
+import enum
 import uuid
-from typing import final, override
+from typing import cast, final, override
 
 import asyncpg
 import pytest
@@ -15,7 +16,7 @@ from mizzle.core.steps import Statement
 from mizzle.dialects.postgres.driver import PostgresDriver
 from mizzle.kit.diff import diff
 from mizzle.kit.snapshot import build_snapshot
-from mizzle.pg import integer, serial, text, varchar
+from mizzle.pg import integer, pg_enum, serial, text, varchar
 from tests.integration.test_kit_cli import kit_url
 from tests.integration.test_kit_unmanaged import (
     Items,
@@ -304,5 +305,38 @@ async def test_a_type_change_under_a_generated_column(kit_url: str) -> None:
     row = await fetch_one(kit_url, "SELECT email, lower_email FROM mail")
     assert (row["email"], row["lower_email"]) == ("A@X.io", "a@x.io")
     assert await fetch_one(kit_url, "SELECT 1 AS i FROM pg_indexes WHERE indexname = 'mail_lower'")
+    current = await live(kit_url, ["public"])
+    assert diff(current, v2, compare_expressions=False) == []
+
+
+def kinds(values: tuple[str, ...]) -> Snapshot:
+    kind_enum = cast(type[enum.StrEnum], enum.StrEnum("Kind", {v.upper(): v for v in values}))
+
+    @final
+    class Kinds(Table, name="kinds"):
+        kind = pg_enum(kind_enum, type_name="kind").primary_key()
+        is_a = integer().generated_always_as(sql("CASE WHEN kind = 'a' THEN 1 ELSE 0 END"))
+
+    @final
+    class Things(Table, name="things"):
+        id = serial().primary_key()
+        kind = pg_enum(kind_enum, type_name="kind").not_null().references(lambda: Kinds.kind)
+
+    return build_snapshot([Kinds, Things], dialect)
+
+
+async def test_an_enum_under_a_foreign_key_is_created_again(kit_url: str) -> None:
+    # H14-1: converting a key column while a foreign key joined it to a column still of the
+    # old type failed ("foreign key constraint cannot be implemented").
+    v1, v2 = kinds(("a", "b", "c")), kinds(("b", "a"))
+    await migrate(kit_url, empty_snapshot("postgresql"), v1)
+    await execute(
+        kit_url, "INSERT INTO kinds VALUES ('a'), ('b'); INSERT INTO things (kind) VALUES ('a')"
+    )
+    await migrate(kit_url, v1, v2)
+    row = await fetch_one(
+        kit_url, "SELECT kind::text AS k, is_a FROM kinds JOIN things USING (kind)"
+    )
+    assert (row["k"], row["is_a"]) == ("a", 1)
     current = await live(kit_url, ["public"])
     assert diff(current, v2, compare_expressions=False) == []

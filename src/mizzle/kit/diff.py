@@ -275,33 +275,42 @@ def _diff_enums(
 MAX_ENUM_NAME = 63
 
 
-def _retype_replaced(old: Snapshot, replaced: Mapping[str, str], plan: _Plan) -> Snapshot:
-    """``old`` with the columns of re-created enums typed as the renamed old type, so the
+def _retype_replaced(
+    tables: Mapping[str, TableSnap], replaced: Mapping[str, str], plan: _Plan
+) -> None:
+    """Type the old ``tables``' columns of re-created enums as the renamed old type, so the
     table diff converts them. Checks and indexes that use such a column are dropped here
-    and created again by the diff: their stored text names the old type."""
+    and created again by the diff (their stored text names the old type), and so are the
+    foreign keys on either side of one (the two sides differ while one is converted).
+    ``tables`` are the old ones after renames, so the drops use the new names."""
     if not replaced:
-        return old
-    out = copy.deepcopy(old)
-    for table in out["tables"].values():
-        schema, name = table["schema"], table["name"]
-        moved: list[str] = []
+        return
+    moved: dict[tuple[str, str], set[str]] = {}
+    for table in tables.values():
         for cname, column in table["columns"].items():
             base = column["type"].removesuffix("[]")
             if base in replaced:
                 column["type"] = replaced[base] + column["type"][len(base) :]
-                moved.append(cname)
-        if not moved:
+                moved.setdefault((table["schema"], table["name"]), set()).add(cname)
+    for table in tables.values():
+        schema, name = table["schema"], table["name"]
+        mine = moved.get((schema, name), set())
+        for fname, fk in list(table["foreign_keys"].items()):
+            theirs = moved.get((fk["ref_schema"], fk["ref_table"]), set())
+            if mine & set(fk["columns"]) or theirs & set(fk["ref_columns"]):
+                plan.drop_fks.append(DropConstraint(schema, name, fname, "foreign_key"))
+                del table["foreign_keys"][fname]
+        if not mine:
             continue
         for cname, check in list(table["checks"].items()):
-            if _mentions(check["expression"], moved):
+            if _mentions(check["expression"], mine):
                 plan.drop_constraints.append(DropConstraint(schema, name, cname, "check"))
                 del table["checks"][cname]
         for iname, index in list(table["indexes"].items()):
             texts = (index.get("expression"), index["where"])
-            if any(_mentions(t, moved) for t in texts):
+            if any(_mentions(t, mine) for t in texts):
                 plan.drop_indexes.append(DropIndex(schema, iname))
                 del table["indexes"][iname]
-    return out
 
 
 def _rename_columns_in(table: TableSnap, mapping: Mapping[str, str]) -> None:
@@ -714,7 +723,6 @@ def diff(
     plan = _Plan()
     plan.schemas = [CreateSchema(s) for s in new["schemas"] if s not in old["schemas"]]
     remade = _diff_enums(old, new, plan, resolve)
-    old = _retype_replaced(old, remade, plan)
     # Columns of these types change type through text (C23). A type in the default schema
     # may be spelled without it, so the bare name counts too.
     enum_names = (
@@ -723,6 +731,7 @@ def diff(
         | frozenset(remade.values())
     )
     old_tables = _apply_renames(old, new, resolve, plan)
+    _retype_replaced(old_tables, remade, plan)
 
     for k, table in new["tables"].items():
         before = old_tables.get(k)
