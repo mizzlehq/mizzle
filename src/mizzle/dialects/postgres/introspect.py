@@ -52,6 +52,17 @@ _NEXTVAL = re.compile(r"nextval\('.*'::regclass\)")
 _NOT_EXTENSION = """NOT EXISTS (SELECT 1 FROM pg_depend d WHERE d.classid = {catalog}::regclass
                   AND d.objid = {oid} AND d.deptype = 'e')"""
 
+
+# A partition, an inheritance child or an extension's table: not managed (K6-3, K6-6). A
+# foreign key that references one is not managed either (K7-2).
+def _unmanaged_relation(oid: str) -> str:
+    return (
+        f"(EXISTS (SELECT 1 FROM pg_inherits i WHERE i.inhrelid = {oid})\n  OR "
+        + _NOT_EXTENSION.format(catalog="'pg_class'", oid=oid).removeprefix("NOT ")
+        + ")"
+    )
+
+
 _TABLES = f"""
 SELECT c.oid, n.nspname AS schema, c.relname AS name,
        c.relrowsecurity AS rls, c.relforcerowsecurity AS rls_force,
@@ -63,8 +74,7 @@ LEFT JOIN pg_class tc ON tc.oid = c.reltoastrelid
 -- A partitioned table reads as a plain one; its partitions and inheritance children are
 -- not read (not managed, K6-6), nor are an extension's tables (K6-3).
 WHERE c.relkind IN ('r', 'p') AND n.nspname = ANY($1::text[]) AND c.relname <> $2
-  AND NOT EXISTS (SELECT 1 FROM pg_inherits i WHERE i.inhrelid = c.oid)
-  AND {_NOT_EXTENSION.format(catalog="'pg_class'", oid="c.oid")}
+  AND NOT {_unmanaged_relation("c.oid")}
 ORDER BY n.nspname, c.relname
 """
 
@@ -94,7 +104,7 @@ WHERE a.attrelid = ANY($1::oid[]) AND a.attnum > 0 AND NOT a.attisdropped
 ORDER BY a.attrelid, a.attnum
 """
 
-_CONSTRAINTS = """
+_CONSTRAINTS = f"""
 SELECT con.conrelid AS table_oid, con.conname AS name, con.contype::text AS kind,
        ARRAY(SELECT a.attname FROM unnest(con.conkey) WITH ORDINALITY k(n, ord)
              JOIN pg_attribute a ON a.attrelid = con.conrelid AND a.attnum = k.n
@@ -113,9 +123,11 @@ FROM pg_constraint con
 LEFT JOIN pg_class fc ON fc.oid = con.confrelid
 LEFT JOIN pg_namespace fn ON fn.oid = fc.relnamespace
 -- Exclusion constraints (contype 'x') are not managed: not read. Nor are the per-partition
--- copies of an FK that references a partitioned table (K6-2).
+-- copies of an FK that references a partitioned table (K6-2), nor an FK to a table that
+-- is not managed (K7-2).
 WHERE con.conrelid = ANY($1::oid[]) AND con.contype IN ('p', 'u', 'f', 'c')
   AND con.conparentid = 0
+  AND NOT (con.contype = 'f' AND {_unmanaged_relation("con.confrelid")})
 ORDER BY con.conrelid, con.conname
 """
 
@@ -209,6 +221,13 @@ SELECT 'exclusion constraint ' || quote_ident(con.conname) || ' on '
 FROM pg_constraint con JOIN pg_class c ON c.oid = con.conrelid
 JOIN pg_namespace n ON n.oid = c.relnamespace
 WHERE con.contype = 'x' AND n.nspname = ANY($1::text[])
+UNION ALL
+SELECT 'foreign key ' || quote_ident(con.conname) || ' on ' || con.conrelid::regclass::text
+       || ' (it references ' || con.confrelid::regclass::text || ')'
+FROM pg_constraint con JOIN pg_class c ON c.oid = con.conrelid
+JOIN pg_namespace n ON n.oid = c.relnamespace
+WHERE con.contype = 'f' AND con.conparentid = 0 AND n.nspname = ANY($1::text[])
+  AND {_unmanaged_relation("con.confrelid")}
 UNION ALL
 SELECT 'sequence ' || c.oid::regclass::text
 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
@@ -819,18 +838,26 @@ async def _normalize(snapshot: Snapshot, read_back: _ReadBack, version: int) -> 
         like = (
             f"CREATE TEMP TABLE {quote(_NORM)} (LIKE {qualified(table['schema'], table['name'])})"
         )
+        real = qualified(table["schema"], table["name"])
         for policy in table.get("policies", {}).values():
-            create = f"CREATE POLICY p ON {norm} FOR {policy['command'].upper()}"
+            body = f" FOR {policy['command'].upper()}"
             if policy["using"] is not None:
-                create += f" USING ({policy['using']})"
+                body += f" USING ({policy['using']})"
             if policy["with_check"] is not None:
-                create += f" WITH CHECK ({policy['with_check']})"
-            row = await read_back(
-                [like, create],
+                body += f" WITH CHECK ({policy['with_check']})"
+            query = (
                 "SELECT pg_get_expr(polqual, polrelid) AS using, "
-                "pg_get_expr(polwithcheck, polrelid) AS with_check "
-                f"FROM pg_policy WHERE polrelid = {rel}",
+                "pg_get_expr(polwithcheck, polrelid) AS with_check FROM pg_policy "
             )
+            row = await read_back(
+                [like, f"CREATE POLICY p ON {norm}{body}"], f"{query}WHERE polrelid = {rel}"
+            )
+            if row is None:  # it names its own table (refs.t): on the table itself (K7-3)
+                row = await read_back(
+                    [f"CREATE POLICY {quote(_NORM)} ON {real}{body}"],
+                    f"{query}WHERE polrelid = to_regclass({_text(real)}) "
+                    f"AND polname = {_text(_NORM)}",
+                )
             if row is not None:
                 policy["using"], policy["with_check"] = (
                     _opt_str(row["using"]),

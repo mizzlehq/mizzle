@@ -524,7 +524,7 @@ def _set_expression(step: AlterColumnGenerated, new: GeneratedSnap) -> str:
     )
     rel, att = _literal(table), _literal(step.column)
     return (
-        "DO $mizzle$ DECLARE defs text[]; refs text[]; def text; r record; BEGIN\n"
+        "DO $mizzle$ DECLARE defs text[]; refs text[]; def text; r record; note text; BEGIN\n"
         "IF current_setting('server_version_num')::int >= 170000 THEN\n"
         f"  EXECUTE {_literal(set_expression)};\n"
         "ELSE\n"
@@ -559,8 +559,13 @@ def _set_expression(step: AlterColumnGenerated, new: GeneratedSnap) -> str:
         "    refs := refs || format('ALTER TABLE %s ADD CONSTRAINT %I %s', r.t, r.conname, r.d);\n"
         "    EXECUTE format('ALTER TABLE %s DROP CONSTRAINT %I', r.t, r.conname);\n"
         "  END LOOP;\n"
+        f"  note := col_description({rel}::regclass, (SELECT attnum FROM pg_attribute "
+        f"WHERE attrelid = {rel}::regclass AND attname = {att}));\n"
         f"  EXECUTE {_literal(f'ALTER TABLE {table} DROP COLUMN {quote(step.column)}')};\n"
         f"  EXECUTE {_literal(add)};\n"
+        # The comment goes with the column (K7-4).
+        "  IF note IS NOT NULL THEN EXECUTE format('COMMENT ON COLUMN %s.%I IS %L', "
+        f"{rel}, {att}, note); END IF;\n"
         "  FOREACH def IN ARRAY coalesce(defs, '{}') LOOP EXECUTE def; END LOOP;\n"
         "  FOREACH def IN ARRAY coalesce(refs, '{}') LOOP EXECUTE def; END LOOP;\n"
         "END IF; END $mizzle$"
@@ -755,7 +760,9 @@ _SAVED_SQL = "pg_temp.__mizzle_saved_sql"
 def _save_grants(name: str) -> str:
     """Keep a relation's ACL, owner and comment in a temporary table for _restore_grants:
     a view that is dropped and created again would lose them. So would its column grants,
-    triggers and rules (not managed, K6-1): kept as the statements that make them again."""
+    triggers and rules (not managed, K6-1), column comments and defaults (K7-1): kept as the
+    statements that make them again. A grant is made again by the role that made it, so
+    grant option chains hold (K7-1)."""
     rel = _literal(name)
     grantee = (
         "CASE WHEN g.grantee = 0 THEN 'PUBLIC' ELSE quote_ident(pg_get_userbyid(g.grantee)) END"
@@ -770,23 +777,44 @@ def _save_grants(name: str) -> str:
         f"  RAISE EXCEPTION 'view % has a disabled trigger or rule, which would come back "
         f"enabled when it is created again; this needs a custom migration', {rel};\n"
         "END IF;\n"
+        # PostgreSQL has no GRANTED BY another role for object privileges: SET ROLE to it.
+        "IF EXISTS (SELECT 1 FROM pg_class c, LATERAL (SELECT c.relacl UNION ALL SELECT attacl "
+        "FROM pg_attribute WHERE attrelid = c.oid) x(acl), aclexplode(x.acl) g "
+        f"WHERE c.oid = {rel}::regclass AND g.grantor <> c.relowner "
+        "AND NOT pg_has_role(g.grantor, 'MEMBER')) THEN\n"
+        f"  RAISE EXCEPTION 'view % has privileges granted by a role the current user is not "
+        f"a member of, which it cannot grant again; this needs a custom migration', {rel};\n"
+        "END IF;\n"
         f"CREATE TEMP TABLE IF NOT EXISTS __mizzle_saved "
         "(rel text PRIMARY KEY, acl aclitem[], owner oid, comment text);\n"
-        "CREATE TEMP TABLE IF NOT EXISTS __mizzle_saved_sql (rel text, col name, stmt text);\n"
+        "CREATE TEMP TABLE IF NOT EXISTS __mizzle_saved_sql "
+        "(id serial, rel text, col name, stmt text, grantor oid);\n"
         f"INSERT INTO {_SAVED} SELECT {rel}, c.relacl, c.relowner, "
         "obj_description(c.oid, 'pg_class') FROM pg_class c "
         f"WHERE c.oid = {rel}::regclass\n"
         "ON CONFLICT (rel) DO UPDATE SET acl = EXCLUDED.acl, owner = EXCLUDED.owner, "
         "comment = EXCLUDED.comment;\n"
         f"DELETE FROM {_SAVED_SQL} WHERE rel = {rel};\n"
-        f"INSERT INTO {_SAVED_SQL} SELECT {rel}, a.attname, format('GRANT %s (%I) ON %s TO %s%s', "
+        f"INSERT INTO {_SAVED_SQL} (rel, col, stmt, grantor) SELECT {rel}, a.attname, "
+        "format('GRANT %s (%I) ON %s TO %s%s', "
         f"g.privilege_type, a.attname, {rel}, {grantee}, "
-        "CASE WHEN g.is_grantable THEN ' WITH GRANT OPTION' ELSE '' END) "
-        "FROM pg_attribute a, aclexplode(a.attacl) g "
-        f"WHERE a.attrelid = {rel}::regclass AND a.attacl IS NOT NULL;\n"
-        f"INSERT INTO {_SAVED_SQL} SELECT {rel}, NULL, pg_get_triggerdef(t.oid) "
+        "CASE WHEN g.is_grantable THEN ' WITH GRANT OPTION' ELSE '' END), g.grantor "
+        "FROM pg_attribute a, aclexplode(a.attacl) WITH ORDINALITY g "
+        f"WHERE a.attrelid = {rel}::regclass AND a.attacl IS NOT NULL "
+        "ORDER BY a.attnum, g.ordinality;\n"
+        f"INSERT INTO {_SAVED_SQL} (rel, col, stmt) SELECT {rel}, a.attname, "
+        f"format('COMMENT ON COLUMN %s.%I IS %L', {rel}, a.attname, d.description) "
+        "FROM pg_attribute a JOIN pg_description d ON d.objoid = a.attrelid "
+        "AND d.classoid = 'pg_class'::regclass AND d.objsubid = a.attnum "
+        f"WHERE a.attrelid = {rel}::regclass;\n"
+        f"INSERT INTO {_SAVED_SQL} (rel, col, stmt) SELECT {rel}, a.attname, "
+        f"format('ALTER VIEW %s ALTER COLUMN %I SET DEFAULT %s', {rel}, a.attname, "
+        "pg_get_expr(d.adbin, d.adrelid)) FROM pg_attrdef d JOIN pg_attribute a "
+        f"ON a.attrelid = d.adrelid AND a.attnum = d.adnum WHERE d.adrelid = {rel}::regclass;\n"
+        f"INSERT INTO {_SAVED_SQL} (rel, col, stmt) SELECT {rel}, NULL, pg_get_triggerdef(t.oid) "
         f"FROM pg_trigger t WHERE t.tgrelid = {rel}::regclass AND NOT t.tgisinternal;\n"
-        f"INSERT INTO {_SAVED_SQL} SELECT {rel}, NULL, rtrim(pg_get_ruledef(r.oid), ';') "
+        f"INSERT INTO {_SAVED_SQL} (rel, col, stmt) SELECT {rel}, NULL, "
+        "rtrim(pg_get_ruledef(r.oid), ';') "
         f"FROM pg_rewrite r WHERE r.ev_class = {rel}::regclass AND r.rulename <> '_RETURN';\n"
         "END $mizzle$"
     )
@@ -795,7 +823,7 @@ def _save_grants(name: str) -> str:
 def _restore_grants(name: str, kind: str) -> str:
     rel = _literal(name)
     return (
-        "DO $mizzle$ DECLARE s record; a record; BEGIN\n"
+        "DO $mizzle$ DECLARE s record; a record; me text := current_setting('role'); BEGIN\n"
         "IF to_regclass('pg_temp.__mizzle_saved') IS NULL THEN RETURN; END IF;\n"
         f"SELECT * INTO s FROM {_SAVED} WHERE rel = {rel};\n"
         "IF NOT FOUND THEN RETURN; END IF;\n"
@@ -809,21 +837,30 @@ def _restore_grants(name: str, kind: str) -> str:
         f"{rel}, CASE WHEN a.grantee = 0 THEN 'PUBLIC' "
         "ELSE quote_ident(pg_get_userbyid(a.grantee)) END);\n"
         "END LOOP;\n"
-        "FOR a IN SELECT * FROM aclexplode(coalesce(s.acl, acldefault('r', s.owner))) LOOP\n"
+        # The owner's grants first, then those its grantees made, in the order they were.
+        "FOR a IN SELECT * FROM aclexplode(coalesce(s.acl, acldefault('r', s.owner))) "
+        "WITH ORDINALITY g ORDER BY g.grantor <> s.owner, g.ordinality LOOP\n"
+        "  IF a.grantor <> s.owner THEN "
+        "PERFORM set_config('role', pg_get_userbyid(a.grantor), true); END IF;\n"
         "  EXECUTE format('GRANT %s ON %s TO %s%s', a.privilege_type, "
         f"{rel}, CASE WHEN a.grantee = 0 THEN 'PUBLIC' "
         "ELSE quote_ident(pg_get_userbyid(a.grantee)) END, "
         "CASE WHEN a.is_grantable THEN ' WITH GRANT OPTION' ELSE '' END);\n"
+        "  PERFORM set_config('role', me, true);\n"
         "END LOOP;\n"
         "IF s.comment IS NOT NULL THEN\n"
         f"  EXECUTE format('COMMENT ON {kind} %s IS %L', {rel}, s.comment);\n"
         "END IF;\n"
-        # Column grants on a column the view still has; triggers and rules fail the
-        # migration if the new view cannot carry them, never vanish.
-        f"FOR a IN SELECT stmt FROM {_SAVED_SQL} WHERE rel = {rel} AND (col IS NULL OR "
+        # Column grants, comments and defaults on a column the view still has; triggers
+        # and rules fail the migration if the new view cannot carry them, never vanish.
+        f"FOR a IN SELECT stmt, grantor FROM {_SAVED_SQL} WHERE rel = {rel} AND (col IS NULL OR "
         f"EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = {rel}::regclass "
-        "AND attname = col AND NOT attisdropped)) LOOP\n"
+        "AND attname = col AND NOT attisdropped)) "
+        "ORDER BY coalesce(grantor <> s.owner, false), id LOOP\n"
+        "  IF a.grantor <> s.owner THEN "
+        "PERFORM set_config('role', pg_get_userbyid(a.grantor), true); END IF;\n"
         "  EXECUTE a.stmt;\n"
+        "  PERFORM set_config('role', me, true);\n"
         "END LOOP;\n"
         f"DELETE FROM {_SAVED_SQL} WHERE rel = {rel};\n"
         f"DELETE FROM {_SAVED} WHERE rel = {rel};\n"
@@ -870,7 +907,7 @@ def _unmanaged_check(table: str, name: str, column: str, restored: str = "") -> 
         "AND NOT EXISTS (SELECT 1 FROM pg_constraint n WHERE d.classid = "
         f"'pg_constraint'::regclass AND n.oid = d.objid AND n.contype = 'n'){restored}) THEN\n"
         f"  RAISE EXCEPTION 'column % is dropped and added again, which would drop the grants, "
-        "constraints or triggers on it that mizzle does not manage; this needs a custom "
+        "constraints, views or triggers on it that mizzle does not manage; this needs a custom "
         f"migration', {what};\n"
         "END IF;\n"
     )

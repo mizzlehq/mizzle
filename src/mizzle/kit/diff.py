@@ -432,6 +432,13 @@ def _diff_table(
         if c in old["columns"] and _rebuilt(old["columns"][c], col)
     ]:
         plan.drop_rebuilt += [DropColumn(schema, name, c, rebuilt=True) for c in rebuilt]
+        # The comment goes with the column; a changed one is set by _diff_comments (K7-4).
+        plan.comments += [
+            SetColumnComment(schema, name, c, comment)
+            for c in rebuilt
+            if (comment := new["columns"][c].get("comment")) is not None
+            and comment == old["columns"][c].get("comment")
+        ]
         kept = _without_columns(old, rebuilt)
         # Dropped explicitly (DROP COLUMN would take them silently): keys other foreign keys
         # use are then re-created around it, and the rest is added again by the diff below.
@@ -749,6 +756,9 @@ def _changed_tables(plan: _Plan) -> set[str]:
             case DropColumn(table=table, name=name):
                 names |= {table, name}
             case AlterColumnType(table=table, column=column):
+                names |= {table, column}
+            # Before PostgreSQL 17 a new expression drops the column and adds it again (K7-5).
+            case AlterColumnGenerated(table=table, column=column) if step.old and step.new:
                 names |= {table, column}
             case _:
                 pass
