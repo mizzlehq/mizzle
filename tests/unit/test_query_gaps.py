@@ -20,10 +20,14 @@ from mizzle import (
     eq,
     exists,
     func,
+    greatest,
+    gt,
     in_,
     lag,
     lower,
+    max_,
     not_similar_to,
+    nullable,
     placeholder,
     row_number,
     rows_between,
@@ -369,3 +373,18 @@ def test_url_scheme_is_case_insensitive() -> None:
     # R8-3: RFC 3986 schemes are case-insensitive; asyncpg takes PostgreSQL:// too.
     assert isinstance(dialect_for_url("PostgreSQL://u@h/d"), PostgresDialect)
     assert isinstance(dialect_for_url("POSTGRES://u@h/d"), PostgresDialect)
+
+
+def test_values_next_to_expressions_of_a_column_are_encoded(qb: QueryBuilder) -> None:
+    # Q9-3: only a bare column (or CTE column) encoded the other side; an expression that
+    # keeps the column's type sent the raw value (an Enum asyncpg cannot take).
+    query = qb.select(Priced.id).from_(Priced)
+    for where in (
+        eq(nullable(Priced.price), 150),
+        eq(coalesce(Priced.price, 0), 150),
+        in_(coalesce(Priced.price, 0), [150]),
+        gt(greatest(Priced.price, 100), 150),
+    ):
+        assert Decimal("1.5") in query.where(where).to_sql()[1]
+    having = query.group_by(Priced.id).having(eq(max_(Priced.price), 150))
+    assert having.to_sql()[1] == (Decimal("1.5"),)
