@@ -192,7 +192,7 @@ from mizzle.core.sql.raw import sql
 from mizzle.db import Database, QueryEvent, Session
 from mizzle.dialects.base import Notification, Reconnected
 
-__version__ = "0.3.0"
+__version__ = "0.3.1"
 
 __all__ = [
     "AfterCommitError",

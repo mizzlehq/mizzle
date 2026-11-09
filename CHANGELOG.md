@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.3.1
 
 - `db.listen()` and `db.notify()` for LISTEN / NOTIFY. The listener uses its own
   connection, reconnects by itself and tells you with a `Reconnected` event.
