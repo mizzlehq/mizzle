@@ -139,11 +139,14 @@ _LEFTOVERS = (
     "drop table if exists st_notes, st_csv, st_types, st_num, st_dom, st_mod, st_many, st_json,"
     ' st_neg, "st/a", st_sdom, st_bad, st_head, st_tie, st_skip, st_domt, st_ck, st_tx, st_log,'
     " st_stale, st_kid, st_parent, st_part, st_sort, st_uskip, st_items, st_iv, st_sread,"
-    ' st_call, "st\nnl", "st_k.y", st_cins, st_rt cascade;'
+    ' st_call, "st\nnl", "st_k.y", st_cins, st_rt, st_rls, st_victim, st_inj, st_sp,'
+    " st_qt cascade;"
     ' drop sequence if exists st_seq; drop schema if exists "date", "public.st_k", st_app cascade;'
     ' drop domain if exists st_amt2, st_amt, st_span, st_basedom, "St Base Dom", st_dpair,'
-    " st_dj, interval_st_label; drop type if exists st_pair, interval_st_unit;"
-    " drop function if exists st_skip_fn(), st_logit(int), st_uskip_fn();"
+    " st_dj, interval_st_label;"
+    ' drop type if exists st_pair, interval_st_unit, "st_q[]t";'
+    " drop function if exists st_skip_fn(), st_logit(int), st_uskip_fn(), st_w(),"
+    " public.now();"
     " drop procedure if exists st_call_p()"
 )
 
@@ -1811,6 +1814,9 @@ def test_a_new_row_takes_a_composite_as_text(client: TestClient) -> None:
         ("float8", "'-0'"),
         ("real", "'-0'"),
         ("float8[]", "'{-0,1.5}'"),
+        # S7-4: an extension's type read as JSON, which is not its input syntax.
+        ("hstore", "'a=>1, b=>\"x y\"'"),
+        ("hstore[]", "array['a=>1'::hstore]"),
     ],
 )
 def test_saving_a_cell_unchanged_keeps_it(client: TestClient, decl: str, literal: str) -> None:
@@ -1818,6 +1824,7 @@ def test_saving_a_cell_unchanged_keeps_it(client: TestClient, decl: str, literal
     # and a float's sign of zero, so saving the cell unchanged changed it.
     _sql(
         client,
+        "create extension if not exists hstore; "
         f"create table st_rt (id int primary key, c {decl}); "
         f"insert into st_rt values (1, {literal})",
     )
@@ -1830,3 +1837,95 @@ def test_saving_a_cell_unchanged_keeps_it(client: TestClient, decl: str, literal
     )
     assert saved.status_code == 200, saved.text
     assert _query(client, "select c::text from st_rt") == before
+
+
+def _with_query(url: str, query: str) -> str:
+    parts = urlsplit(url)
+    return urlunsplit(parts._replace(query="&".join(q for q in (parts.query, query) if q)))
+
+
+@pytest.mark.parametrize("read_only", [True, False])
+def test_reads_run_in_a_read_only_transaction(
+    client: TestClient, ro_url: str, read_only: bool
+) -> None:
+    # S7-1: the grid and the export ran their reads read-write, so a row security policy
+    # (or a type's function) that writes deleted rows, in read-only Studio too.
+    _sql(
+        client,
+        "create table st_victim (id int primary key); insert into st_victim values (1), (2); "
+        "create function st_w() returns boolean language sql "
+        "as $$ delete from public.st_victim returning true $$; "
+        "create table st_rls (id int primary key); insert into st_rls values (1); "
+        "alter table st_rls enable row level security; "
+        "create policy st_p on st_rls for select using (coalesce(st_w(), true)); "
+        f"grant select, delete on st_victim, st_rls to {RO_ROLE}",
+    )
+    with make_client(ro_url, read_only=read_only) as app:
+        for path in ("rows", "export?format=csv", "export?format=json"):
+            response = app.get(f"/api/tables/public/st_rls/{path}", headers=AUTH)
+            assert response.status_code == 400 and "read-only" in response.text, path
+    assert _query(client, "select count(*) from st_victim") == [[2]]
+
+
+def test_column_names_are_not_sql_with_backslash_escapes(pg_url: str, client: TestClient) -> None:
+    # S7-2: a column's name went into the row query as '...' by hand; with
+    # standard_conforming_strings off a name ending in a backslash ended that string, and
+    # the next name ran as SQL (here: deleting another table's rows from a GET).
+    from mizzle.dialects.postgres.ddl import literal
+
+    tail = ",st_w())))::text FROM public.st_inj t--"
+    _sql(
+        client,
+        "create table st_victim (id int primary key); insert into st_victim values (1); "
+        "create function st_w() returns int language sql "
+        "as $$ delete from public.st_victim returning 1 $$; "
+        f'create table st_inj (id int primary key, "x\\" numeric, "{tail}" numeric); '
+        "insert into st_inj values (1, 2, 3)",
+    )
+    with make_client(_with_query(pg_url, "standard_conforming_strings=off")) as app:
+        assert _query(app, "show standard_conforming_strings") == [["off"]]
+        text = "a\\'b\\"
+        assert _query(app, f"select {literal(text)}") == [[text]]
+        assert _rows(app, "st_inj") == [{"id": 1, "x\\": "2", tail: "3"}]
+    assert _query(client, "select count(*) from st_victim") == [[1]]
+
+
+def test_ddl_finds_built_ins_before_public(pg_url: str, client: TestClient) -> None:
+    # S7-3: DDL put public before a pg_catalog the role's path listed, so a public.now()
+    # stood in for the built-in in a new column's default.
+    _sql(
+        client,
+        "create function public.now() returns timestamptz language sql "
+        "as $$ select timestamptz '2000-01-01 00:00+00' $$",
+    )
+    with make_client(_with_query(pg_url, "search_path=pg_catalog,public")) as app:
+        column = {"name": "at", "type": "timestamptz", "default": "now()"}
+        op = {"operation": "create_table", "schema": "public", "name": "st_sp"}
+        columns = [{"name": "id", "type": "integer", "primary_key": True}, column]
+        applied = app.post("/api/ddl/apply", json={**op, "columns": columns}, headers=AUTH)
+        assert applied.status_code == 200, applied.text
+    _sql(client, "drop function public.now(); insert into st_sp values (1)")
+    assert _query(client, "select at > '2001-01-01' from st_sp") == [[True]]
+
+
+def test_console_set_role_does_not_stay_on_the_connection(client: TestClient, ro_url: str) -> None:
+    # S7-5: the pool's reset ran RESET ALL, which leaves the role, so later requests (the
+    # grid, DDL) ran as whatever role the console had set.
+    [[login]] = _query(client, "select current_user")
+    _sql(client, f"set role {RO_ROLE}")
+    for _ in range(8):  # every pooled connection
+        assert _query(client, "select current_user") == [[login]]
+
+
+def test_a_type_name_with_brackets_is_cast_to_itself(client: TestClient) -> None:
+    # S7-6: "[]" was removed from anywhere in the type, so "st_q[]t" became st_qt[].
+    _sql(
+        client,
+        "create type \"st_q[]t\" as enum ('x'); "
+        'create table st_qt (id int primary key, e "st_q[]t", es "st_q[]t"[])',
+    )
+    rows = "/api/tables/public/st_qt/rows"
+    values = {"id": 1, "e": "x", "es": ["x"]}
+    added = client.post(rows, json={"values": values}, headers=AUTH)
+    assert added.status_code == 201, added.text
+    assert _query(client, "select e::text, es::text from st_qt") == [["x", "{x}"]]

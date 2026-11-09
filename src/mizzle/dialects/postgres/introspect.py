@@ -36,6 +36,7 @@ from mizzle.dialects.postgres.ddl import (
     SERIAL_TYPES,
     create_index,
     default_sql,
+    literal,
     normalize_default,
     qualified,
     quote,
@@ -710,7 +711,7 @@ async def _normalize_column_expressions(snapshot: Snapshot, read_back: _ReadBack
                 [f"CREATE TEMP TABLE {quote(_NORM)} ({columns})"],
                 "SELECT pg_get_expr(d.adbin, d.adrelid) AS e FROM pg_attrdef d "
                 "JOIN pg_attribute a ON a.attrelid = d.adrelid AND a.attnum = d.adnum "
-                f"WHERE d.adrelid = {rel} AND a.attname = {_text(name)}",
+                f"WHERE d.adrelid = {rel} AND a.attname = {literal(name)}",
             )
             if row is None or row["e"] is None:
                 continue  # cannot be created here (a type or sequence made later): as is
@@ -718,11 +719,6 @@ async def _normalize_column_expressions(snapshot: Snapshot, read_back: _ReadBack
                 generated["expression"] = str(row["e"])
             else:
                 column["default"] = normalize_default(str(row["e"]))  # as introspect does
-
-
-def _text(value: str) -> str:
-    """``value`` as an SQL string literal."""
-    return "'" + value.replace("'", "''") + "'"
 
 
 async def normalize_snapshot(conn: Connection, snapshot: Snapshot) -> Snapshot:

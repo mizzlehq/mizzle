@@ -391,9 +391,11 @@ class _PoolConnection(asyncpg.Connection):
     async def reset_session(self) -> None:
         """Undo session state, then re-apply the ``on_connect`` hook.
 
-        ``RESET ALL`` undoes whatever the hook set (a ``search_path``, a role), and asyncpg
-        only runs ``init`` on a new connection, so the hook has to run again here. Otherwise
-        it works on the first query and is silently gone after any raw statement.
+        ``RESET ALL`` undoes the settings the hook (or a raw statement) set, such as a
+        ``search_path``, but not the role: ``SET ROLE`` and ``SET SESSION AUTHORIZATION``
+        are left alone by it, so they are reset on their own (S7-5). asyncpg only runs
+        ``init`` on a new connection, so the hook has to run again here. Otherwise it works
+        on the first query and is silently gone after any raw statement.
 
         The hook runs *only* when the connection was actually reset (B1): running it on
         every release made each query pay for it, and ran a non-idempotent hook once per
@@ -410,9 +412,12 @@ class _PoolConnection(asyncpg.Connection):
             if reset:
                 await self.execute(self.get_reset_query())
         if reset:
+            # RESET ALL skips the role, so a console's SET ROLE outlived the release and the
+            # next user of the connection ran as that role (S7-5). Resetting the session
+            # authorization back to the login role needs no privilege.
             # asyncpg's reset keeps temp tables, so their rows reached the next user of the
             # connection (C14). Not DEALLOCATE ALL: asyncpg's statement cache needs its own.
-            await self.execute("DISCARD TEMP")
+            await self.execute("RESET SESSION AUTHORIZATION; RESET ROLE; DISCARD TEMP")
         hook = self._mizzle_on_connect
         if hook is not None and reset:
             await hook(PostgresConnection(self))

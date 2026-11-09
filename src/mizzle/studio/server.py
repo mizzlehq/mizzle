@@ -34,7 +34,15 @@ import re
 import secrets
 import time
 import webbrowser
-from collections.abc import AsyncGenerator, Awaitable, Callable, Iterable, Mapping, Sequence
+from collections.abc import (
+    AsyncGenerator,
+    Awaitable,
+    Callable,
+    Collection,
+    Iterable,
+    Mapping,
+    Sequence,
+)
 from contextlib import aclosing, asynccontextmanager
 from dataclasses import dataclass, field
 from decimal import Decimal
@@ -56,7 +64,7 @@ from mizzle.core.errors import DatabaseError, MigrationError, MizzleError
 from mizzle.core.query.base import Row
 from mizzle.core.snapshot import ColumnSnap, EnumSnap, TableSnap
 from mizzle.dialects.base import Connection, Dialect, Driver
-from mizzle.dialects.postgres.ddl import SERIAL_TYPES, quote
+from mizzle.dialects.postgres.ddl import SERIAL_TYPES, literal, quote
 from mizzle.kit.config import Config
 from mizzle.kit.migrate import apply_statements
 from mizzle.kit.sqltext import first_token, split_statements
@@ -200,6 +208,9 @@ class Studio:
     bases: dict[tuple[str, str], dict[str, str]] = field(default_factory=dict)
     # (schema, table) -> its composite columns (and arrays of them): read-only in the grid
     composites: dict[tuple[str, str], list[str]] = field(default_factory=dict)
+    # (schema, table) -> its columns of a type no built-in one (an extension's hstore, ...):
+    # the grid reads and writes them as their text (S7-4)
+    texts: dict[tuple[str, str], list[str]] = field(default_factory=dict)
     history: list[dict[str, object]] = field(default_factory=list)
     saved: dict[str, str] = field(default_factory=dict)
     state_path: Path | None = None
@@ -211,7 +222,7 @@ class Studio:
 
     async def load_snapshot(self, refresh: bool = False) -> dict[tuple[str, str], TableSnap]:
         if self.tables is None or refresh:
-            async with self.pool().acquire() as conn:
+            async with self.pool().acquire() as conn, conn.transaction(readonly=True):
                 # One schema at a time: within one, the "schema.name" key cannot collide.
                 snapshots = [await self.dialect.introspect(conn, [s]) for s in self.schemas]
                 rows = await conn.fetch_dicts(_BASE_TYPES, [self.schemas])
@@ -219,12 +230,14 @@ class Studio:
                 (t["schema"], t["name"]): t for s in snapshots for t in s["tables"].values()
             }
             self.enums = {k: e for s in snapshots for k, e in s["enums"].items()}
-            self.bases, self.composites = {}, {}
+            self.bases, self.composites, self.texts = {}, {}, {}
             for row in rows:
                 k, column = (str(row["schema"]), str(row["table"])), str(row["name"])
                 self.bases.setdefault(k, {})[column] = str(row["base"])
                 if row["composite"]:
                     self.composites.setdefault(k, []).append(column)
+                if row["extension"]:
+                    self.texts.setdefault(k, []).append(column)
         return self.tables
 
     async def table(
@@ -248,7 +261,7 @@ class Studio:
         stale type decoded a column changed to jsonb as JSON, and saving that wrote numbers
         back as strings (S5-4)."""
         table, base = await self.table(schema, name)
-        async with self.pool().acquire() as conn:
+        async with self.pool().acquire() as conn, conn.transaction(readonly=True):
             rows = await conn.fetch_dicts(_BASE_TYPES + " AND c.relname = $2", [[schema], name])
         if {str(r["name"]): str(r["base"]) for r in rows} != self.bases.get((schema, name), {}):
             return await self.table(schema, name, fresh=True)
@@ -258,6 +271,9 @@ class Studio:
         """Composite columns: the grid shows them, but does not write them (S5-2)."""
         composites = self.composites.get((table["schema"], table["name"]), [])
         return [c for c in table["columns"] if c in composites]
+
+    def text_columns(self, table: TableSnap) -> list[str]:
+        return self.texts.get((table["schema"], table["name"]), [])
 
     # -- query history and saved queries ----------------------------------------------
 
@@ -371,8 +387,11 @@ def _cast_type(column: ColumnSnap, base: str) -> str:
     # Introspected types come from format_type(), which already quotes when needed.
     full = SERIAL_TYPES.get(column["type"], column["type"])
     bare = _TYPMOD.sub(lambda m: m.group(0) if m.group(0).startswith('"') else "", full)
-    arrays = bare.count("[]")
-    bare = bare.replace("[]", "").strip()
+    # Array suffixes only: a "[]" inside a quoted name ("a[]b") is part of the name (S7-6).
+    arrays = 0
+    while bare.endswith("[]"):
+        bare, arrays = bare[:-2].rstrip(), arrays + 1
+    bare = bare.strip()
     if interval := _INTERVAL.fullmatch(base):  # "interval year to month" cuts the days off
         return "interval" + interval.group(1)
     return _UNBOUNDED.get(bare, bare) + "[]" * arrays
@@ -410,7 +429,9 @@ WITH RECURSIVE r(rel, name, oid, typmod, dims) AS (
 )
 SELECT n.nspname AS schema, c.relname AS table, r.name,
        format_type(r.oid, r.typmod) || repeat('[]', r.dims) AS base,
-       t.typtype = 'c' AS composite
+       t.typtype = 'c' AS composite,
+       -- a base type no built-in one (16384: FirstNormalObjectId), an extension's
+       t.typtype = 'b' AND t.oid >= 16384 AS extension
 FROM r JOIN pg_type t ON t.oid = r.oid
 JOIN pg_class c ON c.oid = r.rel JOIN pg_namespace n ON n.oid = c.relnamespace
 WHERE t.typtype <> 'd' AND t.typcategory <> 'A'
@@ -591,15 +612,16 @@ _FLOAT = re.compile(r"(?:real|double precision)(?:\[\])*")
 _PAIRS = 50
 
 
-def _row_sql(base: Mapping[str, str]) -> str:
+def _row_sql(base: Mapping[str, str], texts: Collection[str] = ()) -> str:
     """``_ROW`` with the json, jsonb and numeric columns (and arrays of them, and domains
     over them: S4-5) as text. So are the values to_jsonb changes: an array whose bounds do
     not start at 1 ("[0:1]={5,6}" became [5, 6]) and a float's -0 (became 0), which saving
-    the cell unchanged then wrote back (S6-4)."""
+    the cell unchanged then wrote back (S6-4). ``texts`` are columns of an extension's type
+    (hstore): to_jsonb's JSON for them is not their input syntax, so a save failed (S7-4)."""
     pairs: list[str] = []
     for name, t in base.items():
-        label, ref = "'" + name.replace("'", "''") + "'", f"t.{quote(name)}::text"
-        if _EXACT_TEXT.fullmatch(t):
+        label, ref = literal(name), f"t.{quote(name)}::text"
+        if _EXACT_TEXT.fullmatch(t) or name in texts:
             pairs.append(f"{label}, {ref}")
         elif t.endswith("[]") or _FLOAT.fullmatch(t):
             changed = [f"{ref} LIKE '[%'"] if t.endswith("[]") else []
@@ -720,10 +742,12 @@ async def list_rows(studio: Studio, request: Request) -> Response:
     where = _where(table, base, filters, params)
     order_sql = _order_sql(table, base, q)
     source = f"{_relation(table)} AS t"
-    async with studio.pool().acquire() as conn:
+    # S7-1: READ ONLY, also in a read-write Studio. Reading a table runs code of the
+    # database's (an RLS policy, a type's output function): it must not be able to write.
+    async with studio.pool().acquire() as conn, conn.transaction(readonly=True):
         [total] = await conn.fetch(f"SELECT count(*) FROM {source}{where}", params)
         rows = await conn.fetch(
-            f"SELECT {_row_sql(base)} FROM {source}{where}{order_sql}"
+            f"SELECT {_row_sql(base, studio.text_columns(table))} FROM {source}{where}{order_sql}"
             f" LIMIT {limit} OFFSET {offset}",
             params,
         )
@@ -765,7 +789,9 @@ async def export_rows(studio: Studio, request: Request) -> Response:
     where = _where(table, base, filters, params)
     order_sql = _order_sql(table, base, q)
     source = f"{_relation(table)} AS t"
-    row = _row_sql(base) if fmt == "csv" else _ROW  # JSON export: the server's own JSON
+    row = (
+        _row_sql(base, studio.text_columns(table)) if fmt == "csv" else _ROW
+    )  # JSON export: the server's own JSON
     sql = f"SELECT {row} FROM {source}{where}{order_sql}"
     headers = {
         "Content-Disposition": _download_name(table["schema"], table["name"], fmt),
@@ -783,7 +809,7 @@ async def export_rows(studio: Studio, request: Request) -> Response:
         return (b"" if first or not rows else b",") + b",".join(rows)
 
     async def body() -> AsyncGenerator[bytes]:
-        async with studio.pool().acquire() as conn, conn.transaction():
+        async with studio.pool().acquire() as conn, conn.transaction(readonly=True):
             async with aclosing(conn.cursor(sql, params, batch_size)) as batches:
                 # The first batch is read before any byte is sent, so a query that fails
                 # (a bad filter value) is a 400, not a 200 with a cut-off file (C7).
@@ -842,15 +868,16 @@ async def insert_row(studio: Studio, request: Request) -> Response:
     _reject_composites(studio, table, values, text_ok=True)
     params: list[object] = []
     target = f"{_relation(table)} AS t"
+    returning = _row_sql(base, studio.text_columns(table))
     if values:
         columns = [_column(table, c) for c in values]
         names = ", ".join(quote(c["name"]) for c in columns)
         placeholders = ", ".join(
             _param(params, c, values[c["name"]], base[c["name"]]) for c in columns
         )
-        sql = f"INSERT INTO {target} ({names}) VALUES ({placeholders}) RETURNING {_row_sql(base)}"
+        sql = f"INSERT INTO {target} ({names}) VALUES ({placeholders}) RETURNING {returning}"
     else:
-        sql = f"INSERT INTO {target} DEFAULT VALUES RETURNING {_row_sql(base)}"
+        sql = f"INSERT INTO {target} DEFAULT VALUES RETURNING {returning}"
     async with studio.pool().acquire() as conn:
         rows = await conn.fetch(sql, params)
     if not rows:  # S14: a BEFORE trigger returned NULL (or a rule did nothing)
@@ -874,7 +901,8 @@ async def update_row(studio: Studio, request: Request) -> Response:
         for c in (_column(table, name) for name in values)
     )
     target = f"{_relation(table)} AS t"
-    sql = f"UPDATE {target} SET {sets} WHERE {match} RETURNING {_row_sql(base)}"
+    returning = _row_sql(base, studio.text_columns(table))
+    sql = f"UPDATE {target} SET {sets} WHERE {match} RETURNING {returning}"
     async with studio.pool().acquire() as conn, conn.transaction():
         rows = await conn.fetch(sql, params)
         _one_row(len(rows))
@@ -1116,10 +1144,16 @@ async def ddl_apply(studio: Studio, request: Request) -> Response:
         # resolve them in public first, never in a "$user" schema. The rest of the role's
         # path stays: an extension's function or an app schema's type is found by it (S6-2).
         # pg_temp goes last: unlisted it is searched first, and a temporary table or type
-        # left on this pooled connection must not stand in for a real one.
+        # left on this pooled connection must not stand in for a real one. pg_catalog is
+        # left out, so it is searched first: a role path that listed it put it after public,
+        # and a planted public.now() or type shadowed the built-in (S7-3). Listed first, it
+        # would be where the bare CREATE TABLE goes. The role's schemas come resolved from
+        # the server, each quoted, with the system ones (pg_catalog, pg_temp_N) left out.
         await conn.execute(
             "SELECT set_config('search_path', concat_ws(', ', 'public', "
-            "nullif(current_setting('search_path'), ''), 'pg_temp'), false)",
+            "(SELECT string_agg(quote_ident(s), ', ' ORDER BY i) "
+            "FROM unnest(current_schemas(false)) WITH ORDINALITY AS u(s, i) "
+            "WHERE s <> 'public' AND left(s, 3) <> 'pg_'), 'pg_temp'), false)",
             [],
         )
         try:

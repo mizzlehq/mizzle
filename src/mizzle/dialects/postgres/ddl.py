@@ -420,7 +420,7 @@ def create_index(schema: str, table: str, index: IndexSnap) -> str:
     if options := index.get("options"):
         text += (
             " WITH ("
-            + ", ".join(f"{_option_key(k)} = {_literal(v)}" for k, v in options.items())
+            + ", ".join(f"{_option_key(k)} = {literal(v)}" for k, v in options.items())
             + ")"
         )
     return text + (f" WHERE {index['where']}" if index["where"] else "")
@@ -438,8 +438,14 @@ def _role_options(role: RoleSnap) -> str:
     )
 
 
-def _literal(text: str) -> str:
-    return "'" + no_nul(text).replace("'", "''") + "'"
+def literal(text: str) -> str:
+    """``text`` as an SQL string literal, read the same with standard_conforming_strings
+    off. There a backslash in a plain '...' escapes the next character, so a name ending in
+    one ran the rest of the statement as SQL (S7-2): such text is an E'...' string instead."""
+    body = no_nul(text).replace("'", "''")
+    if "\\" in body:
+        return "E'" + body.replace("\\", "\\\\") + "'"
+    return f"'{body}'"
 
 
 # Storage parameter names are identifiers, optionally in the toast namespace. Values are a
@@ -459,7 +465,7 @@ def _storage_option(name: str, value: object) -> str:
     text = "true" if value is True else "false" if value is False else str(value)
     if _OPTION_NUMBER.fullmatch(text) or text in ("true", "false"):
         return f"{key}={text}"
-    return f"{key}={_literal(text)}"
+    return f"{key}={literal(text)}"
 
 
 def _alter_identity(step: AlterColumnIdentity, sql_type: str) -> str:
@@ -475,8 +481,7 @@ def _alter_identity(step: AlterColumnIdentity, sql_type: str) -> str:
         # next insert hit a duplicate key (C29). Move it past the largest value.
         table = qualified(step.schema, step.table)
         name = quote(step.column)
-        sequence = "pg_get_serial_sequence('" + table.replace("'", "''") + "', '"
-        sequence += step.column.replace("'", "''") + "')"
+        sequence = f"pg_get_serial_sequence({literal(table)}, {literal(step.column)})"
         return (
             f"{add};\nSELECT setval({sequence}, "
             f"greatest(coalesce(max({name}) + 1, {new['start']}), {new['start']}), false) "
@@ -522,11 +527,11 @@ def _set_expression(step: AlterColumnGenerated, new: GeneratedSnap) -> str:
         f"ALTER TABLE {table} ALTER COLUMN {quote(step.column)} "
         f"SET EXPRESSION AS ({new['expression']})"
     )
-    rel, att = _literal(table), _literal(step.column)
+    rel, att = literal(table), literal(step.column)
     return (
         "DO $mizzle$ DECLARE defs text[]; refs text[]; def text; r record; BEGIN\n"
         "IF current_setting('server_version_num')::int >= 170000 THEN\n"
-        f"  EXECUTE {_literal(set_expression)};\n"
+        f"  EXECUTE {literal(set_expression)};\n"
         "ELSE\n"
         # Constraints and indexes on the column are made again below; nothing else (K6-10).
         + _unmanaged_check(
@@ -559,8 +564,8 @@ def _set_expression(step: AlterColumnGenerated, new: GeneratedSnap) -> str:
         "    refs := refs || format('ALTER TABLE %s ADD CONSTRAINT %I %s', r.t, r.conname, r.d);\n"
         "    EXECUTE format('ALTER TABLE %s DROP CONSTRAINT %I', r.t, r.conname);\n"
         "  END LOOP;\n"
-        f"  EXECUTE {_literal(f'ALTER TABLE {table} DROP COLUMN {quote(step.column)}')};\n"
-        f"  EXECUTE {_literal(add)};\n"
+        f"  EXECUTE {literal(f'ALTER TABLE {table} DROP COLUMN {quote(step.column)}')};\n"
+        f"  EXECUTE {literal(add)};\n"
         "  FOREACH def IN ARRAY coalesce(defs, '{}') LOOP EXECUTE def; END LOOP;\n"
         "  FOREACH def IN ARRAY coalesce(refs, '{}') LOOP EXECUTE def; END LOOP;\n"
         "END IF; END $mizzle$"
@@ -590,21 +595,18 @@ def render_step(step: Step) -> Statement:
         case CreateSchema(name=name):
             return Statement(f"CREATE SCHEMA IF NOT EXISTS {quote(name)}")
         case CreateEnum(enum=enum):
-            values = ", ".join("'" + v.replace("'", "''") + "'" for v in enum["values"])
+            values = ", ".join(literal(v) for v in enum["values"])
             return Statement(
                 f"CREATE TYPE {qualified(enum['schema'], enum['name'])} AS ENUM ({values})"
             )
         case AddEnumValue(schema=schema, name=name, value=value, after=after, before=before):
             # IF NOT EXISTS: it commits on its own, so a migration that fails later must
             # be able to run again (C22).
-            text = (
-                f"ALTER TYPE {qualified(schema, name)} ADD VALUE IF NOT EXISTS "
-                f"'{value.replace("'", "''")}'"
-            )
+            text = f"ALTER TYPE {qualified(schema, name)} ADD VALUE IF NOT EXISTS {literal(value)}"
             if after is not None:
-                text += f" AFTER '{after.replace("'", "''")}'"
+                text += f" AFTER {literal(after)}"
             elif before is not None:
-                text += f" BEFORE '{before.replace("'", "''")}'"
+                text += f" BEFORE {literal(before)}"
             # A new enum value cannot be used in the transaction that adds it.
             return Statement(text, transactional=False)
         case DropEnum(schema=schema, name=name):
@@ -692,7 +694,7 @@ def render_step(step: Step) -> Statement:
             name = quote(role["name"])
             return Statement(  # one statement, so migration files keep one per step
                 "DO $mizzle$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = "
-                f"{_literal(role['name'])}) THEN CREATE ROLE {name}; END IF; "
+                f"{literal(role['name'])}) THEN CREATE ROLE {name}; END IF; "
                 f"ALTER ROLE {name} {_role_options(role)}; END $mizzle$"
             )
         case AlterRole(role=role):
@@ -719,10 +721,10 @@ def render_step(step: Step) -> Statement:
                 f"{'FORCE' if force else 'NO FORCE'} ROW LEVEL SECURITY",
             )
         case SetTableComment(schema=schema, table=table, comment=comment):
-            value = "NULL" if comment is None else _literal(comment)
+            value = "NULL" if comment is None else literal(comment)
             return Statement(f"COMMENT ON TABLE {qualified(schema, table)} IS {value}")
         case SetColumnComment(schema=schema, table=table, column=column, comment=comment):
-            value = "NULL" if comment is None else _literal(comment)
+            value = "NULL" if comment is None else literal(comment)
             target = f"{qualified(schema, table)}.{quote(column)}"
             return Statement(f"COMMENT ON COLUMN {target} IS {value}")
         case CreatePolicy(schema=schema, table=table, policy=policy):
@@ -756,7 +758,7 @@ def _save_grants(name: str) -> str:
     """Keep a relation's ACL, owner and comment in a temporary table for _restore_grants:
     a view that is dropped and created again would lose them. So would its column grants,
     triggers and rules (not managed, K6-1): kept as the statements that make them again."""
-    rel = _literal(name)
+    rel = literal(name)
     grantee = (
         "CASE WHEN g.grantee = 0 THEN 'PUBLIC' ELSE quote_ident(pg_get_userbyid(g.grantee)) END"
     )
@@ -793,7 +795,7 @@ def _save_grants(name: str) -> str:
 
 
 def _restore_grants(name: str, kind: str) -> str:
-    rel = _literal(name)
+    rel = literal(name)
     return (
         "DO $mizzle$ DECLARE s record; a record; BEGIN\n"
         "IF to_regclass('pg_temp.__mizzle_saved') IS NULL THEN RETURN; END IF;\n"
@@ -856,8 +858,8 @@ def _unmanaged_check(table: str, name: str, column: str, restored: str = "") -> 
     """The IF ... RAISE that refuses to drop a column something unmanaged depends on.
     `restored` is an extra SQL condition on the dependency `d` for what the caller
     makes again after the drop."""
-    rel, col = _literal(table), _literal(column)
-    what = _literal(f"{name}.{column}")
+    rel, col = literal(table), literal(column)
+    what = literal(f"{name}.{column}")
     return (
         "IF EXISTS (SELECT 1 FROM pg_attribute a WHERE a.attrelid = "
         f"{rel}::regclass AND a.attname = {col} AND a.attacl IS NOT NULL)\n"
