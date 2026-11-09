@@ -14,7 +14,7 @@ from asyncpg import BitString, Line, Point
 from mizzle.core.compiler import CompiledQuery, Compiler, interval_text
 from mizzle.core.errors import QueryError
 from mizzle.core.sql.alias import real_table
-from mizzle.core.sql.nodes import ExprBase, Node
+from mizzle.core.sql.nodes import ExprBase, Node, Param, Placeholder
 from mizzle.dialects.postgres.types import CustomColumn, JsonText
 
 if TYPE_CHECKING:
@@ -180,6 +180,21 @@ class PostgresCompiler(Compiler):
     def param_marker(self, index: int, /) -> str:
         return f"${index}"
 
+    # A value compared with a custom() column is typed as it: a tuple next to a composite
+    # was an anonymous record, which PostgreSQL cannot take as input (Q8-5).
+    @override
+    def visit_Param(self, node: Param) -> str:
+        return self._as_custom(super().visit_Param(node), node.column)
+
+    @override
+    def visit_Placeholder(self, node: Placeholder) -> str:
+        return self._as_custom(super().visit_Placeholder(node), node.column)
+
+    def _as_custom(self, marker: str, column: ColumnBase | None) -> str:
+        if isinstance(column, CustomColumn) and not self.inline_literals:
+            return f"{marker}::{column.sql_type}"
+        return marker
+
     @override
     def literal(self, value: object) -> str:
         # Quoted text cast to the type, as for interval and bytea (Q12).
@@ -306,7 +321,8 @@ class PostgresCompiler(Compiler):
 
     def json_value(self, ref: str, column: ColumnBase) -> str:
         if isinstance(column, CustomColumn):
-            return ref  # nested as to_json of the value (its JSON form)
+            # Its text form: a JSON number would lose digits of a numeric domain (R8-1).
+            return f"{ref}::text"
         if column.item is not None:
             item = self.json_value("x.v", column.item)
             if item == "x.v":

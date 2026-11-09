@@ -16,8 +16,9 @@ update models never contain database-generated columns (serial and identity ids,
 generated columns), and update models never contain primary keys, unless you ``include``
 them explicitly.
 
-Models only carry the fields a client sent: ``values(model)`` / ``set(model)`` use
-``model_dump(exclude_unset=True)``, so omitted fields keep their database defaults.
+Models only carry the fields a client sent: ``values(model)`` / ``set(model)`` take the
+fields set on the model (``model_dump(exclude_unset=True)``, with each value as the model
+holds it), so omitted fields keep their database defaults.
 """
 
 from __future__ import annotations
@@ -38,6 +39,7 @@ except ImportError as exc:  # pragma: no cover - exercised only without the extr
 from mizzle.core.errors import SchemaError
 from mizzle.core.schema.column import ColumnBase
 from mizzle.core.schema.table import Table
+from mizzle.dialects.postgres.types import CustomColumn
 
 type Mode = Literal["select", "insert", "update"]
 
@@ -137,6 +139,17 @@ def _pydantic_type(kind: type, parse: Callable[[object], object] | None) -> obje
 
 
 def _field(column: ColumnBase, mode: Mode, override: object) -> tuple[object, object]:
+    item = column
+    while item.item is not None:
+        item = item.item
+    untyped = isinstance(item, CustomColumn) and item.accepts == (object,)
+    if untyped and mode == "select" and override is None:
+        # Its values (asyncpg's Range, Box, Record...) may have no JSON form (Q8-4).
+        raise SchemaError(
+            f"{column.qualified_name}: select_model needs the Python type of a custom() "
+            "column: give it py_type= (and decode=/encode= to convert the driver's "
+            "values), or a field type with refine="
+        )
     annotation = override if override is not None else column_type(column)
     if column.nullable:
         # Type forms (Annotated[...], list[...], Any, ...) support ``| None`` at runtime;

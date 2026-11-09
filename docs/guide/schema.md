@@ -315,7 +315,10 @@ place.nights  # <Range [1, 5)>
 
 The value type is `object` unless you say otherwise. `py_type=` names it (for type
 checkers, `select_model` and the write check), `decode=` turns a value read into it and
-`encode=` turns one written into what the driver takes:
+`encode=` turns one written into what the driver takes. Type checkers take the type from
+`decode`'s return type, else from `encode`'s parameter, so `py_type=` must agree with them.
+`select_model` needs `py_type=` (or a field type through `refine=`): the driver's values
+(a `Range`, a `Record`...) have no JSON form of their own.
 
 ```python
 from dataclasses import dataclass
@@ -342,13 +345,14 @@ class Stays(Table, name="stays"):
 ```
 
 `Stays.nights` is a `Column[Nights | None]`; filters encode their values too
-(`eq(Stays.nights, Nights(1, 4))`).
+(`eq(Stays.nights, Nights(1, 4))`), and send them as the column's type (`$1::int4range`),
+so a tuple compares with a composite.
 
 A relational query (`with_=`) nests related rows as JSON, so a custom column there holds
-its JSON form (`to_json` of the value): `"[1,5)"` for a range, `{"amount": 1.5, "day":
-"2020-01-02"}` for a composite, a number for a numeric domain. `decode` is applied to that
-form too, so a column with `decode` and nested reads needs a `decode` that takes both, or
-read the column with a plain select.
+its text form, a `str` as PostgreSQL prints the value: `"[1,5)"` for a range,
+`"(1.5,2020-01-02)"` for a composite, `"12345678901234567890.123456789"` for a numeric
+domain (all digits kept). `decode` is applied to that `str` too, so a column with `decode`
+and nested reads needs a `decode` that takes both, or read the column with a plain select.
 
 The domain, composite type or extension itself is not managed by mizzle: create it in a
 custom migration (see [Not managed by mizzle](migrations.md#not-managed-by-mizzle)).

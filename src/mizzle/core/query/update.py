@@ -38,7 +38,7 @@ class Update[T: Table](ReturningMixin[T]):
         """``set(bio="x")``, ``set({"bio": "x"})`` or ``set(pydantic_model)``."""
         if values is not None and fields:
             raise QueryError("pass a mapping or keyword arguments to set(), not both")
-        changes = dict(as_mapping(values)) if values is not None else fields
+        changes = dict(as_mapping(values, self.table)) if values is not None else fields
         check_values(self.table, changes)
         return evolve(self, values_={**self.values_, **changes})
 

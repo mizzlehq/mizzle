@@ -983,7 +983,7 @@ def _insert_batches(
     params = 0
     limit = MAX_PARAMS - reserved
     for row in rows:
-        values = prepare_row(table, as_mapping(row), allow_identity=allow_identity)
+        values = prepare_row(table, as_mapping(row, table), allow_identity=allow_identity)
         size = sum(not isinstance(v, Node) for v in values.values())  # SQL is not bound
         if batch and (params + size > limit or len(batch) == batch_size):
             yield tuple(batch)
@@ -996,7 +996,7 @@ def _insert_batches(
 
 def dialect_for_url(url: str) -> Dialect:
     scheme, sep, _ = url.partition("://")
-    if sep and scheme in ("postgresql", "postgres"):
+    if sep and scheme.lower() in ("postgresql", "postgres"):  # case-insensitive (RFC 3986)
         return PostgresDialect()
     # Never echo the URL: anything after the scheme may hold a password (R7-1).
     shown = f" {scheme!r}" if sep and scheme.isalnum() and len(scheme) <= 20 else ""

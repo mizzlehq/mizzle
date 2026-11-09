@@ -15,10 +15,18 @@
   verbatim. Values are what asyncpg reads and writes for the type (`str` for citext or
   tsvector, `Range`, `Box`, a `Record` for a composite), with no SQL around the column, so
   it compares, sorts and deduplicates as the type. `decode=` / `encode=` convert values
-  read and written, and `py_type=` is the Python type (`object` by default), also for
-  `select_model`. Nested rows (`with_=`) give the value's JSON form, through `decode` if
-  given. `pull` writes every column of a type mizzle has no column type for as
-  `custom(...)`.
+  read and written, and `py_type=` is the Python type (`object` by default; type checkers
+  take it from `decode`'s return or `encode`'s parameter when given). `select_model` needs
+  `py_type=` (or `refine=`) for such a column. Values compared with it are sent as its type
+  (`$1::type`), so a tuple matches a composite. Nested rows (`with_=`) give the value's
+  text form (a `str`, exact for a numeric domain), through `decode` if given. `pull` writes
+  every column of a type mizzle has no column type for as `custom(...)`.
+- `values(model)` / `set(model)` take each field as the model holds it, so a dataclass or
+  model in a `custom()` column reaches `encode=` as one; json columns still get the dumped
+  form.
+- Values compared with a CTE or subquery column are encoded as the column it selects again
+  (enums, `custom()` with `encode=`).
+- Database URLs take the scheme in any case (`PostgreSQL://`).
 - A `Decimal` inside a json/jsonb value is written with its exact digits, and a value
   JSON cannot hold names the reason (`Object of type set is not JSON serializable`).
 - `select_model` accepts multi-dimensional array values.
