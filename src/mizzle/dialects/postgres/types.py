@@ -10,7 +10,7 @@ import re
 import struct
 import uuid as _uuid
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from typing import Protocol, cast, override, runtime_checkable
+from typing import Never, Protocol, cast, overload, override, runtime_checkable
 
 from asyncpg import BitString, Line, Point
 
@@ -381,20 +381,54 @@ def pg_enum[E: enum.Enum](
     return column
 
 
-class CustomColumn(Column[str | None]):
-    """See ``custom``. The PostgreSQL compiler binds its values as ``$1::text::type`` and
-    reads it as ``col::text`` (an array of them as ``text[]``) only where rows reach Python:
-    the outermost select list or RETURNING. CTEs, FROM subqueries and subqueries in an
-    expression or feeding a write keep the type; ``SELECT DISTINCT`` ordered by it selects
-    and orders the real values in a subquery."""
-
-    # ponytail: driver codecs (set_type_codec) would drop the casts, but they miss domains
-    # (sent as the base type), types created after connect, and change built-in types
-    # connection-wide.
+class CustomColumn[T](Column[T]):
+    """See ``custom``. A relational query nests its values as ``to_json`` of them."""
 
 
-def custom(sql_type: str, name: str | None = None) -> CustomColumn:
-    """A column of a type mizzle has no column type for: ``sql_type`` is its DDL type,
-    verbatim (``"citext"``, ``"box"``, ``"int4range"``, ``"my_domain"``, ``"app.my_type"``).
-    Values are ``str`` in the type's text form, as PostgreSQL prints it."""
-    return CustomColumn(sql_type, (str,), name)
+def _as_is(value: object) -> object:
+    return value
+
+
+@overload
+def custom(sql_type: str, name: str | None = None) -> CustomColumn[object]: ...
+@overload
+def custom[T, D](
+    sql_type: str,
+    name: str | None = None,
+    *,
+    py_type: type[T],
+    decode: Callable[[D], T] | None = None,
+    encode: Callable[[T], D] | None = None,
+) -> CustomColumn[T | None]: ...
+@overload
+def custom[T, D](
+    sql_type: str,
+    name: str | None = None,
+    *,
+    decode: Callable[[D], T],
+    encode: Callable[[T], D] | None = None,
+) -> CustomColumn[T | None]: ...
+def custom(
+    sql_type: str,
+    name: str | None = None,
+    *,
+    py_type: type[object] = object,
+    decode: Callable[[Never], object] | None = None,
+    encode: Callable[[Never], object] | None = None,
+) -> ColumnBase:
+    """A column of a type mizzle has no column type for, like Drizzle's ``customType``:
+    ``sql_type`` is its DDL type, verbatim (``"citext"``, ``"int4range"``, ``"my_domain"``,
+    ``"app.my_type"``). Values are the driver's (asyncpg's) for that type, both ways: a
+    ``str`` for citext or tsvector, a ``Range`` for int4range, a ``Record`` for a composite.
+    ``decode`` turns a value read into ``py_type``, ``encode`` one written into what the
+    driver takes. A relational query nests it as its JSON form (``decode`` then gets that).
+    """
+    column = CustomColumn[object](
+        sql_type,
+        (py_type,),
+        name,
+        encoder=cast(Callable[[object], object] | None, encode),
+        decoder=cast(Callable[[object], object] | None, decode),
+    )
+    column.json_decoder = _as_is  # the JSON form as it is
+    return column

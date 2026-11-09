@@ -704,6 +704,7 @@ def render_schema_module(snapshot: Snapshot) -> str:
 # -- typegen --------------------------------------------------------------------------
 
 _PY_TYPES: dict[type[object], str] = {
+    object: "object",  # custom() without py_type
     int: "int",
     str: "str",
     bool: "bool",

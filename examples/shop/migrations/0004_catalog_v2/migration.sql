@@ -15,6 +15,10 @@ DO $mizzle$ DECLARE defs text[]; refs text[]; def text; r record; BEGIN
 IF current_setting('server_version_num')::int >= 170000 THEN
   EXECUTE 'ALTER TABLE "products" ALTER COLUMN "search" SET EXPRESSION AS (setweight(to_tsvector(''english'', name), ''A'') || setweight(to_tsvector(''english'', coalesce(details, '''')), ''B''))';
 ELSE
+IF EXISTS (SELECT 1 FROM pg_attribute a WHERE a.attrelid = '"products"'::regclass AND a.attname = 'search' AND a.attacl IS NOT NULL)
+OR EXISTS (SELECT 1 FROM pg_depend d JOIN pg_attribute a ON a.attrelid = d.refobjid AND a.attnum = d.refobjsubid WHERE d.refclassid = 'pg_class'::regclass AND d.refobjid = '"products"'::regclass AND a.attname = 'search' AND d.deptype IN ('a', 'n') AND d.classid <> 'pg_attrdef'::regclass AND NOT EXISTS (SELECT 1 FROM pg_class s WHERE d.classid = 'pg_class'::regclass AND s.oid = d.objid AND s.relkind = 'S') AND NOT EXISTS (SELECT 1 FROM pg_constraint n WHERE d.classid = 'pg_constraint'::regclass AND n.oid = d.objid AND n.contype = 'n') AND d.classid <> 'pg_constraint'::regclass AND NOT EXISTS (SELECT 1 FROM pg_class i WHERE d.classid = 'pg_class'::regclass AND i.oid = d.objid AND i.relkind IN ('i', 'I'))) THEN
+  RAISE EXCEPTION 'column % is dropped and added again, which would drop the grants, constraints or triggers on it that mizzle does not manage; this needs a custom migration', 'products.search';
+END IF;
   SELECT array_agg(d) INTO defs FROM (
     SELECT format('ALTER TABLE %s ADD CONSTRAINT %I %s', '"products"', conname, pg_get_constraintdef(c.oid)) AS d
     FROM pg_constraint c JOIN pg_attribute a ON a.attrelid = c.conrelid

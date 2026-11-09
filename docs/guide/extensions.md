@@ -65,7 +65,8 @@ The server needs pgvector installed.
 
 ### Types from other extensions
 
-A column of another extension's type is `custom("type")`, its values the type's text form:
+A column of another extension's type is `custom("type")`, its values what asyncpg reads for
+the type (a `str` for these three; see [Columns of other types](schema.md#columns-of-other-types)):
 
 ```python
 from mizzle.pg import custom

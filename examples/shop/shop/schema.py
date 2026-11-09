@@ -136,7 +136,7 @@ class Products(Table, name="products"):
     tags = array(text()).not_null().default(sql("'{}'::text[]"))
     attrs = jsonb[dict[str, Any]]().not_null().default(sql("'{}'::jsonb"))
     active = boolean().not_null().default(True)
-    search = custom("tsvector").generated_always_as(
+    search = custom("tsvector", py_type=str).generated_always_as(
         sql(
             "setweight(to_tsvector('english', name), 'A') || "
             f"setweight(to_tsvector('english', coalesce({DETAILS}, '')), 'B')"

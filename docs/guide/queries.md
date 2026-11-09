@@ -652,5 +652,6 @@ found = await (
 - `websearch_to_tsquery` takes search-box syntax (`"a phrase" or -word`) and never fails
   on bad input.
 - `ts_rank_cd` also rewards matching words that are close together.
-- For speed, store the vector in a generated `custom("tsvector")` column with a GIN index
+- For speed, store the vector in a generated `custom("tsvector", py_type=str)` column (a
+  `str` to the type checker, as `matches` and `ts_rank` take) with a GIN index
   (see [Schema](schema.md#identity-and-generated-columns)).

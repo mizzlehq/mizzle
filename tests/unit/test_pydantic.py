@@ -198,3 +198,21 @@ def test_geometry_and_bit_strings_round_trip_json() -> None:
     row = Model(id=1, at=Point(1.5, -2), bits=BitString.from_int(5, 4))
     assert Model.model_validate_json(row.model_dump_json()) == row
     assert row.model_dump(mode="json")["bits"] == "0101"
+
+
+def test_custom_fields_take_their_py_type() -> None:
+    from asyncpg import Range
+
+    from mizzle.pg import custom
+
+    class Odd(Table, name="odd"):
+        id = serial().primary_key()
+        anything = custom("tsvector")
+        span = custom("int4range", py_type=Range)
+
+    fields = select_model(Odd).model_fields
+    assert fields["anything"].annotation == object | None
+    model = select_model(Odd)(id=1, anything="'a'", span=Range(1, 2))
+    assert model.model_dump()["span"] == Range(1, 2)
+    with pytest.raises(pydantic.ValidationError):
+        select_model(Odd)(id=1, anything=None, span="[1,2)")
