@@ -1,74 +1,44 @@
 # Changelog
 
+## Unreleased
+
+- Install `mizzle[speed]` to read json and jsonb values with orjson, 1.5 to 3 times faster.
+  Values stay exactly the same.
+
 ## 0.3.0
 
-- **Breaking: mizzle manages tables and what hangs on them, nothing more.** Functions, triggers, domains,
-  composite types, extensions, exclusion constraints, partitions and grants are gone from
-  the schema API (`function`, `trigger`, `domain`, `composite`, `extension`, `exclusion`,
-  `partition`, `partition_by=`, `grant`, `pg_domain`, `pg_composite`). `generate`, `push`
-  and `pull` leave them alone: never created, dropped or reported as drift; `pull` names
-  them in a warning and reads a partitioned table as a plain one. Write them in a custom
-  migration (`mizzle generate --custom`); see "Not managed by mizzle" in the migrations
-  guide. A vector column no longer creates the `vector` extension either.
-- `custom("type")` in `mizzle.pg`: a column of any other type
-  (a domain, a composite, a range, `citext`, `box`, `app.my_type`...), its DDL type
-  verbatim. Values are what asyncpg reads and writes for the type (`str` for citext or
-  tsvector, `Range`, `Box`, a `Record` for a composite), with no SQL around the column, so
-  it compares, sorts and deduplicates as the type. `decode=` / `encode=` convert values
-  read and written, and `py_type=` is the Python type (`object` by default; type checkers
-  take it from `decode`'s return or `encode`'s parameter when given). `select_model` needs
-  `py_type=` (or `refine=`) for such a column. Values compared with it are sent with no
-  cast (a cast cut `varchar(5)` text and rounded `numeric(10,2)`); compare a tuple with a
-  composite as `sql("{}::type", value)`. Nested rows (`with_=`) give the value's
-  JSON form (`bool`, `int`, `Decimal` with all digits, `str`, `dict`), through `decode`
-  if given. `pull` writes
-  every column of a type mizzle has no column type for as `custom(...)`.
-- `values(model)` / `set(model)` take the fields set on the model (`model_fields_set`) with
-  their dumped values, so serializers run and nested models keep their defaults
-  (`exclude_unset` dropped those). A dataclass or model in a `custom()` column with that
-  `py_type` reaches `encode=` as one.
-- A value compared with an expression that keeps a column's type (`nullable()`,
-  `coalesce()`, `max_()`, `greatest()`...) is encoded as that column, as next to the column
-  itself (an `Enum` was sent raw).
-- A type change of a column a generated column uses works: the generated column is dropped
-  and added again after it (PostgreSQL refused the change). `--rename` hints for a table in
-  another schema give the flag that works (`app.posts=articles`), and `app.posts=app.articles`
-  is a rename too.
-- Values compared with a CTE or subquery column are encoded as the column it selects again
-  (enums, `custom()` with `encode=`).
-- Database URLs take the scheme in any case (`PostgreSQL://`).
-- A `Decimal` inside a json/jsonb value is written with its exact digits, and a value
-  JSON cannot hold names the reason (`Object of type set is not JSON serializable`).
-- `select_model` accepts multi-dimensional array values.
-- `mizzle generate --custom --record-schema`: a custom migration that makes a schema change
-  itself (an enum value removed or renamed) records the new schema, so the next `generate`
-  does not refuse the same change again.
-- `mizzle generate --custom` keeps the previous schema snapshot, so a custom migration can
-  run before the tables that need what it creates; schema changes go into the next
-  generated migration.
-- Studio resolves domains with the server (`pg_type.typbasetype`) instead of parsing type
-  names, and shows composite columns read-only.
-- Removed column types from `mizzle.pg`: the ranges and multiranges (`int4range`,
-  `int8range`, `numrange`, `daterange`, `tsrange`, `tstzrange` and their `*multirange`),
-  the geometry shapes `box`, `lseg`, `path`, `polygon` and `circle` (`point` and `line`
-  stay), `hstore`, `ltree`, `citext`, `xml`, `money`, `tsvector` and `tsquery`. Declare such
-  a column with `custom("type")`. The range operators went with them: `contains`,
-  `contained_by` and `overlaps` work on arrays and jsonb.
-- Removed `Database.listen()` and `notify()` (with `Notification`, `Reconnected` and
-  `ListenerOverflow`). Use asyncpg's `add_listener` on a connection of your own.
-- Removed `copy_into()` and `copy_from()`. Use `insert_many()` for bulk loads.
-- **Breaking: a savepoint belongs to the task that opened it**. Tasks started inside a savepoint can no longer use the transaction while it is
-  open (`QueryError`), so `asyncio.gather` of statements or savepoint blocks inside a
-  savepoint is refused. `gather` of statements (and `insert_many()`) on a transaction with
-  no savepoint open still works. Savepoint hooks are kept per savepoint: a refused or
-  rolled-back savepoint no longer drops or runs the hooks of a later one, and a savepoint
-  always ends (`RELEASE` / `ROLLBACK TO`) before a cancel that hit while it waited to end.
-- A raw `COMMIT AND CHAIN` / `ROLLBACK AND CHAIN` inside a transaction is no longer
-  detected (the check needed PL/pgSQL on every `COMMIT`). Do not send transaction control
-  as raw SQL; a plain `COMMIT` or `ROLLBACK` is still detected.
-- A malformed database URL with a user name or password no longer quotes any part of the
-  parser's message, which could hold a piece of the password (a password with both `'`
-  and `"`, or an unencoded `@`).
+### New
+
+- `custom("type")` for columns of any type mizzle has no helper for: domains, composites,
+  ranges, `citext`, extension types. Use `decode=` and `encode=` to convert values.
+- `mizzle generate --custom --record-schema` for changes you write by hand, such as
+  renaming an enum value.
+- New docs pages: [All features](https://mizzle.readthedocs.io/en/latest/features/) and
+  [Known gaps](https://mizzle.readthedocs.io/en/latest/gaps/).
+
+### Changed
+
+- mizzle now manages tables, columns, indexes, constraints, enums, views, policies and
+  roles. Functions, triggers, extensions, domains, partitions and grants are left alone:
+  write them in a custom migration.
+- Range, geometry, `citext`, `hstore`, `ltree`, `xml`, `money` and text-search column types
+  moved to `custom("type")`.
+- A savepoint belongs to the task that opened it. Other tasks cannot use the transaction
+  while it is open.
+- `values(model)` and `set(model)` run Pydantic serializers and keep nested defaults.
+
+### Removed
+
+- `Database.listen()` and `notify()`. Use asyncpg's `add_listener` on your own connection.
+- `copy_into()` and `copy_from()`. Use `insert_many()`.
+
+### Fixed
+
+- Changing the type of a column that a generated column uses.
+- Filters on CTE, subquery and `coalesce()` columns now convert enum and custom values.
+- Exact `Decimal` values inside json and jsonb.
+- Clearer errors for bad database URLs, which never show the password.
+- Many smaller fixes in migrations, Studio and queries.
 
 ## 0.2.4
 
