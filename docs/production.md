@@ -43,6 +43,15 @@ db = await Database.connect(url, reset_connections="always")
 - **Transaction mode:** pass `statement_cache_size=0`.
 - **Session mode:** works as is.
 
+## Schemas other roles can write to
+
+mizzle's own SQL (studio, migrations, introspection) calls PostgreSQL's built-in functions
+as `pg_catalog.<name>`, so a function another role creates in `public` cannot stand in for
+them. Your queries, and the asyncpg driver's own type lookups, use the search path as
+written. Do not let untrusted roles create objects in a schema on the app's or the
+migrator's search path: this is the default from PostgreSQL 15; on older servers run
+`REVOKE CREATE ON SCHEMA public FROM PUBLIC`.
+
 ## Memory
 
 On glibc, a busy process can keep freed memory, so its RSS grows slowly and then levels
