@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Literal, Protocol, Self, override
+from typing import Literal, Protocol, Self, cast, override
 
 from mizzle.core.compiler import CompiledQuery
 from mizzle.core.errors import QueryError
@@ -17,31 +17,43 @@ from mizzle.core.sql.nodes import Expr
 
 
 class ModelLike(Protocol):
-    """A Pydantic model (or anything with the same ``model_dump``)."""
+    """A Pydantic model (or anything with the same ``model_dump`` and ``model_fields_set``)."""
 
-    def model_dump(self, *, exclude_unset: bool = ...) -> dict[str, object]: ...
+    @property
+    def model_fields_set(self) -> set[str]: ...
+
+    def model_dump(self) -> dict[str, object]: ...
 
 
 type RowLike = Mapping[str, object] | ModelLike
 
 
 def as_mapping(value: RowLike, table: type[Table]) -> Mapping[str, object]:
-    """A Pydantic model becomes the dict of fields the client actually set, with the
-    model's own values: a dataclass for a custom() column stays one (Q8-3). Only json
-    columns take the dumped form (nested models as dicts)."""
+    """A Pydantic model becomes the dict of fields the client actually set, so omitted
+    columns keep their defaults. The values are the dumped ones (serializers run, nested
+    models complete with their defaults: R9-2, Q9-4), except where the column cannot take
+    the dumped value but takes the model's own: a dataclass for a custom() column with
+    ``py_type=`` stays one for ``encode=`` (Q8-3)."""
     if isinstance(value, Mapping):
         return value
     columns = table.__table__.columns
-    dumped = value.model_dump(exclude_unset=True)
-    return {
-        k: v if _holds_json(columns.get(k)) else getattr(value, k, v) for k, v in dumped.items()
-    }
+    out: dict[str, object] = {}
+    for key, dumped in value.model_dump().items():
+        if key in value.model_fields_set:
+            column = columns.get(key)
+            held = getattr(value, key, dumped)
+            keep = column is not None and not _fits(column, dumped) and _fits(column, held)
+            out[key] = held if keep else dumped
+    return out
 
 
-def _holds_json(column: ColumnBase | None) -> bool:
-    while column is not None and column.item is not None:
-        column = column.item
-    return column is None or column.accepts is None
+def _fits(column: ColumnBase, value: object) -> bool:
+    """Whether the column takes ``value`` as it is (arrays: each element)."""
+    if value is None or column.accepts is None:
+        return True
+    if column.item is not None and isinstance(value, list | tuple):
+        return all(_fits(column.item, v) for v in cast(Sequence[object], value))
+    return isinstance(value, column.accepts)
 
 
 def check_values(table: type[Table], values: Mapping[str, object]) -> None:

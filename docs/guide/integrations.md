@@ -86,8 +86,8 @@ except pydantic.ValidationError:
 ```
 
 `values(model)` and `set(model)` use only the fields the client sent
-(`model_dump(exclude_unset=True)`), so the others keep their database defaults or current
-values. (`as_user` is defined [below](#supabase).)
+(`model_fields_set`), so the others keep their database defaults or current values. Each
+value is the dumped one: serializers run, and a nested model keeps its defaults. (`as_user` is defined [below](#supabase).)
 
 !!! warning "Use include= for client input"
     A model accepts every field it contains. Without `include=`, a client could send a

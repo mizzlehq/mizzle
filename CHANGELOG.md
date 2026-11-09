@@ -23,9 +23,10 @@
   JSON form (`bool`, `int`, `Decimal` with all digits, `str`, `dict`), through `decode`
   if given. `pull` writes
   every column of a type mizzle has no column type for as `custom(...)`.
-- `values(model)` / `set(model)` take each field as the model holds it, so a dataclass or
-  model in a `custom()` column reaches `encode=` as one; json columns still get the dumped
-  form.
+- `values(model)` / `set(model)` take the fields set on the model (`model_fields_set`) with
+  their dumped values, so serializers run and nested models keep their defaults
+  (`exclude_unset` dropped those). A dataclass or model in a `custom()` column with that
+  `py_type` reaches `encode=` as one.
 - Values compared with a CTE or subquery column are encoded as the column it selects again
   (enums, `custom()` with `encode=`).
 - Database URLs take the scheme in any case (`PostgreSQL://`).

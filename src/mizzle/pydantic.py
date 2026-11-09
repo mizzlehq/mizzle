@@ -17,8 +17,9 @@ generated columns), and update models never contain primary keys, unless you ``i
 them explicitly.
 
 Models only carry the fields a client sent: ``values(model)`` / ``set(model)`` take the
-fields set on the model (``model_dump(exclude_unset=True)``, with each value as the model
-holds it), so omitted fields keep their database defaults.
+fields set on the model (``model_fields_set``), so omitted fields keep their database
+defaults. Values are ``model_dump()``'s (serializers run, nested models complete), except a
+custom() column's ``py_type`` value, which stays as the model holds it.
 """
 
 from __future__ import annotations

@@ -1,6 +1,6 @@
 from dataclasses import dataclass
 from decimal import Decimal
-from typing import Any
+from typing import Annotated, Any
 
 import pydantic
 import pytest
@@ -248,3 +248,38 @@ async def test_models_keep_custom_class_values(qb: QueryBuilder) -> None:
     assert qb.insert(Stay).values(body).to_sql()[1] == (Range(1, 3), {"a": 1})  # json: dumped
     patch = update_model(Stay)(nights=Nights(2, 4))
     assert qb.update(Stay).set(patch).all_rows().to_sql()[1] == (Range(2, 4),)
+
+
+class Settings(pydantic.BaseModel):
+    theme: str
+    lang: str = "en"
+
+
+class Slug:
+    def __init__(self, text: str) -> None:
+        self.text = text
+
+
+async def test_models_dump_values_but_only_set_fields(qb: QueryBuilder) -> None:
+    # R9-2: exclude_unset also dropped a nested model's defaults; Q9-4: values skipped the
+    # model's serializers. Only the top-level unset fields are left out.
+    class Account(Table, name="account"):
+        id = serial().primary_key()
+        name = text()
+        slug = text()
+        settings = jsonb()
+        stays = array(custom("int4range", py_type=Nights, encode=_span))
+
+    class Body(pydantic.BaseModel):
+        model_config = pydantic.ConfigDict(arbitrary_types_allowed=True)
+        name: str | None = None
+        slug: Annotated[Slug, pydantic.PlainSerializer(lambda v: v.text.lower())] | None = None
+        settings: Settings | None = None
+        stays: list[Nights] | None = None
+
+    body = Body(slug=Slug("Hello-W"), settings=Settings(theme="dark"), stays=[Nights(1, 3)])
+    sql_text, params = qb.insert(Account).values(body).to_sql()
+    assert "name" not in sql_text
+    assert params == ("hello-w", {"theme": "dark", "lang": "en"}, [Range(1, 3)])
+    patch = qb.update(Account).set(Body(settings=Settings(theme="x"))).all_rows()
+    assert patch.to_sql()[1] == ({"theme": "x", "lang": "en"},)
