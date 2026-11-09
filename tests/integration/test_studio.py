@@ -1770,11 +1770,13 @@ def test_ddl_keeps_the_rest_of_the_search_path(pg_url: str, client: TestClient) 
             assert _query(app, "show search_path") == [["st_app"]]
 
 
-def test_ddl_never_changes_the_search_path(
+def test_ddl_keeps_the_roles_search_path_with_pg_temp_last(
     client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # S8-2: DDL ran with public first in the search_path, so the bare names in a default or
-    # type bound to whatever was planted in public, not to what the role's path finds.
+    # type bound to whatever was planted in public, not to what the role's path finds. The
+    # role's path is kept as it is; only pg_temp is added last (a temporary type on the
+    # pooled connection must not be found first), and the path is put back afterwards.
     seen: list[str] = []
     from mizzle.kit.migrate import apply_statements as real
 
@@ -1791,7 +1793,9 @@ def test_ddl_never_changes_the_search_path(
         "/api/ddl/apply", json={**op, "column": {"name": "n", "type": "integer"}}, headers=AUTH
     )
     assert applied.status_code == 200, applied.text
-    assert seen == [path]
+    assert seen == [f"{path}, pg_temp"]
+    assert _query(client, "select current_setting('search_path')") == [[path]]
+    _sql(client, "drop table st_gen_t")
 
 
 def test_ddl_default_resolves_through_the_roles_path(pg_url: str, client: TestClient) -> None:

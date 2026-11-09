@@ -1158,11 +1158,23 @@ async def ddl_apply(studio: Studio, request: Request) -> Response:
     _configured_schema(studio, data)
     steps = build_steps(studio.dialect, data, await _current_table(studio, data))
     # S8-2: tables are named with their schema ("public"."t", never a "$user" schema's t),
-    # and the search_path is never changed: everything else in the DDL (a default's
-    # uuid_generate_v4(), a type) resolves through the role's own path, as psql would.
+    # and everything else in the DDL (a default's uuid_generate_v4(), a type) resolves
+    # through the role's own path, as psql would. Only pg_temp is moved, to the end:
+    # unlisted it is searched first, and a temporary type left on this pooled connection
+    # must not stand in for a real one. The statement calls only pg_catalog functions.
     statements = studio.dialect.render(steps, qualify=True)
     async with studio.pool().acquire() as conn:
-        await apply_statements(conn, statements)
+        await conn.execute(
+            "SELECT pg_catalog.set_config('search_path', "
+            "pg_catalog.concat_ws(', ', "
+            "NULLIF(pg_catalog.current_setting('search_path'), ''), 'pg_temp'), "
+            "false)",
+            [],
+        )
+        try:
+            await apply_statements(conn, statements)
+        finally:
+            await conn.execute("RESET search_path", [])
     await studio.load_snapshot(refresh=True)
     return JSONResponse(
         {"applied": len(statements), "statements": statement_rows(studio.dialect, steps)}
