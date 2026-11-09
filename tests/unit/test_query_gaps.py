@@ -388,3 +388,23 @@ def test_values_next_to_expressions_of_a_column_are_encoded(qb: QueryBuilder) ->
         assert Decimal("1.5") in query.where(where).to_sql()[1]
     having = query.group_by(Priced.id).having(eq(max_(Priced.price), 150))
     assert having.to_sql()[1] == (Decimal("1.5"),)
+
+
+def test_nested_custom_numbers_take_the_py_type() -> None:
+    # H10-1: a nested py_type=float value was a Decimal (0.1 + 1.0 raised TypeError), and a
+    # py_type=Decimal whole number an int.
+    def parse(column: object, text: str) -> object:
+        decoder = getattr(column, "json_decoder")  # noqa: B009
+        return decoder(text)
+
+    as_float, as_decimal, untyped = (
+        custom("f", py_type=float),
+        custom("d", py_type=Decimal),
+        custom("n"),
+    )
+    assert parse(as_float, "0.1") == 0.1 and type(parse(as_float, "2")) is float
+    assert parse(as_float, '"NaN"') != parse(as_float, '"NaN"')  # a float NaN
+    assert parse(as_decimal, "2") == Decimal(2) and type(parse(as_decimal, "2")) is Decimal
+    assert str(parse(as_decimal, "1.50")) == "1.50"
+    assert parse(as_decimal, '"Infinity"') == Decimal("Infinity")
+    assert parse(untyped, "2") == 2 and str(parse(untyped, "1.10")) == "1.10"

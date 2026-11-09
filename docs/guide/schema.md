@@ -352,7 +352,7 @@ compared with a composite needs the type written out:
 
 A relational query (`with_=`) nests related rows as JSON, so a custom column there holds
 its JSON form (`to_json`): a `bool` or `int` for a domain over one, a `Decimal` with all
-digits for other numbers, a `str` such as `"[1,5)"` for a range, a `dict` such as
+digits for other numbers (a `float` or `Decimal` when that is the `py_type`), a `str` such as `"[1,5)"` for a range, a `dict` such as
 `{"amount": Decimal("1.5"), "day": "2020-01-02"}` for a composite. `decode` is applied to
 that value too, so a column with `decode` and nested reads needs a `decode` that takes
 both, or read the column with a plain select.

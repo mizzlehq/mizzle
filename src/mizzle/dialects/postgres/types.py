@@ -386,10 +386,26 @@ class CustomColumn[T](Column[T]):
     """See ``custom``. A relational query nests its values as their JSON form."""
 
 
-def _parse_json(value: object) -> object:
-    # Nested as JSON text (to_json(col)::text), parsed here so numbers keep every digit:
-    # a numeric domain's 1.10 is Decimal("1.10"), not a float (R8-1, Q9-2).
-    return cast(object, _jsonlib.loads(cast(str, value), parse_float=Decimal))
+_NON_FINITE = frozenset({"NaN", "Infinity", "-Infinity"})
+
+
+def _json_parser(py_type: type[object] | None) -> Callable[[object], object]:
+    """Nested as JSON text (``to_json(col)::text``): numbers are ints or Decimals, so every
+    digit is kept (R8-1, Q9-2), or ``py_type`` when that is float or Decimal, as a plain
+    select gives (H10-1); for those, NaN and Infinity (JSON strings) too."""
+    number = cast(Callable[[str], object], py_type) if py_type in (float, Decimal) else None
+
+    def parse(value: object) -> object:
+        text = cast(str, value)
+        parsed = cast(
+            object,
+            _jsonlib.loads(text, parse_float=number or Decimal, parse_int=number or int),
+        )
+        if number is not None and isinstance(parsed, str) and parsed in _NON_FINITE:
+            return number(parsed)
+        return parsed
+
+    return parse
 
 
 @overload
@@ -442,5 +458,5 @@ def custom(
         encoder=cast(Callable[[object], object] | None, encode),
         decoder=cast(Callable[[object], object] | None, decode),
     )
-    column.json_decoder = _parse_json
+    column.json_decoder = _json_parser(py_type)
     return column
