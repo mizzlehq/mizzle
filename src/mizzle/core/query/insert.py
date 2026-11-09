@@ -25,11 +25,23 @@ class ModelLike(Protocol):
 type RowLike = Mapping[str, object] | ModelLike
 
 
-def as_mapping(value: RowLike) -> Mapping[str, object]:
-    """A Pydantic model becomes the dict of fields the client actually set."""
+def as_mapping(value: RowLike, table: type[Table]) -> Mapping[str, object]:
+    """A Pydantic model becomes the dict of fields the client actually set, with the
+    model's own values: a dataclass for a custom() column stays one (Q8-3). Only json
+    columns take the dumped form (nested models as dicts)."""
     if isinstance(value, Mapping):
         return value
-    return value.model_dump(exclude_unset=True)
+    columns = table.__table__.columns
+    dumped = value.model_dump(exclude_unset=True)
+    return {
+        k: v if _holds_json(columns.get(k)) else getattr(value, k, v) for k, v in dumped.items()
+    }
+
+
+def _holds_json(column: ColumnBase | None) -> bool:
+    while column is not None and column.item is not None:
+        column = column.item
+    return column is None or column.accepts is None
 
 
 def check_values(table: type[Table], values: Mapping[str, object]) -> None:
@@ -181,11 +193,11 @@ class Insert[T: Table](ReturningMixin[T]):
                 raise QueryError("values() needs at least one row; use values({}) for all defaults")
             batch: list[Mapping[str, object]] = [fields]
         elif isinstance(rows, Sequence):
-            batch = [as_mapping(r) for r in rows]
+            batch = [as_mapping(r, self.table) for r in rows]
             if not batch:
                 raise QueryError("values() got an empty list")
         else:
-            batch = [as_mapping(rows)]
+            batch = [as_mapping(rows, self.table)]
         rows = tuple(
             prepare_row(self.table, row, allow_identity=True, defaults=False) for row in batch
         )

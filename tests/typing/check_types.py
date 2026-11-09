@@ -342,3 +342,10 @@ def custom_columns_take_their_python_type() -> None:
     assert_type(custom("citext", py_type=str), CustomColumn[str | None])
     assert_type(custom("cash", decode=money, encode=cents), CustomColumn[int | None])
     assert_type(custom("cash", py_type=int, decode=money).not_null(), Column[int])
+    # Q8-6: encode alone gives its parameter type; with decode, decode's return type
+    # decides (pyright widened a disagreeing py_type to str | int).
+    assert_type(custom("cash", encode=cents), CustomColumn[int | None])
+    assert_type(custom("cash", py_type=int, encode=cents), CustomColumn[int | None])
+    assert_type(custom("cash", decode=money), CustomColumn[int | None])
+    assert_type(custom("cash", py_type=Decimal, decode=money), CustomColumn[int | None])
+    custom("cash", py_type=str, encode=cents)  # type: ignore[arg-type]  # pyright: ignore[reportArgumentType]

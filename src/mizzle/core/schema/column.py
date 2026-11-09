@@ -192,7 +192,10 @@ class ColumnBase(ExprBase):
         if self.accepts is None:
             return
         # bool is a subclass of int; True must not slip into an integer column.
-        bad_bool = isinstance(value, bool) and bool not in self.accepts
+        # object accepts anything (custom() without py_type, R8-2).
+        bad_bool = (
+            isinstance(value, bool) and bool not in self.accepts and object not in self.accepts
+        )
         if bad_bool or not isinstance(value, self.accepts):
             expected = " | ".join(t.__name__ for t in self.accepts)
             raise QueryError(

@@ -349,6 +349,18 @@ async def test_custom_values_are_the_drivers(cus_db: Database) -> None:
     assert mood == [{"m": "happy"}]
     labelled = await cus_db.select().from_(CusRow).where(eq(CusRow.label, Label("HI")))
     assert [r.label for r in labelled] == [Label("Hi")]
+    # A tuple compared with a composite is typed as it (Q8-5).
+    paired = await cus_db.select().from_(CusRow).where(eq(CusRow.pair, (Decimal("1.5"), _DAY)))
+    assert [r.id for r in paired] == [rows[0].id]
+    # A subquery or CTE column encodes values as the column it selects (Q8-1).
+    s = cus_db.select(CusRow.id, CusRow.label).from_(CusRow).subquery("s")
+    found_s = (
+        await cus_db.select(s.c("id", int)).from_(s).where(eq(s.c("label", Label), Label("HI")))
+    )
+    c = cus_db.select(CusRow.id, CusRow.label).from_(CusRow).cte("c")
+    in_c = in_(c.c("label", Label), [Label("hi"), Label("no")])
+    found_c = await cus_db.with_(c).select(c.c("id", int)).from_(c).where(in_c)
+    assert found_s == found_c == [(rows[0].id,)]
 
     upd = cus_db.update(CusRow).set(span=Range(2, 3, upper_inc=True), label=Label("x"))
     [changed] = await upd.where(eq(CusRow.ci, "Z")).returning()
@@ -359,8 +371,9 @@ async def test_custom_values_are_the_drivers(cus_db: Database) -> None:
     assert upserted == {"r": Box((3, 3), (1, 1)), "c": "Z"}
 
 
-async def test_custom_nested_rows_are_json(cus_db: Database) -> None:
-    # A relational query nests a custom() value as to_json of it; decode still applies.
+async def test_custom_nested_rows_are_text(cus_db: Database) -> None:
+    # A relational query nests a custom() value as its text form; decode still applies.
+    # As JSON a numeric domain was a float, which loses digits (R8-1).
     [owner] = await cus_db.query(CusOwner).find_many(with_={"rows": {"order_by": CusRow.id}})
     row = owner.rows[0]
     assert (row.ci, row.mail, row.mood, row.doc, row.label) == (
@@ -370,7 +383,8 @@ async def test_custom_nested_rows_are_json(cus_db: Database) -> None:
         "'a' 'b'",
         Label("Hi"),
     )
-    assert row.num == 1.0 and row.pair == {"amount": 1.5, "day": "2020-01-02"}
+    assert [r.num for r in owner.rows] == ["1.0", "1.00", "2"]
+    assert row.pair == "(1.5,2020-01-02)"
     assert (row.span, row.rect, row.rects) == ("[1,5)", "(2,2),(0,0)", ["(2,2),(0,0)", None])
 
 

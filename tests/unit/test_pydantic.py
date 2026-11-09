@@ -1,15 +1,16 @@
+from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any
 
 import pydantic
 import pytest
-from asyncpg import Point
+from asyncpg import Point, Range
 
 from mizzle.core.errors import SchemaError
 from mizzle.core.query.builder import QueryBuilder
 from mizzle.core.schema.table import Table
 from mizzle.core.schema.types import integer, numeric, text
-from mizzle.dialects.postgres.types import array, point, serial
+from mizzle.dialects.postgres.types import array, custom, jsonb, point, serial
 from mizzle.pydantic import insert_model, select_model, update_model
 from tests.models import Posts, Role, Users
 from tests.unit.conftest import FakeRunner
@@ -201,18 +202,49 @@ def test_geometry_and_bit_strings_round_trip_json() -> None:
 
 
 def test_custom_fields_take_their_py_type() -> None:
-    from asyncpg import Range
-
-    from mizzle.pg import custom
-
     class Odd(Table, name="odd"):
         id = serial().primary_key()
         anything = custom("tsvector")
         span = custom("int4range", py_type=Range)
 
-    fields = select_model(Odd).model_fields
-    assert fields["anything"].annotation == object | None
-    model = select_model(Odd)(id=1, anything="'a'", span=Range(1, 2))
+    # Q8-4: without py_type the value (a Range, a Record...) may have no JSON form.
+    with pytest.raises(SchemaError, match=r"Odd\.anything: select_model needs .*py_type="):
+        select_model(Odd)
+    with pytest.raises(SchemaError, match="anything"):
+        select_model(Odd, include=["id", "anything"])
+    Model = select_model(Odd, refine={"anything": str})
+    model = Model(id=1, anything="'a'", span=Range(1, 2))
     assert model.model_dump()["span"] == Range(1, 2)
+    assert select_model(Odd, exclude=["anything"]).model_fields.keys() == {"id", "span"}
     with pytest.raises(pydantic.ValidationError):
-        select_model(Odd)(id=1, anything=None, span="[1,2)")
+        Model(id=1, anything=None, span="[1,2)")
+    assert insert_model(Odd).model_fields["anything"].annotation == object | None
+
+
+@dataclass(frozen=True)
+class Nights:
+    first: int
+    last: int
+
+
+def _span(nights: Nights) -> Range[int]:
+    return Range(nights.first, nights.last)
+
+
+class Inner(pydantic.BaseModel):
+    a: int
+
+
+async def test_models_keep_custom_class_values(qb: QueryBuilder) -> None:
+    # Q8-3: model_dump() turned the dataclass into a dict, which encode= cannot take.
+    class Stay(Table, name="stay"):
+        id = serial().primary_key()
+        nights = custom("int4range", py_type=Nights, encode=_span)
+        meta = jsonb()
+
+    body = insert_model(Stay, refine={"meta": Inner}).model_validate_json(
+        '{"nights": {"first": 1, "last": 3}, "meta": {"a": 1}}'
+    )
+    assert qb.insert(Stay).values(body).to_sql()[1] == (Range(1, 3), {"a": 1})  # json: dumped
+    patch = update_model(Stay)(nights=Nights(2, 4))
+    assert qb.update(Stay).set(patch).all_rows().to_sql()[1] == (Range(2, 4),)

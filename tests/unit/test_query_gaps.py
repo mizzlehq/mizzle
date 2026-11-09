@@ -3,6 +3,7 @@ subqueries in FROM, relational queries on an alias, ORDER BY expressions after U
 raw SQL reused next to different types, and OVERRIDING ... VALUE."""
 
 import datetime
+from decimal import Decimal
 
 import pytest
 
@@ -11,6 +12,7 @@ from mizzle import (
     alias,
     and_,
     asc,
+    between,
     cast,
     coalesce,
     count,
@@ -18,9 +20,11 @@ from mizzle import (
     eq,
     exists,
     func,
+    in_,
     lag,
     lower,
     not_similar_to,
+    placeholder,
     row_number,
     rows_between,
     similar_to,
@@ -36,8 +40,10 @@ from mizzle.core.query.base import row_decoder
 from mizzle.core.query.builder import QueryBuilder
 from mizzle.core.schema.table import Table
 from mizzle.core.sql.nodes import ExprBase, Node
+from mizzle.db import dialect_for_url
+from mizzle.dialects.postgres import PostgresDialect
 from mizzle.dialects.postgres.compiler import PostgresCompiler
-from mizzle.pg import date, integer, serial, text
+from mizzle.pg import custom, date, integer, serial, text
 from tests.models import Posts, Role, Users
 from tests.unit.conftest import FakeRunner
 
@@ -313,3 +319,61 @@ def test_ctes_reach_insert_update_delete_and_merge(qb: QueryBuilder) -> None:
         .to_sql()[0]
     )
     assert merge_sql.startswith(head + 'MERGE INTO "posts"')
+
+
+def _dollars(cents: int) -> Decimal:
+    return Decimal(cents) / 100
+
+
+def _cents(dollars: Decimal) -> int:
+    return int(dollars * 100)
+
+
+class Priced(Table, name="priced"):
+    id = serial().primary_key()
+    price = custom("money_amount", py_type=int, decode=_cents, encode=_dollars)
+    pair = custom("price_pair")
+    flag = custom("flag_domain")  # a domain over boolean
+
+
+def test_values_next_to_cte_and_subquery_columns_are_encoded(qb: QueryBuilder) -> None:
+    # Q8-1: a value compared with a CTE or subquery column was sent raw (150, not 1.50).
+    s = qb.select(Priced.id, Priced.price).from_(Priced).subquery("s")
+    q = qb.select(s.c("id", int)).from_(s).where(eq(s.c("price", int), 150))
+    assert q.to_sql()[1] == (Decimal("1.5"),)
+    c = qb.select(Priced.id, Priced.price).from_(Priced).cte("c")
+    q = qb.with_(c).select(c.c("id", int)).from_(c)
+    assert q.where(in_(c.c("price", int), [1, 2])).to_sql()[1] == (Decimal("0.01"), Decimal("0.02"))
+    assert q.where(between(c.c("price", int), 1, 2)).to_sql()[1] == (
+        Decimal("0.01"),
+        Decimal("0.02"),
+    )
+
+
+def test_values_compared_with_custom_columns_take_their_type(qb: QueryBuilder) -> None:
+    # Q8-5: a tuple next to a composite was an anonymous record PostgreSQL cannot take.
+    sql_text, params = qb.select(Priced.id).from_(Priced).where(eq(Priced.pair, (1, 2))).to_sql()
+    assert sql_text.endswith('WHERE "priced"."pair" = $1::price_pair') and params == ((1, 2),)
+    where = eq(Priced.pair, placeholder("p"))
+    assert qb.select(Priced.id).from_(Priced).where(where).to_sql()[0].endswith("$1::price_pair")
+    assert (
+        qb.select(Priced.id)
+        .from_(Priced)
+        .where(eq(Priced.price, 150))
+        .to_sql()[0]
+        .endswith("$1::money_amount")
+    )
+    # Writes are unchanged.
+    assert qb.insert(Priced).values(pair=(1, 2)).to_sql()[0].endswith("VALUES ($1)")
+
+
+def test_untyped_custom_columns_take_booleans(qb: QueryBuilder) -> None:
+    # R8-2: a custom() column without py_type takes any value, True too.
+    assert qb.insert(Priced).values(flag=True).to_sql()[1] == (True,)
+    assert qb.update(Priced).set(flag=False).all_rows().to_sql()[1] == (False,)
+
+
+def test_url_scheme_is_case_insensitive() -> None:
+    # R8-3: RFC 3986 schemes are case-insensitive; asyncpg takes PostgreSQL:// too.
+    assert isinstance(dialect_for_url("PostgreSQL://u@h/d"), PostgresDialect)
+    assert isinstance(dialect_for_url("POSTGRES://u@h/d"), PostgresDialect)

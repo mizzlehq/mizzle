@@ -382,7 +382,7 @@ def pg_enum[E: enum.Enum](
 
 
 class CustomColumn[T](Column[T]):
-    """See ``custom``. A relational query nests its values as ``to_json`` of them."""
+    """See ``custom``. A relational query nests its values as their text form."""
 
 
 def _as_is(value: object) -> object:
@@ -391,28 +391,35 @@ def _as_is(value: object) -> object:
 
 @overload
 def custom(sql_type: str, name: str | None = None) -> CustomColumn[object]: ...
+# The value type: decode's return type, else encode's parameter type, else py_type (Q8-6).
+# With decode, py_type does not take part: pyright would widen a disagreeing py_type and
+# decode to a union (str | int); py_type must name decode's return type.
 @overload
 def custom[T, D](
     sql_type: str,
     name: str | None = None,
     *,
-    py_type: type[T],
-    decode: Callable[[D], T] | None = None,
+    py_type: type[object] | None = None,
+    decode: Callable[[D], T],
     encode: Callable[[T], D] | None = None,
 ) -> CustomColumn[T | None]: ...
 @overload
-def custom[T, D](
+def custom[T](
     sql_type: str,
     name: str | None = None,
     *,
-    decode: Callable[[D], T],
-    encode: Callable[[T], D] | None = None,
+    py_type: type[T] | None = None,
+    encode: Callable[[T], object],
+) -> CustomColumn[T | None]: ...
+@overload
+def custom[T](
+    sql_type: str, name: str | None = None, *, py_type: type[T]
 ) -> CustomColumn[T | None]: ...
 def custom(
     sql_type: str,
     name: str | None = None,
     *,
-    py_type: type[object] = object,
+    py_type: type[object] | None = None,
     decode: Callable[[Never], object] | None = None,
     encode: Callable[[Never], object] | None = None,
 ) -> ColumnBase:
@@ -421,14 +428,15 @@ def custom(
     ``"app.my_type"``). Values are the driver's (asyncpg's) for that type, both ways: a
     ``str`` for citext or tsvector, a ``Range`` for int4range, a ``Record`` for a composite.
     ``decode`` turns a value read into ``py_type``, ``encode`` one written into what the
-    driver takes. A relational query nests it as its JSON form (``decode`` then gets that).
+    driver takes. A relational query nests it as its text form (``decode`` then gets that
+    ``str``): JSON has no exact form for some values, such as a numeric domain's.
     """
     column = CustomColumn[object](
         sql_type,
-        (py_type,),
+        (py_type or object,),
         name,
         encoder=cast(Callable[[object], object] | None, encode),
         decoder=cast(Callable[[object], object] | None, decode),
     )
-    column.json_decoder = _as_is  # the JSON form as it is
+    column.json_decoder = _as_is  # the text form as it is
     return column
