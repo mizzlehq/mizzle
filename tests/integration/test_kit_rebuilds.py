@@ -8,7 +8,7 @@ from typing import cast, final, override
 import asyncpg
 import pytest
 
-from mizzle import Constraint, QueryBuilder, Table, View, check, index, policy, rls, sql
+from mizzle import Constraint, Database, QueryBuilder, Table, View, check, index, policy, rls, sql
 from mizzle.core.errors import DatabaseError
 from mizzle.core.snapshot import Snapshot, empty_snapshot
 from mizzle.core.sql.nodes import Node
@@ -340,3 +340,22 @@ async def test_an_enum_under_a_foreign_key_is_created_again(kit_url: str) -> Non
     assert (row["k"], row["is_a"]) == ("a", 1)
     current = await live(kit_url, ["public"])
     assert diff(current, v2, compare_expressions=False) == []
+
+
+async def test_open_connections_survive_an_enum_created_again(kit_url: str) -> None:
+    # H15-1: before PostgreSQL 17, every pooled connection kept plans for the old type and
+    # failed each query on it ("cache lookup failed for type") until the app restarted.
+    v1, v2 = kinds(("a", "b")), kinds(("b", "a"))
+    await migrate(kit_url, empty_snapshot("postgresql"), v1)
+    await execute(
+        kit_url, "INSERT INTO kinds VALUES ('a'), ('b'); INSERT INTO things (kind) VALUES ('a')"
+    )
+    things = v1["tables"]["public.things"]
+    assert things["columns"]["kind"]["type"] == "kind"
+    async with await Database.connect(kit_url, pool_size=1) as db:
+        query = sql("SELECT kind::text AS k FROM things WHERE kind = {}::kind", "a")
+        assert await db.execute(query) == [{"k": "a"}]
+        await migrate(kit_url, v1, v2)
+        assert await db.execute(query) == [{"k": "a"}]
+        async with db.transaction() as tx:  # a fresh transaction works as well
+            assert await tx.execute(query) == [{"k": "a"}]

@@ -4,6 +4,8 @@
 
 - `generate` renames, removes and reorders enum values: `--rename status.done=finished`
   for a rename; a removal or a new order creates the type again and converts its columns.
+- Open connections recover by themselves after a migration creates a type again: before
+  PostgreSQL 17 each one failed with "cache lookup failed for type" until a restart.
 
 ## 0.3.1
 

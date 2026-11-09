@@ -1829,6 +1829,7 @@ async def test_enum_values_renamed_removed_and_reordered(
     )
 
     async def rows() -> list[tuple[object, ...]]:
+        await conn.reload_schema_state()  # before PostgreSQL 17 it keeps the old type's plans
         return [
             tuple(r)
             for r in await conn.fetch("SELECT status::text, history::text[] FROM task ORDER BY id")
@@ -1872,6 +1873,7 @@ async def test_enum_values_renamed_removed_and_reordered(
     )
     rewrite_schema(project, v4, monkeypatch)
     assert await cli("generate") == 0 and await cli("migrate") == 0
+    await conn.reload_schema_state()
     assert await conn.fetchval("SELECT enum_range(NULL::status)::text") == "{finished,draft}"
     assert await rows() == [("finished", ["draft", "finished"]), ("draft", None)]
     await no_drift()

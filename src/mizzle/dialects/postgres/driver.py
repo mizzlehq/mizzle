@@ -273,6 +273,24 @@ class PostgresConnection:
             server = None
         return _translate(exc, sql, server)
 
+    async def _fresh[R](self, run: Callable[[], Awaitable[R]]) -> R:
+        """``run()``, again once if the connection's cached plans named a type that is gone.
+
+        A migration that creates a type again (an enum's values removed or reordered) leaves
+        every open connection with prepared statements for the old type; before PostgreSQL
+        17 each fails with "cache lookup failed for type" until the app restarts (H15-1).
+        The caches are cleared and the statement runs again, unless in a transaction (it is
+        aborted then: the next one works)."""
+        try:
+            return await run()
+        except asyncpg.InternalServerError as exc:
+            if not str(exc).startswith("cache lookup failed for type"):
+                raise
+            await self._conn.reload_schema_state()
+            if self._conn.is_in_transaction():
+                raise
+        return await run()
+
     async def fetch(
         self,
         sql: str,
@@ -283,7 +301,7 @@ class PostgresConnection:
     ) -> list[Row]:
         self.dirty |= not session_safe
         try:
-            return list(await self._conn.fetch(sql, *params, timeout=timeout))
+            return list(await self._fresh(lambda: self._conn.fetch(sql, *params, timeout=timeout)))
         except Exception as exc:
             raise self._translate(exc, sql) from None
 
@@ -292,9 +310,8 @@ class PostgresConnection:
     ) -> list[dict[str, object]]:
         self.dirty = True
         try:
-            return [
-                dict(record) for record in await self._conn.fetch(sql, *params, timeout=timeout)
-            ]
+            rows = await self._fresh(lambda: self._conn.fetch(sql, *params, timeout=timeout))
+            return [dict(record) for record in rows]
         except Exception as exc:
             raise self._translate(exc, sql) from None
 
@@ -308,7 +325,8 @@ class PostgresConnection:
     ) -> int:
         self.dirty |= not session_safe
         try:
-            return _rowcount(await self._conn.execute(sql, *params, timeout=timeout))
+            status = await self._fresh(lambda: self._conn.execute(sql, *params, timeout=timeout))
+            return _rowcount(status)
         except Exception as exc:
             raise self._translate(exc, sql) from None
 
@@ -318,7 +336,7 @@ class PostgresConnection:
         self.dirty = True
         try:
             # asyncpg pipelines these in as few round trips as it can.
-            await self._conn.executemany(sql, params, timeout=timeout)
+            await self._fresh(lambda: self._conn.executemany(sql, params, timeout=timeout))
         except Exception as exc:
             raise self._translate(exc, sql) from None
         return len(params)
@@ -402,7 +420,7 @@ class PostgresConnection:
         # A protocol-level portal: it ends with the transaction, so it needs no reset.
         self.dirty |= not session_safe
         try:
-            cursor = await self._conn.cursor(sql, *params, timeout=timeout)
+            cursor = await self._fresh(lambda: self._conn.cursor(sql, *params, timeout=timeout))
             while batch := await cursor.fetch(batch_size, timeout=timeout):
                 yield list(batch)
         except Exception as exc:
