@@ -469,6 +469,8 @@ async def introspect(
     try:
         async with conn.transaction():  # rolled back, and the SET LOCAL with it
             await conn.execute("SET LOCAL TimeZone = 'UTC'", [])
+            # Printed '...' strings keep their backslashes as written (K8-3).
+            await conn.execute("SET LOCAL standard_conforming_strings = on", [])
             snapshot = await _introspect(conn, schemas, roles)
             rows = await conn.fetch_dicts(_SERVER_KEYWORDS, [])
             _requote_types(snapshot, frozenset(str(r["word"]) for r in rows))
@@ -786,6 +788,10 @@ async def normalize_snapshot(conn: Connection, snapshot: Snapshot) -> Snapshot:
     try:
         async with conn.transaction():
             await conn.execute("SET LOCAL TimeZone = 'UTC'", [])  # as introspect reads
+            await conn.execute("SET LOCAL standard_conforming_strings = on", [])
+            # LIKE takes ACCESS SHARE on the real table: never wait long behind a migration
+            # holding it (what times out keeps its text, K8-1).
+            await conn.execute("SET LOCAL lock_timeout = '2s'", [])
             await _normalize(out, read_back, version)
             rows = await conn.fetch_dicts(_SERVER_KEYWORDS, [])  # as introspect prints them
             _requote_types(out, frozenset(str(r["word"]) for r in rows))
@@ -870,11 +876,16 @@ async def _normalize(snapshot: Snapshot, read_back: _ReadBack, version: int) -> 
             row = await read_back(
                 [like, f"CREATE POLICY p ON {norm}{body}"], f"{query}WHERE polrelid = {rel}"
             )
-            if row is None:  # it names its own table (refs.t): on the table itself (K7-3)
+            if row is None:  # it names its own table (refs.t, K7-3): on a temporary copy
+                # under the same name (pg_temp is searched first), never on the table itself:
+                # CREATE POLICY there queued an ACCESS EXCLUSIVE lock behind readers (K8-1).
+                shadow = f"pg_temp.{quote(table['name'])}"
                 row = await read_back(
-                    [f"CREATE POLICY {quote(_NORM)} ON {real}{body}"],
-                    f"{query}WHERE polrelid = to_regclass({literal(real)}) "
-                    f"AND polname = {literal(_NORM)}",
+                    [
+                        f"CREATE TEMP TABLE {quote(table['name'])} (LIKE {real})",
+                        f"CREATE POLICY p ON {shadow}{body}",
+                    ],
+                    f"{query}WHERE polrelid = to_regclass({literal(shadow)})",
                 )
             if row is not None:
                 policy["using"], policy["with_check"] = (

@@ -58,6 +58,14 @@ def format_sql(statements: list[Statement], header: str = "") -> str:
     return header + f"\n{BREAKPOINT}\n".join(chunks) + "\n"
 
 
+def comment(text: str) -> str:
+    """``-- text`` on one line: a name with a newline (or another control character) ended
+    the comment, and the rest of it ran as SQL (K8-5). Such characters are escaped (\\n)."""
+    return "-- " + "".join(
+        c if c.isprintable() else c.encode("unicode_escape").decode() for c in text
+    )
+
+
 def parse_sql(text: str) -> list[Statement]:
     statements: list[Statement] = []
     for chunk in re.split(rf"^{re.escape(BREAKPOINT)}\s*$", text, flags=re.MULTILINE):

@@ -1728,3 +1728,25 @@ async def test_a_custom_migration_keeps_the_previous_snapshot(project: Path) -> 
     assert await cli("generate") == 0
     [generated] = project.glob("migrations/0002_*/migration.sql")
     assert "CREATE TABLE" in generated.read_text()
+
+
+NEWLINE_NAME = """
+from mizzle import Table
+from mizzle.pg import serial
+
+class Items(Table, name="items\\nCREATE TABLE pwned (x int);\\n--"):
+    id = serial().primary_key()
+"""
+
+
+async def test_a_name_with_a_newline_stays_in_its_comment(
+    project: Path, kit_url: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # K8-5: the name ended the "-- create table ..." header and the rest ran as SQL.
+    rewrite_schema(project, NEWLINE_NAME, monkeypatch)
+    assert await cli("generate") == 0
+    [path] = project.glob("migrations/0001_*/migration.sql")
+    assert path.read_text().startswith("-- create table items\\nCREATE TABLE pwned (x int);\\n--\n")
+    assert await cli("migrate") == 0
+    assert await columns(kit_url, "pwned") == []
+    assert await columns(kit_url, "items\nCREATE TABLE pwned (x int);\n--") == ["id"]

@@ -30,6 +30,7 @@ from mizzle.kit.journal import (
     JournalEntry,
     Migration,
     MigrationsDir,
+    comment,
     format_sql,
     parse_sql,
     slugify,
@@ -151,6 +152,13 @@ def _diff_with_renames(
 ) -> list[Step]:
     """``diff`` with the --rename flags; one that matched nothing is an error, not a
     silent drop and create (C20)."""
+    for key, table in new["tables"].items():  # an older mizzle's type spelling (K8-2)
+        if (before := old["tables"].get(key)) is None:
+            continue
+        for name, column in table["columns"].items():
+            was = before["columns"].get(name)
+            if was is not None and dialect.same_type(was["type"], column["type"]):
+                was["type"] = column["type"]
     resolver = _resolver(args, dialect)
     steps = diff(old, new, resolver, compare_expressions=compare_expressions, normalized=normalized)
     if isinstance(resolver, StrictRenames) and (unused := resolver.unused()):
@@ -264,7 +272,7 @@ def cmd_generate(config: Config, args: Args) -> int:
     # prompt asks you to confirm it (C29).
     statements = dialect.render(steps)
     _guard_data_loss(steps, args.allow_data_loss)
-    header = "".join(f"-- {s.describe()}\n" for s in steps)
+    header = "".join(comment(s.describe()) + "\n" for s in steps)
     name = args.name or steps[0].describe()
     migration = directory.write(name, statements, current, header)
     print(f"Created {migration.sql_path} ({len(steps)} changes)")
@@ -352,7 +360,7 @@ def _migrate_dry_run(config: Config, args: Args, directory: MigrationsDir) -> in
         print("Database is up to date.")
         return 0
     for migration, recorded in pending:
-        print(f"-- {migration.name}")
+        print(comment(migration.name))
         if recorded:
             print("-- record baseline: the database has its objects, so nothing runs")
         else:

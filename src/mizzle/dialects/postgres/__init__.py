@@ -73,6 +73,9 @@ class PostgresDialect:
     def normalize_type(self, sql_type: str) -> str:
         return ddl.normalize_type(sql_type)
 
+    def same_type(self, a: str, b: str) -> bool:
+        return ddl.same_type(a, b)
+
     def expression(self, node: Node, casing: Casing | None) -> str:
         return ddl.expression(node, casing)
 

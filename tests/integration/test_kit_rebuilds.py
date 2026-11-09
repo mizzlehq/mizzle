@@ -1,9 +1,14 @@
 """Re-created views, rebuilt columns and unmanaged references keep what they had (K7)."""
 
+import asyncio
 import uuid
 from typing import final, override
 
+import asyncpg
+import pytest
+
 from mizzle import Constraint, QueryBuilder, Table, View, policy, rls, sql
+from mizzle.core.errors import DatabaseError
 from mizzle.core.snapshot import Snapshot, empty_snapshot
 from mizzle.core.sql.nodes import Node
 from mizzle.core.steps import Statement
@@ -61,6 +66,40 @@ async def test_recreated_view_keeps_column_comments_defaults_and_grantors(
         await execute(pg_url, f"DROP ROLE {a}, {b}")
 
 
+async def test_recreating_a_view_refuses_a_grantor_it_cannot_set_role_to(
+    kit_url: str, pg_url: str
+) -> None:
+    # K8-4: the check asked for membership, but PostgreSQL 16+ allows SET ROLE only with
+    # the SET option: it failed with "permission denied to set role" instead.
+    row = await fetch_one(pg_url, "SELECT current_setting('server_version_num')::int AS v")
+    if row["v"] < 160000:
+        pytest.skip("membership without SET is PostgreSQL 16+")
+    a, m = (f"mizzle_k8_{n}_{uuid.uuid4().hex[:6]}" for n in "am")
+    v1 = build_snapshot([Items, items_view("")], dialect)
+    await migrate(kit_url, empty_snapshot("postgresql"), v1)
+    await execute(pg_url, f"CREATE ROLE {a}; CREATE ROLE {m} LOGIN PASSWORD 'pw'")
+    try:
+        await execute(
+            kit_url,
+            f"GRANT CREATE ON SCHEMA public TO {m}; ALTER TABLE items OWNER TO {m}; "
+            f"ALTER VIEW v_items OWNER TO {m}; SET ROLE {m}; "
+            f"GRANT SELECT ON v_items TO {a} WITH GRANT OPTION; RESET ROLE; "
+            f"SET ROLE {a}; GRANT SELECT ON v_items TO PUBLIC; RESET ROLE; "
+            f"GRANT {a} TO {m} WITH INHERIT FALSE, SET FALSE",
+        )
+        base, _, database = kit_url.rpartition("/")
+        host = base.rpartition("@")[2]
+        with pytest.raises(DatabaseError, match="needs a custom migration"):
+            await migrate(
+                f"postgresql://{m}:pw@{host}/{database}",
+                v1,
+                build_snapshot([Items, items_view(" WHERE id > 0")], dialect),
+            )
+    finally:
+        await execute(kit_url, f"DROP OWNED BY {a}, {m}")
+        await execute(pg_url, f"DROP ROLE {a}, {m}")
+
+
 async def test_a_foreign_key_to_an_unmanaged_table_is_not_read(kit_url: str) -> None:
     # K7-2: the FK to an extension's table was read, pull wrote no code for it, and the
     # next generate dropped it.
@@ -82,9 +121,11 @@ async def test_a_foreign_key_to_an_unmanaged_table_is_not_read(kit_url: str) -> 
     assert "foreign key places_e_fkey on places (it references ext_t)" in skipped
 
 
-async def test_a_policy_naming_its_own_table_is_normalized(kit_url: str) -> None:
+@pytest.mark.parametrize("reader", [False, True])
+async def test_a_policy_naming_its_own_table_is_normalized(kit_url: str, reader: bool) -> None:
     # K7-3: `refs.t` failed on the temporary table, so the text stayed as written and
-    # differed from the database's forever.
+    # differed from the database's forever. K8-1: it was then created on the real table,
+    # which queued an ACCESS EXCLUSIVE lock behind an open reader (and blocked every read).
     @final
     class Totals(Table, name="totals"):
         id = serial().primary_key()
@@ -103,11 +144,15 @@ async def test_a_policy_naming_its_own_table_is_normalized(kit_url: str) -> None
 
     v1 = build_snapshot([Totals, Refs], dialect)
     await migrate(kit_url, empty_snapshot("postgresql"), v1)
+    other = await asyncpg.connect(kit_url)
     driver = await PostgresDriver.connect(kit_url, pool_size=1)
     try:
+        if reader:
+            await other.execute("BEGIN; SELECT * FROM refs")
         async with driver.acquire() as conn:
-            normalized = await dialect.normalize_snapshot(conn, v1)
+            normalized = await asyncio.wait_for(dialect.normalize_snapshot(conn, v1), 10)
     finally:
+        await other.close()
         await driver.close()
     current = await live(kit_url)
     assert diff(current, normalized, compare_expressions=False, normalized=True) == []

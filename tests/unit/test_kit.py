@@ -18,7 +18,7 @@ from mizzle.core.steps import (
     Statement,
 )
 from mizzle.dialects.postgres import PostgresDialect
-from mizzle.dialects.postgres.ddl import normalize_default, normalize_type
+from mizzle.dialects.postgres.ddl import escape_backslashes, normalize_default, normalize_type
 from mizzle.kit.codegen import render_schema_module
 from mizzle.kit.config import load_config
 from mizzle.kit.diff import StrictRenames, diff
@@ -49,6 +49,26 @@ dialect = PostgresDialect()
 )
 def test_normalize_default(raw: str | None, expected: str | None) -> None:
     assert normalize_default(raw) == expected
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        (
+            r"""DEFAULT 'x\y' CHECK (("c\" <> '\'::text))""",
+            r"""DEFAULT E'x\\y' CHECK (("c\" <> E'\\'::text))""",
+        ),
+        (r"x = E'a\\b' AND y = 'q' AND z = U&'\0041'", None),  # escapes, or no backslash
+        (r"DO $x$ BEGIN PERFORM 'a\b'; END $x$", None),  # a body runs later
+        (r"-- 'a\b'", None),
+        (r"name'a\b' $1", r"name E'a\\b' $1"),
+    ],
+)
+def test_ddl_strings_read_the_same_with_standard_conforming_strings_off(
+    raw: str, expected: str | None
+) -> None:
+    # K8-3: a pulled default or check printed as 'x\y' lost the backslash there, or failed.
+    assert escape_backslashes(raw) == (raw if expected is None else expected)
 
 
 @pytest.mark.parametrize(

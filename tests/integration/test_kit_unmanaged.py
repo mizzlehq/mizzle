@@ -370,6 +370,79 @@ async def test_an_old_snapshot_with_nested_array_types_is_no_change(
     assert "No schema changes." in capsys.readouterr().out
 
 
+OLD_SPELLINGS = """
+from mizzle import Table
+from mizzle.pg import serial, custom
+
+class Items(Table, name="items"):
+    id = serial().primary_key()
+    a = custom("public.posint")
+    b = custom("pg_catalog.int4")
+    c = custom("public.int4")
+"""
+
+
+async def test_an_old_snapshot_with_unqualified_types_is_no_change(
+    project: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # K8-2: an older mizzle stored "posint" and "integer" for these, so generate reported
+    # type changes (that lose data) on an unchanged schema. public.int4 stays a domain (K7-7).
+    rewrite_schema(project, OLD_SPELLINGS, monkeypatch)
+    assert await cli("generate") == 0
+    path = next(project.glob("migrations/0001_*/snapshot.json"))
+    data = json.loads(path.read_text())
+    columns = data["tables"]["public.items"]["columns"]
+    columns["a"]["type"], columns["b"]["type"] = "posint", "integer"
+    path.write_text(json.dumps(data))
+    capsys.readouterr()
+    assert await cli("generate", "--sql") == 0
+    assert "No schema changes." in capsys.readouterr().out
+    columns["c"]["type"] = "integer"
+    path.write_text(json.dumps(data))
+    assert await cli("generate", "--sql") == 0
+    assert capsys.readouterr().out == (
+        'ALTER TABLE "items" ALTER COLUMN "c" SET DATA TYPE public.int4 USING "c"::public.int4;\n'
+    )
+
+
+BACKSLASHES = r"""
+from mizzle import Constraint, Table, check, sql
+from mizzle.pg import serial, text
+
+class Items(Table, name="items"):
+    id = serial().primary_key()
+    p = text().default("C:\\dir\\x'")
+    q = text().default(sql("'a\\'"))
+    r = text().comment("a\\b")
+
+    @classmethod
+    def config(cls) -> list[Constraint]:
+        return [check("items_q_check", sql("q <> 'z\\'"))]
+"""
+
+
+async def test_backslashes_in_string_literals_with_standard_conforming_strings_off(
+    project: Path,
+    kit_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # K8-3: a default '...' lost its backslashes there, or one before the closing quote
+    # escaped it and the migration failed (and so did a pulled baseline's text).
+    database = kit_url.rpartition("/")[2]
+    await execute(kit_url, f'ALTER DATABASE "{database}" SET standard_conforming_strings = off')
+    rewrite_schema(project, BACKSLASHES, monkeypatch)
+    assert await cli("generate") == 0
+    assert await cli("migrate") == 0
+    row = await fetch_one(
+        kit_url,
+        "INSERT INTO items DEFAULT VALUES "
+        "RETURNING p, q, col_description('items'::regclass, 4) AS r",
+    )
+    assert (row["p"], row["q"], row["r"]) == ("C:\\dir\\x'", "a\\", "a\\b")
+    await no_drift(capsys)
+
+
 ROLES = """
 from mizzle import Table, policy, rls, role, sql
 from mizzle.pg import integer, serial
