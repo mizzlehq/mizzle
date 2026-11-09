@@ -232,10 +232,14 @@ def _diff_enums(old: Snapshot, new: Snapshot, plan: _Plan) -> None:
         old_values, new_values = before["values"], enum["values"]
         if removed := [v for v in old_values if v not in new_values]:
             raise MigrationError(
-                f"enum {enum['name']}: removing values {removed} needs a custom migration"
+                f"enum {enum['name']}: removing values {removed} needs a custom migration "
+                "(mizzle generate --custom --record-schema)"
             )
         if [v for v in new_values if v in old_values] != old_values:
-            raise MigrationError(f"enum {enum['name']}: reordering values needs a custom migration")
+            raise MigrationError(
+                f"enum {enum['name']}: reordering values needs a custom migration "
+                "(mizzle generate --custom --record-schema)"
+            )
         for i, value in enumerate(new_values):
             if value in old_values:
                 continue

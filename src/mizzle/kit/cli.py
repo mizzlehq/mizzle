@@ -60,6 +60,7 @@ class Args(Protocol):
     func: Callable[[Config, Args], int]
     name: str | None
     custom: bool
+    record_schema: bool
     rename: list[str] | None
     no_renames: bool
     allow_data_loss: bool
@@ -238,6 +239,8 @@ def cmd_generate(config: Config, args: Args) -> int:
     )
     if args.template and not args.custom:
         raise MigrationError("--template only applies to --custom migrations")
+    if args.record_schema and not args.custom:
+        raise MigrationError("--record-schema only applies to --custom migrations")
     if args.custom:
         if args.template:
             template = Path(args.template)
@@ -251,8 +254,10 @@ def cmd_generate(config: Config, args: Args) -> int:
             print(header.rstrip())
             return 0
         # The schema as it was: changes to it still go into the next generated migration
-        # (a custom migration may have to run before them: extensions, functions).
-        kept = copy.deepcopy(previous)
+        # (a custom migration may have to run before them: extensions, functions). With
+        # --record-schema the migration's SQL makes the changes itself (an enum value
+        # removed or renamed, H12-1), so the schema as it is now is its snapshot.
+        kept = current if args.record_schema else copy.deepcopy(previous)
         kept["id"], kept["prev_id"] = current["id"], prev_id
         migration = directory.write(args.name or "custom", [], kept, header, custom=True)
         print(f"Created {migration.sql_path}")
@@ -1036,6 +1041,11 @@ def _parser() -> argparse.ArgumentParser:
         "--sql", action="store_true", help="print the SQL instead of writing a migration"
     )
     p.add_argument("--template", help="file whose contents seed a --custom migration")
+    p.add_argument(
+        "--record-schema",
+        action="store_true",
+        help="with --custom: its SQL makes the schema changes, so record them as done",
+    )
     renames(p)
     p.set_defaults(func=cmd_generate)
 

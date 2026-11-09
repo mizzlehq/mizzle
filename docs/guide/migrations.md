@@ -119,6 +119,20 @@ migration if it has not been applied yet. A custom migration keeps the schema sn
 was: schema changes still go into the next generated migration, so a custom migration can
 run before the tables that need what it creates.
 
+Some changes mizzle refuses to write: removing, renaming or reordering an enum's values.
+Change the schema, then write the SQL in a custom migration that records the new schema:
+
+```bash
+mizzle generate --custom --record-schema --name rename_status
+```
+
+```sql
+-- Custom migration. Separate statements with: -- mizzle:breakpoint
+ALTER TYPE status RENAME VALUE 'done' TO 'finished';
+```
+
+After `migrate`, the next `generate` finds no changes.
+
 ## Not managed by mizzle
 
 Functions, triggers, domains, composite types, extensions, exclusion constraints,

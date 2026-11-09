@@ -1750,3 +1750,30 @@ async def test_a_name_with_a_newline_stays_in_its_comment(
     assert await cli("migrate") == 0
     assert await columns(kit_url, "pwned") == []
     assert await columns(kit_url, "items\nCREATE TABLE pwned (x int);\n--") == ["id"]
+
+
+async def test_a_custom_migration_can_record_the_schema_it_changes(
+    project: Path, kit_url: str, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # H12-1: an enum value removed or renamed "needs a custom migration", but after writing
+    # and applying it, generate refused the same way forever: the custom migration kept the
+    # old snapshot. --record-schema records the schema its SQL brings.
+    assert await cli("generate") == 0
+    assert await cli("migrate") == 0
+    conn = await asyncpg.connect(kit_url)
+    await conn.execute("INSERT INTO users (email, role) VALUES ('a@b.c', 'user')")
+    rewrite_schema(project, V1.replace('USER = "user"', 'USER = "member"'), monkeypatch)
+    assert await cli("generate") == 1
+    assert "--custom --record-schema" in capsys.readouterr().err
+    assert await cli("generate", "--record-schema") == 1  # only with --custom
+    assert await cli("generate", "--custom", "--record-schema", "--name", "member") == 0
+    [sql_file] = project.glob("migrations/*_member/migration.sql")
+    with sql_file.open("a") as out:
+        out.write("ALTER TYPE role RENAME VALUE 'user' TO 'member';\n")
+    assert await cli("migrate") == 0
+    assert await conn.fetchval("SELECT role::text FROM users") == "member"
+    await conn.close()
+    capsys.readouterr()
+    assert await cli("generate", "--sql") == 0
+    assert "No schema changes." in capsys.readouterr().out
+    assert await cli("check") == 0

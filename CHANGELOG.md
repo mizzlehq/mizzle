@@ -40,6 +40,9 @@
 - A `Decimal` inside a json/jsonb value is written with its exact digits, and a value
   JSON cannot hold names the reason (`Object of type set is not JSON serializable`).
 - `select_model` accepts multi-dimensional array values.
+- `mizzle generate --custom --record-schema`: a custom migration that makes a schema change
+  itself (an enum value removed or renamed) records the new schema, so the next `generate`
+  does not refuse the same change again.
 - `mizzle generate --custom` keeps the previous schema snapshot, so a custom migration can
   run before the tables that need what it creates; schema changes go into the next
   generated migration.
