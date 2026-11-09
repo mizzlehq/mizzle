@@ -222,12 +222,26 @@ def normalize_type(sql_type: str) -> str:
     return base + args + array
 
 
-# Built-in type names a bare spelling may resolve to (with _TYPE_ALIASES and _KEYWORDS).
+# Every built-in type name a bare spelling may resolve to (with _TYPE_ALIASES and
+# _KEYWORDS): a missing one let public.jsonpath pass for the built-in (K9-4). From
+# PostgreSQL 18 (a superset of 14-17's):
+#   SELECT typname FROM pg_type WHERE typnamespace = 'pg_catalog'::regnamespace
+#   AND typtype IN ('b', 'r', 'm', 'p') AND NOT (typcategory = 'A' AND typname LIKE '\_%')
 _BUILTIN_TYPES = frozenset(
     """
-    text uuid bytea inet cidr macaddr macaddr8 date interval json jsonb xml money name oid
-    tsvector tsquery point line lseg box path polygon circle pg_lsn int4range int8range
-    numrange tsrange tstzrange daterange record regclass regtype
+    _record aclitem any anyarray anycompatible anycompatiblearray anycompatiblemultirange
+    anycompatiblenonarray anycompatiblerange anyelement anyenum anymultirange anynonarray
+    anyrange bit bool box bpchar bytea char cid cidr circle cstring date datemultirange
+    daterange event_trigger fdw_handler float4 float8 gtsvector index_am_handler inet int2
+    int2vector int4 int4multirange int4range int8 int8multirange int8range internal
+    interval json jsonb jsonpath language_handler line lseg macaddr macaddr8 money name
+    numeric nummultirange numrange oid oidvector path pg_brin_bloom_summary
+    pg_brin_minmax_multi_summary pg_ddl_command pg_dependencies pg_lsn pg_mcv_list
+    pg_ndistinct pg_node_tree pg_snapshot point polygon record refcursor regclass
+    regcollation regconfig regdictionary regnamespace regoper regoperator regproc
+    regprocedure regrole regtype table_am_handler text tid time timestamp timestamptz
+    timetz trigger tsm_handler tsmultirange tsquery tsrange tstzmultirange tstzrange
+    tsvector txid_snapshot unknown uuid varbit varchar void xid xid8 xml
     """.split()  # noqa: SIM905
 )
 

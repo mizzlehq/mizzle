@@ -18,7 +18,12 @@ from mizzle.core.steps import (
     Statement,
 )
 from mizzle.dialects.postgres import PostgresDialect
-from mizzle.dialects.postgres.ddl import escape_backslashes, normalize_default, normalize_type
+from mizzle.dialects.postgres.ddl import (
+    escape_backslashes,
+    normalize_default,
+    normalize_type,
+    same_type,
+)
 from mizzle.kit.codegen import render_schema_module
 from mizzle.kit.config import load_config
 from mizzle.kit.diff import StrictRenames, diff
@@ -440,3 +445,18 @@ def test_pulled_role_variables_never_shadow_imported_names() -> None:
     pulled = namespace["Items"]
     assert isinstance(pulled, type) and issubclass(pulled, Table)
     assert build_snapshot([pulled], dialect)["tables"]["public.items"].get("policies")
+
+
+@pytest.mark.parametrize(
+    ("a", "b", "same"),
+    [
+        ("posint", "public.posint", True),  # K8-2: an older snapshot's spelling
+        ("integer", "pg_catalog.int4", True),
+        ("int4", "public.int4", False),  # K7-7: public.int4 can be a domain
+        ("jsonpath", "public.jsonpath", False),  # K9-4: a built-in missing from the list
+        ("int4multirange", "public.int4multirange", False),
+        ("xid8", "public.xid8", False),
+    ],
+)
+def test_same_type(a: str, b: str, same: bool) -> None:
+    assert same_type(a, b) is same
