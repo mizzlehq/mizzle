@@ -193,3 +193,12 @@ async def test_channel_names_and_payload_sizes_are_checked(db: Database) -> None
     with pytest.raises(QueryError, match="under 8000 bytes"):
         await db.notify("big", "x" * 8000)
     await db.notify("c" * 63, "x" * 7999)  # the limits themselves are fine
+
+
+async def test_reading_after_the_block_raises(db: Database) -> None:
+    # H13-4: it waited forever.
+    async with db.listen("after", keepalive=0.1) as events:
+        pass
+    with pytest.raises(QueryError, match="listener is closed"):
+        async with asyncio.timeout(2):
+            await anext(events)

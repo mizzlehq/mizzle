@@ -848,6 +848,7 @@ class _Listener[T]:
         self._conn: asyncpg.Connection | None = None
         self._lost = False
         self._overflow = False
+        self._closed = False
 
     async def start(self) -> None:
         self._conn = await self._listen()
@@ -919,6 +920,8 @@ class _Listener[T]:
 
     async def __anext__(self) -> Notification[T] | Reconnected:
         while True:
+            if self._closed:  # read after the block: it would wait forever (H13-4)
+                raise QueryError("the listener is closed: read its events inside its block")
             if self._queue:
                 channel, payload, pid = self._queue.popleft()
                 return Notification(channel, payload, self._decode(payload), pid)
@@ -964,6 +967,8 @@ class _Listener[T]:
             delay = min(delay * 2, 10.0)
 
     async def close(self) -> None:
+        self._closed = True
+        self._wake.set()
         conn, self._conn = self._conn, None
         if conn is None:
             return
