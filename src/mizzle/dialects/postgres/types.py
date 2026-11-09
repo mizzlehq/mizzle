@@ -442,7 +442,7 @@ def custom(
     decode: Callable[[Never], object] | None = None,
     encode: Callable[[Never], object] | None = None,
 ) -> ColumnBase:
-    """A column of a type mizzle has no column type for, like Drizzle's ``customType``:
+    """A column of a type mizzle has no column type for:
     ``sql_type`` is its DDL type, verbatim (``"citext"``, ``"int4range"``, ``"my_domain"``,
     ``"app.my_type"``). Values are the driver's (asyncpg's) for that type, both ways: a
     ``str`` for citext or tsvector, a ``Range`` for int4range, a ``Record`` for a composite.

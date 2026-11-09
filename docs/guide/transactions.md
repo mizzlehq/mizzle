@@ -72,8 +72,7 @@ async with db.transaction() as tx:
         pass  # only the savepoint rolled back; the entry is still there
 ```
 
-A savepoint belongs to the task that opened it, as nested transactions do in Drizzle. While
-it is open, only that task (and code it awaits directly) may use the transaction: a
+A savepoint belongs to the task that opened it. While it is open, only that task (and code it awaits directly) may use the transaction: a
 statement from another task would be undone with the savepoint, so it raises `QueryError`
 at once, and the savepoint goes on. Tasks started inside a savepoint (`asyncio.gather`,
 `create_task`, a `TaskGroup`) count as other tasks, so `gather` of statements inside a

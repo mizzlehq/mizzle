@@ -231,8 +231,8 @@ class Session(QueryBuilder):
     _tags: Mapping[str, object]
     _conn: Connection | None
     _lock: asyncio.Lock
-    # Open savepoints and their hooks. A savepoint belongs to the task that opened it, as
-    # in Drizzle: while it is open, another task's statement would be undone with it, so
+    # Open savepoints and their hooks. A savepoint belongs to the task that opened it:
+    # while it is open, another task's statement would be undone with it, so
     # it is refused (B39, C11).
     _tx: _Tx
     # False on insert_many's private view: its hidden savepoint holds the statement lock

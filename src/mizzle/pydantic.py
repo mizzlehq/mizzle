@@ -1,4 +1,4 @@
-"""Pydantic models from tables (like drizzle-zod). Needs ``pip install "mizzle[pydantic]"``.
+"""Pydantic models from tables. Needs ``pip install "mizzle[pydantic]"``.
 
     UserOut = select_model(Users)                              # every column, as stored
     SignUp = insert_model(Users, include=["email", "name"])    # what a client may send

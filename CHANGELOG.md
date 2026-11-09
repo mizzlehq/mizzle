@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-- **Breaking: mizzle manages only what Drizzle ORM manages.** Functions, triggers, domains,
+- **Breaking: mizzle manages tables and what hangs on them, nothing more.** Functions, triggers, domains,
   composite types, extensions, exclusion constraints, partitions and grants are gone from
   the schema API (`function`, `trigger`, `domain`, `composite`, `extension`, `exclusion`,
   `partition`, `partition_by=`, `grant`, `pg_domain`, `pg_composite`). `generate`, `push`
@@ -10,7 +10,7 @@
   them in a warning and reads a partitioned table as a plain one. Write them in a custom
   migration (`mizzle generate --custom`); see "Not managed by mizzle" in the migrations
   guide. A vector column no longer creates the `vector` extension either.
-- `custom("type")` in `mizzle.pg`, like Drizzle's `customType`: a column of any other type
+- `custom("type")` in `mizzle.pg`: a column of any other type
   (a domain, a composite, a range, `citext`, `box`, `app.my_type`...), its DDL type
   verbatim. Values are what asyncpg reads and writes for the type (`str` for citext or
   tsvector, `Range`, `Box`, a `Record` for a composite), with no SQL around the column, so
@@ -57,8 +57,7 @@
 - Removed `Database.listen()` and `notify()` (with `Notification`, `Reconnected` and
   `ListenerOverflow`). Use asyncpg's `add_listener` on a connection of your own.
 - Removed `copy_into()` and `copy_from()`. Use `insert_many()` for bulk loads.
-- **Breaking: a savepoint belongs to the task that opened it**, as nested transactions do in
-  Drizzle. Tasks started inside a savepoint can no longer use the transaction while it is
+- **Breaking: a savepoint belongs to the task that opened it**. Tasks started inside a savepoint can no longer use the transaction while it is
   open (`QueryError`), so `asyncio.gather` of statements or savepoint blocks inside a
   savepoint is refused. `gather` of statements (and `insert_many()`) on a transaction with
   no savepoint open still works. Savepoint hooks are kept per savepoint: a refused or
@@ -194,7 +193,7 @@
   `increment=`.
 - Index operator classes per key: `.using("btree", [None, "text_pattern_ops"])`.
 - `mizzle.supabase`: Supabase roles, `auth_uid()`, `auth_jwt()`, `auth_role()`, and
-  `crud_policy(...)` like Drizzle's.
+  `crud_policy(...)` for the usual policies.
 
 **Bulk and streaming**
 

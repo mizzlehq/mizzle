@@ -275,8 +275,7 @@ changes it, and `schema=` puts the type in another schema. Rows hold enum member
 ## Columns of other types
 
 `custom("type")` (from `mizzle.pg`) is a column of any type mizzle has no column type for:
-a domain, a composite type, a range, a type from an extension. It works like Drizzle's
-`customType`. The string is the type as PostgreSQL prints it (`format_type()`), used as is
+a domain, a composite type, a range, a type from an extension. The string is the type as PostgreSQL prints it (`format_type()`), used as is
 in DDL. mizzle adds no SQL around the column: values are what the driver (asyncpg) reads
 and writes for that type, and the column compares, sorts and deduplicates as the type.
 

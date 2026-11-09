@@ -41,7 +41,7 @@ class Notes(Table, name="notes"):
 pip install "mizzle[pydantic]"
 ```
 
-`mizzle.pydantic` builds Pydantic models from a table, like drizzle-zod:
+`mizzle.pydantic` builds Pydantic models from a table:
 
 ```python
 class NoteIn(insert_model(Notes, include=["body", "public"])):
@@ -113,8 +113,7 @@ models in a FastAPI app.
 - `auth_uid()`, `auth_jwt()`, `auth_role()`: `(select auth.uid())` and friends, for
   policy conditions. The subquery makes PostgreSQL evaluate them once per statement
   instead of once per row, as Supabase recommends.
-- `crud_policy(name, to=[...], read=..., modify=...)`: the usual policies, like Drizzle's
-  `crudPolicy`. `read` controls SELECT; `modify` controls INSERT, UPDATE and DELETE.
+- `crud_policy(name, to=[...], read=..., modify=...)`: the usual policies. `read` controls SELECT; `modify` controls INSERT, UPDATE and DELETE.
   `True` allows every row, `False` none, a condition the matching rows, and `None` adds no
   policy. They are named `{name}_select`, `{name}_insert`, `{name}_update` and
   `{name}_delete`.
