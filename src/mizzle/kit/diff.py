@@ -119,7 +119,10 @@ class StrictRenames:
         for old in removed:
             new = self._lookup(scope, old)
             if kind == "table" and scope != "*" and new is not None and "." in new:
-                continue  # "schema.table": a move, asked for with scope "*"
+                into, _, bare = new.rpartition(".")
+                if into != scope:
+                    continue  # "schema.table": a move, asked for with scope "*"
+                new = bare  # app.posts=app.articles: a rename in its schema (H11-2)
             if new is not None:
                 if new not in added:
                     raise MigrationError(
@@ -131,10 +134,13 @@ class StrictRenames:
         if left_removed and left_added and self.ask is not None:
             return result | self.ask(kind, scope, left_removed, left_added)
         if left_removed and left_added:
+            # The key _lookup takes: schema-qualified unless in the default schema (H11-2);
+            # a move ("*") names "schema.table" already.
+            key = left_removed[0] if scope == "*" else f"{scope}.{left_removed[0]}"
+            key = key.removeprefix(f"{self.default_schema}.")
             raise MigrationError(
                 f"{kind}s {left_removed} were removed and {left_added} added in {scope}: "
-                f"pass --rename {scope.split('.')[-1] + '.' if kind == 'column' else ''}"
-                f"{left_removed[0]}={left_added[0]} if it is a rename, or --no-renames"
+                f"pass --rename {key}={left_added[0]} if it is a rename, or --no-renames"
             )
         return result
 

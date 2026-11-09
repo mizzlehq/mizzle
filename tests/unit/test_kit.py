@@ -460,3 +460,18 @@ def test_pulled_role_variables_never_shadow_imported_names() -> None:
 )
 def test_same_type(a: str, b: str, same: bool) -> None:
     assert same_type(a, b) is same
+
+
+def test_rename_hints_and_flags_in_another_schema() -> None:
+    # H11-2: the hint said --rename posts=articles for app.posts, which matched nothing;
+    # app.posts=app.articles was taken for a move and refused.
+    renames = StrictRenames()
+    with pytest.raises(MigrationError, match=r"--rename app\.posts=articles "):
+        renames("table", "app", ["posts"], ["articles"])
+    with pytest.raises(MigrationError, match=r"--rename app\.posts\.name=title "):
+        renames("column", "app.posts", ["name"], ["title"])
+    with pytest.raises(MigrationError, match=r"--rename users\.name=title "):
+        renames("column", "public.users", ["name"], ["title"])
+    same = StrictRenames({"app.posts": "app.articles"})
+    assert same("table", "app", ["posts"], ["articles"]) == {"posts": "articles"}
+    assert same.unused() == []
