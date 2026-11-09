@@ -609,8 +609,9 @@ def _set_expression(step: AlterColumnGenerated, new: GeneratedSnap) -> str:
     table = qualified(step.schema, step.table)
     if step.definition is None:
         raise MigrationError(f"{step.table}.{step.column}: the column's definition is missing")
-    add = f"ALTER TABLE {table} ADD COLUMN {column_definition(step.definition)}"
-    set_expression = (
+    # EXECUTE reads them with the session's standard_conforming_strings too (K9-3).
+    add = escape_backslashes(f"ALTER TABLE {table} ADD COLUMN {column_definition(step.definition)}")
+    set_expression = escape_backslashes(
         f"ALTER TABLE {table} ALTER COLUMN {quote(step.column)} "
         f"SET EXPRESSION AS ({new['expression']})"
     )

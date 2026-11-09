@@ -446,6 +446,39 @@ async def test_backslashes_in_string_literals_with_standard_conforming_strings_o
     await no_drift(capsys)
 
 
+GENERATED_V1 = r"""
+from mizzle import Table, sql
+from mizzle.pg import serial, text
+
+class Items(Table, name="items"):
+    id = serial().primary_key()
+    a = text()
+    g = text().generated_always_as(sql("lower(a)"))
+"""
+
+
+async def test_executed_strings_with_standard_conforming_strings_off(
+    project: Path,
+    kit_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # K9-3: a changed generated column's expression is EXECUTEd in a DO block, where
+    # '\d+' lost its backslash.
+    database = kit_url.rpartition("/")[2]
+    await execute(kit_url, f'ALTER DATABASE "{database}" SET standard_conforming_strings = off')
+    rewrite_schema(project, GENERATED_V1, monkeypatch)
+    assert await cli("generate") == 0
+    assert await cli("migrate") == 0
+    v2 = GENERATED_V1.replace('sql("lower(a)")', r"""sql("regexp_replace(a, '\d+', 'Y')")""")
+    rewrite_schema(project, v2, monkeypatch)
+    assert await cli("generate") == 0
+    assert await cli("migrate") == 0
+    row = await fetch_one(kit_url, "INSERT INTO items (a) VALUES ('a12') RETURNING a, g")
+    assert row["g"] == "aY"
+    await no_drift(capsys)
+
+
 ROLES = """
 from mizzle import Table, policy, rls, role, sql
 from mizzle.pg import integer, serial
