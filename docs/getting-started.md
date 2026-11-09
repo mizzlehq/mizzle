@@ -6,6 +6,7 @@
 pip install mizzle               # or: uv add mizzle
 pip install "mizzle[pydantic]"   # Pydantic models from your tables
 pip install "mizzle[studio]"     # mizzle studio, the data browser
+pip install "mizzle[speed]"      # faster json/jsonb reads (orjson)
 ```
 
 mizzle needs Python 3.12+ and PostgreSQL 14+.

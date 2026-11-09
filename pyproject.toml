@@ -33,6 +33,9 @@ studio = [
 pydantic = [
     "pydantic>=2.7",
 ]
+speed = [
+    "orjson>=3.10",
+]
 
 [project.scripts]
 mizzle = "mizzle.kit.cli:main"
@@ -57,7 +60,7 @@ exclude = ["studio-ui", ".github", "docs", "benchmarks", "examples", "docker-com
 
 [dependency-groups]
 dev = [
-    "mizzle[studio,pydantic]",  # dev and CI always have the optional extras
+    "mizzle[studio,pydantic,speed]",  # dev and CI always have the optional extras
     "fastapi>=0.115",  # lets editors and CI type-check examples/social from the repo root
     "pytest>=8.3",
     "pytest-asyncio>=0.25",

@@ -470,12 +470,40 @@ def _json_exact(value: object) -> str:
             return json.dumps(value)
 
 
+def _orjson_loads() -> Callable[[bytes], object] | None:
+    """orjson's parser, when installed (pip install "mizzle[speed]")."""
+    try:
+        import orjson
+    except ImportError:  # pragma: no cover - orjson is in the dev group
+        return None
+    return cast(Callable[[bytes], object], orjson.loads)
+
+
+_FAST_LOADS = _orjson_loads()
+# orjson reads an integer outside 64 bits as a float, without an error. Only a run of 19
+# digits can hold one, so such text (rare: a long number, or digits inside a string) goes
+# to json, which keeps it exact. Mapping digits to "0" first keeps the check in C.
+_DIGITS = bytes(48 if 48 <= i <= 57 else 32 for i in range(256))
+_LONG_RUN = b"0" * 19
+
+
+def _json_loads(data: bytes) -> object:
+    """A json/jsonb value: with orjson when installed (and it reads the text exactly),
+    else json. Both give the same Python values."""
+    if _FAST_LOADS is not None and _LONG_RUN not in data.translate(_DIGITS):
+        try:
+            return _FAST_LOADS(data)
+        except ValueError:  # a lone surrogate, 1e400: json reads those
+            pass
+    return cast(object, json.loads(data))
+
+
 def _jsonb_encode(value: object) -> bytes:
     return b"\x01" + _json_text(value).encode()  # binary jsonb: a version byte, then text
 
 
 def _jsonb_decode(data: bytes) -> object:
-    return json.loads(data[1:])  # pyright: ignore[reportAny]
+    return _json_loads(data[1:])
 
 
 def _json_encode(value: object) -> bytes:
@@ -484,7 +512,7 @@ def _json_encode(value: object) -> bytes:
 
 async def _init_connection(conn: asyncpg.Connection) -> None:
     await conn.set_type_codec(
-        "json", encoder=_json_encode, decoder=json.loads, schema="pg_catalog", format="binary"
+        "json", encoder=_json_encode, decoder=_json_loads, schema="pg_catalog", format="binary"
     )
     await conn.set_type_codec(
         "jsonb", encoder=_jsonb_encode, decoder=_jsonb_decode, schema="pg_catalog", format="binary"

@@ -393,4 +393,11 @@ db = await Database.connect(url, replicas=[replica_url], pool_size=20, query_tim
 await db.primary.select().from_(Users)  # read your own write
 ```
 
+**Faster JSON reads.** With orjson installed, json and jsonb values are parsed 1.5 to 3
+times faster, with the same values.
+
+```bash
+pip install "mizzle[speed]"
+```
+
 For what mizzle does not do, see [Known gaps](gaps.md).
