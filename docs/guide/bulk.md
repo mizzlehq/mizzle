@@ -77,6 +77,11 @@ await db.copy_to(sql("SELECT id, body FROM posts"), write, format="text")
 It returns the row count. Plain selects read from a replica, like other reads. An error of
 the output (a full disk) is raised as it is.
 
+COPY takes no bind parameters, so mizzle writes the query's values into its text. They
+show in `pg_stat_activity` and in server logs: keep secrets out of `copy_to()` filters.
+With values, the SQL may not hold comments, dollar quotes, backslashes or unclosed quotes
+(a raw `sql()` that does raises `QueryError`).
+
 ## stream()
 
 Awaiting a query loads every row into memory at once. `stream()` reads from a server-side

@@ -243,15 +243,12 @@ def _exact_float_literal(value: object, type_name: str) -> str | None:
     return None
 
 
+# How copy_to() finds the "$n" to write values into: only in SQL whose quoting this reads
+# exactly as PostgreSQL does. Without backslashes, '...' (also E'', U&''), "..." end only at
+# a single quote; comments, dollar quotes and unclosed quotes are refused, since a scanner
+# that read them differently would put a value where the server sees SQL.
 _PARAM_OR_QUOTED = re.compile(
-    r"\$(\d+)\b"
-    r"|[eE]'(?:[^'\\]|\\.|'')*'"
-    r"|'(?:[^']|'')*'"
-    r'|"(?:[^"]|"")*"'
-    r"|--[^\n]*"
-    r"|/\*.*?\*/"
-    r"|\$([A-Za-z_][A-Za-z0-9_]*)?\$.*?\$\2\$",
-    re.DOTALL,
+    r"""\$(\d+)\b|'(?:[^']|'')*'|"(?:[^"]|"")*"|(?P<refused>--|/\*|\$|'|")"""
 )
 
 
@@ -415,6 +412,11 @@ class PostgresConnection:
         """``sql`` with each ``$n`` replaced by its value as a quoted literal. Like asyncpg's
         own inlining (the server quotes each value), except floats: the server prints those
         per ``extra_float_digits`` (0 rounds to 15 digits), so they are written here exactly."""
+        if "\\" in sql or any(m["refused"] for m in _PARAM_OR_QUOTED.finditer(sql)):
+            raise QueryError(
+                "copy_to() with values takes SQL without comments, dollar quotes, "
+                "backslashes or unclosed quotes; pass the values in the query text instead"
+            )
         statement = await self._conn.prepare(sql)
         literals: list[str | None] = []
         casts: list[str] = []
@@ -434,7 +436,7 @@ class PostgresConnection:
         row = await self._conn.fetchrow(f"SELECT {', '.join(casts)}", *values) if casts else None
         quoted = iter(row or ())
         texts = [text if text is not None else cast(str, next(quoted)) for text in literals]
-        # Quoted text, identifiers, comments and dollar-quoted bodies keep their "$n" as is.
+        # Quoted text and identifiers keep their "$n" as is.
         return _PARAM_OR_QUOTED.sub(
             lambda m: texts[int(m.group(1)) - 1] if m.group(1) else m.group(0), sql
         )
@@ -507,6 +509,8 @@ class PostgresConnection:
             status = await self._conn.copy_from_query(
                 query, output=write, format=format, header=header or None, timeout=timeout
             )
+        except MizzleError:
+            raise  # SQL copy_to() will not write values into
         except Exception as exc:
             if output_errors:
                 raise output_errors[0] from None

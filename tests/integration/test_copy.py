@@ -227,9 +227,25 @@ async def test_copy_to_float_values_are_exact(pg_url: str) -> None:
 
 
 async def test_copy_to_inlines_only_real_placeholders(db: Database) -> None:
-    # "$1" inside quoted text, identifiers, comments and dollar quotes is not a parameter;
-    # asyncpg's own inlining replaced it there too, breaking the quoting.
-    query = sql("select {} as a, '$1' as b, E'it\\'s $1' as c, $q$ $1 $q$ as \"$1\" -- $1\n", "x")
+    # "$1" inside quoted text and identifiers is not a parameter.
+    query = sql("""select {} as a, '$1' as b, 'it''s $1' as c, 2 as "$1" """, "x")
     buffer = io.BytesIO()
     assert await db.copy_to(query, buffer) == 1
-    assert buffer.getvalue() == b"x,$1,it's $1, $1 \n"
+    assert buffer.getvalue() == b"x,$1,it's $1,2\n"
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "select {} /* /* nested */ $1 */",  # read as two comments by a simple scanner
+        "select {} -- $1",
+        "select {}, $q$ $1 $q$",
+        "select {}, E'\\' $1'",  # a backslash: read differently with standard_conforming_strings
+        "select {}, 'unclosed $1",
+    ],
+)
+async def test_copy_to_refuses_sql_it_could_misread(db: Database, text: str) -> None:
+    # Values are written into the SQL: only where PostgreSQL surely sees "$n" as a
+    # parameter. Elsewhere a value could end a comment or a string and run as SQL.
+    with pytest.raises(QueryError, match="without comments"):
+        await db.copy_to(sql(text, "x */ select 1 --"), io.BytesIO())

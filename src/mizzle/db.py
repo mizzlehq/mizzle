@@ -478,7 +478,8 @@ class Session(QueryBuilder):
         """Export the rows of ``query`` (a select, a relational query or ``sql(...)``) with
         ``COPY (query) TO STDOUT`` into ``output``: a file path, a binary file, or
         ``async def write(chunk: bytes)``. Returns the row count. Plain selects read from a
-        replica, like other reads."""
+        replica, like other reads. COPY takes no bind parameters, so the query's values are
+        written into its text: they show in ``pg_stat_activity`` and server logs."""
         compiled = self.compile(query)
         if compiled.has_placeholders:
             raise QueryError("copy_to() does not take placeholders")
