@@ -31,7 +31,6 @@ from mizzle.core.sql.nodes import (
     Cube,
     Excluded,
     Exists,
-    ExprBase,
     Fragment,
     Frame,
     Func,
@@ -178,9 +177,6 @@ class Compiler:
     _dynamic: bool
     _opaque: bool
     _writes: bool
-    # Whether the statement being compiled returns its rows to Python, so output() converts
-    # them (read_as); off inside a subquery that feeds a write or an expression.
-    _read: bool
     # (id(Param), SQL type it is compared with) -> its marker: a reused node reuses its
     # parameter, unless raw SQL holding it sits next to values of different types.
     # Marker per (node id, context). The node is kept in the value: a temporary Param (an
@@ -217,7 +213,6 @@ class Compiler:
         self._alias_count = 0
         # id(column) -> its output name, while a UNION's ORDER BY renders (C42).
         self._output_names: dict[int, str] = {}
-        self._read = True
 
     def compile(self, node: Node) -> CompiledQuery:
         self._params, self._placeholders, self._raw, self._locking = [], [], False, False
@@ -226,7 +221,6 @@ class Compiler:
         self._writes = False
         self._bound = {}
         self._context = None
-        self._read = True
         text = no_nul(self.visit(node))  # also raw sql() and collate() text (Q4-8)
         return CompiledQuery(
             text,
@@ -357,25 +351,7 @@ class Compiler:
             # Encoded by the column it fills, as in where(): an IntEnum or vector value
             # was sent raw (C33).
             value = replace(value, column=column)
-        if isinstance(value, Node):
-            return self.visit(value)
-        return self.typed_param(column, self.bind(column.encode(value)))
-
-    def typed_param(self, _column: ColumnBase | None, marker: str, /) -> str:
-        """The parameter ``marker`` of a value for ``column``; a dialect may cast it."""
-        return marker
-
-    def output(self, node: Node) -> str:
-        """An expression a query returns: converted by ``read_as`` when the rows reach
-        Python, as is when they feed an outer statement (INSERT ... SELECT, a subquery)."""
-        read, self._read = self._read, False
-        text = self.visit(node)
-        self._read = read
-        return self.read_as(node, text) if read else text
-
-    def read_as(self, _node: Node, text: str, /) -> str:
-        """``text``, an expression whose value is returned to Python; a dialect may cast it."""
-        return text
+        return self.visit(value) if isinstance(value, Node) else self.bind(column.encode(value))
 
     # -- expressions ------------------------------------------------------------------
 
@@ -401,11 +377,11 @@ class Compiler:
                 # In the column's type: ARRAY['a'] was text[] next to varchar[] (Q4-1).
                 bound = self._bound[key] = (node, self.column_literal(node.column, value))
             else:
-                bound = self._bound[key] = (node, self.typed_param(node.column, self.bind(value)))
+                bound = self._bound[key] = (node, self.bind(value))
         return bound[1]
 
     def visit_Placeholder(self, node: Placeholder) -> str:
-        return self.typed_param(node.column, self.bind(None, node))
+        return self.bind(None, node)
 
     def visit_BinaryOp(self, node: BinaryOp) -> str:
         left, right = node.left, node.right
@@ -607,19 +583,16 @@ class Compiler:
             if issubclass(source, TableAlias):
                 return f"{self.table_name(source.__alias_of__)} AS {self.table_name(source)}"
             return self.table_name(source)
-        if source.inline:  # the outer select list converts what it reads (Q6-8)
-            read, self._read = self._read, False
-            text = f"({self.visit(source.query)}) AS {self.quote(source.alias or source.name)}"
-            self._read = read
-            return text
+        if source.inline:
+            return f"({self.visit(source.query)}) AS {self.quote(source.alias or source.name)}"
         if source.alias is not None:
             return f"{self.quote(source.name)} AS {self.quote(source.alias)}"
         return self.quote(source.name)
 
     def select_slot(self, slot: Slot) -> str:
         if isinstance(slot, type):
-            return ", ".join(self.output(c) for c in slot.__table__.columns.values())
-        return self.output(slot)
+            return ", ".join(self.visit(c) for c in slot.__table__.columns.values())
+        return self.visit(slot)
 
     def count_value(self, value: int | Placeholder) -> str:
         return self.visit(value) if isinstance(value, Placeholder) else self.bind(value)
@@ -673,69 +646,15 @@ class Compiler:
         # A nested SELECT (e.g. EXISTS in a UNION's ORDER BY) names its own tables again.
         qualify, self.qualify_columns = self.qualify_columns, self._qualify_default
         saved, self._output_names = self._output_names, {}
-        read = self._read
         try:
-            if read and node.distinct_ and any(self._converted(e) for e in node.order_by_):
-                return self._sorted_distinct(node)
             return self._select_body(node)
         finally:
             self.qualify_columns = qualify
             self._output_names = saved
-            self._read = read
-
-    def _converted(self, node: Node) -> bool:
-        """Whether ``read_as`` converts ``node`` where rows reach Python."""
-        expr = node.expr if isinstance(node, OrderBy) else node
-        return self.read_as(expr, "") != ""
-
-    def _sorted_distinct(self, node: SelectBase) -> str:
-        """SELECT DISTINCT orders only by its outputs, so ordering by one read_as converts
-        would sort by the converted value: select and order the real values in a subquery
-        and convert them around it (Q6-7)."""
-        named: list[tuple[str | None, ExprBase]]
-        if isinstance(node.projection, dict):
-            named = list(node.projection.items())
-        else:
-            named = [
-                (None, e)
-                for slot in node.slots()
-                for e in (slot.__table__.columns.values() if isinstance(slot, type) else (slot,))
-            ]
-        self._read = False
-        hidden = {f"_{i}": e for i, (_, e) in enumerate(named)}
-        inner = self._select_body(replace(node, projection=hidden))
-        self._read = True
-        items = [
-            self.read_as(e, f"{self.quote('_d')}.{self.quote(f'_{i}')}")
-            + ("" if key is None else f" AS {self.quote(key)}")
-            for i, (key, e) in enumerate(named)
-        ]
-        # A FROM subquery's order is not kept by the query around it: order again by the
-        # real values, which DISTINCT already put in the select list.
-        order: list[str] = []
-        for item in node.order_by_:
-            expr = item.expr if isinstance(item, OrderBy) else item
-            i = next((i for i, (_, e) in enumerate(named) if e is expr), None)
-            if i is None:
-                continue
-            text = f"{self.quote('_d')}.{self.quote(f'_{i}')}"
-            if isinstance(item, OrderBy):
-                text += " DESC" if item.descending else " ASC"
-                text += f" NULLS {item.nulls.upper()}" if item.nulls else ""
-            order.append(text)
-        tail = f" ORDER BY {', '.join(order)}" if order else ""
-        return f"SELECT {', '.join(items)} FROM ({inner}) AS {self.quote('_d')}{tail}"
 
     def _note_write(self) -> None:
-        """Mark the statement as a write; a subclass visitor (MERGE) calls this. What it
-        reads from (INSERT ... SELECT, MERGE USING) keeps its types (Q6-4); its RETURNING
-        is read as the statement holding it was (visit_Returning)."""
+        """Mark the statement as a write; a subclass visitor (MERGE) calls this."""
         self._writes = True
-        self._unread()
-
-    def _unread(self) -> None:
-        """What follows is not read by Python: subqueries in it keep their types."""
-        self._read = False
 
     def _with_ctes(self, ctes: Sequence[Cte]) -> str:
         """The ``WITH`` prefix for a select or a write that carries CTEs (a data-modifying
@@ -743,13 +662,8 @@ class Compiler:
         if not ctes:
             return ""
         keyword = "WITH RECURSIVE" if any(c.recursive for c in ctes) else "WITH"
-        read = self._read  # the outer select list converts what it reads from them (Q6-8)
-        rendered: list[str] = []
-        for c in ctes:
-            self._read = False
-            rendered.append(f"{self.quote(c.name)} AS ({self.visit(c.query)})")
-        self._read = read
-        return f"{keyword} {', '.join(rendered)} "
+        rendered = ", ".join(f"{self.quote(c.name)} AS ({self.visit(c.query)})" for c in ctes)
+        return f"{keyword} {rendered} "
 
     def _select_body(self, node: SelectBase) -> str:
         if node.lock is not None:
@@ -760,18 +674,15 @@ class Compiler:
             parts.append(self._with_ctes(node.ctes).rstrip())
         if node.distinct_ and node.distinct_on_:
             raise QueryError("distinct() and distinct_on() cannot be combined")
-        read = self._read  # the select list reaches the reader
         if node.distinct_on_:
-            self._read = False
             columns = ", ".join(self.visit(e) for e in node.distinct_on_)
-            self._read = read
             parts.append(f"SELECT DISTINCT ON ({columns})")
         elif node.distinct_:
             parts.append("SELECT DISTINCT")
         else:
             parts.append("SELECT")
         if isinstance(node.projection, dict):
-            items = [f"{self.output(e)} AS {self.quote(k)}" for k, e in node.projection.items()]
+            items = [f"{self.visit(e)} AS {self.quote(k)}" for k, e in node.projection.items()]
         else:
             items = [self.select_slot(slot) for slot in node.slots()]
         parts.append(", ".join(items))
@@ -784,14 +695,11 @@ class Compiler:
             from_ += " " + clause
         parts.append(from_)
         for join in node.joins:
-            self._read = False
             on = "" if join.on is None else f" ON {self.visit(join.on)}"
-            self._read = read
             lateral = " LATERAL" if join.lateral else ""
             if join.on is None and join.kind != "CROSS":  # LATERAL without a condition
                 on = " ON true"
             parts.append(f"{join.kind} JOIN{lateral} {self.source(join.source)}{on}")
-        self._unread()  # the rest are expressions
         if node.where_ is not None:
             parts.append(f"WHERE {self.visit(node.where_)}")
         if node.group_by_:
@@ -846,7 +754,7 @@ class Compiler:
         return ", ".join(items)
 
     def visit_Insert(self, node: Insert[Table]) -> str:
-        self._note_write()
+        self._writes = True
         prefix = self._with_ctes(node.ctes)
         if node.source is not None:
             return prefix + self._insert_select_text(node, node.source)
@@ -943,7 +851,7 @@ class Compiler:
             value = column.encoder(value)
         self._params.append(value)
         self._placeholders.append(None)
-        return self.typed_param(column, self.param_marker(len(self._params)))
+        return self.param_marker(len(self._params))
 
     def _require_filter(self, node: Update[Table] | Delete[Table], verb: str) -> None:
         if node.where_ is None and not node.all_rows_:
@@ -953,7 +861,7 @@ class Compiler:
             )
 
     def visit_Update(self, node: Update[Table]) -> str:
-        self._note_write()
+        self._writes = True
         if not node.values_:
             raise QueryError(f"update({node.table.__name__}) needs .set(...)")
         self._require_filter(node, "update")
@@ -966,7 +874,7 @@ class Compiler:
         return prefix + text
 
     def visit_Delete(self, node: Delete[Table]) -> str:
-        self._note_write()
+        self._writes = True
         self._require_filter(node, "delete")
         prefix = self._with_ctes(node.ctes)
         text = f"DELETE FROM {self.source(node.table)}"
@@ -977,7 +885,4 @@ class Compiler:
         return prefix + text
 
     def visit_Returning(self, node: Returning[object]) -> str:
-        read = self._read
-        text = self.visit(node.query)
-        self._read = read
-        return f"{text} {self.returning_clause(node)}"
+        return f"{self.visit(node.query)} {self.returning_clause(node)}"

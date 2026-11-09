@@ -13,6 +13,7 @@ from mizzle.core.query.builder import QueryBuilder
 from mizzle.core.schema.column import Column
 from mizzle.core.sql.nodes import Aggregate, Expr, Json
 from mizzle.core.sql.operators import count, eq, json_agg, lt, nullable
+from mizzle.dialects.postgres.types import CustomColumn
 from tests.models import Posts, Role, Users
 
 
@@ -324,3 +325,20 @@ def string_agg_takes_text() -> None:
     # C46: string_agg(integer, text) does not exist in PostgreSQL.
     string_agg(Users.id, ",")  # type: ignore[arg-type]  # pyright: ignore[reportArgumentType]
     string_agg(Users.bio, ",")
+
+
+def custom_columns_take_their_python_type() -> None:
+    from decimal import Decimal
+
+    from mizzle.pg import custom
+
+    def money(value: Decimal) -> int:
+        return int(value * 100)
+
+    def cents(value: int) -> Decimal:
+        return Decimal(value) / 100
+
+    assert_type(custom("citext"), CustomColumn[object])
+    assert_type(custom("citext", py_type=str), CustomColumn[str | None])
+    assert_type(custom("cash", decode=money, encode=cents), CustomColumn[int | None])
+    assert_type(custom("cash", py_type=int, decode=money).not_null(), Column[int])

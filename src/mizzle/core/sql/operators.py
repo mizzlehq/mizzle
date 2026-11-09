@@ -21,7 +21,6 @@ from mizzle.core.sql.nodes import (
     BoolOp,
     Cast,
     Condition,
-    CteColumn,
     Excluded,
     Exists,
     Expr,
@@ -48,8 +47,7 @@ type Operand[T] = T | Expr[T] | Raw
 
 def _wrap(value: object, like: ExprBase) -> Node:
     """Turn a Python value into a Param; the column on the other side encodes it."""
-    # A CTE or subquery column has the type of the column it selects (Q6-8).
-    column = column_of(like) if isinstance(like, ColumnBase | CteColumn) else None
+    column = like if isinstance(like, ColumnBase) else None
     if isinstance(value, Placeholder) and column is not None and value.column is None:
         return replace(value, column=column)
     if isinstance(value, Node):

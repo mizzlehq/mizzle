@@ -275,9 +275,10 @@ changes it, and `schema=` puts the type in another schema. Rows hold enum member
 ## Columns of other types
 
 `custom("type")` (from `mizzle.pg`) is a column of any type mizzle has no column type for:
-a domain, a composite type, a range, a type from an extension. The string is the type as
-PostgreSQL prints it (`format_type()`), used as is in DDL. Values are `str` in the type's
-text form: mizzle sends them as text and reads them back as the server prints them.
+a domain, a composite type, a range, a type from an extension. It works like Drizzle's
+`customType`. The string is the type as PostgreSQL prints it (`format_type()`), used as is
+in DDL. mizzle adds no SQL around the column: values are what the driver (asyncpg) reads
+and writes for that type, and the column compares, sorts and deduplicates as the type.
 
 ```python
 from typing import final
@@ -289,20 +290,69 @@ from mizzle.pg import custom, serial
 @final
 class Places(Table, name="places"):
     id = serial().primary_key()
-    email = custom("email")  # a domain made in a custom migration
-    area = custom("box")
-    nights = custom("daterange")
     name = custom("citext")  # needs the citext extension
+    search = custom("tsvector", py_type=str)  # str to type checkers, as matches() takes
+    nights = custom("int4range")
+    price = custom("money_amount")  # a domain over numeric, made in a custom migration
+    pair = custom("price_pair")  # a composite type
 ```
 
-`await db.insert(Places).values(area="(2,2),(0,0)")`; reading it back gives
-`"(2,2),(0,0)"`; an `array(custom("box"))` reads as a `list[str]`. mizzle casts to
-`text` only where rows reach Python (the outermost select list or `returning()`): a CTE,
-a subquery, a select feeding `insert().from_select()` or `merge().using()`, or a subquery
-in a condition keeps the type, so it compares and sorts as the type. The domain, composite type or extension itself is not managed by mizzle:
-create it in a custom migration (see
-[Not managed by mizzle](migrations.md#not-managed-by-mizzle)). `pull` writes every column of
-such a type as `custom(...)`.
+| Type | Reads as | Write |
+|---|---|---|
+| `citext`, `tsvector`, an enum, a domain over `text` | `str` | a `str` |
+| a domain over `numeric` | `Decimal` (the base type's value) | a `Decimal` or `int` |
+| `int4range`, `daterange`, ... | `asyncpg.Range` | a `Range` |
+| `box` | `asyncpg.Box` | a `Box` or `((x1, y1), (x2, y2))` |
+| a composite | `asyncpg.Record` | a tuple of its fields |
+
+```python
+from asyncpg import Range
+
+await db.insert(Places).values(name="Dhaka", search="old town", nights=Range(1, 5))
+[place] = await db.select().from_(Places).where(eq(Places.name, "DHAKA"))  # citext
+place.nights  # <Range [1, 5)>
+```
+
+The value type is `object` unless you say otherwise. `py_type=` names it (for type
+checkers, `select_model` and the write check), `decode=` turns a value read into it and
+`encode=` turns one written into what the driver takes:
+
+```python
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True)
+class Nights:
+    first: int
+    last: int
+
+
+def nights_of(span: Range[int]) -> Nights:
+    return Nights(span.lower or 0, (span.upper or 1) - 1)
+
+
+def span_of(nights: Nights) -> Range[int]:
+    return Range(nights.first, nights.last, upper_inc=True)
+
+
+@final
+class Stays(Table, name="stays"):
+    id = serial().primary_key()
+    nights = custom("int4range", py_type=Nights, decode=nights_of, encode=span_of)
+```
+
+`Stays.nights` is a `Column[Nights | None]`; filters encode their values too
+(`eq(Stays.nights, Nights(1, 4))`).
+
+A relational query (`with_=`) nests related rows as JSON, so a custom column there holds
+its JSON form (`to_json` of the value): `"[1,5)"` for a range, `{"amount": 1.5, "day":
+"2020-01-02"}` for a composite, a number for a numeric domain. `decode` is applied to that
+form too, so a column with `decode` and nested reads needs a `decode` that takes both, or
+read the column with a plain select.
+
+The domain, composite type or extension itself is not managed by mizzle: create it in a
+custom migration (see [Not managed by mizzle](migrations.md#not-managed-by-mizzle)).
+`pull` writes every column of such a type as `custom(...)`.
 
 ## Identity and generated columns
 

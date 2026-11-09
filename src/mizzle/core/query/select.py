@@ -185,6 +185,8 @@ def _fits(value: type[object], hint: type[object]) -> bool | None:
     checked (a TypedDict or a Protocol refuses ``issubclass``, B45)."""
     if hint is float and value is int:  # PEP 484: int is acceptable where float is
         return True
+    if value is object:  # custom(): any value
+        return None
     try:
         return issubclass(value, hint)
     except TypeError:

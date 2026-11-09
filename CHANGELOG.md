@@ -10,16 +10,18 @@
   them in a warning and reads a partitioned table as a plain one. Write them in a custom
   migration (`mizzle generate --custom`); see "Not managed by mizzle" in the migrations
   guide. A vector column no longer creates the `vector` extension either.
-- `custom("type")` in `mizzle.pg`: a column of any other type (a domain, a composite, a
-  range, `citext`, `box`, `app.my_type`...), its DDL type verbatim and its values `str` in
-  the type's text form (sent as text, read as the server prints it, nested rows too; an
-  array of them as `list[str]`). Only the outermost select list or RETURNING casts it to
-  text: CTEs, FROM subqueries, selects feeding a write (`from_select`, MERGE `using`) and
-  subqueries in a condition keep the type, and `distinct()` orders such a column by it.
+- `custom("type")` in `mizzle.pg`, like Drizzle's `customType`: a column of any other type
+  (a domain, a composite, a range, `citext`, `box`, `app.my_type`...), its DDL type
+  verbatim. Values are what asyncpg reads and writes for the type (`str` for citext or
+  tsvector, `Range`, `Box`, a `Record` for a composite), with no SQL around the column, so
+  it compares, sorts and deduplicates as the type. `decode=` / `encode=` convert values
+  read and written, and `py_type=` is the Python type (`object` by default), also for
+  `select_model`. Nested rows (`with_=`) give the value's JSON form, through `decode` if
+  given. `pull` writes every column of a type mizzle has no column type for as
+  `custom(...)`.
 - A `Decimal` inside a json/jsonb value is written with its exact digits, and a value
   JSON cannot hold names the reason (`Object of type set is not JSON serializable`).
 - `select_model` accepts multi-dimensional array values.
-  `pull` writes every column of a type mizzle has no column type for as `custom(...)`.
 - `mizzle generate --custom` keeps the previous schema snapshot, so a custom migration can
   run before the tables that need what it creates; schema changes go into the next
   generated migration.
