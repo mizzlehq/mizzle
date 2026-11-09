@@ -213,6 +213,38 @@ def normalize_type(sql_type: str) -> str:
     return base + args + array
 
 
+# Built-in type names a bare spelling may resolve to (with _TYPE_ALIASES and _KEYWORDS).
+_BUILTIN_TYPES = frozenset(
+    """
+    text uuid bytea inet cidr macaddr macaddr8 date interval json jsonb xml money name oid
+    tsvector tsquery point line lseg box path polygon circle pg_lsn int4range int8range
+    numrange tsrange tstzrange daterange record regclass regtype
+    """.split()  # noqa: SIM905
+)
+
+
+def same_type(a: str, b: str) -> bool:
+    """Whether two spellings name one type, offline: an older mizzle stored ``posint`` and
+    ``integer`` for ``custom('public.posint')`` and ``custom('pg_catalog.int4')`` (K8-2).
+    ``public.X`` is bare X unless X names a built-in (``public.int4`` can be a domain,
+    K7-7); ``pg_catalog.X`` is X as a built-in."""
+    return a == b or _comparable(a) == _comparable(b)
+
+
+def _comparable(sql_type: str) -> str:
+    sql_type = normalize_type(sql_type)
+    base, array = _array_base(sql_type)
+    schema, dot, rest = base.partition(".")
+    if dot and schema == "pg_catalog":
+        return normalize_type(rest) + array
+    if dot and schema == DEFAULT_SCHEMA and "." not in rest:
+        name = rest.split("(")[0].strip()
+        builtin = {*_TYPE_ALIASES, *_TYPE_ALIASES.values(), *_KEYWORDS, *_BUILTIN_TYPES}
+        if name not in builtin:
+            return rest + array
+    return sql_type
+
+
 def _array_base(sql_type: str) -> tuple[str, str]:
     """``integer[][]`` -> ``("integer", "[]")``."""
     base = sql_type
@@ -459,6 +491,33 @@ def literal(text: str) -> str:
     if "\\" in body:
         return "E'" + body.replace("\\", "\\\\") + "'"
     return f"'{body}'"
+
+
+# What a statement's text holds, left to right: only a plain '...' string is rewritten.
+_LEXEME = re.compile(
+    r"""(?P<keep>(?:[Ee]|[Uu]&)'(?:[^'\\]|\\.|'')*'"""  # E'..' / U&'..' (backslash escapes)
+    r"""|"(?:[^"]|"")*"|--[^\n]*|/\*.*?\*/"""  # a quoted name, a comment
+    r"""|\$(?P<tag>[A-Za-z_][A-Za-z0-9_]*|)\$.*?\$(?P=tag)\$"""  # a dollar-quoted body
+    r"""|[^\W\d][\w$]*)"""  # a word, so name'...' is not an E'' string
+    r"""|'(?P<plain>(?:[^']|'')*)'""",
+    re.DOTALL,
+)
+
+
+def escape_backslashes(sql: str) -> str:
+    """``sql`` read the same with standard_conforming_strings off: each plain '...' string
+    holding a backslash becomes E'...' (as literal() writes it, K8-3). Defaults, checks,
+    views and policies are SQL text, compiled or printed by the server (pulled), where a
+    backslash in '...' was lost or escaped the closing quote; other text is unchanged."""
+
+    def one(match: re.Match[str]) -> str:
+        plain = match["plain"]
+        if plain is None or "\\" not in plain:
+            return match[0]
+        glued = re.fullmatch(r"[\w$]", sql[match.start() - 1 : match.start()]) is not None
+        return (" E'" if glued else "E'") + plain.replace("\\", "\\\\") + "'"
+
+    return _LEXEME.sub(one, sql)
 
 
 # Storage parameter names are identifiers, optionally in the toast namespace. Values are a
@@ -792,13 +851,15 @@ def _save_grants(name: str) -> str:
         f"  RAISE EXCEPTION 'view % has a disabled trigger or rule, which would come back "
         f"enabled when it is created again; this needs a custom migration', {rel};\n"
         "END IF;\n"
-        # PostgreSQL has no GRANTED BY another role for object privileges: SET ROLE to it.
+        # PostgreSQL has no GRANTED BY another role for object privileges: SET ROLE to it,
+        # which PostgreSQL 16+ allows only with the membership's SET option (K8-4).
         "IF EXISTS (SELECT 1 FROM pg_class c, LATERAL (SELECT c.relacl UNION ALL SELECT attacl "
         "FROM pg_attribute WHERE attrelid = c.oid) x(acl), aclexplode(x.acl) g "
         f"WHERE c.oid = {rel}::regclass AND g.grantor <> c.relowner "
-        "AND NOT pg_has_role(g.grantor, 'MEMBER')) THEN\n"
-        f"  RAISE EXCEPTION 'view % has privileges granted by a role the current user is not "
-        f"a member of, which it cannot grant again; this needs a custom migration', {rel};\n"
+        "AND NOT pg_has_role(g.grantor, CASE WHEN current_setting('server_version_num')::int "
+        ">= 160000 THEN 'SET' ELSE 'MEMBER' END)) THEN\n"
+        f"  RAISE EXCEPTION 'view % has privileges granted by a role the current user cannot "
+        f"SET ROLE to, so it cannot grant them again; this needs a custom migration', {rel};\n"
         "END IF;\n"
         f"CREATE TEMP TABLE IF NOT EXISTS __mizzle_saved "
         "(rel text PRIMARY KEY, acl aclitem[], owner oid, comment text);\n"
@@ -936,7 +997,8 @@ def render(steps: Sequence[Step], *, qualify: bool = False) -> list[Statement]:
         for step in steps:
             if isinstance(step, DropColumn) and step.rebuilt:
                 out.append(Statement(_rebuild_guard(step)))
-            out.append(render_step(step))
+            statement = render_step(step)
+            out.append(Statement(escape_backslashes(statement.sql), statement.transactional))
         return out
     finally:
         _QUALIFY.reset(token)
