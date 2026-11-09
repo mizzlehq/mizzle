@@ -7,7 +7,7 @@ from typing import final, override
 import asyncpg
 import pytest
 
-from mizzle import Constraint, QueryBuilder, Table, View, check, policy, rls, sql
+from mizzle import Constraint, QueryBuilder, Table, View, check, index, policy, rls, sql
 from mizzle.core.errors import DatabaseError
 from mizzle.core.snapshot import Snapshot, empty_snapshot
 from mizzle.core.sql.nodes import Node
@@ -15,7 +15,7 @@ from mizzle.core.steps import Statement
 from mizzle.dialects.postgres.driver import PostgresDriver
 from mizzle.kit.diff import diff
 from mizzle.kit.snapshot import build_snapshot
-from mizzle.pg import integer, serial, text
+from mizzle.pg import integer, serial, text, varchar
 from tests.integration.test_kit_cli import kit_url
 from tests.integration.test_kit_unmanaged import (
     Items,
@@ -274,3 +274,35 @@ async def test_a_new_expression_before_pg17_keeps_the_comment_and_managed_views(
     await apply(kit_url, old_branch)
     assert await comment_of_b(kit_url) == "computed"
     assert (await fetch_one(kit_url, "SELECT b FROM v_calc"))["b"] == "AB"
+
+
+def mail(width: int) -> Snapshot:
+    @final
+    class Mail(Table, name="mail"):
+        id = serial().primary_key()
+        email = varchar(width)
+        lower_email = text().generated_always_as(sql("lower(email)"))
+
+        @classmethod
+        @override
+        def config(cls) -> list[Constraint]:
+            return [index("mail_lower").on(cls.lower_email)]
+
+    return build_snapshot([Mail], dialect)
+
+
+async def test_a_type_change_under_a_generated_column(kit_url: str) -> None:
+    # H11-1: PostgreSQL cannot change the type of a column a generated column uses, so
+    # migrate failed. The generated column is dropped and added again after the change,
+    # with its index; no data is lost (it is computed), so no --allow-data-loss either.
+    v1, v2 = mail(20), mail(40)
+    await migrate(kit_url, empty_snapshot("postgresql"), v1)
+    await execute(kit_url, "INSERT INTO mail (email) VALUES ('A@X.io')")
+    steps = diff(v1, v2)
+    assert not any(s.data_loss for s in steps)
+    await migrate(kit_url, v1, v2)
+    row = await fetch_one(kit_url, "SELECT email, lower_email FROM mail")
+    assert (row["email"], row["lower_email"]) == ("A@X.io", "a@x.io")
+    assert await fetch_one(kit_url, "SELECT 1 AS i FROM pg_indexes WHERE indexname = 'mail_lower'")
+    current = await live(kit_url, ["public"])
+    assert diff(current, v2, compare_expressions=False) == []

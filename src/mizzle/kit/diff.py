@@ -157,6 +157,7 @@ class _Plan:
     drop_constraints: list[Step] = field(default_factory=list[Step])
     drop_indexes: list[Step] = field(default_factory=list[Step])
     drop_rebuilt: list[Step] = field(default_factory=list[Step])  # columns added again
+    add_rebuilt: list[Step] = field(default_factory=list[Step])  # after the type changes
     drop_early: list[Step] = field(default_factory=list[Step])  # tables whose names are reused
     create_tables: list[Step] = field(default_factory=list[Step])
     add_columns: list[Step] = field(default_factory=list[Step])
@@ -195,6 +196,7 @@ class _Plan:
             *self.create_tables,
             *self.add_columns,
             *self.alter_columns,
+            *self.add_rebuilt,
             *self.table_options,
             *self.drop_columns,
             *self.add_constraints,
@@ -426,12 +428,36 @@ def _diff_table(
     # Checks, index predicates and generated expressions are compared when both sides are as
     # the database prints them (normalized), even with compare_expressions off (C24).
     expressions = compare_expressions or normalized
+    # A generated column blocks a type change of a column it uses (H11-1): it is dropped,
+    # and added again after the change (its values are computed: nothing is lost).
+    retyped = [
+        c
+        for c, col in new["columns"].items()
+        if c in old["columns"] and old["columns"][c]["type"] != col["type"]
+    ]
     if rebuilt := [
         c
         for c, col in new["columns"].items()
-        if c in old["columns"] and _rebuilt(old["columns"][c], col)
+        if c in old["columns"]
+        and (
+            _rebuilt(old["columns"][c], col)
+            or (
+                (generated := old["columns"][c].get("generated")) is not None
+                and c not in retyped
+                and _mentions(generated["expression"], retyped)
+            )
+        )
     ]:
-        plan.drop_rebuilt += [DropColumn(schema, name, c, rebuilt=True) for c in rebuilt]
+        plan.drop_rebuilt += [
+            DropColumn(
+                schema,
+                name,
+                c,
+                rebuilt=True,
+                computed="generated" in old["columns"][c] and "generated" in new["columns"][c],
+            )
+            for c in rebuilt
+        ]
         # The comment goes with the column; a changed one is set by _diff_comments (K7-4).
         plan.comments += [
             SetColumnComment(schema, name, c, comment)
@@ -460,7 +486,9 @@ def _diff_table(
     for cname, column in new["columns"].items():
         before = old["columns"].get(cname)
         if before is None:
-            plan.add_columns.append(AddColumn(schema, name, column))
+            (plan.add_rebuilt if cname in rebuilt else plan.add_columns).append(
+                AddColumn(schema, name, column)
+            )
             continue
         old_default = before["default"]
         old_identity, new_identity = before.get("identity"), column.get("identity")

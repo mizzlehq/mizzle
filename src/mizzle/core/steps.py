@@ -179,11 +179,13 @@ class DropColumn(Step):
     # Dropped to be added again (made generated...): refused at migrate time when objects
     # mizzle does not manage hang on it (K6-7).
     rebuilt: bool = False
+    # Generated before and after: its values are computed again, so nothing is lost.
+    computed: bool = False
 
     @property
     @override
     def data_loss(self) -> bool:
-        return True
+        return not self.computed
 
     @override
     def describe(self) -> str:
